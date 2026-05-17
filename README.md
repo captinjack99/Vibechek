@@ -34,14 +34,15 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phased plan.
 | Phase | What | Status |
 |---|---|---|
 | 1 | Refactor working Python scripts into a `vibechek` package + CLI | ✅ Done |
-| 2 | Cross-platform installer (PyInstaller + platform installers) | 🚧 In progress |
-| 3 | Desktop UI (Tauri + Python sidecar, reusing prototype design) | ⏳ Planned |
+| 2 | Cross-platform installer (PyInstaller + platform installers) | ✅ Done |
+| 3 | Desktop UI (Tauri + Python sidecar, reusing prototype design) | 🚧 In progress |
 | 4 | Polish, docs, community launch | ⏳ Planned |
 
 ## What's in the repo
 
-- [`vibechek/`](vibechek/) — the Python package: analyzer, tagger, duplicates, organizer, CLI.
-- [`tests/`](tests/) — 67 pytest cases covering pure logic and end-to-end flows.
+- [`vibechek/`](vibechek/) — the Python package: analyzer, tagger, duplicates, organizer, CLI, JSON-RPC sidecar.
+- [`tests/`](tests/) — 67+ pytest cases covering pure logic and end-to-end flows.
+- [`ui/`](ui/) — Tauri 2.x desktop shell + React frontend (see [ui/README.md](ui/README.md)).
 - [`packaging/`](packaging/) — PyInstaller spec, build scripts for each OS, Inno Setup config for the Windows installer.
 - [`.github/workflows/`](.github/workflows/) — CI (test on every push) + release (build artifacts on tag).
 - [`legacy/`](legacy/) — the original v1 scripts that already processed a 12k-track library. Kept as the historical source of truth.

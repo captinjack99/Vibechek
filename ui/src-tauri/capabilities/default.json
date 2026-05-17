@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability set for the Vibechek desktop shell",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "shell:default",
+    "shell:allow-execute",
+    "shell:allow-spawn",
+    "dialog:default",
+    "dialog:allow-open"
+  ]
+}

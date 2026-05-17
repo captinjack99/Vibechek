@@ -42,14 +42,19 @@ venv/
 env/
 ENV/
 
-# --- Node / Frontend (when prototype is revived) ---
+# --- Node / Frontend ---
 node_modules/
-dist/
 .vite/
 *.tsbuildinfo
+# Vite build output for the UI
+ui/dist/
 
-# --- Rust / Tauri (if revived) ---
+# --- Rust / Tauri ---
 target/
+ui/src-tauri/target/
+ui/src-tauri/gen/
+# PyInstaller'd sidecar binaries dropped into the bundle dir at release time
+ui/src-tauri/binaries/
 
 # --- ML models (downloaded on first run, ~800MB) ---
 models/
