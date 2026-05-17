@@ -23,7 +23,6 @@ class AnalysisConfig:
     """Controls for the ML analysis pass."""
 
     workers: int = 4  # Multi-process; Python GIL prevents true threading
-    skip_bpm_and_key: bool = True  # Trust Rekordbox over the ML BPM/key models
     models_dir: Path = MODELS_DIR
 
 
@@ -35,6 +34,7 @@ class TaggingConfig:
     write_subgenre_as_main_genre: bool = True  # Rekordbox can only sort by main genre
     preserve_rekordbox_frames: bool = True  # GEOB / PRIV — cue points, beat grids
     backup_before_write: bool = True
+    skip_bpm_and_key: bool = True  # Trust Rekordbox over the ML BPM/key models
 
 
 @dataclass
