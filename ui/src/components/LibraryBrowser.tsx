@@ -1,7 +1,10 @@
 import { useMemo, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { AnimatePresence } from "framer-motion";
-import { FolderOpen, Sparkles, Search, Music, AlertCircle, CheckSquare, Square, Tag } from "lucide-react";
+import {
+  FolderOpen, Sparkles, Search, Music, AlertCircle, CheckSquare, Square, Tag,
+  Eye, RefreshCw,
+} from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -11,6 +14,7 @@ import type { AnalysisReport, PreflightResult, TrackAnalysis } from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
 import { PreflightDialog } from "./PreflightDialog";
 import { ConfirmModal } from "./ConfirmModal";
+import { FilterChips, applyFilters, emptyFilters, type LibraryFilters } from "./LibraryFilters";
 
 export function LibraryBrowser() {
   const tracks = useLibraryStore((s) => s.tracks);
@@ -39,24 +43,35 @@ export function LibraryBrowser() {
   const [scanCount, setScanCount] = useState<number | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
   const [confirmBulkTag, setConfirmBulkTag] = useState<"selected" | "all" | null>(null);
+  const [filters, setFilters] = useState<LibraryFilters>(emptyFilters());
+
+  const analyzedCount = useMemo(
+    () => tracks.filter((t) => t.ml_analysis).length,
+    [tracks],
+  );
+  const unanalyzedCount = tracks.length - analyzedCount;
 
   const filtered = useMemo(() => {
-    if (!searchFilter) return tracks;
-    const q = searchFilter.toLowerCase();
-    return tracks.filter((t) =>
-      t.filename.toLowerCase().includes(q) ||
-      (t.filename_artist ?? "").toLowerCase().includes(q) ||
-      (t.filename_title ?? "").toLowerCase().includes(q) ||
-      (t.ml_analysis?.ml_genre ?? "").toLowerCase().includes(q) ||
-      (t.ml_analysis?.ml_subgenre ?? "").toLowerCase().includes(q),
-    );
-  }, [tracks, searchFilter]);
+    let result = applyFilters(tracks, filters);
+    if (searchFilter) {
+      const q = searchFilter.toLowerCase();
+      result = result.filter((t) =>
+        t.filename.toLowerCase().includes(q) ||
+        (t.filename_artist ?? "").toLowerCase().includes(q) ||
+        (t.filename_title ?? "").toLowerCase().includes(q) ||
+        (t.ml_analysis?.ml_genre ?? "").toLowerCase().includes(q) ||
+        (t.ml_analysis?.ml_subgenre ?? "").toLowerCase().includes(q),
+      );
+    }
+    return result;
+  }, [tracks, searchFilter, filters]);
 
   const handleOpenFolder = async () => {
     const selected = await openDialog({ directory: true, multiple: false });
     if (typeof selected !== "string") return;
 
     setLibraryPath(selected);
+    setTracks([]);
     begin("analyze");
     try {
       const result = await rpc<{ count: number }>("scan_directory", { path: selected });
@@ -67,16 +82,43 @@ export function LibraryBrowser() {
     }
   };
 
-  const runAnalyze = async () => {
+  // "Just show me my library" — instant, no ML. Reads filenames + existing tags
+  // so the user can browse / dedupe / organize without committing to a long ML run.
+  const runFastScan = async () => {
     if (!libraryPath) return;
+    begin("analyze");
+    try {
+      const report = await rpc<AnalysisReport>("scan_only", { path: libraryPath });
+      setTracks(report.tracks);
+      finish();
+    } catch (e) {
+      fail(String(e));
+    }
+  };
+
+  // Run ML analyze. If `incremental` is true, skip every file already in `tracks`
+  // and merge the new results into what's there.
+  const runAnalyze = async (incremental = false) => {
+    if (!libraryPath) return;
+    const alreadyAnalyzed = incremental
+      ? tracks.filter((t) => t.ml_analysis).map((t) => t.path)
+      : [];
     begin("analyze");
     try {
       const report = await rpc<AnalysisReport>("analyze_directory", {
         path: libraryPath,
         workers: analysisCfg.workers,
         use_gpu: analysisCfg.use_gpu,
+        skip_paths: alreadyAnalyzed,
       });
-      setTracks(report.tracks);
+      if (incremental) {
+        // Merge: keep existing analyzed tracks, add the new ones, dedup by path
+        const existing = new Map(tracks.map((t) => [t.path, t]));
+        for (const t of report.tracks) existing.set(t.path, t);
+        setTracks(Array.from(existing.values()));
+      } else {
+        setTracks(report.tracks);
+      }
       finish();
     } catch (e) {
       fail(String(e));
@@ -191,18 +233,35 @@ export function LibraryBrowser() {
                 : "Vibechek will scan your music folder, then let you analyze, dedupe, tag, or reorganize it."}
             </p>
             {libraryPath ? (
-              <div className="flex items-center justify-center gap-2">
-                <button
-                  className="btn-primary"
-                  onClick={handleAnalyze}
-                  disabled={active !== null}
-                >
-                  <Sparkles className="w-4 h-4" />
-                  Analyze with ML
-                </button>
-                <button className="btn-ghost" onClick={handleOpenFolder}>
-                  Choose a different folder
-                </button>
+              <div className="space-y-3">
+                <div className="flex items-center justify-center gap-2">
+                  <button
+                    className="btn-primary"
+                    onClick={runFastScan}
+                    disabled={active !== null}
+                    title="Read filenames + existing tags. Takes a few seconds."
+                  >
+                    <Eye className="w-4 h-4" />
+                    Just show me my library
+                  </button>
+                  <button
+                    className="btn-ghost"
+                    onClick={handleAnalyze}
+                    disabled={active !== null}
+                    title="Full ML pass — detects genre, mood, energy, etc. Takes longer."
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    Analyze with ML
+                  </button>
+                </div>
+                <div>
+                  <button
+                    className="text-xs text-white/40 hover:text-white"
+                    onClick={handleOpenFolder}
+                  >
+                    Choose a different folder
+                  </button>
+                </div>
               </div>
             ) : (
               <button className="btn-primary" onClick={handleOpenFolder}>
@@ -276,26 +335,47 @@ export function LibraryBrowser() {
           </>
         ) : (
           <>
-            <button
-              className="btn-ghost"
-              onClick={() => setConfirmBulkTag("all")}
-              disabled={active !== null || tracks.length === 0}
-              title="Write ML tags to every analyzed track"
-            >
-              <Tag className="w-4 h-4" />
-              Apply ML tags to all
-            </button>
+            {analyzedCount > 0 && (
+              <button
+                className="btn-ghost"
+                onClick={() => setConfirmBulkTag("all")}
+                disabled={active !== null}
+                title="Write ML tags to every analyzed track"
+              >
+                <Tag className="w-4 h-4" />
+                Apply ML tags to all
+              </button>
+            )}
+            {unanalyzedCount > 0 && libraryPath && (
+              <button
+                className="btn-ghost"
+                onClick={() => runAnalyze(true)}
+                disabled={active !== null}
+                title={`Run ML on the ${unanalyzedCount} tracks that haven't been analyzed yet`}
+              >
+                <Sparkles className="w-4 h-4" />
+                Analyze new ({unanalyzedCount})
+              </button>
+            )}
             <button
               className="btn-ghost"
               onClick={handleAnalyze}
               disabled={active !== null || !libraryPath}
+              title="Re-run ML on the whole library"
             >
-              <Sparkles className="w-4 h-4" />
-              Re-analyze
+              <RefreshCw className="w-4 h-4" />
+              Re-analyze all
             </button>
           </>
         )}
       </div>
+
+      {/* Filter chips (only render when there are analyzed tracks to filter) */}
+      {analyzedCount > 0 && (
+        <div className="px-4 py-2 border-b border-white/5">
+          <FilterChips tracks={tracks} filters={filters} setFilters={setFilters} />
+        </div>
+      )}
 
       {/* Track list */}
       <div className="flex-1 min-h-0">

@@ -111,8 +111,50 @@ def _scan_directory(params: dict) -> dict:
     }
 
 
+def _scan_only(params: dict) -> dict:
+    """Lightweight library load: returns TrackAnalysis-shaped records with
+    filename-parsed hints + existing tags, but no ML analysis.
+
+    Lets the user see + browse their library instantly without waiting for
+    the full ML run. They can analyze later — or never, and just use Vibechek
+    for dedupe / organize / tag-backup workflows.
+    """
+    from dataclasses import asdict
+    from vibechek.analyzer import analyze_track
+    from vibechek.utils import find_audio_files
+
+    path = Path(params["path"])
+    recursive = bool(params.get("recursive", True))
+    files = find_audio_files(path, recursive=recursive)
+    total = len(files)
+    tracks: list[dict] = []
+    for i, fp in enumerate(files):
+        _emit_progress(i + 1, total, fp.name)
+        try:
+            # Pass models=None so analyze_track only does the cheap pass
+            tracks.append(asdict(analyze_track(fp, models=None)))
+        except Exception as e:  # noqa: BLE001
+            tracks.append({
+                "path": str(fp),
+                "filename": fp.name,
+                "extension": fp.suffix.lower(),
+                "size_mb": 0.0,
+                "error": str(e),
+            })
+    return {
+        "status": "complete",
+        "summary": {"total_files": total, "analyzed": 0, "errors": sum(1 for t in tracks if t.get("error"))},
+        "statistics": {},
+        "tracks": tracks,
+    }
+
+
 def _analyze_directory(params: dict) -> dict:
-    """Full ML analysis. Emits progress notifications."""
+    """Full ML analysis. Emits progress notifications.
+
+    Supports incremental runs via `skip_paths` (list of absolute paths already
+    analyzed). The GUI uses this for the 'Analyze new tracks only' button.
+    """
     from vibechek.analyzer import analyze_directory
 
     config = AnalysisConfig(
@@ -122,6 +164,9 @@ def _analyze_directory(params: dict) -> dict:
     if "models_dir" in params and params["models_dir"]:
         config.models_dir = Path(params["models_dir"])
 
+    skip_paths = params.get("skip_paths")
+    skip_set: set[str] | None = set(skip_paths) if skip_paths else None
+
     return analyze_directory(
         Path(params["path"]),
         config=config,
@@ -129,6 +174,7 @@ def _analyze_directory(params: dict) -> dict:
         output_path=Path(params["output_path"]) if params.get("output_path") else None,
         skip=int(params.get("skip", 0)),
         limit=int(params.get("limit") or 0) or None,
+        skip_paths=skip_set,
     )
 
 
@@ -363,6 +409,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "install_wsl": _install_wsl,
     "install_vibechek_in_wsl": _install_vibechek_in_wsl,
     "scan_directory": _scan_directory,
+    "scan_only": _scan_only,
     "analyze_directory": _analyze_directory,
     "find_duplicates": _find_duplicates,
     "handle_duplicates": _handle_duplicates,
@@ -381,6 +428,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
 # Methods that run long ops and should be cancellable.
 _CANCELLABLE_METHODS = {
     "analyze_directory": "analyze",
+    "scan_only": "analyze",
     "find_duplicates": "dedupe",
     "organize": "organize",
     "apply_ml_tags": "tag",

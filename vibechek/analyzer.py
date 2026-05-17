@@ -596,17 +596,24 @@ def analyze_directory(
     output_path: Path | None = None,
     skip: int = 0,
     limit: int | None = None,
+    skip_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     """Analyze every audio file under `library_path`.
 
     Writes an incremental JSON report to `output_path` (if provided) every 50
     tracks so a crash doesn't lose all progress. Uses `config.workers` parallel
     processes when >1.
+
+    When `skip_paths` is provided, files whose absolute string path is in the
+    set are skipped — used by the GUI's incremental "analyze new tracks only"
+    flow so re-runs don't re-process the whole library.
     """
     if config is None:
         config = AnalysisConfig()
 
     files = find_audio_files(library_path)
+    if skip_paths:
+        files = [f for f in files if str(f) not in skip_paths]
     if skip:
         files = files[skip:]
     if limit:
