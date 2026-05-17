@@ -1,23 +1,85 @@
 /**
  * Global error banner. Shown whenever `useOperationStore.error` is set so an
- * operation failure can never silently disappear into the void. Dismissed by
- * clicking the close button or by starting a new operation.
+ * operation failure can never silently disappear.
+ *
+ * Two actions:
+ *   - Copy details — full error to clipboard
+ *   - Report issue — opens a prefilled GitHub Issue with the error + system
+ *     context so the user doesn't have to type it all out
  */
 
+import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { AlertCircle, X } from "lucide-react";
+import { AlertCircle, X, Copy, Check, ExternalLink } from "lucide-react";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 
 import { useOperationStore } from "../stores";
+import { rpc, sidecarStatus } from "../hooks/useSidecar";
+
+const ISSUES_URL = "https://github.com/papapew/Vibechek/issues/new";
 
 export function ErrorToast() {
   const error = useOperationStore((s) => s.error);
   const clearError = useOperationStore((s) => s.clearError);
 
+  const [copied, setCopied] = useState(false);
+
+  // Reset the copy state when a new error appears
+  useEffect(() => {
+    setCopied(false);
+  }, [error]);
+
   if (!error) return null;
 
-  // Heuristic: pull a friendlier summary line out of the sidecar's error JSON
-  // when possible. The Rust shell wraps RPC errors as JSON strings.
   const message = friendlyMessage(error);
+
+  const handleCopy = () => {
+    void navigator.clipboard.writeText(error);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  const handleReport = async () => {
+    // Gather a bit of context to prefill the issue body
+    let version = "unknown";
+    let sidecar = "unknown";
+    try {
+      const v = await rpc<{ version: string }>("version");
+      version = v.version;
+    } catch { /* ignore */ }
+    try {
+      const s = await sidecarStatus();
+      sidecar = s.binary;
+    } catch { /* ignore */ }
+
+    const body = [
+      "**What I was doing:**",
+      "<!-- e.g. clicked Analyze on D:\\Music -->",
+      "",
+      "**Expected:**",
+      "<!-- what should have happened -->",
+      "",
+      "**Got:**",
+      "```",
+      error.slice(0, 4000),
+      "```",
+      "",
+      "---",
+      `Vibechek version: ${version}`,
+      `Sidecar: ${sidecar}`,
+      `Platform: ${navigator.userAgent}`,
+    ].join("\n");
+
+    const url = `${ISSUES_URL}?title=${encodeURIComponent("Error: " + message.slice(0, 80))}&body=${encodeURIComponent(body)}`;
+
+    try {
+      await openUrl(url);
+    } catch (e) {
+      // Fallback: copy URL to clipboard so the user can paste it
+      void navigator.clipboard.writeText(url);
+      window.alert("Couldn't open browser; URL copied to clipboard.");
+    }
+  };
 
   return (
     <motion.div
@@ -30,17 +92,39 @@ export function ErrorToast() {
         <AlertCircle className="w-5 h-5 text-accent-red flex-none mt-0.5" />
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium text-accent-red">
-            Operation failed
+            Something went wrong
           </div>
           <div className="text-xs text-white/70 mt-1 break-words">
             {message}
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              onClick={handleCopy}
+              className="text-xs text-white/60 hover:text-white inline-flex items-center gap-1"
+              title="Copy the full error message"
+            >
+              {copied ? (
+                <Check className="w-3 h-3 text-accent-green" />
+              ) : (
+                <Copy className="w-3 h-3" />
+              )}
+              {copied ? "Copied" : "Copy details"}
+            </button>
+            <button
+              onClick={handleReport}
+              className="text-xs text-white/60 hover:text-white inline-flex items-center gap-1"
+              title="Open a pre-filled GitHub issue in your browser"
+            >
+              <ExternalLink className="w-3 h-3" />
+              Report on GitHub
+            </button>
           </div>
           {message !== error && (
             <details className="mt-2 text-[11px] text-white/40">
               <summary className="cursor-pointer hover:text-white/60">
                 Full error
               </summary>
-              <pre className="mt-1 font-mono whitespace-pre-wrap break-all">
+              <pre className="mt-1 font-mono whitespace-pre-wrap break-all max-h-48 overflow-auto">
                 {error}
               </pre>
             </details>
@@ -67,6 +151,5 @@ function friendlyMessage(raw: string): string {
   } catch {
     /* not JSON, fall through */
   }
-  // Trim noisy prefixes
   return raw.replace(/^Error invoking remote method '[^']+':\s*/, "").trim();
 }
