@@ -74,9 +74,17 @@ Goal: full graphical workflow — open folder, analyze, preview, apply.
   - Builds PyInstaller CLI bundle on each OS
   - Builds Tauri installers (`.msi`/`.exe`/`.dmg`/`.AppImage`/`.deb`) with sidecar bundled
   - Draft GitHub Release with all artifacts on tag push
+- ✅ Pre-flight system ([`vibechek/preflight.py`](../vibechek/preflight.py) + GUI dialog) — catches missing essentia / models before any operation starts so multiprocessing.Pool can't hang silently.
+- ✅ Fully automated Windows setup ([`vibechek/wsl.py`](../vibechek/wsl.py)):
+  - Detects WSL availability + installed distros + whether vibechek/essentia are inside any of them.
+  - One-click install of WSL itself (elevated PowerShell, triggers UAC).
+  - One-click install of vibechek + essentia + chromaprint into the user's distro.
+  - When essentia is unavailable natively but available via WSL, `analyze` is
+    routed through WSL transparently, with Windows ↔ WSL path translation
+    (`C:\foo` ↔ `/mnt/c/foo`) at the boundary.
+- ✅ App icons ([`packaging/generate-icons.py`](../packaging/generate-icons.py)) — branded vinyl disc, generated in all formats Tauri needs.
 - [ ] Settings persistence (TOML in user config dir) — currently in-memory only
 - [ ] Cancellation support — long ops can't be interrupted from the UI yet
-- [ ] App icons (`ui/src-tauri/icons/`) — currently using Tauri defaults
 - [ ] Tag a `v0.3.0` release with the desktop app
 
 ### Notes on the desktop stack

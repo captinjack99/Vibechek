@@ -17,6 +17,7 @@ from pathlib import Path
 
 from vibechek.analyzer import MODELS
 from vibechek.config import MODELS_DIR
+from vibechek.wsl import WSLStatus, detect_wsl
 
 log = logging.getLogger(__name__)
 
@@ -52,12 +53,17 @@ class PreflightResult:
     essentia: EssentiaCheck
     models: ModelsCheck
     platform: str
+    # WSL status — only meaningful on Windows. On other OSes wsl.is_windows
+    # is False and the rest can be ignored.
+    wsl: WSLStatus | None = None
+    # How analyze will actually run when ready=True: "native" or "wsl"
+    analyze_via: str | None = None
 
     @property
     def reasons_not_ready(self) -> list[str]:
         out: list[str] = []
-        if not self.essentia.installed:
-            out.append("essentia-tensorflow is not installed")
+        if not self.essentia.installed and not (self.wsl and self.wsl.can_run_vibechek):
+            out.append("essentia-tensorflow is not installed (native or in WSL)")
         if self.models.missing:
             out.append(f"{len(self.models.missing)} ML model file(s) missing")
         return out
@@ -118,14 +124,31 @@ def check_models(models_dir: Path | None = None) -> ModelsCheck:
 
 
 def preflight(models_dir: Path | None = None) -> PreflightResult:
-    """Full check; ready=True iff analyze can actually run."""
+    """Full check; ready=True iff analyze can actually run.
+
+    "Ready" means EITHER:
+      - Native essentia is installed AND models are present, OR
+      - We're on Windows, WSL has vibechek + essentia, AND models are present
+        (models live on the Windows side and are mounted into WSL via /mnt/c)
+    """
     essentia = check_essentia()
     models = check_models(models_dir)
+    wsl_status = detect_wsl()  # cheap no-op on non-Windows
+
+    have_native = essentia.installed
+    have_wsl = wsl_status.can_run_vibechek
+    have_engine = have_native or have_wsl
+
+    ready = have_engine and not models.missing
+    analyze_via = "native" if have_native else ("wsl" if have_wsl else None)
+
     return PreflightResult(
-        ready=essentia.installed and not models.missing,
+        ready=ready,
         essentia=essentia,
         models=models,
         platform=platform.platform(),
+        wsl=wsl_status,
+        analyze_via=analyze_via,
     )
 
 
@@ -133,6 +156,10 @@ def to_dict(r: PreflightResult) -> dict:
     """JSON-serializable form, including derived reasons."""
     d = asdict(r)
     d["reasons_not_ready"] = r.reasons_not_ready
+    # Hand-fill the WSL convenience properties (asdict won't include @property)
+    if r.wsl is not None:
+        d["wsl"]["can_run_vibechek"] = r.wsl.can_run_vibechek
+        d["wsl"]["usable_distro"] = r.wsl.usable_distro
     return d
 
 
@@ -169,8 +196,31 @@ def summary_lines(r: PreflightResult) -> list[str]:
             lines.append(f"    ... and {len(r.models.missing) - 8} more")
         lines.append("  Run: vibechek download-models")
 
+    if r.wsl and r.wsl.is_windows:
+        lines.append("")
+        lines.append("WSL (Windows fallback for analyze):")
+        if not r.wsl.wsl_available:
+            lines.append("  wsl.exe not on PATH")
+        elif not r.wsl.wsl_feature_enabled:
+            lines.append("  feature disabled; the GUI can install it for you")
+        elif not r.wsl.distros:
+            lines.append("  feature on, no distros installed yet")
+        elif r.wsl.can_run_vibechek:
+            lines.append(f"  OK ({r.wsl.usable_distro} has vibechek + essentia)")
+        else:
+            for d in r.wsl.distros:
+                bits = []
+                if d.vibechek_installed: bits.append("vibechek")
+                if d.essentia_installed: bits.append("essentia")
+                status = ", ".join(bits) if bits else "neither installed"
+                lines.append(f"  - {d.name}: {status}")
+            lines.append("  Run the GUI installer or `pip install essentia-tensorflow vibechek` inside your distro.")
+
     lines.append("")
-    lines.append("READY" if r.ready else "NOT READY (cannot run `analyze`)")
+    if r.ready:
+        lines.append(f"READY (will analyze via: {r.analyze_via})")
+    else:
+        lines.append("NOT READY (cannot run `analyze`)")
     return lines
 
 

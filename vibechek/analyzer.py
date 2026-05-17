@@ -629,6 +629,13 @@ def analyze_directory(
             "for actionable instructions."
         )
 
+    # If native essentia is missing but WSL has it, route through WSL transparently.
+    if pf.analyze_via == "wsl":
+        return _analyze_via_wsl(
+            library_path, config, on_progress, output_path, skip, limit,
+            distro=pf.wsl.usable_distro,  # type: ignore[union-attr]
+        )
+
     file_strs = [str(f) for f in files]
     results: list[dict[str, Any]] = []
 
@@ -671,6 +678,101 @@ def analyze_directory(
             json.dumps(report, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    return report
+
+
+def _analyze_via_wsl(
+    library_path: Path,
+    config: AnalysisConfig,
+    on_progress: ProgressCallback | None,
+    output_path: Path | None,
+    skip: int,
+    limit: int | None,
+    distro: str,
+) -> dict[str, Any]:
+    """Route the analyze to vibechek-inside-WSL.
+
+    All file paths get translated: Windows `C:\\foo` ↔ WSL `/mnt/c/foo`. The
+    resulting analysis.json comes back with WSL paths in it; we rewrite them
+    to Windows paths before returning so the GUI sees a consistent view.
+    """
+    import json as _json
+    import re
+    import tempfile
+
+    from vibechek.wsl import run_vibechek_in_wsl, win_to_wsl_path, wsl_to_win_path
+
+    # Pick an output file the WSL side can write to (under Windows tmp so we
+    # can read it back from native Python).
+    if output_path is None:
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".json", prefix="vibechek-wsl-", delete=False,
+        )
+        tmp.close()
+        local_output = Path(tmp.name)
+    else:
+        local_output = Path(output_path)
+
+    wsl_input = win_to_wsl_path(str(library_path))
+    wsl_output = win_to_wsl_path(str(local_output))
+
+    workers = config.workers if config.workers and config.workers > 0 else 0
+
+    args = [
+        "analyze", wsl_input,
+        "-o", wsl_output,
+        "--gpu", config.use_gpu,
+    ]
+    if workers > 0:
+        args += ["--workers", str(workers)]
+    if skip:
+        args += ["--skip", str(skip)]
+    if limit:
+        args += ["--limit", str(limit)]
+
+    # Progress lines from `vibechek analyze` look like "Progress: 50/12000 ..."
+    # We re-emit them as JSON-RPC notifications for the GUI.
+    progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+    def on_line(line: str) -> None:
+        if not line:
+            return
+        m = progress_re.search(line)
+        if m and on_progress:
+            on_progress(int(m.group(1)), int(m.group(2)), line[:80])
+
+    result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"vibechek analyze inside WSL ({distro}) exited with "
+            f"{result.returncode}. stdout tail:\n{result.stdout[-1500:]}"
+        )
+
+    # Read the analysis.json the WSL side wrote and rewrite paths
+    if not local_output.exists():
+        raise RuntimeError(
+            f"WSL analyze finished but no output file at {local_output}"
+        )
+
+    report = _json.loads(local_output.read_text(encoding="utf-8"))
+    for track in report.get("tracks", []):
+        if "path" in track:
+            track["path"] = wsl_to_win_path(track["path"])
+
+    if output_path is not None:
+        # Rewrite the file with translated paths so external consumers see Windows paths
+        local_output.write_text(
+            _json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    else:
+        # Clean up our temp file
+        try:
+            local_output.unlink()
+        except OSError:
+            pass
+
     return report
 
 

@@ -37,33 +37,42 @@ pip install essentia-tensorflow
 
 That's it. Then run `vibechek download-models` once to fetch the model weights (~800 MB to a per-user data directory).
 
-### Windows (harder)
+### Windows (now fully automated)
 
-Essentia does not publish official Windows wheels. Two workarounds:
+Essentia doesn't publish a Windows wheel, but the Vibechek desktop app handles
+that for you. The first time you click **Analyze**, a setup dialog walks you
+through the whole thing — no terminal required:
 
-#### Option A: use WSL (recommended)
+1. **Install WSL + Ubuntu** — one click, triggers a UAC prompt, ~5-15 min
+   download (Windows handles the install itself).
+2. **Install Vibechek + Essentia inside Ubuntu** — one click, ~3-5 min,
+   runs entirely inside WSL with no extra prompts.
+3. **Download ML models** — one click, ~200 MB.
 
-Run Vibechek inside WSL Ubuntu and point it at your music drive mounted under `/mnt/`. This is the same setup that processed the original 12k-track library — see [`docs/PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md) for context.
+After setup, when you analyze a library on `C:\Music\Tracks` the app
+automatically routes that analyze through WSL, translates the path to
+`/mnt/c/Music/Tracks`, runs essentia inside the Linux environment, and
+returns Windows paths in the resulting `analysis.json`. You never see WSL.
+
+If you'd rather do it by hand (e.g. running on a server), the manual
+equivalents are:
 
 ```powershell
 wsl --install -d Ubuntu-24.04
+# After Windows finishes the install + you've launched Ubuntu once:
+wsl -d Ubuntu-24.04 -- bash -lc '
+  sudo apt update &&
+  sudo apt install -y python3-pip libchromaprint-tools &&
+  pip install essentia-tensorflow vibechek &&
+  vibechek --version'
 ```
 
-Then inside the WSL shell:
+### Skipping analyze entirely
 
-```bash
-sudo apt update && sudo apt install -y python3-pip libchromaprint-tools
-pip install essentia-tensorflow vibechek
-vibechek analyze "/mnt/d/Music/Tracks"
-```
-
-#### Option B: skip analyze, use Vibechek for the rest
-
-Everything except `analyze` works on native Windows: dedupe, organize, tag (from an existing analysis.json), backup/restore, route. If you have an analysis.json from a friend or from a previous run, you can use the rest of Vibechek normally.
-
-#### Option C: build Essentia from source
-
-Possible but painful — requires Visual Studio, vcpkg, and patience. Not officially supported; consider Option A first.
+Everything else works on native Windows without Essentia: dedupe, organize,
+tag (from an existing `analysis.json`), backup, restore, route. If you have
+an analysis from a friend or a previous run, the rest of Vibechek runs
+straight from the standalone installer.
 
 ## Installing fpcalc (for `dedupe`'s audio fingerprinting)
 

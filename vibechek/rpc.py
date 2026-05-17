@@ -145,6 +145,26 @@ def _preflight(params: dict) -> dict:
     return to_dict(preflight(models_dir))
 
 
+def _wsl_status(_params: dict) -> dict:
+    """Report WSL detection results (Windows only; no-op fields elsewhere)."""
+    from vibechek.wsl import detect_wsl, to_dict
+    return to_dict(detect_wsl())
+
+
+def _install_wsl(params: dict) -> dict:
+    """Install WSL + the named distro via elevated PowerShell. Triggers UAC."""
+    from vibechek.wsl import install_wsl
+    distro = str(params.get("distro", "Ubuntu-24.04"))
+    return install_wsl(distro=distro, on_progress=_emit_progress)
+
+
+def _install_vibechek_in_wsl(params: dict) -> dict:
+    """Install vibechek + essentia-tensorflow + chromaprint inside a WSL distro."""
+    from vibechek.wsl import install_vibechek_in_wsl
+    distro = str(params["distro"])
+    return install_vibechek_in_wsl(distro, on_progress=_emit_progress)
+
+
 def _find_duplicates(params: dict) -> dict:
     from vibechek.duplicates import find_duplicates
 
@@ -307,6 +327,9 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "version": _version,
     "system_info": _system_info,
     "preflight": _preflight,
+    "wsl_status": _wsl_status,
+    "install_wsl": _install_wsl,
+    "install_vibechek_in_wsl": _install_vibechek_in_wsl,
     "scan_directory": _scan_directory,
     "analyze_directory": _analyze_directory,
     "find_duplicates": _find_duplicates,
