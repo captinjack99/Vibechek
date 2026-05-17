@@ -138,6 +138,13 @@ def _system_info(_params: dict) -> dict:
     return to_dict(detect())
 
 
+def _preflight(params: dict) -> dict:
+    """Verify essentia + models are ready for `analyze_directory`."""
+    from vibechek.preflight import preflight, to_dict
+    models_dir = Path(params["models_dir"]) if params.get("models_dir") else None
+    return to_dict(preflight(models_dir))
+
+
 def _find_duplicates(params: dict) -> dict:
     from vibechek.duplicates import find_duplicates
 
@@ -299,6 +306,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "ping": _ping,
     "version": _version,
     "system_info": _system_info,
+    "preflight": _preflight,
     "scan_directory": _scan_directory,
     "analyze_directory": _analyze_directory,
     "find_duplicates": _find_duplicates,

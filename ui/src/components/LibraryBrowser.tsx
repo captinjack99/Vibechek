@@ -1,13 +1,15 @@
 import { useMemo, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
+import { AnimatePresence } from "framer-motion";
 import { FolderOpen, Sparkles, Search, Music, AlertCircle } from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { useLibraryStore, useOperationStore, useConfigStore, useUIStore } from "../stores";
 import { rpc } from "../hooks/useSidecar";
-import type { AnalysisReport, TrackAnalysis } from "../types";
+import type { AnalysisReport, PreflightResult, TrackAnalysis } from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
+import { PreflightDialog } from "./PreflightDialog";
 
 export function LibraryBrowser() {
   const tracks = useLibraryStore((s) => s.tracks);
@@ -29,6 +31,7 @@ export function LibraryBrowser() {
   const selectedTrackPath = useUIStore((s) => s.selectedTrackPath);
 
   const [scanCount, setScanCount] = useState<number | null>(null);
+  const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
 
   const filtered = useMemo(() => {
     if (!searchFilter) return tracks;
@@ -57,13 +60,14 @@ export function LibraryBrowser() {
     }
   };
 
-  const handleAnalyze = async () => {
+  const runAnalyze = async () => {
     if (!libraryPath) return;
     begin("analyze");
     try {
       const report = await rpc<AnalysisReport>("analyze_directory", {
         path: libraryPath,
         workers: analysisCfg.workers,
+        use_gpu: analysisCfg.use_gpu,
       });
       setTracks(report.tracks);
       finish();
@@ -72,11 +76,45 @@ export function LibraryBrowser() {
     }
   };
 
+  // Gate analyze behind preflight. If not ready, show the dialog; the user
+  // can fix things and click Re-check, which auto-proceeds when ready.
+  const handleAnalyze = async () => {
+    if (!libraryPath) return;
+    try {
+      const result = await rpc<PreflightResult>("preflight", {});
+      if (result.ready) {
+        runAnalyze();
+      } else {
+        setPreflightResult(result);
+      }
+    } catch (e) {
+      fail(String(e));
+    }
+  };
+
+  // Preflight dialog (rendered above whichever state is active)
+  const preflightOverlay = (
+    <AnimatePresence>
+      {preflightResult && !preflightResult.ready && (
+        <PreflightDialog
+          preflight={preflightResult}
+          onRefresh={setPreflightResult}
+          onClose={() => setPreflightResult(null)}
+          onReady={() => {
+            setPreflightResult(null);
+            runAnalyze();
+          }}
+        />
+      )}
+    </AnimatePresence>
+  );
+
   // Empty state
   if (tracks.length === 0) {
     return (
       <div className="h-full flex flex-col">
         <Header onOpen={handleOpenFolder} libraryPath={libraryPath} />
+        {preflightOverlay}
         <div className="flex-1 flex items-center justify-center px-8">
           <div className="text-center max-w-md">
             <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-white/5 flex items-center justify-center">
@@ -126,6 +164,7 @@ export function LibraryBrowser() {
   return (
     <div className="h-full flex flex-col">
       <Header onOpen={handleOpenFolder} libraryPath={libraryPath} />
+      {preflightOverlay}
 
       {/* Toolbar */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-white/5">

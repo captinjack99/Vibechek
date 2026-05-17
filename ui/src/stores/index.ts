@@ -79,6 +79,7 @@ interface OperationState {
   setProgress: (p: ProgressEvent) => void;
   finish: () => void;
   fail: (error: string) => void;
+  clearError: () => void;
 
   setDuplicateReport: (r: DuplicateReport | null) => void;
   setOrganizePlan: (p: OrganizePlan | null) => void;
@@ -97,7 +98,8 @@ export const useOperationStore = create<OperationState>((set) => ({
     set({ active: kind, progress: null, error: null, startedAt: Date.now() }),
   setProgress: (p) => set({ progress: p }),
   finish: () => set({ active: null, progress: null, startedAt: null }),
-  fail: (error) => set({ active: null, error }),
+  fail: (error) => set({ active: null, progress: null, startedAt: null, error }),
+  clearError: () => set({ error: null }),
 
   setDuplicateReport: (r) => set({ duplicateReport: r }),
   setOrganizePlan: (p) => set({ organizePlan: p }),

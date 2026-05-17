@@ -616,6 +616,19 @@ def analyze_directory(
         return {"status": "complete", "summary": {"total_files": 0, "analyzed": 0, "errors": 0},
                 "tracks": [], "statistics": {}}
 
+    # Pre-flight: catch missing essentia / models BEFORE we spawn a worker pool.
+    # An ImportError inside a multiprocessing.Pool initializer hangs the pool
+    # silently instead of surfacing the error — we never want to land there.
+    from vibechek.preflight import preflight  # noqa: PLC0415
+
+    pf = preflight(config.models_dir)
+    if not pf.ready:
+        raise RuntimeError(
+            "Cannot analyze: " + "; ".join(pf.reasons_not_ready) +
+            ". Run `vibechek preflight` (or check Settings in the GUI) "
+            "for actionable instructions."
+        )
+
     file_strs = [str(f) for f in files]
     results: list[dict[str, Any]] = []
 
