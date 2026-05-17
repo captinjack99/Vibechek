@@ -381,5 +381,23 @@ def download_models_cmd(models_dir: Path | None) -> None:
     console.print(f"\n[green]Done.[/] {len(descriptors)} models available in [cyan]{target}[/]")
 
 
+# ---------------------------------------------------------------------------
+# rpc — JSON-RPC server for the desktop sidecar
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+def rpc() -> None:
+    """Run as a JSON-RPC sidecar (used by the Tauri desktop shell).
+
+    Reads JSON-RPC 2.0 requests from stdin, writes responses + progress
+    notifications to stdout. Not intended for direct human use; see
+    `vibechek/rpc.py` for the protocol.
+    """
+    from vibechek.rpc import serve
+
+    serve()
+
+
 if __name__ == "__main__":
     main()

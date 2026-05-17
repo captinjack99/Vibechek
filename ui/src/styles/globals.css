@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------------------
+ * Base
+ * ------------------------------------------------------------------------- */
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: theme('fontFamily.sans');
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar — subtle on dark background */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.08);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
+
+/* ---------------------------------------------------------------------------
+ * Reusable component classes
+ * ------------------------------------------------------------------------- */
+
+@layer components {
+  .panel {
+    @apply bg-surface-100 border border-white/5 rounded-xl;
+  }
+
+  .panel-pad {
+    @apply panel p-4;
+  }
+
+  .btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
+           transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent/90;
+  }
+
+  .btn-ghost {
+    @apply btn text-white/80 hover:text-white hover:bg-white/5;
+  }
+
+  .btn-danger {
+    @apply btn bg-accent-red/20 text-accent-red hover:bg-accent-red/30;
+  }
+
+  .input {
+    @apply bg-surface-200 border border-white/10 rounded-lg px-3 py-2 text-sm
+           focus:outline-none focus:border-accent/60 placeholder-white/30;
+  }
+
+  .label {
+    @apply block text-xs font-medium text-white/60 uppercase tracking-wider mb-1.5;
+  }
+
+  .track-row {
+    @apply flex items-center px-4 py-2 border-b border-white/5
+           hover:bg-white/[0.03] cursor-pointer transition-colors;
+  }
+
+  .track-row.selected {
+    @apply bg-accent/10 border-accent/30;
+  }
+}

@@ -50,19 +50,34 @@ Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 - [ ] macOS notarization (deferred — same reason).
 - [ ] Tag a `v0.2.0` release with downloadable artifacts.
 
-### Phase 3 — Desktop UI
+### Phase 3 — Desktop UI _(in progress)_
 
-Goal: full graphical workflow — open folder, analyze, preview tag changes, apply selectively.
+Goal: full graphical workflow — open folder, analyze, preview, apply.
 
-- [ ] Tauri shell with Python sidecar (or PyWebView fallback)
-- [ ] Port the React prototype design in `docs/prototype/` and `docs/PROTOTYPE_DESIGN.md`
-  - Library browser (virtualized for 10k+ tracks)
-  - Analysis progress overlay
-  - Track detail panel with diff preview before write
-  - Settings page exposing **every** field in `vibechek/config.py`
-  - Duplicates view (group → pick keeper → resolve)
-- [ ] Wire IPC to the Python core
-- [ ] `v0.3.0` release with full GUI
+- ✅ JSON-RPC sidecar ([`vibechek/rpc.py`](../vibechek/rpc.py)): 13 methods, progress notifications, error handling.
+- ✅ Tauri 2.x Rust shell ([`ui/src-tauri/`](../ui/src-tauri/)):
+  - Spawns the Python sidecar at startup
+  - Multiplexes JSON-RPC requests by id
+  - Re-broadcasts progress notifications as `sidecar:*` Tauri events
+  - Sidecar binary resolution: env var → externalBin sibling → PATH
+- ✅ React frontend ([`ui/src/`](../ui/src/)): Vite, TypeScript, Tailwind, Zustand, react-virtuoso.
+- ✅ Components:
+  - Library browser (virtualized) with search filter and ML tag/energy badges
+  - Analysis progress overlay (live updates from sidecar progress notifications)
+  - Duplicates view (per-group summary, exact + audio sections)
+  - Settings page surfacing every field of `VibechekConfig` (analysis, tagging, duplicates, organization)
+- [ ] Track detail panel with before/after tag diff preview
+- [ ] Duplicates resolver UI (per-group: pick keeper, move/trash)
+- [ ] Organize preview/execute UI (currently CLI-only)
+- [ ] Settings persistence (TOML in user config dir)
+- [ ] Wire Tauri release build into the existing GitHub Actions workflow
+- [ ] Tag a `v0.3.0` release with the desktop app
+
+### Notes on the desktop stack
+
+- **Tauri vs Electron**: Tauri produces ~10× smaller installers (~30 MB shell + ~30 MB Python sidecar vs Electron's ~100+ MB Chromium).
+- **Rust vs Python contributors**: The Rust shell is small (~300 lines) and rarely changes. Contributors who don't touch Rust never need to. The interesting code is in React (frontend) and Python (sidecar / core).
+- **Sidecar protocol**: JSON-RPC 2.0 over stdin/stdout (Tauri's recommended sidecar pattern). No port management; sidecar lifetime tied to the Tauri process.
 
 ### Phase 4 — Polish & launch
 
