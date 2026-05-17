@@ -10,8 +10,10 @@ import { Settings } from "./components/Settings";
 import { AnalysisProgress } from "./components/AnalysisProgress";
 import { TrackDetails } from "./components/TrackDetails";
 import { ErrorToast } from "./components/ErrorToast";
+import { Toast } from "./components/Toast";
+import { Onboarding } from "./components/Onboarding";
 
-import { useUIStore, useOperationStore } from "./stores";
+import { useUIStore, useOperationStore, useConfigStore } from "./stores";
 import { useSidecarProgress } from "./hooks/useSidecar";
 import { useConfigPersistence } from "./hooks/useConfigPersistence";
 
@@ -25,6 +27,12 @@ export default function App() {
 
   // Load config from disk on startup, then auto-save (debounced) on change.
   useConfigPersistence();
+
+  // First-launch tour. Don't render it until config is loaded — otherwise we'd
+  // flash the overlay over an already-onboarded user before disk catches up.
+  const configLoaded = useConfigStore((s) => s.loaded);
+  const seenOnboarding = useConfigStore((s) => s.config.ui.seen_onboarding);
+  const showOnboarding = configLoaded && !seenOnboarding;
 
   // Esc closes overlays / clears selection
   useEffect(() => {
@@ -54,6 +62,11 @@ export default function App() {
       <AnimatePresence>
         <AnalysisProgress />
         <ErrorToast />
+      </AnimatePresence>
+      <Toast />
+
+      <AnimatePresence>
+        {showOnboarding && <Onboarding />}
       </AnimatePresence>
     </div>
   );

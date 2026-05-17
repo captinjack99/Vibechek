@@ -10,19 +10,22 @@
 
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { AlertCircle, X, Copy, Check, ExternalLink } from "lucide-react";
+import { AlertCircle, X, Copy, Check, ExternalLink, FileText } from "lucide-react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 
-import { useOperationStore } from "../stores";
+import { useNotificationStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
+import { LogsViewer } from "./LogsViewer";
 
 const ISSUES_URL = "https://github.com/papapew/Vibechek/issues/new";
 
 export function ErrorToast() {
   const error = useOperationStore((s) => s.error);
   const clearError = useOperationStore((s) => s.clearError);
+  const notify = useNotificationStore((s) => s.notify);
 
   const [copied, setCopied] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
 
   // Reset the copy state when a new error appears
   useEffect(() => {
@@ -77,7 +80,10 @@ export function ErrorToast() {
     } catch (e) {
       // Fallback: copy URL to clipboard so the user can paste it
       void navigator.clipboard.writeText(url);
-      window.alert("Couldn't open browser; URL copied to clipboard.");
+      notify("Couldn't open browser", {
+        detail: "URL copied to clipboard — paste it anywhere to file the issue.",
+        kind: "info",
+      });
     }
   };
 
@@ -111,6 +117,14 @@ export function ErrorToast() {
               {copied ? "Copied" : "Copy details"}
             </button>
             <button
+              onClick={() => setShowLogs(true)}
+              className="text-xs text-white/60 hover:text-white inline-flex items-center gap-1"
+              title="Show recent log lines from the sidecar"
+            >
+              <FileText className="w-3 h-3" />
+              View logs
+            </button>
+            <button
               onClick={handleReport}
               className="text-xs text-white/60 hover:text-white inline-flex items-center gap-1"
               title="Open a pre-filled GitHub issue in your browser"
@@ -138,6 +152,7 @@ export function ErrorToast() {
           <X className="w-4 h-4" />
         </button>
       </div>
+      <LogsViewer open={showLogs} onClose={() => setShowLogs(false)} />
     </motion.div>
   );
 }

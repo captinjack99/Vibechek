@@ -122,7 +122,12 @@ class MLResult:
 
 @dataclass
 class TrackAnalysis:
-    """The full per-file record written to analysis.json."""
+    """The full per-file record written to analysis.json.
+
+    `existing_tags` and `ml_analysis` are stored as plain dicts here because
+    the analyzer builds them dynamically. On the wire (and in TypeScript) they
+    take their narrower structured forms — see `__ts_overrides__` below.
+    """
 
     path: str
     filename: str
@@ -136,6 +141,15 @@ class TrackAnalysis:
     existing_tags: dict[str, Any] = field(default_factory=dict)
     ml_analysis: dict[str, Any] | None = None  # MLResult as dict, or None
     error: str | None = None
+
+    # Read by scripts/generate_ts_types.py: replace the Python-level dict types
+    # with the structured TS interfaces the wire actually carries. ExistingTags
+    # is hand-written in ui/src/types/index.ts (no Python dataclass yet); MLResult
+    # is generated from this same module.
+    __ts_overrides__ = {
+        "existing_tags": "ExistingTags",
+        "ml_analysis": "MLResult | null",
+    }
 
 
 # ---------------------------------------------------------------------------

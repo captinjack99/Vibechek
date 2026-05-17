@@ -3,11 +3,13 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield,
   Zap, AlertTriangle, CheckCircle2, RotateCcw, ChevronDown, ChevronRight,
+  FileText,
 } from "lucide-react";
 
 import { useConfigStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
 import type { PreflightResult, SystemResources, VibechekConfig } from "../types";
+import { LogsViewer } from "./LogsViewer";
 
 export function Settings() {
   const cfg = useConfigStore((s) => s.config);
@@ -23,6 +25,7 @@ export function Settings() {
   const fail = useOperationStore((s) => s.fail);
 
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
 
   const handleRestoreAll = async () => {
     try {
@@ -378,9 +381,20 @@ export function Settings() {
           Sidecar: {sidecarBinary ?? "?"}
         </div>
         <div className="text-xs text-white/40 mt-1">
-          Settings live in-memory for now; TOML persistence comes in a later release.
+          Settings are saved to <code className="font-mono">config.toml</code> automatically (debounced 500ms).
+        </div>
+        <div className="mt-3">
+          <button
+            className="btn-ghost text-xs"
+            onClick={() => setShowLogs(true)}
+          >
+            <FileText className="w-3.5 h-3.5" />
+            View logs
+          </button>
         </div>
       </Section>
+
+      <LogsViewer open={showLogs} onClose={() => setShowLogs(false)} />
     </div>
   );
 }

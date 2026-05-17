@@ -67,10 +67,10 @@ def test_find_duplicates_detects_exact_md5_match(tiny_library: Path) -> None:
         DuplicateConfig(use_md5=True, use_chromaprint=False),
     )
 
-    assert len(report.exact_groups) == 1
-    group = report.exact_groups[0]
+    assert len(report.exact_duplicates) == 1
+    group = report.exact_duplicates[0]
     assert group.method == "md5"
-    filenames = {group.keeper.filename, *(d.filename for d in group.duplicates)}
+    filenames = {group.keep.filename, *(d.filename for d in group.duplicates)}
     assert filenames == {"track3.mp3", "track3_dup.mp3"}
 
 

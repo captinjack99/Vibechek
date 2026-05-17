@@ -78,6 +78,18 @@ class OrganizationConfig:
 
 
 @dataclass
+class UIConfig:
+    """Persistent flags for the GUI itself (not the analysis pipeline).
+
+    Lives alongside the pipeline config because everything the user can change
+    should round-trip through one file. Add new flags here rather than spawning
+    a second config file.
+    """
+
+    seen_onboarding: bool = False  # Becomes True after the first-launch tour
+
+
+@dataclass
 class VibechekConfig:
     """Top-level config — everything a GUI form needs to render."""
 
@@ -85,6 +97,7 @@ class VibechekConfig:
     tagging: TaggingConfig = field(default_factory=TaggingConfig)
     duplicates: DuplicateConfig = field(default_factory=DuplicateConfig)
     organization: OrganizationConfig = field(default_factory=OrganizationConfig)
+    ui: UIConfig = field(default_factory=UIConfig)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "VibechekConfig":
@@ -126,6 +139,7 @@ class VibechekConfig:
             tagging=_subset(TaggingConfig, data.get("tagging", {})),
             duplicates=_subset(DuplicateConfig, data.get("duplicates", {})),
             organization=_subset(OrganizationConfig, data.get("organization", {})),
+            ui=_subset(UIConfig, data.get("ui", {})),
         )
 
 
@@ -186,5 +200,6 @@ __all__ = [
     "TaggingConfig",
     "DuplicateConfig",
     "OrganizationConfig",
+    "UIConfig",
     "VibechekConfig",
 ]

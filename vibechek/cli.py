@@ -262,9 +262,9 @@ def dedupe(path: Path, output: Path, no_chromaprint: bool, no_md5: bool,
     save_report(report, output)
     console.print(
         f"\n[green]Scan done.[/] "
-        f"Exact: {len(report.exact_groups)} groups • "
-        f"Audio: {len(report.audio_groups)} groups • "
-        f"Recoverable: {report.recoverable_mb:.1f} MB → [cyan]{output}[/]"
+        f"Exact: {len(report.exact_duplicates)} groups • "
+        f"Audio: {len(report.audio_duplicates)} groups • "
+        f"Recoverable: {report.summary.space_recoverable_mb:.1f} MB → [cyan]{output}[/]"
     )
 
     if action is not DuplicateAction.REPORT:

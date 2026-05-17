@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
-import { useOperationStore, useConfigStore, useLibraryStore } from "../stores";
+import { useOperationStore, useConfigStore, useLibraryStore, useNotificationStore } from "../stores";
 import { rpc } from "../hooks/useSidecar";
 import type { DuplicateGroup, DuplicateReport, FileInfo } from "../types";
 import {
@@ -32,6 +32,7 @@ import {
   ruleHelp,
   ruleLabel,
 } from "../lib/keeperRules";
+import { ConfirmModal } from "./ConfirmModal";
 
 type Action = "report" | "move" | "trash";
 
@@ -50,10 +51,19 @@ export function DuplicatesView() {
   const dupCfg = useConfigStore((s) => s.config.duplicates);
   const updateDuplicates = useConfigStore((s) => s.updateDuplicates);
 
+  const notify = useNotificationStore((s) => s.notify);
+
   const [scanPath, setScanPath] = useState<string | null>(libraryPath);
   const [rules, setRules] = useState<KeeperRule[]>(DEFAULT_RULES);
   const [keeperOverrides, setKeeperOverrides] = useState<Record<string, string>>({});
   const [skippedGroups, setSkippedGroups] = useState<Set<string>>(new Set());
+
+  // Pending confirm — captures the user's choice + the computed plan so the
+  // modal can render without re-running applyChoices.
+  const [pendingResolve, setPendingResolve] = useState<
+    | { action: Action; filtered: DuplicateReport; reviewFolder: string | null }
+    | null
+  >(null);
 
   // Wipe per-group overrides whenever the report or rules change
   useEffect(() => {
@@ -82,6 +92,7 @@ export function DuplicatesView() {
     }
   };
 
+  // Stage 1: build the plan + open the confirm modal.
   const handleResolve = async (action: Action) => {
     if (!report) return;
 
@@ -94,18 +105,14 @@ export function DuplicatesView() {
     }
 
     const filtered = applyChoices(report, rules, keeperOverrides, skippedGroups);
+    setPendingResolve({ action, filtered, reviewFolder });
+  };
 
-    const verb = action === "trash" ? "send to your OS trash" : "move to the review folder";
-    const ok = window.confirm(
-      `About to ${verb}:\n\n` +
-      `  ${filtered.summary.total_duplicates} duplicate files\n` +
-      `  freeing ~${filtered.summary.space_recoverable_mb.toFixed(0)} MB\n\n` +
-      (action === "trash"
-        ? "Files go to the OS trash (recoverable until you empty it)."
-        : `Files will be moved to:\n  ${reviewFolder}`) +
-      "\n\nProceed?",
-    );
-    if (!ok) return;
+  // Stage 2: user confirmed — actually run it.
+  const performResolve = async () => {
+    if (!pendingResolve) return;
+    const { action, filtered, reviewFolder } = pendingResolve;
+    setPendingResolve(null);
 
     begin("dedupe");
     try {
@@ -115,11 +122,13 @@ export function DuplicatesView() {
         review_folder: reviewFolder,
       });
       finish();
-      const word = action === "trash" ? "trashed" : "moved";
-      window.alert(
-        `${word}: ${summary.deleted ?? summary.moved ?? 0}\n` +
-        `errors: ${summary.errors ?? 0}`,
-      );
+      const word = action === "trash" ? "Trashed" : "Moved";
+      const count = summary.deleted ?? summary.moved ?? 0;
+      const errors = summary.errors ?? 0;
+      notify(`${word} ${count} duplicate${count === 1 ? "" : "s"}`, {
+        detail: errors > 0 ? `${errors} error${errors === 1 ? "" : "s"} — see report.` : undefined,
+        kind: errors > 0 ? "info" : "success",
+      });
       handleScan();
     } catch (e) {
       fail(String(e));
@@ -173,6 +182,44 @@ export function DuplicatesView() {
           onResolve={handleResolve}
         />
       )}
+
+      <ConfirmModal
+        open={pendingResolve !== null}
+        variant={pendingResolve?.action === "trash" ? "danger" : "default"}
+        icon={pendingResolve?.action === "trash" ? Trash2 : Folder}
+        title={
+          pendingResolve?.action === "trash"
+            ? `Send ${pendingResolve.filtered.summary.total_duplicates} files to trash?`
+            : `Move ${pendingResolve?.filtered.summary.total_duplicates ?? 0} files to review folder?`
+        }
+        message={
+          pendingResolve && (
+            <div className="space-y-2">
+              <p>
+                <strong>{pendingResolve.filtered.summary.total_duplicates}</strong> duplicate files,
+                freeing about{" "}
+                <strong>{pendingResolve.filtered.summary.space_recoverable_mb.toFixed(0)} MB</strong>.
+              </p>
+              {pendingResolve.action === "trash" ? (
+                <p className="text-xs text-white/60">
+                  Files go to the OS trash and stay recoverable until you empty it.
+                </p>
+              ) : (
+                <>
+                  <p className="text-xs text-white/60">Files will be moved to:</p>
+                  <code className="block font-mono text-xs text-white/70 bg-surface-300 p-2 rounded break-all">
+                    {pendingResolve.reviewFolder}
+                  </code>
+                </>
+              )}
+            </div>
+          )
+        }
+        confirmLabel={pendingResolve?.action === "trash" ? "Yes, send to trash" : "Yes, move files"}
+        cancelLabel="Cancel"
+        onConfirm={performResolve}
+        onCancel={() => setPendingResolve(null)}
+      />
     </div>
   );
 }

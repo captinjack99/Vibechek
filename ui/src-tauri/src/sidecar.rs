@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -38,6 +38,20 @@ struct Inner {
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
     stdin: Mutex<ChildStdin>,
     binary_path: String,
+    /// Set once the sidecar's stdout has EOF'd or the wait task observed exit.
+    /// All subsequent `call()`s fail fast instead of hanging until the
+    /// RPC_TIMEOUT_SECS deadline.
+    dead: AtomicBool,
+}
+
+impl Inner {
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    fn mark_dead(&self) {
+        self.dead.store(true, Ordering::Release);
+    }
 }
 
 impl SidecarHandle {
@@ -47,6 +61,15 @@ impl SidecarHandle {
 
     /// Send a JSON-RPC request and await its response.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        // Fast-fail if we already know the sidecar is gone, rather than
+        // hanging on the 1-hour timeout.
+        if self.inner.is_dead() {
+            return Err(anyhow!(
+                "sidecar is no longer running (binary: {}); restart the app",
+                self.inner.binary_path
+            ));
+        }
+
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
 
@@ -75,8 +98,13 @@ impl SidecarHandle {
         match tokio::time::timeout(Duration::from_secs(RPC_TIMEOUT_SECS), rx).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_canceled)) => {
-                // Receiver dropped — sidecar must have died
-                Err(anyhow!("sidecar dropped the response channel"))
+                // Receiver dropped — sender was either taken by the EOF
+                // drain (sidecar died) or never got the chance to fire.
+                Err(anyhow!(
+                    "sidecar died mid-request on method '{}' (binary: {})",
+                    method,
+                    self.inner.binary_path
+                ))
             }
             Err(_elapsed) => {
                 // Drop the pending entry so we don't leak it
@@ -129,6 +157,7 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
         pending: Mutex::new(HashMap::new()),
         stdin: Mutex::new(stdin),
         binary_path: binary,
+        dead: AtomicBool::new(false),
     });
 
     // stderr reader: just log everything so users can diagnose Python errors
@@ -139,30 +168,95 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
         }
     });
 
-    // stdout reader: demux responses + re-emit notifications
+    // stdout reader: demux responses + re-emit notifications. When the stream
+    // hits EOF (Ok(None)) the sidecar is dead — flip the dead flag and drain
+    // all pending oneshots so in-flight calls fail immediately instead of
+    // hanging until the 1-hour RPC timeout.
     {
         let inner = inner.clone();
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Err(e) = handle_message(&inner, &app, &line).await {
-                    eprintln!("dispatch error on '{line}': {e}");
+            loop {
+                match reader.next_line().await {
+                    Ok(Some(line)) => {
+                        if let Err(e) = handle_message(&inner, &app, &line).await {
+                            eprintln!("dispatch error on '{line}': {e}");
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "sidecar stdout EOF — process is dead (binary: {})",
+                            inner.binary_path
+                        );
+                        mark_dead_and_drain(&inner).await;
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "sidecar stdout read error: {e} (binary: {})",
+                            inner.binary_path
+                        );
+                        mark_dead_and_drain(&inner).await;
+                        break;
+                    }
                 }
             }
-            eprintln!("sidecar stdout closed; further calls will hang until timeout");
         });
     }
 
-    // Wait task: log when child exits (so users see it in dev)
-    tauri::async_runtime::spawn(async move {
-        match child.wait().await {
-            Ok(status) => eprintln!("sidecar exited with {status}"),
-            Err(e) => eprintln!("sidecar wait failed: {e}"),
-        }
-    });
+    // Wait task: log when child exits (so users see it in dev). Also flip the
+    // dead flag in case the child exited without closing stdout cleanly (rare,
+    // but belt-and-suspenders).
+    {
+        let inner = inner.clone();
+        tauri::async_runtime::spawn(async move {
+            match child.wait().await {
+                Ok(status) => eprintln!(
+                    "sidecar exited with {status} (binary: {})",
+                    inner.binary_path
+                ),
+                Err(e) => eprintln!(
+                    "sidecar wait failed: {e} (binary: {})",
+                    inner.binary_path
+                ),
+            }
+            mark_dead_and_drain(&inner).await;
+        });
+    }
 
     Ok(SidecarHandle { inner })
+}
+
+/// Flip the dead flag and fail every in-flight request with a clear error.
+/// Idempotent — safe to call from both the stdout EOF path and the child-wait
+/// path; the second call's drain just finds an empty map.
+async fn mark_dead_and_drain(inner: &Arc<Inner>) {
+    inner.mark_dead();
+    // Take ownership of the pending map under the lock, then drop the lock
+    // before iterating so handlers calling back into call() don't deadlock.
+    let drained: HashMap<u64, oneshot::Sender<Value>> = {
+        let mut pending = inner.pending.lock().await;
+        std::mem::take(&mut *pending)
+    };
+    let count = drained.len();
+    for (id, tx) in drained {
+        let err = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32000,
+                "message": format!(
+                    "sidecar died (binary: {}); in-flight request aborted",
+                    inner.binary_path
+                ),
+            }
+        });
+        let _ = tx.send(err);
+    }
+    if count > 0 {
+        eprintln!("sidecar drain: aborted {count} in-flight request(s)");
+    }
 }
 
 async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Result<()> {

@@ -19,7 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -35,16 +38,42 @@ from vibechek.config import (
 
 log = logging.getLogger(__name__)
 
+# How many requests can be processed in parallel. Long ops are still gated
+# by the cancellation singleton (one at a time), but quick reads (config,
+# system_info, preflight) can interleave so the GUI stays responsive.
+_DISPATCH_WORKERS = 8
+
 
 # ---------------------------------------------------------------------------
 # Wire format
 # ---------------------------------------------------------------------------
 
+# Single shared writer. Concurrent handler threads write through this; the
+# lock guarantees each JSON line lands atomically on stdout.
+class _StdoutWriter:
+    def __init__(self, stream):
+        self.stream = stream
+        self.lock = threading.Lock()
+
+    def write(self, msg: dict[str, Any]) -> None:
+        line = json.dumps(msg, default=_json_default) + "\n"
+        with self.lock:
+            self.stream.write(line)
+            self.stream.flush()
+
+
+# Bootstrapped on serve(); used by all the helpers below.
+_writer: _StdoutWriter | None = None
+
 
 def _write_message(msg: dict[str, Any]) -> None:
     """Write a single JSON-RPC message to stdout, flushed immediately."""
-    sys.stdout.write(json.dumps(msg, default=_json_default) + "\n")
-    sys.stdout.flush()
+    if _writer is not None:
+        _writer.write(msg)
+    else:
+        # Fallback for tests that import these helpers without calling serve()
+        sys.stdout.write(json.dumps(msg, default=_json_default) + "\n")
+        sys.stdout.flush()
 
 
 def _json_default(o: Any) -> Any:
@@ -154,8 +183,13 @@ def _analyze_directory(params: dict) -> dict:
 
     Supports incremental runs via `skip_paths` (list of absolute paths already
     analyzed). The GUI uses this for the 'Analyze new tracks only' button.
+
+    Auto-persists the result to `<data_dir>/analyses/...` and updates the
+    recent-libraries index unless `auto_save=False` is passed (e.g. for
+    one-off CLI runs that already specify their own --output).
     """
     from vibechek.analyzer import analyze_directory
+    from vibechek import library_state
 
     config = AnalysisConfig(
         workers=int(params.get("workers", 0)),
@@ -166,9 +200,10 @@ def _analyze_directory(params: dict) -> dict:
 
     skip_paths = params.get("skip_paths")
     skip_set: set[str] | None = set(skip_paths) if skip_paths else None
+    library_path = Path(params["path"])
 
-    return analyze_directory(
-        Path(params["path"]),
+    report = analyze_directory(
+        library_path,
         config=config,
         on_progress=_emit_progress,
         output_path=Path(params["output_path"]) if params.get("output_path") else None,
@@ -176,6 +211,14 @@ def _analyze_directory(params: dict) -> dict:
         limit=int(params.get("limit") or 0) or None,
         skip_paths=skip_set,
     )
+
+    if bool(params.get("auto_save", True)):
+        try:
+            library_state.record_analysis(library_path, report)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not auto-save analysis state: %s", e)
+
+    return report
 
 
 def _system_info(_params: dict) -> dict:
@@ -226,7 +269,16 @@ def _find_duplicates(params: dict) -> dict:
         action=params.get("action", "report"),
         review_folder=Path(params["review_folder"]) if params.get("review_folder") else None,
     )
-    report = find_duplicates(Path(params["path"]), config, on_progress=_emit_progress)
+    # Default True for safety — the GUI's auto-keeper rules need bitrate/duration.
+    # The GUI can pass read_metadata=false for MD5-only dedup with default rules,
+    # which saves a per-file mutagen probe (~30s on a 12k-track library).
+    read_metadata = bool(params.get("read_metadata", True))
+    report = find_duplicates(
+        Path(params["path"]),
+        config,
+        on_progress=_emit_progress,
+        read_metadata=read_metadata,
+    )
     return report.to_dict()
 
 
@@ -249,23 +301,31 @@ def _handle_duplicates(params: dict) -> dict:
 
 
 def _rebuild_report(d: dict) -> Any:
-    from vibechek.duplicates import DuplicateGroup, DuplicateReport, FileInfo
+    from vibechek.duplicates import (
+        DuplicateGroup, DuplicateReport, DuplicateSummary, FileInfo,
+    )
 
     def _group(g: dict) -> DuplicateGroup:
-        keeper = FileInfo(**g["keep"])
+        keep = FileInfo(**g["keep"])
         dupes = [FileInfo(**x) for x in g["duplicates"]]
         return DuplicateGroup(
             method=g["method"],
             key=g["key"],
-            keeper=keeper,
+            keep=keep,
             duplicates=dupes,
             recoverable_mb=g["recoverable_mb"],
         )
 
+    # Filter the summary dict to fields the dataclass knows about — protects
+    # against older clients that might send extra keys.
+    raw_summary = d.get("summary", {})
+    valid_summary_fields = {f.name for f in dataclasses.fields(DuplicateSummary)}
+    summary = DuplicateSummary(**{k: v for k, v in raw_summary.items() if k in valid_summary_fields})
+
     return DuplicateReport(
-        total_files=d.get("summary", {}).get("total_files", 0),
-        exact_groups=[_group(g) for g in d.get("exact_duplicates", [])],
-        audio_groups=[_group(g) for g in d.get("audio_duplicates", [])],
+        summary=summary,
+        exact_duplicates=[_group(g) for g in d.get("exact_duplicates", [])],
+        audio_duplicates=[_group(g) for g in d.get("audio_duplicates", [])],
     )
 
 
@@ -334,12 +394,18 @@ def _apply_ml_tags(params: dict) -> dict:
 
 def _backup_tags(params: dict) -> dict:
     from vibechek.tagger import backup_tags
+    from vibechek import backup_history
 
-    stats = backup_tags(
-        Path(params["path"]),
-        Path(params["output_path"]),
-        on_progress=_emit_progress,
-    )
+    library = Path(params["path"])
+    output = Path(params["output_path"])
+    stats = backup_tags(library, output, on_progress=_emit_progress)
+
+    # Record in the user's backup history so the Tags view can list it.
+    try:
+        backup_history.record(library, output, stats.backed_up)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not record backup in history: %s", e)
+
     return asdict(stats)
 
 
@@ -385,6 +451,87 @@ def _cancel_operation(_params: dict) -> dict:
     return {"cancelled": kind}
 
 
+# ---------------------------------------------------------------------------
+# Library state — recent libraries + auto-load last analysis
+# ---------------------------------------------------------------------------
+
+
+def _library_state(_params: dict) -> dict:
+    """Return the recent-libraries list. Used by the GUI's startup screen."""
+    from vibechek import library_state
+
+    state = library_state.load_state()
+    return {"recent": [asdict(r) for r in state.recent]}
+
+
+def _forget_library(params: dict) -> dict:
+    """Remove a library from the recent list."""
+    from vibechek import library_state
+
+    removed = library_state.forget(params["path"])
+    return {"removed": removed}
+
+
+def _load_recent_analysis(params: dict) -> dict:
+    """Load a saved analysis JSON by library path, or by analysis_path."""
+    from vibechek import library_state
+
+    if "library_path" in params:
+        state = library_state.load_state()
+        record = next(
+            (r for r in state.recent if r.path == params["library_path"]),
+            None,
+        )
+        if not record:
+            return {"loaded": False, "reason": "library not in recents"}
+        report = library_state.load_analysis(record)
+    elif "analysis_path" in params:
+        path = Path(params["analysis_path"])
+        if not path.exists():
+            return {"loaded": False, "reason": "file not found"}
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            return {"loaded": False, "reason": str(e)}
+    else:
+        return {"loaded": False, "reason": "missing library_path or analysis_path"}
+
+    if report is None:
+        return {"loaded": False, "reason": "analysis file missing or corrupt"}
+    return {"loaded": True, "report": report}
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+
+def _get_log_tail(params: dict) -> dict:
+    """Return the most recent log lines so the GUI can show them after an error."""
+    from vibechek import logging_setup
+
+    n = int(params.get("n", 200))
+    return {
+        "log_file": str(logging_setup.LOG_FILE),
+        "lines": logging_setup.tail(n),
+    }
+
+
+def _backup_history(_params: dict) -> dict:
+    """List every tag backup the user has made via Vibechek."""
+    from vibechek import backup_history
+
+    return backup_history.to_dict(backup_history.load())
+
+
+def _forget_backup(params: dict) -> dict:
+    """Drop a backup from the history (does not delete the file itself)."""
+    from vibechek import backup_history
+
+    removed = backup_history.forget(params["backup_path"])
+    return {"removed": removed}
+
+
 def _config_to_jsonable(cfg: VibechekConfig) -> dict:
     """asdict + stringify Paths so the GUI gets pure JSON."""
     from vibechek.config import _stringify_paths
@@ -423,6 +570,12 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "save_config": _save_config,
     "restore_default_config": _restore_default_config,
     "cancel_operation": _cancel_operation,
+    "library_state": _library_state,
+    "forget_library": _forget_library,
+    "load_recent_analysis": _load_recent_analysis,
+    "get_log_tail": _get_log_tail,
+    "backup_history": _backup_history,
+    "forget_backup": _forget_backup,
 }
 
 # Methods that run long ops and should be cancellable.
@@ -448,21 +601,70 @@ INTERNAL_ERROR = -32603
 APP_ERROR = -32000
 
 
+def _dispatch(request: dict[str, Any]) -> None:
+    """Run a single request handler. Called from the thread pool.
+
+    Writes the response (or error) directly via _write_message. Long ops
+    register with the cancellation module so the user-facing Cancel button
+    works.
+    """
+    req_id = request.get("id")
+    method = request.get("method")
+    params = request.get("params") or {}
+
+    if not method:
+        _err(req_id, INVALID_REQUEST, "Missing 'method'")
+        return
+
+    handler = METHODS.get(method)
+    if handler is None:
+        _err(req_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+        return
+
+    kind = _CANCELLABLE_METHODS.get(method)
+    if kind is not None:
+        cancellation.begin(kind)
+
+    try:
+        result = handler(params)
+    except cancellation.CancelledError as e:
+        _err(req_id, APP_ERROR, str(e), data={"cancelled": True})
+    except (TypeError, KeyError, ValueError) as e:
+        log.exception("Invalid params to method %s", method)
+        _err(req_id, INVALID_PARAMS, f"Invalid params: {e}")
+    except Exception as e:  # noqa: BLE001
+        log.exception("Handler raised for method %s", method)
+        _err(req_id, APP_ERROR, str(e), data={"traceback": traceback.format_exc()})
+    else:
+        if req_id is not None:
+            _ok(req_id, result)
+    finally:
+        if kind is not None:
+            cancellation.end()
+
+
 def serve(stdin=None, stdout=None) -> None:
     """Read JSON-RPC requests from stdin and write responses to stdout.
 
+    The dispatch loop is single-threaded (reads from stdin) but each request
+    is handed to a thread pool, so a long operation (analyze, dedupe) doesn't
+    block fast requests (config, system_info, preflight). The stdout writer
+    is mutex-protected so concurrent threads never tear each other's frames.
+
     Blocks until EOF on stdin (i.e. parent process closes our stdin).
     """
+    # Configure logging early so anything emitted during startup goes to file
+    try:
+        from vibechek import logging_setup
+        logging_setup.configure()
+    except Exception:  # noqa: BLE001
+        # Logging is nice-to-have; don't take down the sidecar over it
+        pass
+
     stdin = stdin or sys.stdin
-    # Re-route global writers if the caller passed a different stdout (for tests)
-    if stdout is not None:
-        global _write_message
 
-        def _write(msg: dict[str, Any]) -> None:
-            stdout.write(json.dumps(msg, default=_json_default) + "\n")
-            stdout.flush()
-
-        _write_message = _write  # type: ignore[assignment]
+    global _writer
+    _writer = _StdoutWriter(stdout or sys.stdout)
 
     # Announce ourselves so the host knows the sidecar is alive
     _write_message({
@@ -471,55 +673,31 @@ def serve(stdin=None, stdout=None) -> None:
         "params": {"version": __version__, "methods": sorted(METHODS.keys())},
     })
 
-    for line in stdin:
-        line = line.strip()
-        if not line:
-            continue
+    log.info("Sidecar serving on stdin/stdout (workers=%d, methods=%d)",
+             _DISPATCH_WORKERS, len(METHODS))
 
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError as e:
-            _err(None, PARSE_ERROR, f"Parse error: {e}")
-            continue
+    pool = ThreadPoolExecutor(max_workers=_DISPATCH_WORKERS, thread_name_prefix="rpc")
+    try:
+        for line in stdin:
+            line = line.strip()
+            if not line:
+                continue
 
-        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
-            _err(request.get("id") if isinstance(request, dict) else None,
-                 INVALID_REQUEST, "Invalid request (must be JSON-RPC 2.0)")
-            continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError as e:
+                _err(None, PARSE_ERROR, f"Parse error: {e}")
+                continue
 
-        req_id = request.get("id")
-        method = request.get("method")
-        params = request.get("params") or {}
+            if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
+                _err(request.get("id") if isinstance(request, dict) else None,
+                     INVALID_REQUEST, "Invalid request (must be JSON-RPC 2.0)")
+                continue
 
-        if not method:
-            _err(req_id, INVALID_REQUEST, "Missing 'method'")
-            continue
-
-        handler = METHODS.get(method)
-        if handler is None:
-            _err(req_id, METHOD_NOT_FOUND, f"Method not found: {method}")
-            continue
-
-        # Mark long ops as the current cancellable op
-        kind = _CANCELLABLE_METHODS.get(method)
-        if kind is not None:
-            cancellation.begin(kind)
-
-        try:
-            result = handler(params)
-        except cancellation.CancelledError as e:
-            _err(req_id, APP_ERROR, str(e), data={"cancelled": True})
-        except (TypeError, KeyError, ValueError) as e:
-            _err(req_id, INVALID_PARAMS, f"Invalid params: {e}")
-        except Exception as e:  # noqa: BLE001
-            log.exception("Handler raised for method %s", method)
-            _err(req_id, APP_ERROR, str(e), data={"traceback": traceback.format_exc()})
-        else:
-            if req_id is not None:
-                _ok(req_id, result)
-        finally:
-            if kind is not None:
-                cancellation.end()
+            pool.submit(_dispatch, request)
+    finally:
+        log.info("Sidecar shutting down (stdin closed)")
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 __all__ = ["serve", "METHODS"]

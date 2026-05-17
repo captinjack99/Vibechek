@@ -1,11 +1,12 @@
 /**
  * Global UI state stores.
  *
- * Three stores keep concerns separate:
+ * Four stores keep concerns separate:
  *   - useLibraryStore — analyzed tracks + selection
  *   - useOperationStore — running long operations (analyze / dedupe / organize) + progress
  *   - useUIStore — current view, sidebar collapsed state, selected track for the detail pane
  *   - useConfigStore — user-tunable settings, mirroring vibechek.config.VibechekConfig
+ *   - useNotificationStore — transient success/info toasts (auto-dismiss)
  */
 
 import { create } from "zustand";
@@ -142,6 +143,7 @@ interface ConfigState {
   updateTagging: (patch: Partial<VibechekConfig["tagging"]>) => void;
   updateDuplicates: (patch: Partial<VibechekConfig["duplicates"]>) => void;
   updateOrganization: (patch: Partial<VibechekConfig["organization"]>) => void;
+  updateUI: (patch: Partial<VibechekConfig["ui"]>) => void;
 }
 
 const DEFAULT_CONFIG: VibechekConfig = {
@@ -165,7 +167,51 @@ const DEFAULT_CONFIG: VibechekConfig = {
     min_genre_size: 10,
     target_root: null,
   },
+  ui: {
+    seen_onboarding: false,
+  },
 };
+
+// ---------------------------------------------------------------------------
+// Notifications — transient, auto-dismissing success/info toasts.
+//
+// Different from useOperationStore.error (which is sticky, scary, and reserved
+// for operation failures). Notifications are the "✓ done" pat-on-the-back.
+// ---------------------------------------------------------------------------
+
+export type NotificationKind = "success" | "info";
+
+export interface Notification {
+  id: number;
+  kind: NotificationKind;
+  message: string;
+  /** Optional secondary line — shows under the main message. */
+  detail?: string;
+}
+
+interface NotificationState {
+  items: Notification[];
+  notify: (message: string, opts?: { kind?: NotificationKind; detail?: string }) => void;
+  dismiss: (id: number) => void;
+}
+
+let nextNotificationId = 1;
+
+export const useNotificationStore = create<NotificationState>((set) => ({
+  items: [],
+  notify: (message, opts) => {
+    const id = nextNotificationId++;
+    const item: Notification = {
+      id,
+      kind: opts?.kind ?? "success",
+      message,
+      detail: opts?.detail,
+    };
+    set((s) => ({ items: [...s.items, item] }));
+  },
+  dismiss: (id) =>
+    set((s) => ({ items: s.items.filter((n) => n.id !== id) })),
+}));
 
 export const useConfigStore = create<ConfigState>((set) => ({
   config: DEFAULT_CONFIG,
@@ -179,4 +225,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
     set((s) => ({ config: { ...s.config, duplicates: { ...s.config.duplicates, ...patch } } })),
   updateOrganization: (patch) =>
     set((s) => ({ config: { ...s.config, organization: { ...s.config.organization, ...patch } } })),
+  updateUI: (patch) =>
+    set((s) => ({ config: { ...s.config, ui: { ...s.config.ui, ...patch } } })),
 }));

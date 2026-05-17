@@ -4,11 +4,31 @@ import { clsx } from "clsx";
 import { useUIStore, useLibraryStore, useOperationStore } from "../stores";
 import type { ViewMode } from "../types";
 
+/** "12,466" → "12k" via Intl. Tooltip-friendly precise form is just toLocaleString. */
+const compactFmt = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+interface Badge {
+  /** Short label rendered in the sidebar: "12k tracks". */
+  short: string;
+  /** Exact count for the title/tooltip: "12,466 tracks". */
+  precise: string;
+}
+
 interface NavItem {
   id: ViewMode;
   label: string;
   icon: React.ReactNode;
-  badge?: () => string | null;
+  badge?: () => Badge | null;
+}
+
+function fmtBadge(count: number, unit: string): Badge {
+  return {
+    short: `${compactFmt.format(count)} ${unit}`,
+    precise: `${count.toLocaleString()} ${unit}`,
+  };
 }
 
 export function Sidebar() {
@@ -23,20 +43,28 @@ export function Sidebar() {
       id: "library",
       label: "Library",
       icon: <Music className="w-5 h-5" />,
-      badge: () => (trackCount > 0 ? String(trackCount) : null),
+      badge: () => (trackCount > 0 ? fmtBadge(trackCount, "tracks") : null),
     },
     {
       id: "duplicates",
       label: "Duplicates",
       icon: <Copy className="w-5 h-5" />,
       badge: () =>
-        dupReport ? String(dupReport.summary.total_duplicates) : null,
+        dupReport && dupReport.summary.total_duplicates > 0
+          ? fmtBadge(dupReport.summary.total_duplicates, "dupes")
+          : null,
     },
     {
       id: "organize",
       label: "Organize",
       icon: <FolderTree className="w-5 h-5" />,
-      badge: () => (organizePlan ? String(organizePlan.moves.length) : null),
+      badge: () =>
+        organizePlan && organizePlan.moves.length > 0
+          ? {
+              short: `${compactFmt.format(organizePlan.moves.length)} moves planned`,
+              precise: `${organizePlan.moves.length.toLocaleString()} moves planned`,
+            }
+          : null,
     },
     {
       id: "tags",
@@ -85,12 +113,15 @@ export function Sidebar() {
               <span className="flex-1 text-left font-medium">{item.label}</span>
               {badge && (
                 <span
+                  title={badge.precise}
                   className={clsx(
-                    "text-[10px] px-1.5 py-0.5 rounded-full font-mono",
-                    isActive ? "bg-accent/30" : "bg-white/10",
+                    "text-[10px] px-2 py-0.5 rounded-full whitespace-nowrap",
+                    isActive
+                      ? "bg-accent/25 text-accent"
+                      : "bg-white/10 text-white/60",
                   )}
                 >
-                  {badge}
+                  {badge.short}
                 </span>
               )}
             </button>

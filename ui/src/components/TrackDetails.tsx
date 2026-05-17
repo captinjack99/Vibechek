@@ -14,8 +14,8 @@ import { useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, ChevronRight, FileAudio, AlertTriangle, CheckCircle2 } from "lucide-react";
 
-import { useLibraryStore, useUIStore, useConfigStore, useOperationStore } from "../stores";
-import { rpc } from "../hooks/useSidecar";
+import { useLibraryStore, useUIStore, useConfigStore, useOperationStore, useNotificationStore } from "../stores";
+import { useApplyTags } from "../hooks/useApplyTags";
 import type { TrackAnalysis, ExistingTags, MLResult } from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
 import { AudioPreview } from "./AudioPreview";
@@ -56,22 +56,22 @@ function DetailContent({
 }) {
   const taggingCfg = useConfigStore((s) => s.config.tagging);
   const active = useOperationStore((s) => s.active);
-  const begin = useOperationStore((s) => s.begin);
-  const finish = useOperationStore((s) => s.finish);
-  const fail = useOperationStore((s) => s.fail);
+  const notify = useNotificationStore((s) => s.notify);
+  const { apply: applyTags } = useApplyTags();
 
   const handleApplyOne = async () => {
-    begin("tag");
-    try {
-      await rpc("apply_ml_tags", {
-        analysis: { tracks: [track] },
-        confidence: taggingCfg.genre_confidence_threshold,
-        skip_bpm_and_key: taggingCfg.skip_bpm_and_key,
-        preserve_rekordbox_frames: taggingCfg.preserve_rekordbox_frames,
+    const result = await applyTags([track]);
+    if (!result) return; // failure already surfaced via useOperationStore.error
+    const wrote = result.applied + result.other;
+    if (wrote === 0 && result.skipped > 0) {
+      notify("Genre skipped — confidence below threshold", {
+        detail: "Lower the threshold in Settings if you want it written anyway.",
+        kind: "info",
       });
-      finish();
-    } catch (e) {
-      fail(String(e));
+    } else {
+      notify(`Tags applied to ${track.filename}`, {
+        kind: result.errors.length > 0 ? "info" : "success",
+      });
     }
   };
 

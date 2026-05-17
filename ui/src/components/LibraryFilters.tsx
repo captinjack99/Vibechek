@@ -6,9 +6,14 @@
  *
  * Filters are kept in local state in LibraryBrowser — they're view-specific
  * (you don't want them persisting across reloads) and lightweight.
+ *
+ * Popover behaviour: at most one chip is open at a time. The parent
+ * (`FilterChips`) holds the `openChip` state and a single document-level
+ * listener handles outside-click + Escape — much lighter than one listener
+ * per chip and avoids stale-closure foot-guns.
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Filter, X } from "lucide-react";
 
 import type { TrackAnalysis } from "../types";
@@ -57,6 +62,9 @@ export function applyFilters(tracks: TrackAnalysis[], f: LibraryFilters): TrackA
   });
 }
 
+/** Identifies which chip's dropdown is open. */
+type ChipKey = "genre" | "energy" | "mood" | "vocal";
+
 interface ChipsProps {
   tracks: TrackAnalysis[];
   filters: LibraryFilters;
@@ -89,6 +97,31 @@ export function FilterChips({ tracks, filters, setFilters }: ChipsProps) {
   const empty = isEmpty(filters);
   const totalActive = filters.genres.size + filters.energies.size + filters.moods.size + filters.vocals.size;
 
+  const [openChip, setOpenChip] = useState<ChipKey | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // Outside-click and Escape close the open dropdown. One listener, one
+  // source of truth — chips below just receive isOpen + onOpen.
+  useEffect(() => {
+    if (!openChip) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (containerRef.current && !containerRef.current.contains(target)) {
+        setOpenChip(null);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpenChip(null);
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [openChip]);
+
   const toggle = <K extends keyof LibraryFilters>(key: K, value: LibraryFilters[K] extends Set<infer V> ? V : never) => {
     const next = { ...filters, [key]: new Set(filters[key] as Set<unknown>) };
     const set = next[key] as Set<unknown>;
@@ -98,7 +131,7 @@ export function FilterChips({ tracks, filters, setFilters }: ChipsProps) {
   };
 
   return (
-    <div className="flex items-center gap-2 flex-wrap">
+    <div ref={containerRef} className="flex items-center gap-2 flex-wrap">
       <div className="text-white/40 flex items-center gap-1.5 text-xs">
         <Filter className="w-3.5 h-3.5" />
         Filter:
@@ -111,6 +144,8 @@ export function FilterChips({ tracks, filters, setFilters }: ChipsProps) {
           options={genres.map((g) => ({ value: g, label: g }))}
           isActive={(v) => filters.genres.has(v as string)}
           onToggle={(v) => toggle("genres", v as string)}
+          isOpen={openChip === "genre"}
+          onOpen={() => setOpenChip(openChip === "genre" ? null : "genre")}
         />
       )}
 
@@ -121,6 +156,8 @@ export function FilterChips({ tracks, filters, setFilters }: ChipsProps) {
           options={energies.map((e) => ({ value: e, label: `Level ${e}` }))}
           isActive={(v) => filters.energies.has(v as number)}
           onToggle={(v) => toggle("energies", v as number)}
+          isOpen={openChip === "energy"}
+          onOpen={() => setOpenChip(openChip === "energy" ? null : "energy")}
         />
       )}
 
@@ -131,6 +168,8 @@ export function FilterChips({ tracks, filters, setFilters }: ChipsProps) {
           options={moods.map((m) => ({ value: m, label: m }))}
           isActive={(v) => filters.moods.has(v as string)}
           onToggle={(v) => toggle("moods", v as string)}
+          isOpen={openChip === "mood"}
+          onOpen={() => setOpenChip(openChip === "mood" ? null : "mood")}
         />
       )}
 
@@ -141,6 +180,8 @@ export function FilterChips({ tracks, filters, setFilters }: ChipsProps) {
           options={vocals.map((v) => ({ value: v, label: v }))}
           isActive={(v) => filters.vocals.has(v as string)}
           onToggle={(v) => toggle("vocals", v as string)}
+          isOpen={openChip === "vocal"}
+          onOpen={() => setOpenChip(openChip === "vocal" ? null : "vocal")}
         />
       )}
 
@@ -164,39 +205,47 @@ interface FilterDropdownProps<V> {
   options: { value: V; label: string }[];
   isActive: (v: V) => boolean;
   onToggle: (v: V) => void;
+  isOpen: boolean;
+  onOpen: () => void;
 }
 
 function FilterDropdown<V extends string | number>({
-  label, activeCount, options, isActive, onToggle,
+  label, activeCount, options, isActive, onToggle, isOpen, onOpen,
 }: FilterDropdownProps<V>) {
   return (
-    <details className="relative">
-      <summary
+    <div className="relative">
+      <button
+        type="button"
+        onClick={onOpen}
+        aria-haspopup="true"
+        aria-expanded={isOpen}
         className={`
-          cursor-pointer select-none list-none px-2.5 py-1 rounded-full text-xs
+          cursor-pointer select-none px-2.5 py-1 rounded-full text-xs
           ${activeCount > 0
             ? "bg-accent/20 text-accent border border-accent/30"
             : "bg-white/5 text-white/70 hover:bg-white/10 border border-transparent"}
         `}
       >
         {label}{activeCount > 0 ? ` · ${activeCount}` : ""}
-      </summary>
-      <div className="absolute top-full left-0 mt-1 z-40 min-w-[160px] panel max-h-64 overflow-auto p-1">
-        {options.map((opt) => (
-          <label
-            key={String(opt.value)}
-            className="flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer hover:bg-white/5 text-sm"
-          >
-            <input
-              type="checkbox"
-              checked={isActive(opt.value)}
-              onChange={() => onToggle(opt.value)}
-              className="accent-accent"
-            />
-            <span className="text-white/90">{opt.label}</span>
-          </label>
-        ))}
-      </div>
-    </details>
+      </button>
+      {isOpen && (
+        <div className="absolute top-full left-0 mt-1 z-40 min-w-[160px] panel max-h-64 overflow-auto p-1">
+          {options.map((opt) => (
+            <label
+              key={String(opt.value)}
+              className="flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer hover:bg-white/5 text-sm"
+            >
+              <input
+                type="checkbox"
+                checked={isActive(opt.value)}
+                onChange={() => onToggle(opt.value)}
+                className="accent-accent"
+              />
+              <span className="text-white/90">{opt.label}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

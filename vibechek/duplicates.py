@@ -65,48 +65,58 @@ class FileInfo:
 class DuplicateGroup:
     method: str  # "md5" | "chromaprint"
     key: str  # the hash or fingerprint string
-    keeper: FileInfo
+    keep: FileInfo  # The "winner" — kept on disk; everything in `duplicates` is removed
     duplicates: list[FileInfo]
     recoverable_mb: float
 
     def to_dict(self) -> dict:
-        return {
-            "method": self.method,
-            "key": self.key,
-            "keep": asdict(self.keeper),
-            "duplicates": [asdict(d) for d in self.duplicates],
-            "recoverable_mb": self.recoverable_mb,
-        }
+        return asdict(self)
+
+
+@dataclass
+class DuplicateSummary:
+    """Computed counts for a DuplicateReport. Field names match the JSON wire."""
+
+    total_files: int = 0
+    exact_duplicate_groups: int = 0
+    exact_duplicate_files: int = 0
+    audio_duplicate_groups: int = 0
+    audio_duplicate_files: int = 0
+    total_duplicates: int = 0
+    space_recoverable_mb: float = 0.0
 
 
 @dataclass
 class DuplicateReport:
-    total_files: int = 0
-    exact_groups: list[DuplicateGroup] = field(default_factory=list)
-    audio_groups: list[DuplicateGroup] = field(default_factory=list)
+    """The result of a duplicate scan. Field names match the JSON-RPC wire shape
+    so the TS generator and the runtime payload are 1:1."""
 
-    @property
-    def total_duplicate_files(self) -> int:
-        return sum(len(g.duplicates) for g in self.exact_groups + self.audio_groups)
+    summary: DuplicateSummary = field(default_factory=DuplicateSummary)
+    exact_duplicates: list[DuplicateGroup] = field(default_factory=list)
+    audio_duplicates: list[DuplicateGroup] = field(default_factory=list)
 
-    @property
-    def recoverable_mb(self) -> float:
-        return sum(g.recoverable_mb for g in self.exact_groups + self.audio_groups)
+    def update_summary(self, total_files: int | None = None) -> None:
+        """Recompute the summary from current groups. Call after mutating lists.
+
+        `total_files` defaults to whatever the summary already had — useful
+        when filtering groups without rescanning the library.
+        """
+        if total_files is not None:
+            self.summary.total_files = total_files
+        exact_files = sum(len(g.duplicates) for g in self.exact_duplicates)
+        audio_files = sum(len(g.duplicates) for g in self.audio_duplicates)
+        self.summary.exact_duplicate_groups = len(self.exact_duplicates)
+        self.summary.exact_duplicate_files = exact_files
+        self.summary.audio_duplicate_groups = len(self.audio_duplicates)
+        self.summary.audio_duplicate_files = audio_files
+        self.summary.total_duplicates = exact_files + audio_files
+        self.summary.space_recoverable_mb = round(
+            sum(g.recoverable_mb for g in self.exact_duplicates + self.audio_duplicates),
+            2,
+        )
 
     def to_dict(self) -> dict:
-        return {
-            "summary": {
-                "total_files": self.total_files,
-                "exact_duplicate_groups": len(self.exact_groups),
-                "exact_duplicate_files": sum(len(g.duplicates) for g in self.exact_groups),
-                "audio_duplicate_groups": len(self.audio_groups),
-                "audio_duplicate_files": sum(len(g.duplicates) for g in self.audio_groups),
-                "total_duplicates": self.total_duplicate_files,
-                "space_recoverable_mb": round(self.recoverable_mb, 2),
-            },
-            "exact_duplicates": [g.to_dict() for g in self.exact_groups],
-            "audio_duplicates": [g.to_dict() for g in self.audio_groups],
-        }
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +158,14 @@ def audio_fingerprint(filepath: Path, fpcalc_cmd: str, duration: int = 120) -> s
     return None
 
 
-def _file_info(filepath: Path) -> FileInfo:
+def _file_info(filepath: Path, read_metadata: bool = True) -> FileInfo:
+    """Build a FileInfo for `filepath`.
+
+    When `read_metadata` is False, skip the mutagen probe entirely — only
+    path/filename/size/codec/modified_time come from os.stat. This saves
+    ~30s on a 12k-track library when the caller doesn't need bitrate/duration
+    (e.g. MD5-only dedup that doesn't use rule-based keeper picking).
+    """
     stat = filepath.stat()
     info = FileInfo(
         path=str(filepath),
@@ -158,6 +175,9 @@ def _file_info(filepath: Path) -> FileInfo:
         codec=filepath.suffix.lower().lstrip("."),
         modified_time=stat.st_mtime,
     )
+
+    if not read_metadata:
+        return info
 
     # Best-effort bitrate / duration via mutagen. Catch broadly — corrupt
     # files shouldn't break the whole dedupe scan.
@@ -203,10 +223,17 @@ def find_duplicates(
     library_path: Path,
     config: DuplicateConfig,
     on_progress: ProgressCallback | None = None,
+    read_metadata: bool = True,
 ) -> DuplicateReport:
-    """Scan `library_path` and return all detected duplicate groups."""
+    """Scan `library_path` and return all detected duplicate groups.
+
+    Set `read_metadata=False` to skip per-file mutagen probes — saves significant
+    time on large libraries when the caller doesn't need bitrate/duration info
+    (e.g. MD5-only dedup with default keeper rules). The format-priority and
+    size-based keeper picking still works without metadata.
+    """
     audio_files = find_audio_files(library_path)
-    report = DuplicateReport(total_files=len(audio_files))
+    report = DuplicateReport(summary=DuplicateSummary(total_files=len(audio_files)))
 
     # ---------- Phase 1: hash everything (cheap; rules out the common case) ----------
     file_infos: dict[str, FileInfo] = {}
@@ -215,7 +242,7 @@ def find_duplicates(
     if config.use_md5:
         for i, fp in enumerate(audio_files):
             report_progress(on_progress, i + 1, len(audio_files), f"hash {fp.name}")
-            info = _file_info(fp)
+            info = _file_info(fp, read_metadata=read_metadata)
             file_infos[str(fp)] = info
             h = file_md5(fp)
             if h:
@@ -225,10 +252,10 @@ def find_duplicates(
         for h, files in by_hash.items():
             if len(files) > 1:
                 keeper, dupes = choose_keeper(files)
-                report.exact_groups.append(DuplicateGroup(
+                report.exact_duplicates.append(DuplicateGroup(
                     method="md5",
                     key=h,
-                    keeper=keeper,
+                    keep=keeper,
                     duplicates=dupes,
                     recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
                 ))
@@ -240,14 +267,14 @@ def find_duplicates(
             log.warning("fpcalc not found; skipping audio fingerprinting")
         else:
             exact_dupe_paths = {
-                d.path for g in report.exact_groups for d in g.duplicates
+                d.path for g in report.exact_duplicates for d in g.duplicates
             }
             remaining = [fp for fp in audio_files if str(fp) not in exact_dupe_paths]
             by_fp: dict[str, list[FileInfo]] = defaultdict(list)
 
             for i, fp in enumerate(remaining):
                 report_progress(on_progress, i + 1, len(remaining), f"fingerprint {fp.name}")
-                info = file_infos.get(str(fp)) or _file_info(fp)
+                info = file_infos.get(str(fp)) or _file_info(fp, read_metadata=read_metadata)
                 file_infos[str(fp)] = info
                 fp_hash = audio_fingerprint(fp, fpcalc)
                 if fp_hash:
@@ -262,14 +289,15 @@ def find_duplicates(
                 if len({f.file_hash for f in files if f.file_hash}) <= 1:
                     continue
                 keeper, dupes = choose_keeper(files)
-                report.audio_groups.append(DuplicateGroup(
+                report.audio_duplicates.append(DuplicateGroup(
                     method="chromaprint",
                     key=fp_hash,
-                    keeper=keeper,
+                    keep=keeper,
                     duplicates=dupes,
                     recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
                 ))
 
+    report.update_summary()
     return report
 
 
@@ -290,7 +318,7 @@ def handle_duplicates(
     action = DuplicateAction(config.action)
     all_dupes = [
         d
-        for g in (*report.exact_groups, *report.audio_groups)
+        for g in (*report.exact_duplicates, *report.audio_duplicates)
         for d in g.duplicates
     ]
     summary = {"moved": 0, "deleted": 0, "errors": 0}
