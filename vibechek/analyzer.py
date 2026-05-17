@@ -21,7 +21,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mutagen import File as MutagenFile  # noqa: N812 (mutagen's API)
 from mutagen.flac import FLAC
@@ -161,33 +161,83 @@ def download_models(
     model_dir: Path,
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Download missing models. Returns descriptors for each (paths + class labels)."""
+    """Download missing model files. Returns descriptors keyed by model name.
+
+    Streams each file with byte-level progress emitted to `on_progress` (the
+    GUI shows a real progress bar instead of jumping in 1/8 steps). Validates
+    that downloads actually succeeded — partial / wrong-size files are
+    deleted and the model name added to `errors`. If ANY model failed, raises
+    `RuntimeError` at the end so the caller can surface the failure rather
+    than returning fake success.
+
+    Idempotent: existing valid files are skipped. A file whose size doesn't
+    match the server's Content-Length is treated as missing and re-fetched.
+    """
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     descriptors: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
 
+    # Two parts per model (weights + metadata) so the overall progress bar
+    # has 2*N steps. We emit bytes-within-current-file as a fractional step
+    # for smooth UX during big downloads.
     items = list(MODELS.items())
-    for i, (name, (subdir, weights_name, metadata_name)) in enumerate(items):
-        report_progress(on_progress, i + 1, len(items), name)
+    total_steps = len(items) * 2
 
+    def emit(step_idx: int, byte_progress: tuple[int, int] | None, label: str) -> None:
+        """Translate (step, file-progress) into a 0..total_steps progress tick."""
+        if byte_progress is not None:
+            done_bytes, total_bytes = byte_progress
+            inner = (done_bytes / total_bytes) if total_bytes > 0 else 0
+            current = step_idx + inner
+        else:
+            current = step_idx + 1
+        report_progress(on_progress, int(current * 100), total_steps * 100, label)
+
+    for i, (name, (subdir, weights_name, metadata_name)) in enumerate(items):
         weights_path = model_dir / f"{name}.pb"
         metadata_path = model_dir / f"{name}.json"
 
-        if not weights_path.exists():
-            url = f"{MODEL_BASE_URL}/{subdir}/{weights_name}"
-            log.info("Downloading %s weights from %s", name, url)
+        # ---- weights ----
+        weights_step = i * 2
+        weights_url = f"{MODEL_BASE_URL}/{subdir}/{weights_name}"
+        if _needs_download(weights_path, weights_url):
             try:
-                urllib.request.urlretrieve(url, weights_path)
+                _download_with_progress(
+                    weights_url,
+                    weights_path,
+                    label=f"{name}.pb",
+                    on_progress=lambda done, total, n=name: emit(
+                        weights_step, (done, total), f"{n} weights ({_fmt_bytes(done)}/{_fmt_bytes(total)})"
+                    ),
+                )
             except Exception as e:  # noqa: BLE001
-                log.warning("Could not download %s: %s", name, e)
+                log.error("Failed to download %s weights: %s", name, e)
+                errors.append(f"{name}.pb: {e}")
+                # Clean up any partial file so a retry doesn't think it's done
+                weights_path.unlink(missing_ok=True)
                 continue
+        emit(weights_step, None, f"{name} weights ready")
 
-        if not metadata_path.exists():
-            url = f"{MODEL_BASE_URL}/{subdir}/{metadata_name}"
+        # ---- metadata ----
+        metadata_step = i * 2 + 1
+        metadata_url = f"{MODEL_BASE_URL}/{subdir}/{metadata_name}"
+        if _needs_download(metadata_path, metadata_url):
             try:
-                urllib.request.urlretrieve(url, metadata_path)
+                _download_with_progress(
+                    metadata_url,
+                    metadata_path,
+                    label=f"{name}.json",
+                    on_progress=lambda done, total, n=name: emit(
+                        metadata_step, (done, total), f"{n} metadata"
+                    ),
+                )
             except Exception as e:  # noqa: BLE001
-                log.warning("Could not download %s metadata: %s", name, e)
+                log.error("Failed to download %s metadata: %s", name, e)
+                errors.append(f"{name}.json: {e}")
+                metadata_path.unlink(missing_ok=True)
+                # Still record the descriptor — the .pb may be usable without metadata
+        emit(metadata_step, None, f"{name} metadata ready")
 
         desc: dict[str, Any] = {
             "weights": str(weights_path),
@@ -203,7 +253,109 @@ def download_models(
 
         descriptors[name] = desc
 
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)} model file(s) failed to download. "
+            f"Check your network and retry. Errors: " + "; ".join(errors[:5])
+        )
+
     return descriptors
+
+
+def _fmt_bytes(n: int) -> str:
+    """Smart byte formatter — KB for small files, MB for medium, GB for huge."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.0f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _needs_download(path: Path, url: str) -> bool:
+    """True if `path` is missing OR clearly truncated relative to `url`."""
+    if not path.exists():
+        return True
+    try:
+        # Cheap HEAD — most CDNs respond with Content-Length
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            expected = int(resp.headers.get("Content-Length") or 0)
+    except Exception as e:  # noqa: BLE001
+        log.debug("HEAD failed for %s: %s — using existing local file", url, e)
+        return False  # Can't verify; trust what we have
+    if expected > 0 and path.stat().st_size != expected:
+        log.warning("Local %s is %d bytes but server says %d — refetching",
+                    path.name, path.stat().st_size, expected)
+        return True
+    return False
+
+
+def _download_with_progress(
+    url: str,
+    dest: Path,
+    label: str,
+    on_progress: Callable[[int, int], None] | None = None,
+    chunk_size: int = 64 * 1024,
+) -> None:
+    """Stream `url` → `dest`, calling `on_progress(bytes_done, bytes_total)`.
+
+    Throttles progress emission to ~10/sec so we don't flood the JSON-RPC pipe.
+    Validates that the file matches the server's Content-Length when present.
+    """
+    import time as _time
+
+    log.info("Downloading %s → %s", url, dest.name)
+
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        bytes_done = 0
+        last_emit = 0.0
+
+        # Atomic write: temp file then rename. Avoids leaving a half-written
+        # file in place if the network drops mid-download.
+        tmp_dest = dest.with_suffix(dest.suffix + ".partial")
+        try:
+            with open(tmp_dest, "wb") as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    bytes_done += len(chunk)
+                    now = _time.monotonic()
+                    if on_progress and (now - last_emit) > 0.1:
+                        try:
+                            on_progress(bytes_done, total)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        last_emit = now
+
+            # Final progress tick for the UI
+            if on_progress:
+                try:
+                    on_progress(bytes_done, max(total, bytes_done))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Validate size
+            if total > 0 and bytes_done != total:
+                raise RuntimeError(
+                    f"truncated download: got {bytes_done} bytes, expected {total}"
+                )
+            # Sanity check on the content — refuse anything implausibly small
+            # for an Essentia model (smallest is ~514KB; smallest metadata ~1KB).
+            min_size = 200 if dest.suffix == ".json" else 100_000
+            if bytes_done < min_size:
+                raise RuntimeError(
+                    f"unexpectedly small file ({bytes_done} bytes) — likely an error page"
+                )
+
+            tmp_dest.replace(dest)
+        except Exception:
+            tmp_dest.unlink(missing_ok=True)
+            raise
 
 
 def load_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
@@ -743,6 +895,11 @@ def _analyze_via_wsl(
 
     wsl_input = win_to_wsl_path(str(library_path))
     wsl_output = win_to_wsl_path(str(local_output))
+    # Critical: tell WSL where the models live. The user downloaded them on
+    # the Windows side; WSL sees that path under /mnt/c/.... Without this,
+    # WSL would default to its own ~/.local/share/Vibechek/models/, find
+    # nothing, and either re-download (slow) or fail silently.
+    wsl_models_dir = win_to_wsl_path(str(config.models_dir))
 
     workers = config.workers if config.workers and config.workers > 0 else 0
 
@@ -750,6 +907,7 @@ def _analyze_via_wsl(
         "analyze", wsl_input,
         "-o", wsl_output,
         "--gpu", config.use_gpu,
+        "--models-dir", wsl_models_dir,
     ]
     if workers > 0:
         args += ["--workers", str(workers)]
