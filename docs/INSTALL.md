@@ -1,11 +1,18 @@
 # Installing Vibechek
 
+Two flavors:
+
+- **Desktop app** (recommended for most users) — point-and-click. Handles its own dependencies via the in-app setup dialog. Download the installer for your OS from [Releases](https://github.com/papapew/Vibechek/releases).
+- **CLI** (`vibechek` command) — for scripting, headless use, or running on a server.
+
+See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop app.
+
 ## What you need depends on what you're doing
 
 | Goal | What to install |
 |---|---|
 | Dedupe, organize, backup, restore, route | **Just Vibechek.** No ML needed. |
-| Run `vibechek analyze` (ML genre/mood/energy detection) | Vibechek + Essentia (see below) |
+| Run `vibechek analyze` (ML genre/mood/energy detection) | Vibechek + Essentia (see below). On Windows the desktop app installs Essentia for you. |
 
 ## Installing Vibechek
 
@@ -109,3 +116,18 @@ vibechek download-models   # one-time, ~800 MB
 **Models download is slow / fails** — `essentia.upf.edu` occasionally rate-limits. Retry, or download the `.pb` files manually from [the model index](https://essentia.upf.edu/models.html) into the directory `vibechek download-models` prints on startup.
 
 **"fpcalc not found"** — install Chromaprint (see above) or use `--no-chromaprint` to fall back to MD5-only duplicate detection.
+
+## Where Vibechek stores things
+
+| File / dir | Purpose | Example (Windows) |
+|---|---|---|
+| `<config_dir>/Vibechek/config.toml` | Your settings (auto-saved 500ms after change) | `%APPDATA%\Vibechek\Vibechek\config.toml` |
+| `<config_dir>/Vibechek/library_state.json` | Recent libraries index | `%APPDATA%\Vibechek\Vibechek\library_state.json` |
+| `<config_dir>/Vibechek/backup_history.json` | Past tag backups | `%APPDATA%\Vibechek\Vibechek\backup_history.json` |
+| `<data_dir>/Vibechek/models/` | Downloaded ML model `.pb` files (~800 MB total) | `%LOCALAPPDATA%\Vibechek\Vibechek\models\` |
+| `<data_dir>/Vibechek/analyses/` | Auto-saved per-library analysis JSONs | `%LOCALAPPDATA%\Vibechek\Vibechek\analyses\` |
+| `<data_dir>/Vibechek/logs/vibechek.log` | Rotating log file (10 MB × 5 backups) | `%LOCALAPPDATA%\Vibechek\Vibechek\logs\vibechek.log` |
+
+`<config_dir>` and `<data_dir>` come from [platformdirs](https://platformdirs.readthedocs.io/) and are correct per OS.
+
+To start fresh: delete the `Vibechek` folder under your config and data dirs.

@@ -6,10 +6,11 @@ A DJ should be able to download Vibechek, double-click an installer, point it at
 
 ## Guiding principles
 
-1. **Safe by default.** Backup before every write. Never touch Rekordbox binary frames. Every destructive operation has a dry-run preview.
+1. **Safe by default.** Backup before every write. Never touch Rekordbox binary frames. Every destructive operation has a confirm modal with a clear preview.
 2. **Granular controls.** Every flag in the legacy scripts becomes a setting in the UI. Power users get knobs; new users get good defaults.
-3. **Just works.** No command line required for end-users. One-click install per OS.
+3. **Just works.** No command line required for end-users. One-click install per OS. Auto-setup of WSL on Windows.
 4. **OSS-friendly stack.** Python core so any DJ-with-some-coding can contribute. Heavy lifting (Essentia) is C++ already; we just need the Python wrapper to be clean.
+5. **No lost work.** Analysis auto-saves. Settings persist. Recent libraries surface on startup.
 
 ## Phases
 
@@ -21,95 +22,108 @@ Goal: a working `pip install -e .` package that mirrors the legacy CLI scripts v
 - ✅ Python package (`vibechek/` with `cli`, `config`, `analyzer`, `tagger`, `duplicates`, `organizer`, `genres`, `keys`, `filename`, `utils`)
 - ✅ `pyproject.toml` with Click-based CLI entry point
 - ✅ Port `legacy/analyze_dj_tracks_v2.py` → `vibechek/analyzer.py`
-- ✅ Port `legacy/backup_tags.py` → `vibechek/tagger.py` (backup + restore)
-- ✅ Port `legacy/apply_tags_filtered.py` → `vibechek/tagger.py` (apply with confidence threshold + GEOB/PRIV preservation)
+- ✅ Port `legacy/backup_tags.py` → `vibechek/tagger.py`
+- ✅ Port `legacy/apply_tags_filtered.py` → `vibechek/tagger.py`
 - ✅ Port `legacy/find_duplicates.py` + `move_safe_duplicates.py` → `vibechek/duplicates.py`
 - ✅ Port `legacy/organize_by_genre.py` + `copy_to_genre_folders.py` → `vibechek/organizer.py`
-- ✅ First round of pytest tests (67 passing, 1 skipped for missing audio fixtures)
-- [ ] TOML config persistence in `vibechek/config.py` (deferred — GUI in Phase 3 will need this)
+- ✅ TOML config persistence in `vibechek/config.py` (delivered Phase 3)
+- ✅ 67 pytest tests
 - [ ] Tag a `v0.1.0` release
 
-### Phase 2 — Cross-platform installer _(in progress)_
+### Phase 2 — Cross-platform installer _(complete)_
 
 Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 
-- ✅ PyInstaller spec ([`packaging/vibechek.spec`](../packaging/vibechek.spec)) — one-folder bundle, CLI-only, ~26 MB.
-- ✅ Build scripts per OS:
-  - [`packaging/build-windows.bat`](../packaging/build-windows.bat)
-  - [`packaging/build-macos.sh`](../packaging/build-macos.sh)
-  - [`packaging/build-linux.sh`](../packaging/build-linux.sh)
-- ✅ Inno Setup installer config ([`packaging/installer.iss`](../packaging/installer.iss)) — optional PATH integration, per-user install (no admin).
-- ✅ First-run model downloader command: `vibechek download-models`.
-- ✅ Essentia kept out of the bundle (too heavy, no Windows wheel) — users install separately or skip if they only need dedup/organize/backup.
+- ✅ PyInstaller spec ([`packaging/vibechek.spec`](../packaging/vibechek.spec))
+- ✅ Build scripts per OS: `build-windows.bat` / `build-macos.sh` / `build-linux.sh`
+- ✅ Inno Setup installer config — per-user, optional PATH integration
+- ✅ Branded app icons in every format Tauri needs (`packaging/generate-icons.py`)
+- ✅ First-run model downloader command + GUI button
 - ✅ GitHub Actions:
-  - CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) — tests + lint on Linux/macOS/Windows × Python 3.10/3.12
-  - Release ([`.github/workflows/release.yml`](../.github/workflows/release.yml)) — on tag push, build all three platforms, draft GitHub Release
-- [ ] `dmgbuild` config for macOS (currently ships `.tar.gz`).
-- [ ] `appimagetool` config for Linux (currently ships `.tar.gz`).
-- [ ] Code signing for Windows (deferred — needs a paid cert; will revisit if SmartScreen warnings hurt adoption).
-- [ ] macOS notarization (deferred — same reason).
-- [ ] Tag a `v0.2.0` release with downloadable artifacts.
+  - CI: tests on Linux/macOS/Windows × Python 3.10/3.12
+  - Release: on tag, builds PyInstaller CLI + Tauri installers, drafts a GitHub Release
+- [ ] `dmgbuild` config for macOS (currently ships `.tar.gz` inside the Tauri `.dmg`)
+- [ ] Code signing for Windows + macOS notarization (deferred — paid certs)
 
-### Phase 3 — Desktop UI _(in progress)_
+### Phase 3 — Desktop UI _(complete)_
 
-Goal: full graphical workflow — open folder, analyze, preview, apply.
+Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI required.
 
-- ✅ JSON-RPC sidecar ([`vibechek/rpc.py`](../vibechek/rpc.py)): 14 methods (incl. `system_info`), progress notifications, error handling.
-- ✅ System resources module ([`vibechek/resources.py`](../vibechek/resources.py)): CPU/RAM/GPU detection, CUDA_VISIBLE_DEVICES control.
-- ✅ Tauri 2.x Rust shell ([`ui/src-tauri/`](../ui/src-tauri/)):
-  - Spawns the Python sidecar at startup
-  - Multiplexes JSON-RPC requests by id
-  - Re-broadcasts progress notifications as `sidecar:*` Tauri events
-  - Sidecar binary resolution: env var → externalBin sibling → PATH
-- ✅ React frontend ([`ui/src/`](../ui/src/)): Vite, TypeScript, Tailwind, Zustand, react-virtuoso, framer-motion.
-- ✅ Sidecar staging scripts ([`packaging/stage-sidecar.{bat,sh}`](../packaging/)) for dev mode.
-- ✅ Components:
-  - Library browser (virtualized) with search filter and ML tag/energy badges
-  - Analysis progress overlay (live updates from sidecar progress notifications)
-  - Duplicates view with **per-group resolver** — pick keeper, skip groups, move-to-folder or trash
-  - Organize view — pick analysis source, tweak rules, preview plan grouped by destination folder, execute
-  - Track details side panel with **before/after diff preview** and "apply to this track only" button
-  - Settings page with **System resources detection** (CPU/RAM/GPU), workers slider, GPU auto/on/off
-- ✅ Release workflow ([`.github/workflows/release.yml`](../.github/workflows/release.yml)):
-  - Builds PyInstaller CLI bundle on each OS
-  - Builds Tauri installers (`.msi`/`.exe`/`.dmg`/`.AppImage`/`.deb`) with sidecar bundled
-  - Draft GitHub Release with all artifacts on tag push
-- ✅ Pre-flight system ([`vibechek/preflight.py`](../vibechek/preflight.py) + GUI dialog) — catches missing essentia / models before any operation starts so multiprocessing.Pool can't hang silently.
-- ✅ Fully automated Windows setup ([`vibechek/wsl.py`](../vibechek/wsl.py)):
-  - Detects WSL availability + installed distros + whether vibechek/essentia are inside any of them.
-  - One-click install of WSL itself (elevated PowerShell, triggers UAC).
-  - One-click install of vibechek + essentia + chromaprint into the user's distro.
-  - When essentia is unavailable natively but available via WSL, `analyze` is
-    routed through WSL transparently, with Windows ↔ WSL path translation
-    (`C:\foo` ↔ `/mnt/c/foo`) at the boundary.
-- ✅ App icons ([`packaging/generate-icons.py`](../packaging/generate-icons.py)) — branded vinyl disc, generated in all formats Tauri needs.
-- [ ] Settings persistence (TOML in user config dir) — currently in-memory only
-- [ ] Cancellation support — long ops can't be interrupted from the UI yet
+- ✅ **JSON-RPC sidecar** ([`vibechek/rpc.py`](../vibechek/rpc.py)): 28 methods, threadpool dispatch (8 workers), stdout lock, progress notifications, structured error codes.
+- ✅ **Async sidecar**: long ops don't block fast ones. Fast endpoints (system_info, preflight) interleave with running analyze/dedupe/organize.
+- ✅ **Cancellation** ([`vibechek/cancellation.py`](../vibechek/cancellation.py)): cooperative token; multiprocessing pool terminates cleanly on cancel; WSL subprocess gets SIGTERM+SIGKILL.
+- ✅ **Auto-saved analysis state** ([`vibechek/library_state.py`](../vibechek/library_state.py)): analysis result writes to `<data_dir>/analyses/...` automatically; recent libraries index surfaces them on the Library tab's empty state.
+- ✅ **Structured logging** ([`vibechek/logging_setup.py`](../vibechek/logging_setup.py)): rotating file logs; `get_log_tail` RPC + LogsViewer modal in the GUI.
+- ✅ **System resource detection** ([`vibechek/resources.py`](../vibechek/resources.py)): CPU/RAM/GPU detection; workers slider snaps to recommended; GPU auto/on/off control.
+- ✅ **TOML settings persistence** ([`vibechek/config.py`](../vibechek/config.py)): debounced auto-save 500ms after any UI change; restore-defaults; Simple/Advanced split.
+- ✅ **Tauri 2.x Rust shell** ([`ui/src-tauri/`](../ui/src-tauri/)):
+  - Spawns Python sidecar
+  - Sidecar-death detection (atomic flag, drains pending oneshots on EOF)
+  - Re-broadcasts progress notifications as Tauri events
+- ✅ **React frontend** ([`ui/src/`](../ui/src/)): Vite, TypeScript, Tailwind, Zustand, react-virtuoso, framer-motion, WaveSurfer.js
+- ✅ **Auto-installed prerequisites on Windows** ([`vibechek/wsl.py`](../vibechek/wsl.py)):
+  - Detects WSL state + installed distros
+  - One-click install of WSL itself (elevated PowerShell, UAC)
+  - One-click install of vibechek + essentia + chromaprint inside the user's distro
+  - Path translation at the WSL boundary (`C:\foo` ↔ `/mnt/c/foo`)
+  - Live progress log in the install dialog, with Cancel
+- ✅ **All major views** with consistent error handling, polished confirm modals, and Toast notifications:
+  - **Library**: scan-only fast path, full analyze, virtualized track list, filter chips (genre/energy/mood/vocal), bulk-select + bulk-apply with genre breakdown summary, error count badge with "errors only" filter
+  - **Track Details** side panel: file metadata, before/after tag diff, waveform audio preview, per-file apply
+  - **Duplicates**: rules-based auto-keeper picker (codec > bitrate > size > newest > shortest-path), manual override, plain-English language
+  - **Organize**: source picker, preview, polished confirm with backup-first option, post-op result panel with folder breakdown
+  - **Tags**: backup/restore + history of past backups with stale warnings
+  - **Settings**: System resources card, Analysis (workers slider, GPU mode), Tagging/Duplicates/Organization (behind Advanced disclosure), restore-defaults, View logs
+- ✅ **Onboarding overlay**: three-slide tour shown once on first launch, persisted in TOML
+- ✅ **Recent libraries**: empty Library tab shows clickable cards for past libraries with relative timestamps
+- ✅ **Error UX**: global ErrorToast with Copy details + View logs + Report on GitHub (prefilled issue)
+- ✅ **24 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+- ✅ **109 backend tests** added (modules: wsl, preflight, cancellation, library_state, logging_setup, RPC dispatch with concurrency check)
+- ✅ **Generated TS types**: `scripts/generate_ts_types.py` walks 9 Python modules and emits 27 TS interfaces. `__ts_overrides__` mechanism handles wire-form ≠ storage-form cases.
 - [ ] Tag a `v0.3.0` release with the desktop app
 
-### Notes on the desktop stack
+### Phase 4 — Polish, docs, community launch _(in progress)_
 
-- **Tauri vs Electron**: Tauri produces ~10× smaller installers (~30 MB shell + ~30 MB Python sidecar vs Electron's ~100+ MB Chromium).
-- **Rust vs Python contributors**: The Rust shell is small (~300 lines) and rarely changes. Contributors who don't touch Rust never need to. The interesting code is in React (frontend) and Python (sidecar / core).
-- **Sidecar protocol**: JSON-RPC 2.0 over stdin/stdout (Tauri's recommended sidecar pattern). No port management; sidecar lifetime tied to the Tauri process.
-
-### Phase 4 — Polish & launch
-
-- [ ] Docs site (GitHub Pages from `/docs`)
-- [ ] User-facing screenshots and walkthroughs
-- [ ] `r/Beatmatch`, `r/DJs`, `r/Rekordbox`, DJ TechTools, Pioneer DJ Forum — community announcement
-- [ ] GitHub Sponsors + Ko-fi link
-- [ ] `v1.0.0` release
+- ✅ Comprehensive README ([README.md](../README.md))
+- ✅ End-user guide ([USER_GUIDE.md](USER_GUIDE.md))
+- ✅ Install instructions for every platform ([INSTALL.md](INSTALL.md))
+- ✅ Architecture docs ([ui/README.md](../ui/README.md))
+- ✅ Mutagen-read opt-out in `duplicates._file_info` (skip the per-file probe when rules don't need bitrate/duration)
+- ✅ Shared `useApplyTags` hook (eliminates dup between LibraryBrowser and TrackDetails)
+- ✅ Polished confirm modal across the app (no `window.confirm` / `window.alert` remain)
+- ✅ Real audio waveform via WaveSurfer.js
+- ✅ Toast notifications for success / info
+- ✅ `.gitignore` hygiene (test artifacts, IDE settings, OS junk)
+- [ ] Hand-test the full Windows flow end-to-end (install WSL → install essentia → analyze 12k tracks → organize → restore)
+- [ ] Tag `v1.0.0`
+- [ ] Post to r/Beatmatch, r/DJs, r/Rekordbox, DJ TechTools, Pioneer DJ Forum
+- [ ] Set up GitHub Sponsors / Ko-fi
+- [ ] Screenshots + animated GIFs in README
+- [ ] Demo video (90 sec)
 
 ## Non-goals (for now)
 
 - **Other DJ software integration.** Rekordbox-first. Serato/Traktor/VirtualDJ XML export can come via community PR.
 - **Cloud anything.** Vibechek is local-only. No telemetry, no account, no upload.
 - **Music recommendation / curation.** This is an organizer, not a discovery tool.
-- **The C++/Rust/Tauri rewrite described in `docs/PROTOTYPE_DESIGN.md`.** The Python core is good enough; the design doc is preserved for UI/UX reference only.
+- **Re-encoding / format conversion.** Not Vibechek's job.
 
-## Open questions
+## Future ideas (v0.5+)
 
-- **Models hosting.** Essentia hosts the models, but bandwidth is unclear. If downloads get rate-limited at scale, we may need to mirror them.
-- **GPU support.** Essentia bundles its own TensorFlow build, which conflicts with CUDA 11/12 system installs. CPU-only is fine for v1 (~35 tracks/min on an i9). Investigate later.
-- **Code signing budget.** Unsigned binaries get scary SmartScreen warnings on Windows. Sponsorship-funded?
+Logged here so they don't get forgotten:
+
+- **Per-genre confidence thresholds.** "Trust ML for House at 70%, but require 90% for Trance because the model gets it wrong."
+- **Smart playlist export.** Generate `.m3u8` for "Peak House, 125-128 BPM, Camelot 8A-9A".
+- **Multi-library support.** Some DJs split by genre — let them work on multiple library roots in one Vibechek session.
+- **A/B compare two tracks.** Side-by-side waveform + tag diff for the "are these actually duplicates?" question.
+- **Tag undo / history.** Per-file tag history so you can roll back specific writes, not just full restores.
+- **MixedInKey/Lexicon/Beatport tag import.** "I already have data from $TOOL, use that as ground truth instead of/alongside ML."
+- **GPU support on Windows.** Currently auto-routes through WSL on Windows; if/when Essentia ships Windows wheels with CUDA, route native.
+- **Cancel mid-step in WSL install.** The bootstrap is a single `bash -s` invocation — cancellation kills the whole thing. Could split into phases.
+
+## Architectural notes
+
+- **Sidecar concurrency.** 8 workers in a ThreadPoolExecutor. Quick ops (config, system_info, preflight, library_state) interleave freely. Long ops (analyze, dedupe, organize, install) can run concurrently with quick ops; only the cancellation token is a singleton, so only ONE long op can be cancellable at a time.
+- **Path translation lives only in `wsl.py`.** The frontend never sees `/mnt/c/...`. The analyzer's WSL detour translates on the way in and out.
+- **TOML config drops unknown keys.** Adding fields is safe — old configs just inherit the defaults for new fields.
+- **`__ts_overrides__` pattern.** A class attribute that the TS generator reads — used when the JSON wire form is narrower than the Python storage form (e.g., `TrackAnalysis.existing_tags: dict[str, Any]` is typed as `ExistingTags` in TypeScript).
