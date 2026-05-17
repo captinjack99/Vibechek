@@ -13,37 +13,42 @@ A DJ should be able to download Vibechek, double-click an installer, point it at
 
 ## Phases
 
-### Phase 1 — Package what works _(in progress)_
+### Phase 1 — Package what works _(complete)_
 
 Goal: a working `pip install -e .` package that mirrors the legacy CLI scripts via a single `vibechek` command.
 
-**Done**
-- ✅ Git repository initialized
-- ✅ AGPL-3.0 license
-- ✅ Package skeleton (`vibechek/` with `cli`, `config`, `analyzer`, `tagger`, `duplicates`, `organizer`)
+- ✅ Git repository initialized + AGPL-3.0 license
+- ✅ Python package (`vibechek/` with `cli`, `config`, `analyzer`, `tagger`, `duplicates`, `organizer`, `genres`, `keys`, `filename`, `utils`)
 - ✅ `pyproject.toml` with Click-based CLI entry point
-- ✅ Legacy scripts preserved in `legacy/` for reference
-
-**To do**
-- [ ] Port `legacy/analyze_dj_tracks_v2.py` → `vibechek/analyzer.py`
-- [ ] Port `legacy/backup_tags.py` → `vibechek/tagger.py` (backup + restore)
-- [ ] Port `legacy/apply_tags_filtered.py` → `vibechek/tagger.py` (apply)
-- [ ] Port `legacy/find_duplicates.py` + `move_safe_duplicates.py` → `vibechek/duplicates.py`
-- [ ] Port `legacy/organize_by_genre.py` + `copy_to_genre_folders.py` → `vibechek/organizer.py`
-- [ ] TOML config persistence in `vibechek/config.py`
-- [ ] First round of pytest tests against a small fixture library
+- ✅ Port `legacy/analyze_dj_tracks_v2.py` → `vibechek/analyzer.py`
+- ✅ Port `legacy/backup_tags.py` → `vibechek/tagger.py` (backup + restore)
+- ✅ Port `legacy/apply_tags_filtered.py` → `vibechek/tagger.py` (apply with confidence threshold + GEOB/PRIV preservation)
+- ✅ Port `legacy/find_duplicates.py` + `move_safe_duplicates.py` → `vibechek/duplicates.py`
+- ✅ Port `legacy/organize_by_genre.py` + `copy_to_genre_folders.py` → `vibechek/organizer.py`
+- ✅ First round of pytest tests (67 passing, 1 skipped for missing audio fixtures)
+- [ ] TOML config persistence in `vibechek/config.py` (deferred — GUI in Phase 3 will need this)
 - [ ] Tag a `v0.1.0` release
 
-### Phase 2 — Cross-platform installer
+### Phase 2 — Cross-platform installer _(in progress)_
 
-Goal: `vibechek-0.2.0-win64.msi` (and `.dmg`, `.AppImage`) that any DJ can double-click.
+Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 
-- [ ] PyInstaller build per OS
-- [ ] First-run model downloader (so the installer stays small; Essentia models add ~800MB)
-- [ ] Inno Setup (Windows), `dmgbuild` (macOS), `appimagetool` (Linux)
-- [ ] GitHub Actions CI building all three platforms on tag push
-- [ ] Code signing for Windows (eventually) and macOS notarization (eventually)
-- [ ] `v0.2.0` release with downloadable installers
+- ✅ PyInstaller spec ([`packaging/vibechek.spec`](../packaging/vibechek.spec)) — one-folder bundle, CLI-only, ~26 MB.
+- ✅ Build scripts per OS:
+  - [`packaging/build-windows.bat`](../packaging/build-windows.bat)
+  - [`packaging/build-macos.sh`](../packaging/build-macos.sh)
+  - [`packaging/build-linux.sh`](../packaging/build-linux.sh)
+- ✅ Inno Setup installer config ([`packaging/installer.iss`](../packaging/installer.iss)) — optional PATH integration, per-user install (no admin).
+- ✅ First-run model downloader command: `vibechek download-models`.
+- ✅ Essentia kept out of the bundle (too heavy, no Windows wheel) — users install separately or skip if they only need dedup/organize/backup.
+- ✅ GitHub Actions:
+  - CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) — tests + lint on Linux/macOS/Windows × Python 3.10/3.12
+  - Release ([`.github/workflows/release.yml`](../.github/workflows/release.yml)) — on tag push, build all three platforms, draft GitHub Release
+- [ ] `dmgbuild` config for macOS (currently ships `.tar.gz`).
+- [ ] `appimagetool` config for Linux (currently ships `.tar.gz`).
+- [ ] Code signing for Windows (deferred — needs a paid cert; will revisit if SmartScreen warnings hurt adoption).
+- [ ] macOS notarization (deferred — same reason).
+- [ ] Tag a `v0.2.0` release with downloadable artifacts.
 
 ### Phase 3 — Desktop UI
 

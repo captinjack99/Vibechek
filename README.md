@@ -2,7 +2,7 @@
 
 **ML-powered DJ library organizer.** Analyze, tag, and organize thousands of tracks automatically — without touching the cue points and beat grids your DJ software depends on.
 
-> Status: 🚧 **Early development.** The underlying Python pipeline has analyzed and organized a 12,000+ track personal library successfully. We are now turning it into a packaged, installable application for everyone.
+> Status: 🚧 **Early development.** Python package + CLI work end-to-end; standalone binaries build on Windows/macOS/Linux. The underlying pipeline has already analyzed and organized a 12,000+ track personal library.
 
 ---
 
@@ -29,40 +29,90 @@ Existing tools (Mixed In Key, Platinum Notes, Lexicon DJ) are great but closed-s
 
 ## Status & roadmap
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phased plan. We are currently at the start of **Phase 1: Package what works**.
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phased plan.
 
 | Phase | What | Status |
 |---|---|---|
-| 1 | Refactor working Python scripts into a `vibechek` package + CLI | 🚧 In progress |
-| 2 | Cross-platform installer (PyInstaller + platform installers) | ⏳ Planned |
+| 1 | Refactor working Python scripts into a `vibechek` package + CLI | ✅ Done |
+| 2 | Cross-platform installer (PyInstaller + platform installers) | 🚧 In progress |
 | 3 | Desktop UI (Tauri + Python sidecar, reusing prototype design) | ⏳ Planned |
 | 4 | Polish, docs, community launch | ⏳ Planned |
 
-## What's already in the repo
+## What's in the repo
 
-- [`vibechek/`](vibechek/) — Python package skeleton (stubs being filled in from the legacy scripts).
-- [`legacy/`](legacy/) — The original scripts that have already processed a 12k-track library. Working, but not packaged. Source of truth being ported into the package.
-- [`docs/`](docs/) — Project summary, design docs for the planned desktop app, roadmap.
+- [`vibechek/`](vibechek/) — the Python package: analyzer, tagger, duplicates, organizer, CLI.
+- [`tests/`](tests/) — 67 pytest cases covering pure logic and end-to-end flows.
+- [`packaging/`](packaging/) — PyInstaller spec, build scripts for each OS, Inno Setup config for the Windows installer.
+- [`.github/workflows/`](.github/workflows/) — CI (test on every push) + release (build artifacts on tag).
+- [`legacy/`](legacy/) — the original v1 scripts that already processed a 12k-track library. Kept as the historical source of truth.
+- [`docs/`](docs/) — project summary, prototype design notes, full roadmap.
 
-## Quick start (developers)
+## Install
+
+### Download a release (recommended)
+
+Grab the latest build for your platform from [Releases](https://github.com/papapew/Vibechek/releases) and extract:
+
+- **Windows**: `vibechek-windows-x64.zip` → unzip, run `vibechek-setup.exe` (or use `vibechek.exe` directly).
+- **macOS**: `vibechek-macos-arm64.tar.gz` → `tar -xzf` and add to your PATH.
+- **Linux**: `vibechek-linux-x64.tar.gz` → `tar -xzf` and add to your PATH.
+
+Then verify:
+
+```
+vibechek --help
+```
+
+For ML analysis (genre/mood/energy detection), install Essentia separately — it's too heavy to bundle:
+
+```
+pip install essentia-tensorflow
+```
+
+Linux & macOS only. Windows users: see `docs/INSTALL.md` for the workaround until Essentia ships a Windows wheel.
+
+### From source (developers)
 
 ```bash
-git clone <repo-url>
-cd vibechek
+git clone https://github.com/papapew/Vibechek.git
+cd Vibechek
 
-# Create venv
 python -m venv .venv
 . .venv/Scripts/activate   # Windows
 # source .venv/bin/activate  # macOS/Linux
 
-# Install in editable mode
-pip install -e .
-
-# Run the CLI (stubs only for now)
+pip install -e ".[dev]"
+pytest
 vibechek --help
 ```
 
-End-user install instructions will come with Phase 2.
+### Build a binary yourself
+
+```bash
+# Windows
+packaging\build-windows.bat
+
+# macOS / Linux
+./packaging/build-macos.sh
+./packaging/build-linux.sh
+```
+
+Output lands in `dist/vibechek/`.
+
+## Commands
+
+```
+vibechek analyze <path>            # Run ML analysis on every track
+vibechek dedupe  <path>            # Find duplicates (MD5 + audio fingerprint)
+vibechek organize <analysis.json>  # Move tracks into genre/subgenre folders
+vibechek tag <analysis.json>       # Write ML tags to files (preserves Rekordbox data)
+vibechek backup-tags <path>        # Snapshot all tags to a JSON file
+vibechek restore-tags <backup>     # Restore from a snapshot
+vibechek route <staging> <library> # Copy new tracks into matching genre folders
+vibechek download-models           # Pre-download ML models (~800 MB)
+```
+
+Every command supports `--help` for its flags. Destructive commands (`organize`, `tag`) support `--dry-run`.
 
 ## Acknowledgements
 
