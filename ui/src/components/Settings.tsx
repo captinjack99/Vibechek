@@ -2,15 +2,16 @@ import { useEffect, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield,
-  Zap, AlertTriangle, CheckCircle2,
+  Zap, AlertTriangle, CheckCircle2, RotateCcw, ChevronDown, ChevronRight,
 } from "lucide-react";
 
 import { useConfigStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
-import type { PreflightResult, SystemResources } from "../types";
+import type { PreflightResult, SystemResources, VibechekConfig } from "../types";
 
 export function Settings() {
   const cfg = useConfigStore((s) => s.config);
+  const setConfig = useConfigStore((s) => s.setConfig);
   const updateAnalysis = useConfigStore((s) => s.updateAnalysis);
   const updateTagging = useConfigStore((s) => s.updateTagging);
   const updateDuplicates = useConfigStore((s) => s.updateDuplicates);
@@ -21,13 +22,51 @@ export function Settings() {
   const finish = useOperationStore((s) => s.finish);
   const fail = useOperationStore((s) => s.fail);
 
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  const handleRestoreAll = async () => {
+    try {
+      const result = await rpc<{ config: VibechekConfig }>("restore_default_config");
+      setConfig(result.config, true);
+    } catch (e) {
+      fail(String(e));
+    }
+  };
+
   const [sidecarBinary, setSidecarBinary] = useState<string | null>(null);
   const [sysInfo, setSysInfo] = useState<SystemResources | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
 
   const refreshPreflight = () => {
+    // Two-phase load: fast preflight first (returns in <1s), then trigger the
+    // slower per-distro WSL probe in the background and merge results.
     rpc<PreflightResult>("preflight", {})
-      .then(setPreflightResult)
+      .then((quick) => {
+        setPreflightResult(quick);
+        // Kick off the slow probe only on Windows where it matters
+        if (quick.wsl?.is_windows) {
+          rpc<PreflightResult["wsl"]>("wsl_status", { quick: false })
+            .then((wsl) => {
+              setPreflightResult((prev) => {
+                if (!prev) return prev;
+                // Recompute the readiness fields now that we know the real
+                // WSL state (quick mode couldn't tell us if essentia is in
+                // a distro). Mirrors the logic in vibechek/preflight.py.
+                const wslReady = wsl?.can_run_vibechek ?? false;
+                const ready =
+                  (prev.essentia.installed || wslReady) &&
+                  prev.models.missing.length === 0;
+                const analyze_via: "native" | "wsl" | null = prev.essentia.installed
+                  ? "native"
+                  : wslReady
+                  ? "wsl"
+                  : null;
+                return { ...prev, wsl, ready, analyze_via };
+              });
+            })
+            .catch(() => {});
+        }
+      })
       .catch(() => {});
   };
 
@@ -167,6 +206,18 @@ export function Settings() {
         </Field>
       </Section>
 
+      {/* Advanced disclosure — hides things most users shouldn't touch */}
+      <div className="mb-4">
+        <button
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="btn-ghost w-full justify-start"
+        >
+          {showAdvanced ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          Advanced settings (tagging, duplicates, organization)
+        </button>
+      </div>
+
+      {showAdvanced && <>
       <Section
         icon={<Shield className="w-5 h-5" />}
         title="Tagging"
@@ -310,6 +361,17 @@ export function Settings() {
           </div>
         </Field>
       </Section>
+      </>}
+
+      <div className="mb-6">
+        <button
+          onClick={handleRestoreAll}
+          className="btn-ghost text-sm"
+        >
+          <RotateCcw className="w-4 h-4" />
+          Restore all settings to defaults
+        </button>
+      </div>
 
       <Section title="About" subtitle="">
         <div className="text-xs text-white/40 font-mono break-all">

@@ -27,6 +27,7 @@ from mutagen import File as MutagenFile  # noqa: N812 (mutagen's API)
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3
 
+from vibechek import cancellation
 from vibechek.config import AnalysisConfig
 from vibechek.filename import extract_from_filename
 from vibechek.genres import GenreResult, get_best_genre
@@ -647,6 +648,7 @@ def analyze_directory(
     if workers == 1:
         models = load_models(config.models_dir, use_gpu=config.use_gpu)
         for i, filepath in enumerate(files):
+            cancellation.check()  # Raises CancelledError if user clicked Cancel
             report_progress(on_progress, i + 1, total, filepath.name)
             try:
                 results.append(asdict(analyze_track(filepath, models)))
@@ -667,6 +669,11 @@ def analyze_directory(
             initargs=(str(config.models_dir), config.use_gpu),
         ) as pool:
             for i, record in enumerate(pool.imap_unordered(_worker_analyze, file_strs)):
+                # On cancel: terminate the pool (kills outstanding workers) and bail.
+                if cancellation.is_cancelled():
+                    pool.terminate()
+                    pool.join()
+                    raise cancellation.CancelledError("Analysis cancelled by user")
                 results.append(record)
                 report_progress(on_progress, i + 1, total, Path(record.get("path", "")).name)
                 if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):

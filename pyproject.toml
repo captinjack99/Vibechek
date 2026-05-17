@@ -30,6 +30,8 @@ dependencies = [
     "rich>=13.7",
     "platformdirs>=4.2",
     "psutil>=5.9",
+    # TOML write support — tomllib is stdlib for reads only
+    "tomli-w>=1.0",
 ]
 
 [project.optional-dependencies]

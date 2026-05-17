@@ -20,6 +20,7 @@ imports don't fail there.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import re
 import shutil
@@ -28,6 +29,11 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
+
+# Distros that aren't real Linux environments — probing them with bash will
+# either fail with garbage output or hang for the full subprocess timeout.
+# Add new known-bad names here as we encounter them.
+_NON_LINUX_DISTROS = {"docker-desktop", "docker-desktop-data", "rancher-desktop"}
 
 log = logging.getLogger(__name__)
 
@@ -93,8 +99,15 @@ def to_dict(s: WSLStatus) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def detect_wsl() -> WSLStatus:
-    """Snapshot the user's WSL setup. Cheap; safe to call frequently."""
+def detect_wsl(quick: bool = False) -> WSLStatus:
+    """Snapshot the user's WSL setup.
+
+    `quick=True` skips the per-distro vibechek/essentia probes (which boot
+    Stopped distros and can take 30+ seconds total). Returns in under a
+    second on typical machines. Used by `preflight()` so the GUI never
+    hangs on first load. Call again with `quick=False` for full detail
+    after the UI has rendered.
+    """
     status = WSLStatus(is_windows=IS_WINDOWS, wsl_available=False, wsl_feature_enabled=False)
 
     if not IS_WINDOWS:
@@ -107,7 +120,7 @@ def detect_wsl() -> WSLStatus:
 
     # `wsl --status` is the cheapest "is the feature enabled?" probe
     try:
-        result = _wsl_run([wsl, "--status"], timeout=10)
+        result = _wsl_run([wsl, "--status"], timeout=5)
     except Exception as e:  # noqa: BLE001
         status.error = f"wsl --status failed: {e}"
         return status
@@ -118,7 +131,7 @@ def detect_wsl() -> WSLStatus:
 
     # Parse `wsl --list --verbose` for the distro inventory
     try:
-        result = _wsl_run([wsl, "--list", "--verbose"], timeout=10)
+        result = _wsl_run([wsl, "--list", "--verbose"], timeout=5)
         if result.returncode == 0:
             status.distros = _parse_distro_list(result.stdout)
             status.default_distro = next(
@@ -127,15 +140,23 @@ def detect_wsl() -> WSLStatus:
     except Exception as e:  # noqa: BLE001
         log.debug("wsl --list failed: %s", e)
 
-    # For each distro, probe whether vibechek + essentia are importable
-    for d in status.distros:
-        try:
-            _probe_distro(d, wsl)
-        except Exception as e:  # noqa: BLE001
-            log.debug("probe %s failed: %s", d.name, e)
-
-    # Pick a recommended distro name for fresh installs
     status.recommended_distro = "Ubuntu-24.04"
+
+    if quick:
+        return status
+
+    # Slow path: probe each Linux distro for vibechek + essentia.
+    # Parallel so total time ≈ slowest single probe, not sum.
+    linux_distros = [d for d in status.distros if d.name.lower() not in _NON_LINUX_DISTROS]
+    if linux_distros:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(linux_distros)) as ex:
+            futures = {ex.submit(_probe_distro, d, wsl): d for d in linux_distros}
+            for fut in concurrent.futures.as_completed(futures, timeout=30):
+                d = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:  # noqa: BLE001
+                    log.debug("probe %s failed: %s", d.name, e)
 
     return status
 
@@ -168,33 +189,35 @@ def _parse_distro_list(stdout: str) -> list[DistroInfo]:
 
 
 def _probe_distro(distro: DistroInfo, wsl_exe: str) -> None:
-    """Check whether `vibechek` and `essentia` are importable inside this distro."""
-    # `which vibechek` — also gives us the path
-    try:
-        which = _wsl_run(
-            [wsl_exe, "-d", distro.name, "--", "bash", "-lc", "which vibechek"],
-            timeout=10,
-        )
-        if which.returncode == 0 and which.stdout.strip():
-            distro.vibechek_installed = True
-            distro.vibechek_path = which.stdout.strip().splitlines()[0]
-    except Exception as e:  # noqa: BLE001
-        log.debug("which vibechek failed in %s: %s", distro.name, e)
+    """Check whether `vibechek` and `essentia` are importable inside this distro.
 
-    # Probe essentia importability — quick python -c
+    A single bash invocation does both probes so we only pay the distro-boot
+    cost once. The script writes plain `vibechek=...` / `essentia=...` lines
+    for unambiguous parsing.
+    """
+    script = (
+        "echo vibechek=$(which vibechek 2>/dev/null);"
+        "echo essentia=$(python3 -c 'import essentia; print(essentia.__version__)' 2>/dev/null)"
+    )
     try:
-        py = _wsl_run(
-            [
-                wsl_exe, "-d", distro.name, "--",
-                "bash", "-lc",
-                "python3 -c 'import essentia; print(essentia.__version__)' 2>/dev/null",
-            ],
-            timeout=15,
+        result = _wsl_run(
+            [wsl_exe, "-d", distro.name, "--", "bash", "-lc", script],
+            timeout=20,  # distro boot + two quick probes
         )
-        if py.returncode == 0 and py.stdout.strip():
-            distro.essentia_installed = True
     except Exception as e:  # noqa: BLE001
-        log.debug("essentia probe failed in %s: %s", distro.name, e)
+        log.debug("probe %s failed: %s", distro.name, e)
+        return
+
+    if result.returncode != 0:
+        return
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("vibechek=") and len(line) > len("vibechek="):
+            distro.vibechek_installed = True
+            distro.vibechek_path = line[len("vibechek="):]
+        elif line.startswith("essentia=") and len(line) > len("essentia="):
+            distro.essentia_installed = True
 
 
 # ---------------------------------------------------------------------------
