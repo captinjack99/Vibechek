@@ -29,6 +29,7 @@ dependencies = [
     "click>=8.1",
     "rich>=13.7",
     "platformdirs>=4.2",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

@@ -65,8 +65,30 @@ npm install
 
 ## Dev mode
 
-The sidecar binary path is set via the `VIBECHEK_SIDECAR` env var. For dev,
-point it at the venv-installed CLI:
+### One-time setup: stage the sidecar binary
+
+Tauri's `externalBin` config validates that the sidecar binary exists even in
+dev mode. Run this once after your first `packaging/build-windows.bat`
+(or build-macos / build-linux):
+
+```powershell
+# Windows
+packaging\stage-sidecar.bat
+
+# macOS / Linux
+./packaging/stage-sidecar.sh
+```
+
+This copies `dist/vibechek/vibechek(.exe)` to
+`ui/src-tauri/binaries/vibechek-sidecar-<target-triple>(.exe)`, the path
+Tauri expects. You only need to re-run it when the PyInstaller build is
+regenerated. The binaries dir is gitignored.
+
+### Run
+
+The sidecar that *actually runs* at dev time comes from `VIBECHEK_SIDECAR`,
+which lets you point at your editable Python install (instant code changes,
+no rebuild needed):
 
 ### Windows (PowerShell)
 

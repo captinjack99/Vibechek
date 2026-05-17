@@ -20,10 +20,19 @@ MODELS_DIR = DATA_DIR / "models"
 
 @dataclass
 class AnalysisConfig:
-    """Controls for the ML analysis pass."""
+    """Controls for the ML analysis pass.
 
-    workers: int = 4  # Multi-process; Python GIL prevents true threading
+    The CLI default for `workers` is computed at invocation time as
+    `max(1, cpu_count - 1)` so we leave one core for the OS. The dataclass
+    default of 0 means "let the caller pick"; specific callers (CLI / RPC)
+    fill it in. The GUI surfaces it as a slider.
+    """
+
+    workers: int = 0  # 0 → auto (cpu_count - 1); set explicitly otherwise
     models_dir: Path = MODELS_DIR
+    # GPU usage. "auto" → TF picks GPU if available, falls back to CPU.
+    # "on" → force GPU 0 visible (errors loudly if no GPU). "off" → CPU-only.
+    use_gpu: str = "auto"
 
 
 @dataclass

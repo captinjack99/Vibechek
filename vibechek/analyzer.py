@@ -31,6 +31,7 @@ from vibechek.config import AnalysisConfig
 from vibechek.filename import extract_from_filename
 from vibechek.genres import GenreResult, get_best_genre
 from vibechek.keys import key_to_camelot
+from vibechek.resources import apply_gpu_preference
 from vibechek.utils import (
     ProgressCallback,
     find_audio_files,
@@ -190,8 +191,15 @@ def download_models(
     return descriptors
 
 
-def load_models(model_dir: Path) -> dict[str, Any]:
-    """Instantiate Essentia model wrappers. Raises if essentia isn't installed."""
+def load_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
+    """Instantiate Essentia model wrappers. Raises if essentia isn't installed.
+
+    `use_gpu` is forwarded to apply_gpu_preference BEFORE the essentia/tensorflow
+    import — this is the only point where CUDA_VISIBLE_DEVICES can still affect
+    TF's device enumeration.
+    """
+    apply_gpu_preference(use_gpu)
+
     try:
         import essentia
         from essentia.standard import (
@@ -561,9 +569,9 @@ def analyze_track(filepath: Path, models: dict[str, Any] | None = None) -> Track
 _WORKER_MODELS: dict[str, Any] | None = None
 
 
-def _worker_init(model_dir: str) -> None:
+def _worker_init(model_dir: str, use_gpu: str) -> None:
     global _WORKER_MODELS
-    _WORKER_MODELS = load_models(Path(model_dir))
+    _WORKER_MODELS = load_models(Path(model_dir), use_gpu=use_gpu)
 
 
 def _worker_analyze(filepath_str: str) -> dict[str, Any]:
@@ -611,11 +619,13 @@ def analyze_directory(
     file_strs = [str(f) for f in files]
     results: list[dict[str, Any]] = []
 
-    workers = max(1, min(config.workers, cpu_count()))
-    log.info("Analyzing %d files with %d worker(s)", total, workers)
+    # Resolve "auto" worker count: leave one core for the OS/GUI.
+    requested = config.workers if config.workers and config.workers > 0 else max(1, cpu_count() - 1)
+    workers = max(1, min(requested, cpu_count()))
+    log.info("Analyzing %d files with %d worker(s), GPU=%s", total, workers, config.use_gpu)
 
     if workers == 1:
-        models = load_models(config.models_dir)
+        models = load_models(config.models_dir, use_gpu=config.use_gpu)
         for i, filepath in enumerate(files):
             report_progress(on_progress, i + 1, total, filepath.name)
             try:
@@ -634,7 +644,7 @@ def analyze_directory(
         with Pool(
             processes=workers,
             initializer=_worker_init,
-            initargs=(str(config.models_dir),),
+            initargs=(str(config.models_dir), config.use_gpu),
         ) as pool:
             for i, record in enumerate(pool.imap_unordered(_worker_analyze, file_strs)):
                 results.append(record)

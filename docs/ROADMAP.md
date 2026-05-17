@@ -54,23 +54,29 @@ Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 
 Goal: full graphical workflow — open folder, analyze, preview, apply.
 
-- ✅ JSON-RPC sidecar ([`vibechek/rpc.py`](../vibechek/rpc.py)): 13 methods, progress notifications, error handling.
+- ✅ JSON-RPC sidecar ([`vibechek/rpc.py`](../vibechek/rpc.py)): 14 methods (incl. `system_info`), progress notifications, error handling.
+- ✅ System resources module ([`vibechek/resources.py`](../vibechek/resources.py)): CPU/RAM/GPU detection, CUDA_VISIBLE_DEVICES control.
 - ✅ Tauri 2.x Rust shell ([`ui/src-tauri/`](../ui/src-tauri/)):
   - Spawns the Python sidecar at startup
   - Multiplexes JSON-RPC requests by id
   - Re-broadcasts progress notifications as `sidecar:*` Tauri events
   - Sidecar binary resolution: env var → externalBin sibling → PATH
-- ✅ React frontend ([`ui/src/`](../ui/src/)): Vite, TypeScript, Tailwind, Zustand, react-virtuoso.
+- ✅ React frontend ([`ui/src/`](../ui/src/)): Vite, TypeScript, Tailwind, Zustand, react-virtuoso, framer-motion.
+- ✅ Sidecar staging scripts ([`packaging/stage-sidecar.{bat,sh}`](../packaging/)) for dev mode.
 - ✅ Components:
   - Library browser (virtualized) with search filter and ML tag/energy badges
   - Analysis progress overlay (live updates from sidecar progress notifications)
-  - Duplicates view (per-group summary, exact + audio sections)
-  - Settings page surfacing every field of `VibechekConfig` (analysis, tagging, duplicates, organization)
-- [ ] Track detail panel with before/after tag diff preview
-- [ ] Duplicates resolver UI (per-group: pick keeper, move/trash)
-- [ ] Organize preview/execute UI (currently CLI-only)
-- [ ] Settings persistence (TOML in user config dir)
-- [ ] Wire Tauri release build into the existing GitHub Actions workflow
+  - Duplicates view with **per-group resolver** — pick keeper, skip groups, move-to-folder or trash
+  - Organize view — pick analysis source, tweak rules, preview plan grouped by destination folder, execute
+  - Track details side panel with **before/after diff preview** and "apply to this track only" button
+  - Settings page with **System resources detection** (CPU/RAM/GPU), workers slider, GPU auto/on/off
+- ✅ Release workflow ([`.github/workflows/release.yml`](../.github/workflows/release.yml)):
+  - Builds PyInstaller CLI bundle on each OS
+  - Builds Tauri installers (`.msi`/`.exe`/`.dmg`/`.AppImage`/`.deb`) with sidecar bundled
+  - Draft GitHub Release with all artifacts on tag push
+- [ ] Settings persistence (TOML in user config dir) — currently in-memory only
+- [ ] Cancellation support — long ops can't be interrupted from the UI yet
+- [ ] App icons (`ui/src-tauri/icons/`) — currently using Tauri defaults
 - [ ] Tag a `v0.3.0` release with the desktop app
 
 ### Notes on the desktop stack

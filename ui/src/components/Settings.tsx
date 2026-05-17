@@ -1,9 +1,13 @@
 import { useEffect, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield } from "lucide-react";
+import {
+  Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield,
+  Zap, AlertTriangle, CheckCircle2,
+} from "lucide-react";
 
 import { useConfigStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
+import type { SystemResources } from "../types";
 
 export function Settings() {
   const cfg = useConfigStore((s) => s.config);
@@ -18,9 +22,20 @@ export function Settings() {
   const fail = useOperationStore((s) => s.fail);
 
   const [sidecarBinary, setSidecarBinary] = useState<string | null>(null);
+  const [sysInfo, setSysInfo] = useState<SystemResources | null>(null);
 
   useEffect(() => {
     sidecarStatus().then((s) => setSidecarBinary(s.binary)).catch(() => {});
+    rpc<SystemResources>("system_info")
+      .then((info) => {
+        setSysInfo(info);
+        // If workers is still 0 (unconfigured), bump it to the recommended count
+        if (cfg.analysis.workers === 0) {
+          updateAnalysis({ workers: info.recommended_workers });
+        }
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleDownloadModels = async () => {
@@ -49,21 +64,69 @@ export function Settings() {
         Settings
       </h1>
 
+      <ResourcesSection sysInfo={sysInfo} />
+
       <Section
         icon={<Cpu className="w-5 h-5" />}
         title="Analysis"
-        subtitle="ML model configuration"
+        subtitle="How much of your machine to use"
       >
-        <Field label="Worker processes">
-          <input
-            type="number"
-            min={1}
-            max={32}
-            className="input w-24"
-            value={cfg.analysis.workers}
-            onChange={(e) => updateAnalysis({ workers: Number(e.target.value) || 1 })}
-          />
-          <Hint>Higher = faster (CPU-bound). Best: number of physical cores.</Hint>
+        <Field label={`Worker processes ${sysInfo ? `(of ${sysInfo.cpu_count} cores)` : ""}`}>
+          <div className="flex items-center gap-3">
+            <input
+              type="range"
+              min={1}
+              max={sysInfo?.cpu_count ?? 32}
+              step={1}
+              value={Math.max(1, cfg.analysis.workers)}
+              onChange={(e) => updateAnalysis({ workers: Number(e.target.value) })}
+              className="flex-1 accent-accent"
+            />
+            <span className="text-sm font-mono w-12 text-right tabular-nums">
+              {Math.max(1, cfg.analysis.workers)}
+            </span>
+            {sysInfo && (
+              <button
+                className="btn-ghost text-xs"
+                onClick={() =>
+                  updateAnalysis({ workers: sysInfo.recommended_workers })
+                }
+                title={`Recommended: ${sysInfo.recommended_workers}`}
+              >
+                auto
+              </button>
+            )}
+          </div>
+          <Hint>
+            Each worker holds ~500 MB of model weights in RAM. Best:{" "}
+            <code>cpu_count − 1</code> for a responsive system,{" "}
+            <code>cpu_count</code> for max throughput.
+          </Hint>
+        </Field>
+
+        <Field label="GPU acceleration">
+          <div className="flex gap-2">
+            {(["auto", "on", "off"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => updateAnalysis({ use_gpu: mode })}
+                className={`btn ${
+                  cfg.analysis.use_gpu === mode
+                    ? "bg-accent text-white"
+                    : "bg-white/5 text-white/70 hover:bg-white/10"
+                }`}
+              >
+                {mode === "auto" && <Zap className="w-3.5 h-3.5" />}
+                <span className="capitalize">{mode}</span>
+              </button>
+            ))}
+          </div>
+          <Hint>
+            {!sysInfo ? "Detecting GPU…" :
+              sysInfo.gpu_available
+                ? `${sysInfo.gpu_devices[0]?.name ?? "GPU"} available — auto will use it. Requires Essentia + CUDA setup.`
+                : "No GPU detected. Stays on CPU regardless of choice."}
+          </Hint>
         </Field>
 
         <Field label="Models directory">
@@ -284,6 +347,120 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function Hint({ children }: { children: React.ReactNode }) {
   return <div className="text-xs text-white/40 mt-1">{children}</div>;
+}
+
+/**
+ * Read-only summary of detected system resources, shown at the top of Settings
+ * so users see what's available before choosing how much to spend.
+ */
+function ResourcesSection({ sysInfo }: { sysInfo: SystemResources | null }) {
+  if (!sysInfo) {
+    return (
+      <Section
+        icon={<Cpu className="w-5 h-5" />}
+        title="System"
+        subtitle="Detecting resources..."
+      >
+        <div className="text-sm text-white/40">Loading...</div>
+      </Section>
+    );
+  }
+
+  const memPct =
+    sysInfo.memory_total_mb && sysInfo.memory_available_mb
+      ? Math.round(
+          ((sysInfo.memory_total_mb - sysInfo.memory_available_mb) /
+            sysInfo.memory_total_mb) *
+            100,
+        )
+      : null;
+
+  return (
+    <Section
+      icon={<Cpu className="w-5 h-5" />}
+      title="System"
+      subtitle="What Vibechek can see on this machine"
+    >
+      <div className="grid grid-cols-3 gap-4">
+        <Stat label="CPU cores" value={sysInfo.cpu_count} />
+        <Stat
+          label="Memory"
+          value={
+            sysInfo.memory_total_mb
+              ? `${(sysInfo.memory_total_mb / 1024).toFixed(1)} GB`
+              : "?"
+          }
+          sub={memPct !== null ? `${memPct}% in use` : undefined}
+        />
+        <Stat
+          label="GPU"
+          value={sysInfo.gpu_available ? "available" : "none"}
+          accent={sysInfo.gpu_available ? "green" : "neutral"}
+        />
+      </div>
+
+      {sysInfo.gpu_available ? (
+        <div className="mt-3 flex items-start gap-2 text-xs">
+          <CheckCircle2 className="w-4 h-4 flex-none text-accent-green mt-0.5" />
+          <div>
+            <div className="text-white/80">
+              {sysInfo.gpu_devices.map((g) => g.name).join(", ")}
+            </div>
+            {sysInfo.cuda_runtime && (
+              <div className="text-white/40 font-mono">
+                CUDA driver {sysInfo.cuda_runtime}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : sysInfo.cuda_runtime ? (
+        <div className="mt-3 flex items-start gap-2 text-xs text-accent-yellow">
+          <AlertTriangle className="w-4 h-4 flex-none mt-0.5" />
+          <div>
+            NVIDIA driver {sysInfo.cuda_runtime} is installed but TensorFlow
+            can&apos;t see the GPU. Check that your CUDA / cuDNN versions match
+            what TensorFlow expects (usually CUDA 11.2 + cuDNN 8.1 for the
+            Essentia-bundled TF).
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 text-xs text-white/40">
+          No NVIDIA GPU detected. Analysis will run on CPU — still fast with
+          enough workers.
+        </div>
+      )}
+
+      <div className="mt-3 text-[11px] text-white/30 font-mono break-all">
+        {sysInfo.platform}
+      </div>
+    </Section>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  sub,
+  accent,
+}: {
+  label: string;
+  value: string | number;
+  sub?: string;
+  accent?: "green" | "neutral";
+}) {
+  return (
+    <div>
+      <div className="label">{label}</div>
+      <div
+        className={`text-xl font-display font-semibold tabular-nums ${
+          accent === "green" ? "text-accent-green" : "text-white"
+        }`}
+      >
+        {value}
+      </div>
+      {sub && <div className="text-[11px] text-white/40">{sub}</div>}
+    </div>
+  );
 }
 
 function Toggle({
