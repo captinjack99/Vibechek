@@ -1,10 +1,10 @@
 name: Release
 
-# Triggered by pushing a tag like `v0.2.0`. Builds the PyInstaller bundle on
-# each OS, packages it (zip for Windows, tar.gz for macOS/Linux), and uploads
-# everything to a GitHub Release.
-#
-# For an interactive run (without tagging), use the workflow_dispatch trigger.
+# Triggered by pushing a tag like `v0.3.0`. Builds:
+#   1. The PyInstaller CLI bundle (zip / tar.gz) per OS
+#   2. The Tauri desktop installer per OS (.msi/.exe on Windows, .dmg on macOS,
+#      .AppImage/.deb on Linux), with the CLI binary bundled as the sidecar
+# All artifacts are uploaded to a draft GitHub Release for manual publishing.
 
 on:
   push:
@@ -15,8 +15,11 @@ permissions:
   contents: write  # needed to create a release
 
 jobs:
-  build:
-    name: Build (${{ matrix.os }})
+  # ---------------------------------------------------------------------------
+  # 1) Build the Python CLI bundle on each OS (this is also the sidecar binary)
+  # ---------------------------------------------------------------------------
+  build-cli:
+    name: Build CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,14 +29,20 @@ jobs:
             asset_name: vibechek-linux-x64.tar.gz
             build_cmd: ./packaging/build-linux.sh
             artifact_glob: dist/vibechek-linux-x64.tar.gz
+            sidecar_name: vibechek-sidecar-x86_64-unknown-linux-gnu
+            sidecar_source: dist/vibechek/vibechek
           - os: macos-latest
             asset_name: vibechek-macos-arm64.tar.gz
             build_cmd: ./packaging/build-macos.sh
             artifact_glob: dist/vibechek-macos-*.tar.gz
+            sidecar_name: vibechek-sidecar-aarch64-apple-darwin
+            sidecar_source: dist/vibechek/vibechek
           - os: windows-latest
             asset_name: vibechek-windows-x64.zip
             build_cmd: packaging\build-windows.bat
             artifact_glob: dist/vibechek-windows-x64.zip
+            sidecar_name: vibechek-sidecar-x86_64-pc-windows-msvc.exe
+            sidecar_source: dist/vibechek/vibechek.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -48,19 +57,111 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x ${{ matrix.build_cmd }}
 
-      - name: Build
+      - name: Build PyInstaller CLI bundle
         run: ${{ matrix.build_cmd }}
 
-      - name: Upload artifact
+      - name: Upload CLI archive
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.artifact_glob }}
           if-no-files-found: error
 
+      - name: Upload sidecar binary (for tauri job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.sidecar_name }}
+          path: ${{ matrix.sidecar_source }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 2) Build the Tauri desktop app on each OS, with the sidecar bundled
+  # ---------------------------------------------------------------------------
+  build-tauri:
+    name: Build desktop (${{ matrix.os }})
+    needs: build-cli
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sidecar_name: vibechek-sidecar-x86_64-unknown-linux-gnu
+            sidecar_dest: ui/src-tauri/binaries/vibechek-sidecar-x86_64-unknown-linux-gnu
+          - os: macos-latest
+            sidecar_name: vibechek-sidecar-aarch64-apple-darwin
+            sidecar_dest: ui/src-tauri/binaries/vibechek-sidecar-aarch64-apple-darwin
+          - os: windows-latest
+            sidecar_name: vibechek-sidecar-x86_64-pc-windows-msvc.exe
+            sidecar_dest: ui/src-tauri/binaries/vibechek-sidecar-x86_64-pc-windows-msvc.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/src-tauri
+
+      - name: Linux system deps for Tauri
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+                              librsvg2-dev patchelf libssl-dev
+
+      - name: Download sidecar binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.sidecar_name }}
+          path: ui/src-tauri/binaries
+
+      - name: Make sidecar executable (Unix)
+        if: runner.os != 'Windows'
+        run: chmod +x ${{ matrix.sidecar_dest }}
+
+      - name: Install UI deps
+        working-directory: ui
+        run: npm ci
+
+      - name: Build Tauri bundles
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ui
+
+      - name: Collect Tauri bundles
+        shell: bash
+        run: |
+          mkdir -p tauri-out
+          # Bundle locations vary by platform; copy whatever we find
+          find ui/src-tauri/target/release/bundle -maxdepth 3 -type f \
+              \( -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \
+                 -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) \
+              -exec cp {} tauri-out/ \; || true
+          ls -la tauri-out/ || true
+
+      - name: Upload Tauri bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibechek-desktop-${{ matrix.os }}
+          path: tauri-out/*
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 3) Aggregate all artifacts into a draft release
+  # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build-cli, build-tauri]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -72,11 +173,15 @@ jobs:
           path: artifacts
 
       - name: Flatten artifact layout
-        # download-artifact v4 puts each artifact in its own folder; collapse
-        # them into a single dir so the release upload step finds them.
         run: |
           mkdir -p release
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          # CLI archives + Tauri bundles
+          find artifacts -type f \
+              \( -name '*.tar.gz' -o -name '*.zip' \
+                 -o -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \
+                 -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
+              -exec cp {} release/ \;
+          # Don't ship the raw sidecar binaries — they're inside the Tauri bundles
           ls -la release/
 
       - name: Create GitHub Release
@@ -89,18 +194,32 @@ jobs:
           body: |
             ## Vibechek ${{ github.ref_name }}
 
-            ML-powered DJ library organizer.
+            ML-powered DJ library organizer. Two flavors:
 
-            ### Install
-            Download the build for your platform below, extract, and run
-            `vibechek` (or `vibechek.exe` on Windows). Add it to your `PATH`
-            for convenience.
+            ### Desktop app (recommended for most users)
 
-            For ML analysis, install Essentia separately:
+            Download the installer for your platform:
+            - **Windows**: `.msi` or `.exe`
+            - **macOS**: `.dmg`
+            - **Linux**: `.AppImage` or `.deb`
+
+            Includes the CLI as a bundled sidecar — nothing else to install.
+
+            ### CLI only
+
+            For headless / scripting use, grab the `vibechek-*-x64.{zip,tar.gz}`
+            archive, extract, and put the `vibechek` binary on your `PATH`.
+
+            ### ML analysis (`vibechek analyze`)
+
+            Install Essentia separately on Linux/macOS:
+
             ```
             pip install essentia-tensorflow
+            vibechek download-models
             ```
-            (Linux/macOS only — Windows users see the README.)
+
+            Windows: see [docs/INSTALL.md](https://github.com/papapew/Vibechek/blob/main/docs/INSTALL.md) for the WSL workaround.
 
             ### What's new
             <!-- generate_release_notes fills this in from commits since last tag -->

@@ -115,7 +115,10 @@ def _analyze_directory(params: dict) -> dict:
     """Full ML analysis. Emits progress notifications."""
     from vibechek.analyzer import analyze_directory
 
-    config = AnalysisConfig(workers=int(params.get("workers", 1)))
+    config = AnalysisConfig(
+        workers=int(params.get("workers", 0)),
+        use_gpu=str(params.get("use_gpu", "auto")),
+    )
     if "models_dir" in params and params["models_dir"]:
         config.models_dir = Path(params["models_dir"])
 
@@ -127,6 +130,12 @@ def _analyze_directory(params: dict) -> dict:
         skip=int(params.get("skip", 0)),
         limit=int(params.get("limit") or 0) or None,
     )
+
+
+def _system_info(_params: dict) -> dict:
+    """Report detected CPU / memory / GPU resources to the GUI."""
+    from vibechek.resources import detect, to_dict
+    return to_dict(detect())
 
 
 def _find_duplicates(params: dict) -> dict:
@@ -289,6 +298,7 @@ def _load_analysis_payload(params: dict) -> dict:
 METHODS: dict[str, Callable[[dict], Any]] = {
     "ping": _ping,
     "version": _version,
+    "system_info": _system_info,
     "scan_directory": _scan_directory,
     "analyze_directory": _analyze_directory,
     "find_duplicates": _find_duplicates,

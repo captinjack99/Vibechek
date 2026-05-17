@@ -1,4 +1,4 @@
-import { Music, Copy, Settings as SettingsIcon, Disc3 } from "lucide-react";
+import { Music, Copy, FolderTree, Settings as SettingsIcon, Disc3 } from "lucide-react";
 import { clsx } from "clsx";
 
 import { useUIStore, useLibraryStore, useOperationStore } from "../stores";
@@ -16,6 +16,7 @@ export function Sidebar() {
   const setViewMode = useUIStore((s) => s.setViewMode);
   const trackCount = useLibraryStore((s) => s.tracks.length);
   const dupReport = useOperationStore((s) => s.duplicateReport);
+  const organizePlan = useOperationStore((s) => s.organizePlan);
 
   const items: NavItem[] = [
     {
@@ -30,6 +31,12 @@ export function Sidebar() {
       icon: <Copy className="w-5 h-5" />,
       badge: () =>
         dupReport ? String(dupReport.summary.total_duplicates) : null,
+    },
+    {
+      id: "organize",
+      label: "Organize",
+      icon: <FolderTree className="w-5 h-5" />,
+      badge: () => (organizePlan ? String(organizePlan.moves.length) : null),
     },
     {
       id: "settings",

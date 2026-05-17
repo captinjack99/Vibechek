@@ -4,8 +4,10 @@ import { AnimatePresence } from "framer-motion";
 import { Sidebar } from "./components/Sidebar";
 import { LibraryBrowser } from "./components/LibraryBrowser";
 import { DuplicatesView } from "./components/DuplicatesView";
+import { OrganizeView } from "./components/OrganizeView";
 import { Settings } from "./components/Settings";
 import { AnalysisProgress } from "./components/AnalysisProgress";
+import { TrackDetails } from "./components/TrackDetails";
 
 import { useUIStore, useOperationStore } from "./stores";
 import { useSidecarProgress } from "./hooks/useSidecar";
@@ -36,8 +38,10 @@ export default function App() {
         <main className="flex-1 min-w-0 overflow-hidden">
           {viewMode === "library" && <LibraryBrowser />}
           {viewMode === "duplicates" && <DuplicatesView />}
+          {viewMode === "organize" && <OrganizeView />}
           {viewMode === "settings" && <Settings />}
         </main>
+        <TrackDetails />
       </div>
 
       <AnimatePresence>

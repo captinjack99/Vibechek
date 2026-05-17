@@ -141,7 +141,7 @@ interface ConfigState {
 }
 
 const DEFAULT_CONFIG: VibechekConfig = {
-  analysis: { workers: 1, models_dir: "" },
+  analysis: { workers: 0, models_dir: "", use_gpu: "auto" },
   tagging: {
     genre_confidence_threshold: 0.85,
     write_subgenre_as_main_genre: true,

@@ -71,18 +71,22 @@ def main() -> None:
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--workers", default=1, show_default=True, help="Parallel analysis processes.")
+@click.option("--workers", default=0, show_default=False,
+              help="Parallel analysis processes (default: auto = cpu_count - 1).")
+@click.option("--gpu", type=click.Choice(["auto", "on", "off"]), default="auto", show_default=True,
+              help="GPU usage: auto = use if available, on = force, off = CPU-only.")
 @click.option("--skip", default=0, show_default=True, help="Skip the first N tracks.")
 @click.option("--limit", default=0, show_default=True, help="Limit to N tracks (0 = all).")
 @click.option("--output", "-o", type=click.Path(path_type=Path),
               default=Path("analysis.json"), show_default=True)
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
               help="Override the ML model directory (defaults to user data dir).")
-def analyze(path: Path, workers: int, skip: int, limit: int, output: Path, models_dir: Path | None) -> None:
+def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
+            output: Path, models_dir: Path | None) -> None:
     """Analyze every audio file under PATH with the ML models."""
     from vibechek.analyzer import analyze_directory
 
-    config = AnalysisConfig(workers=workers)
+    config = AnalysisConfig(workers=workers, use_gpu=gpu)
     if models_dir:
         config.models_dir = models_dir
 
@@ -379,6 +383,48 @@ def download_models_cmd(models_dir: Path | None) -> None:
         descriptors = download_models(target, on_progress=on_progress)
 
     console.print(f"\n[green]Done.[/] {len(descriptors)} models available in [cyan]{target}[/]")
+
+
+# ---------------------------------------------------------------------------
+# system-info
+# ---------------------------------------------------------------------------
+
+
+@main.command("system-info")
+def system_info_cmd() -> None:
+    """Show what CPU, RAM, and GPU Vibechek detects on this machine.
+
+    Use this to confirm GPU availability before launching a long analyze,
+    or to figure out a sensible `--workers` value.
+    """
+    from vibechek.resources import detect, to_dict
+
+    info = detect()
+    console.print("[bold]System resources[/]")
+    console.print(f"  Platform:   {info.platform}")
+    console.print(f"  CPU cores:  {info.cpu_count} "
+                  f"([dim]recommended workers: {info.recommended_workers}[/])")
+    if info.memory_total_mb:
+        avail = f"{info.memory_available_mb} MB free" if info.memory_available_mb else ""
+        console.print(f"  Memory:     {info.memory_total_mb} MB total  {avail}")
+    else:
+        console.print("  Memory:     [dim]install `psutil` for memory detection[/]")
+
+    if info.gpu_available:
+        console.print(f"\n[green]GPU available[/] (driver {info.cuda_runtime or 'unknown'})")
+        for g in info.gpu_devices:
+            mem = f" ({g.memory_mb} MB)" if g.memory_mb else ""
+            console.print(f"  • {g.name} [{g.backend}]{mem}")
+        console.print("\n  Use [bold]--gpu on[/] (or set 'on' in Settings) to force GPU.")
+    else:
+        console.print("\n[yellow]No GPU detected[/] — analysis will run on CPU.")
+        if info.cuda_runtime:
+            console.print(f"  (NVIDIA driver {info.cuda_runtime} present, but TF can't see it — "
+                          "check CUDA/cuDNN versions.)")
+
+    # Also dump as JSON for scripting
+    import json as _json
+    console.print(f"\n[dim]{_json.dumps(to_dict(info), indent=2, default=str)}[/]")
 
 
 # ---------------------------------------------------------------------------

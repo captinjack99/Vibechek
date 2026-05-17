@@ -131,8 +131,26 @@ export interface OrganizePlan {
 // ---------------------------------------------------------------------------
 
 export interface AnalysisConfig {
-  workers: number;
+  workers: number;          // 0 = auto (cpu_count - 1)
   models_dir: string;
+  use_gpu: "auto" | "on" | "off";
+}
+
+export interface GpuDevice {
+  name: string;
+  backend: "cuda" | "rocm" | "metal" | "unknown";
+  memory_mb: number | null;
+}
+
+export interface SystemResources {
+  platform: string;
+  cpu_count: number;
+  memory_total_mb: number | null;
+  memory_available_mb: number | null;
+  gpu_available: boolean;
+  gpu_devices: GpuDevice[];
+  cuda_runtime: string | null;
+  recommended_workers: number;
 }
 
 export interface TaggingConfig {
@@ -168,7 +186,7 @@ export interface VibechekConfig {
 // View state
 // ---------------------------------------------------------------------------
 
-export type ViewMode = "library" | "duplicates" | "settings";
+export type ViewMode = "library" | "duplicates" | "organize" | "settings";
 
 export interface ProgressEvent {
   current: number;
