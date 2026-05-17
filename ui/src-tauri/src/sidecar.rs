@@ -89,10 +89,20 @@ impl SidecarHandle {
 }
 
 /// Spawn the sidecar and start its background reader task.
+///
+/// Called from Tauri's `setup()`, which runs synchronously on the main thread
+/// — there is no ambient Tokio runtime there. We bridge into Tauri's async
+/// runtime explicitly via `block_on` for the spawn itself, and use
+/// `tauri::async_runtime::spawn` (not bare `tokio::spawn`) for the background
+/// reader tasks so they land on the runtime Tauri owns.
 pub fn spawn(app: AppHandle) -> Result<SidecarHandle> {
     let binary = resolve_sidecar_binary().context("locate vibechek sidecar binary")?;
     eprintln!("Spawning sidecar: {} rpc", binary);
 
+    tauri::async_runtime::block_on(async move { spawn_in_runtime(binary, app).await })
+}
+
+async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandle> {
     let mut child = Command::new(&binary)
         .arg("rpc")
         .stdin(std::process::Stdio::piped())
@@ -122,7 +132,7 @@ pub fn spawn(app: AppHandle) -> Result<SidecarHandle> {
     });
 
     // stderr reader: just log everything so users can diagnose Python errors
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             eprintln!("[sidecar] {line}");
@@ -133,7 +143,7 @@ pub fn spawn(app: AppHandle) -> Result<SidecarHandle> {
     {
         let inner = inner.clone();
         let app = app.clone();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 if let Err(e) = handle_message(&inner, &app, &line).await {
@@ -145,7 +155,7 @@ pub fn spawn(app: AppHandle) -> Result<SidecarHandle> {
     }
 
     // Wait task: log when child exits (so users see it in dev)
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         match child.wait().await {
             Ok(status) => eprintln!("sidecar exited with {status}"),
             Err(e) => eprintln!("sidecar wait failed: {e}"),
