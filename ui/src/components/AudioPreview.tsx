@@ -103,9 +103,24 @@ export function AudioPreview({ path }: { path: string }) {
         </div>
       </div>
 
-      {/* Waveform container — WaveSurfer renders into this div */}
-      <div className="rounded overflow-hidden bg-surface-300/40">
+      {/* Waveform container — WaveSurfer renders into this div. The min-height
+          reserves room for the loading overlay before the waveform paints. */}
+      <div className="rounded overflow-hidden bg-surface-300/40 relative min-h-[60px]">
         <div ref={containerRef} className={error ? "hidden" : ""} />
+
+        {/* Decoding overlay — the waveform area sits empty for 1-3s on long
+            FLACs while WaveSurfer pulls peaks. Tell the user something is
+            happening so they don't think the click did nothing. */}
+        {!ready && !error && (
+          <div
+            className="absolute inset-0 flex items-center justify-center gap-2 text-[11px] text-white/50 animate-pulse pointer-events-none"
+            aria-live="polite"
+          >
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            Loading waveform...
+          </div>
+        )}
+
         {error && (
           <div className="px-3 py-6 flex items-center justify-center gap-2 text-xs text-accent-red">
             <AlertCircle className="w-4 h-4 flex-none" />

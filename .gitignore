@@ -60,19 +60,43 @@ ui/src-tauri/binaries/
 models/
 *.pb
 
+# --- Frontend test artifacts ---
+ui/coverage/
+ui/.vitest-cache/
+ui/.vite-cache/
+
+# --- Tauri / Rust build artifacts (in addition to target/ above) ---
+# Note: Cargo.lock IS committed (Tauri shell is a binary, not a library)
+ui/src-tauri/WixTools/
+
+# --- PyInstaller scratch dirs (some emit into the repo root) ---
+*.spec.bak
+pyinstaller.log
+
 # --- IDE / OS ---
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 .DS_Store
 Thumbs.db
 desktop.ini
+*.sublime-workspace
+*.sublime-project
+
+# --- Editor settings that aren't team-shared ---
+.editorconfig.local
 
 # --- Misc ---
 *.log
 .env
 .env.local
+.env.*.local
 
 # Staged for manual review/deletion (duplicate of files already in docs/)
 _to_review/
+
+# OS-level junk inside the repo (rare but possible)
+**/.DS_Store
+**/Thumbs.db

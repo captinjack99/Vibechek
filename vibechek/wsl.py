@@ -440,12 +440,18 @@ def run_vibechek_in_wsl(
 
     stderr lines are streamed live to `on_stderr_line` if provided — useful
     for parsing CLI progress output. stdout is captured and returned.
+
+    Cooperatively cancellable: if `vibechek.cancellation.is_cancelled()`
+    returns True at any point, the child process is terminated. Without this,
+    a Cancel click during a multi-hour analyze inside WSL would do nothing.
     """
+    import threading as _threading
+    from vibechek import cancellation
+
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
     if not wsl:
         raise FileNotFoundError("wsl.exe not on PATH")
 
-    # Use the bash login shell so the user's PATH (incl. ~/.local/bin) is set up
     cmd_str = "vibechek " + " ".join(_shell_quote(a) for a in args)
     proc_cmd = [wsl, "-d", distro, "--", "bash", "-lc", cmd_str]
 
@@ -461,16 +467,40 @@ def run_vibechek_in_wsl(
         bufsize=1,
     )
 
+    # Watchdog: poll the cancellation flag every 500ms; terminate (then kill)
+    # the child if a cancel comes through.
+    cancel_event = _threading.Event()
+
+    def _watch_cancel() -> None:
+        while not cancel_event.is_set() and proc.poll() is None:
+            if cancellation.is_cancelled():
+                log.info("WSL subprocess cancellation requested — terminating PID %s", proc.pid)
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                # Give it a grace period, then SIGKILL equivalent
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                return
+            cancel_event.wait(0.5)
+
+    watchdog = _threading.Thread(target=_watch_cancel, daemon=True)
+    watchdog.start()
+
     stdout_chunks: list[str] = []
 
     if on_stderr_line and proc.stderr is not None:
-        import threading
-
         def _reader() -> None:
             for line in proc.stderr:  # type: ignore[union-attr]
                 on_stderr_line(line.rstrip())
 
-        t = threading.Thread(target=_reader, daemon=True)
+        t = _threading.Thread(target=_reader, daemon=True)
         t.start()
 
     if proc.stdout is not None:
@@ -478,6 +508,11 @@ def run_vibechek_in_wsl(
             stdout_chunks.append(line)
 
     rc = proc.wait(timeout=timeout)
+    cancel_event.set()  # tell the watchdog we're done
+
+    if cancellation.is_cancelled():
+        raise cancellation.CancelledError("WSL analyze cancelled by user")
+
     return subprocess.CompletedProcess(
         args=proc_cmd,
         returncode=rc,

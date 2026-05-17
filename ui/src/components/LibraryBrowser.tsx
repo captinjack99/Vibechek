@@ -1,20 +1,59 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { AnimatePresence } from "framer-motion";
 import {
   FolderOpen, Sparkles, Search, Music, AlertCircle, CheckSquare, Square, Tag,
-  Eye, RefreshCw,
+  Eye, RefreshCw, Clock, X,
 } from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
-import { useLibraryStore, useOperationStore, useConfigStore, useUIStore } from "../stores";
+import {
+  useLibraryStore,
+  useOperationStore,
+  useConfigStore,
+  useUIStore,
+  useNotificationStore,
+} from "../stores";
 import { rpc } from "../hooks/useSidecar";
-import type { AnalysisReport, PreflightResult, TrackAnalysis } from "../types";
+import { useApplyTags } from "../hooks/useApplyTags";
+import type {
+  AnalysisReport, LibraryRecord, LibraryState, PreflightResult, TrackAnalysis,
+} from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
 import { PreflightDialog } from "./PreflightDialog";
 import { ConfirmModal } from "./ConfirmModal";
 import { FilterChips, applyFilters, emptyFilters, type LibraryFilters } from "./LibraryFilters";
+
+/** Compact number formatter — "12k" instead of "12,466". */
+const compactFmt = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+/** "3 hours ago", "yesterday", "2 days ago". Epoch seconds in, friendly string out. */
+function relativeTime(epochSeconds: number): string {
+  if (!epochSeconds) return "never";
+  const secondsAgo = Math.max(0, Date.now() / 1000 - epochSeconds);
+  if (secondsAgo < 60) return "just now";
+  const minutes = Math.floor(secondsAgo / 60);
+  if (minutes < 60) return minutes === 1 ? "1 minute ago" : `${minutes} minutes ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours === 1 ? "1 hour ago" : `${hours} hours ago`;
+  const days = Math.floor(hours / 24);
+  if (days === 1) return "yesterday";
+  if (days < 30) return `${days} days ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return months === 1 ? "1 month ago" : `${months} months ago`;
+  const years = Math.floor(months / 12);
+  return years === 1 ? "1 year ago" : `${years} years ago`;
+}
+
+/** Last path segment, handling both / and \ separators (Windows + POSIX). */
+function basename(path: string): string {
+  const segments = path.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] ?? path;
+}
 
 export function LibraryBrowser() {
   const tracks = useLibraryStore((s) => s.tracks);
@@ -40,10 +79,61 @@ export function LibraryBrowser() {
   const setSelectedTrack = useUIStore((s) => s.setSelectedTrack);
   const selectedTrackPath = useUIStore((s) => s.selectedTrackPath);
 
+  const notify = useNotificationStore((s) => s.notify);
+  const { apply: applyTags } = useApplyTags();
+
   const [scanCount, setScanCount] = useState<number | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
   const [confirmBulkTag, setConfirmBulkTag] = useState<"selected" | "all" | null>(null);
   const [filters, setFilters] = useState<LibraryFilters>(emptyFilters());
+  const [showErrorsOnly, setShowErrorsOnly] = useState(false);
+  const [recentLibraries, setRecentLibraries] = useState<LibraryRecord[]>([]);
+
+  // Pull the recent-libraries list on mount + after a forget. Both empty-state
+  // visibility and the cards themselves read from this.
+  const refreshRecent = useCallback(async () => {
+    try {
+      const state = await rpc<LibraryState>("library_state");
+      setRecentLibraries(state.recent ?? []);
+    } catch {
+      setRecentLibraries([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshRecent();
+  }, [refreshRecent]);
+
+  // Click handler for a recent-library card: reload the saved analysis and
+  // hydrate the store. Falls back to just setting the path if the analysis
+  // file went missing under us.
+  const handleOpenRecent = async (record: LibraryRecord) => {
+    begin("analyze");
+    try {
+      const result = await rpc<{ loaded: boolean; report?: AnalysisReport; reason?: string }>(
+        "load_recent_analysis",
+        { library_path: record.path },
+      );
+      if (!result.loaded || !result.report) {
+        fail(result.reason ?? "Could not load saved analysis");
+        await refreshRecent();
+        return;
+      }
+      setLibraryPath(record.path);
+      setTracks(result.report.tracks);
+      finish();
+    } catch (e) {
+      fail(String(e));
+    }
+  };
+
+  const handleForgetRecent = async (record: LibraryRecord) => {
+    try {
+      await rpc("forget_library", { path: record.path });
+    } finally {
+      await refreshRecent();
+    }
+  };
 
   const analyzedCount = useMemo(
     () => tracks.filter((t) => t.ml_analysis).length,
@@ -51,8 +141,55 @@ export function LibraryBrowser() {
   );
   const unanalyzedCount = tracks.length - analyzedCount;
 
+  // Genre breakdown for the bulk-tag confirm modal: only count tracks whose
+  // genre will actually be written (confidence >= threshold). Tracks without
+  // a confidence are counted as zero (won't be written either).
+  const tagPreview = useMemo(() => {
+    if (!confirmBulkTag) return null;
+    const targets = confirmBulkTag === "all"
+      ? tracks
+      : tracks.filter((t) => selectedIds.has(t.path));
+    const threshold = taggingCfg.genre_confidence_threshold;
+
+    const counts = new Map<string, number>();
+    let belowThreshold = 0;
+    for (const t of targets) {
+      const ml = t.ml_analysis;
+      const conf = ml?.ml_genre_confidence;
+      if (!ml?.ml_genre || conf == null || conf < threshold) {
+        belowThreshold += 1;
+        continue;
+      }
+      // Prefer subgenre when present — that's what gets written.
+      const label = ml.ml_subgenre || ml.ml_genre;
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const top = sorted.slice(0, 5);
+    const others = sorted.slice(5);
+    const otherCount = others.reduce((sum, [, n]) => sum + n, 0);
+    const otherGenres = others.length;
+    const willWrite = sorted.reduce((sum, [, n]) => sum + n, 0);
+    return {
+      total: targets.length,
+      top,
+      otherCount,
+      otherGenres,
+      willWrite,
+      belowThreshold,
+    };
+  }, [confirmBulkTag, tracks, selectedIds, taggingCfg.genre_confidence_threshold]);
+
+  // Tracks with either a top-level scan/decode error or an ML failure.
+  const errorCount = useMemo(
+    () => tracks.filter((t) => t.error || t.ml_analysis?.ml_error).length,
+    [tracks],
+  );
+
   const filtered = useMemo(() => {
-    let result = applyFilters(tracks, filters);
+    let result = showErrorsOnly
+      ? tracks.filter((t) => t.error || t.ml_analysis?.ml_error)
+      : applyFilters(tracks, filters);
     if (searchFilter) {
       const q = searchFilter.toLowerCase();
       result = result.filter((t) =>
@@ -64,7 +201,7 @@ export function LibraryBrowser() {
       );
     }
     return result;
-  }, [tracks, searchFilter, filters]);
+  }, [tracks, searchFilter, filters, showErrorsOnly]);
 
   const handleOpenFolder = async () => {
     const selected = await openDialog({ directory: true, multiple: false });
@@ -125,37 +262,26 @@ export function LibraryBrowser() {
     }
   };
 
-  // Bulk apply ML tags to either selected tracks or all of them.
+  // Bulk apply ML tags to either selected tracks or all of them. The actual
+  // RPC + loading/error handling is in useApplyTags; we just decide the scope
+  // and surface a toast.
   const runBulkTag = async (scope: "selected" | "all") => {
     const targets = scope === "selected"
       ? tracks.filter((t) => selectedIds.has(t.path))
       : tracks;
     if (targets.length === 0) return;
-    begin("tag");
-    try {
-      const stats = await rpc<{
-        total: number;
-        genre_applied: number;
-        genre_skipped_low_confidence: number;
-        other_tags_applied: number;
-        errors: string[];
-      }>("apply_ml_tags", {
-        analysis: { tracks: targets },
-        confidence: taggingCfg.genre_confidence_threshold,
-        skip_bpm_and_key: taggingCfg.skip_bpm_and_key,
-        preserve_rekordbox_frames: taggingCfg.preserve_rekordbox_frames,
-      });
-      finish();
-      window.alert(
-        `Tag write complete.\n\n` +
-        `Genre written (confidence ≥ ${Math.round(taggingCfg.genre_confidence_threshold * 100)}%): ${stats.genre_applied}\n` +
-        `Skipped (low confidence): ${stats.genre_skipped_low_confidence}\n` +
-        `Other tags written (energy / mood / timeslot / etc): ${stats.other_tags_applied}\n` +
-        `Errors: ${stats.errors.length}`,
-      );
-    } catch (e) {
-      fail(String(e));
-    }
+    const result = await applyTags(targets);
+    if (!result) return; // failure already surfaced via useOperationStore.error
+    const threshold = Math.round(taggingCfg.genre_confidence_threshold * 100);
+    const detail =
+      `Genre (conf >= ${threshold}%): ${result.applied}\n` +
+      `Skipped (low confidence): ${result.skipped}\n` +
+      `Other tags (energy / mood / etc): ${result.other}` +
+      (result.errors.length > 0 ? `\nErrors: ${result.errors.length}` : "");
+    notify(`Tagged ${result.applied + result.other} files`, {
+      detail,
+      kind: result.errors.length > 0 ? "info" : "success",
+    });
   };
 
   // Gate analyze behind preflight. If not ready, show the dialog; the user
@@ -215,67 +341,118 @@ export function LibraryBrowser() {
 
   // Empty state
   if (tracks.length === 0) {
+    // If the user has recent libraries AND hasn't pre-selected a folder yet,
+    // show those instead of just "Open folder". Clicking a card re-loads the
+    // saved analysis straight into the store.
+    const showRecents = !libraryPath && recentLibraries.length > 0;
+
     return (
       <div className="h-full flex flex-col">
         <Header onOpen={handleOpenFolder} libraryPath={libraryPath} />
         {preflightOverlay}
-        <div className="flex-1 flex items-center justify-center px-8">
-          <div className="text-center max-w-md">
-            <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-white/5 flex items-center justify-center">
-              <Music className="w-8 h-8 text-white/30" />
+        <div className="flex-1 overflow-auto flex items-center justify-center px-8 py-8">
+          {showRecents ? (
+            <div className="w-full max-w-2xl">
+              <div className="text-center mb-6">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-white/5 flex items-center justify-center">
+                  <Music className="w-6 h-6 text-white/30" />
+                </div>
+                <h2 className="text-xl font-display font-semibold mb-1">
+                  Welcome back
+                </h2>
+                <p className="text-sm text-white/50">
+                  Pick up where you left off, or open a different folder.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                {recentLibraries.map((rec) => (
+                  <RecentLibraryCard
+                    key={rec.path}
+                    record={rec}
+                    disabled={active !== null}
+                    onOpen={() => handleOpenRecent(rec)}
+                    onForget={() => handleForgetRecent(rec)}
+                  />
+                ))}
+              </div>
+
+              <div className="text-center mt-6">
+                <button
+                  className="btn-ghost"
+                  onClick={handleOpenFolder}
+                  disabled={active !== null}
+                >
+                  <FolderOpen className="w-4 h-4" />
+                  Open a different folder
+                </button>
+              </div>
+
+              {errorMsg && (
+                <div className="mt-6 panel-pad text-left text-sm text-accent-red flex gap-2">
+                  <AlertCircle className="w-4 h-4 flex-none mt-0.5" />
+                  <div className="break-words">{errorMsg}</div>
+                </div>
+              )}
             </div>
-            <h2 className="text-xl font-display font-semibold mb-2">
-              {libraryPath ? "Ready to analyze" : "Open a folder to get started"}
-            </h2>
-            <p className="text-white/50 mb-6">
-              {libraryPath
-                ? `Found ${scanCount ?? "?"} audio files in ${libraryPath}. Run analysis to detect genre, energy, mood, and more — or jump straight to dedup / organize using existing tags.`
-                : "Vibechek will scan your music folder, then let you analyze, dedupe, tag, or reorganize it."}
-            </p>
-            {libraryPath ? (
-              <div className="space-y-3">
-                <div className="flex items-center justify-center gap-2">
-                  <button
-                    className="btn-primary"
-                    onClick={runFastScan}
-                    disabled={active !== null}
-                    title="Read filenames + existing tags. Takes a few seconds."
-                  >
-                    <Eye className="w-4 h-4" />
-                    Just show me my library
-                  </button>
-                  <button
-                    className="btn-ghost"
-                    onClick={handleAnalyze}
-                    disabled={active !== null}
-                    title="Full ML pass — detects genre, mood, energy, etc. Takes longer."
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    Analyze with ML
-                  </button>
-                </div>
-                <div>
-                  <button
-                    className="text-xs text-white/40 hover:text-white"
-                    onClick={handleOpenFolder}
-                  >
-                    Choose a different folder
-                  </button>
-                </div>
+          ) : (
+            <div className="text-center max-w-md">
+              <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-white/5 flex items-center justify-center">
+                <Music className="w-8 h-8 text-white/30" />
               </div>
-            ) : (
-              <button className="btn-primary" onClick={handleOpenFolder}>
-                <FolderOpen className="w-4 h-4" />
-                Open folder
-              </button>
-            )}
-            {errorMsg && (
-              <div className="mt-6 panel-pad text-left text-sm text-accent-red flex gap-2">
-                <AlertCircle className="w-4 h-4 flex-none mt-0.5" />
-                <div className="break-words">{errorMsg}</div>
-              </div>
-            )}
-          </div>
+              <h2 className="text-xl font-display font-semibold mb-2">
+                {libraryPath ? "Ready to analyze" : "Open a folder to get started"}
+              </h2>
+              <p className="text-white/50 mb-6">
+                {libraryPath
+                  ? `Found ${scanCount ?? "?"} audio files in ${libraryPath}. Run analysis to detect genre, energy, mood, and more — or jump straight to dedup / organize using existing tags.`
+                  : "Vibechek will scan your music folder, then let you analyze, dedupe, tag, or reorganize it."}
+              </p>
+              {libraryPath ? (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-center gap-2">
+                    <button
+                      className="btn-primary"
+                      onClick={runFastScan}
+                      disabled={active !== null}
+                      title="Read filenames + existing tags. Takes a few seconds."
+                    >
+                      <Eye className="w-4 h-4" />
+                      Just show me my library
+                    </button>
+                    <button
+                      className="btn-ghost"
+                      onClick={handleAnalyze}
+                      disabled={active !== null}
+                      title="Full ML pass — detects genre, mood, energy, etc. Takes longer."
+                    >
+                      <Sparkles className="w-4 h-4" />
+                      Analyze with ML
+                    </button>
+                  </div>
+                  <div>
+                    <button
+                      className="text-xs text-white/40 hover:text-white"
+                      onClick={handleOpenFolder}
+                    >
+                      Choose a different folder
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button className="btn-primary" onClick={handleOpenFolder}>
+                  <FolderOpen className="w-4 h-4" />
+                  Open folder
+                </button>
+              )}
+              {errorMsg && (
+                <div className="mt-6 panel-pad text-left text-sm text-accent-red flex gap-2">
+                  <AlertCircle className="w-4 h-4 flex-none mt-0.5" />
+                  <div className="break-words">{errorMsg}</div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -371,9 +548,31 @@ export function LibraryBrowser() {
       </div>
 
       {/* Filter chips (only render when there are analyzed tracks to filter) */}
-      {analyzedCount > 0 && (
-        <div className="px-4 py-2 border-b border-white/5">
-          <FilterChips tracks={tracks} filters={filters} setFilters={setFilters} />
+      {(analyzedCount > 0 || errorCount > 0) && (
+        <div className="px-4 py-2 border-b border-white/5 flex items-center gap-3 flex-wrap">
+          {analyzedCount > 0 && !showErrorsOnly && (
+            <FilterChips tracks={tracks} filters={filters} setFilters={setFilters} />
+          )}
+          {errorCount > 0 && (
+            <button
+              onClick={() => setShowErrorsOnly((v) => !v)}
+              className={cx(
+                "ml-auto flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition-colors",
+                showErrorsOnly
+                  ? "bg-accent-yellow/20 text-accent-yellow border-accent-yellow/40"
+                  : "bg-accent-yellow/10 text-accent-yellow border-accent-yellow/30 hover:bg-accent-yellow/20",
+              )}
+              title={
+                showErrorsOnly
+                  ? "Showing only tracks with errors — click to clear"
+                  : "Show only tracks with errors"
+              }
+            >
+              <AlertCircle className="w-3.5 h-3.5" />
+              {errorCount} error{errorCount === 1 ? "" : "s"}
+              {showErrorsOnly && <span className="text-accent-yellow/70">· showing</span>}
+            </button>
+          )}
         </div>
       )}
 
@@ -398,13 +597,45 @@ export function LibraryBrowser() {
         open={confirmBulkTag !== null}
         title={`Apply ML tags to ${confirmBulkTag === "all" ? "all" : selectedIds.size} tracks?`}
         message={
-          <div className="space-y-2">
-            <p>
-              Vibechek will write the ML genre, mood, energy, timeslot, direction, and vocal tags
-              to every selected file{" "}
-              <strong>where the genre confidence is at least{" "}
-                {Math.round(taggingCfg.genre_confidence_threshold * 100)}%</strong>.
-            </p>
+          <div className="space-y-3">
+            {tagPreview && (
+              <div className="panel-pad bg-white/[0.02]">
+                <div className="text-xs uppercase tracking-wider text-white/40 mb-2">
+                  Will write
+                </div>
+                {tagPreview.willWrite === 0 ? (
+                  <div className="text-sm text-accent-yellow">
+                    No tracks above the {Math.round(taggingCfg.genre_confidence_threshold * 100)}% confidence threshold —
+                    nothing will be written.
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-sm">
+                    {tagPreview.top.map(([genre, count]) => (
+                      <span key={genre} className="text-white">
+                        <span className="font-mono text-accent">
+                          {count.toLocaleString()}
+                        </span>{" "}
+                        <span className="text-white/70">{genre}</span>
+                      </span>
+                    ))}
+                    {tagPreview.otherGenres > 0 && (
+                      <span className="text-white/50">
+                        <span className="font-mono">{tagPreview.otherCount.toLocaleString()}</span>{" "}
+                        across {tagPreview.otherGenres} other{" "}
+                        {tagPreview.otherGenres === 1 ? "genre" : "genres"}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {tagPreview.belowThreshold > 0 && (
+                  <div className="mt-2 text-xs text-white/50">
+                    {tagPreview.belowThreshold.toLocaleString()} track{tagPreview.belowThreshold === 1 ? "" : "s"} will be
+                    skipped (below {Math.round(taggingCfg.genre_confidence_threshold * 100)}% genre confidence,
+                    or not yet analyzed). Energy / mood / timeslot tags will still be written for analyzed files.
+                  </div>
+                )}
+              </div>
+            )}
             <ul className="list-disc list-inside text-xs text-white/60 space-y-1">
               <li>Rekordbox cue points and beat grids are preserved.</li>
               <li>BPM and key {taggingCfg.skip_bpm_and_key ? "are NOT touched" : "will be overwritten by ML values"}.</li>
@@ -496,6 +727,89 @@ function TrackRow({ track, selected, checked, onCheck, onClick }: TrackRowProps)
       <div className="w-16 text-right text-xs text-white/40 font-mono">
         {track.size_mb.toFixed(1)}M
       </div>
+    </div>
+  );
+}
+
+interface RecentLibraryCardProps {
+  record: LibraryRecord;
+  disabled: boolean;
+  onOpen: () => void;
+  onForget: () => void;
+}
+
+function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibraryCardProps) {
+  // Right-click → forget. Single-button context menus are overkill; just run
+  // the action straight from the menu event.
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (disabled) return;
+    if (window.confirm(`Remove "${basename(record.path)}" from recent libraries?`)) {
+      onForget();
+    }
+  };
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-disabled={disabled}
+      onClick={() => !disabled && onOpen()}
+      onKeyDown={(e) => {
+        if ((e.key === "Enter" || e.key === " ") && !disabled) {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+      onContextMenu={handleContextMenu}
+      className={cx(
+        "group panel-pad flex items-center gap-4 text-left transition-colors",
+        disabled
+          ? "opacity-50 cursor-not-allowed"
+          : "cursor-pointer hover:bg-white/[0.04] hover:border-accent/30",
+      )}
+    >
+      <div className="w-10 h-10 rounded-lg bg-accent/15 text-accent flex items-center justify-center flex-none">
+        <Music className="w-5 h-5" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="font-display font-medium text-base text-white truncate">
+          {basename(record.path)}
+        </div>
+        <div className="text-xs text-white/40 truncate font-mono" title={record.path}>
+          {record.path}
+        </div>
+        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-white/60">
+          <span>
+            <span className="text-white/80 font-mono">
+              {compactFmt.format(record.track_count)}
+            </span>{" "}
+            tracks
+          </span>
+          <span>
+            <span className="text-white/80 font-mono">
+              {compactFmt.format(record.analyzed_count)}
+            </span>{" "}
+            analyzed
+          </span>
+          <span className="flex items-center gap-1 text-white/40">
+            <Clock className="w-3 h-3" />
+            Opened {relativeTime(record.last_opened)}
+          </span>
+        </div>
+      </div>
+      <button
+        className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent-red p-1.5 rounded transition-opacity"
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!disabled) onForget();
+        }}
+        title="Forget this library"
+        aria-label={`Forget ${basename(record.path)}`}
+        disabled={disabled}
+      >
+        <X className="w-4 h-4" />
+      </button>
     </div>
   );
 }
