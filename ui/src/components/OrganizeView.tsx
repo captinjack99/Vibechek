@@ -13,12 +13,13 @@ import { useState } from "react";
 import {
   FolderTree, FolderOpen, Play, Eye, AlertCircle, ArrowRight, FileJson,
 } from "lucide-react";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import { useConfigStore, useLibraryStore, useOperationStore } from "../stores";
 import { rpc } from "../hooks/useSidecar";
 import type { OrganizePlan, PlannedMove } from "../types";
 import { TagBadge } from "./TagBadges";
+import { ConfirmModal } from "./ConfirmModal";
 
 type Source =
   | { kind: "in-memory" }
@@ -43,6 +44,8 @@ export function OrganizeView() {
   const [source, setSource] = useState<Source>(
     tracks.length > 0 ? { kind: "in-memory" } : null,
   );
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [backupFirst, setBackupFirst] = useState(true);
 
   const handlePickAnalysisFile = async () => {
     const path = await openDialog({
@@ -81,12 +84,34 @@ export function OrganizeView() {
     }
   };
 
-  const handleExecute = async () => {
+  const handleExecuteClick = () => {
     if (!plan || plan.moves.length === 0) return;
-    const ok = window.confirm(
-      `Move ${plan.moves.length} files into ${plan.base_dir}?\nThis cannot be undone automatically.`,
-    );
-    if (!ok) return;
+    setShowConfirm(true);
+  };
+
+  const performExecute = async () => {
+    setShowConfirm(false);
+    if (!plan) return;
+
+    // Optionally back up tags first so the user has a restore path
+    if (backupFirst) {
+      const out = await saveDialog({
+        defaultPath: "tags_backup_pre_organize.json",
+        filters: [{ name: "Tag backup (JSON)", extensions: ["json"] }],
+      });
+      if (typeof out !== "string") {
+        // User cancelled the save dialog — abort the whole operation
+        return;
+      }
+      begin("backup");
+      try {
+        await rpc("backup_tags", { path: plan.base_dir, output_path: out });
+        finish();
+      } catch (e) {
+        fail(String(e));
+        return;
+      }
+    }
 
     begin("organize");
     try {
@@ -95,7 +120,11 @@ export function OrganizeView() {
         { ...buildParams(), dry_run: false },
       );
       finish();
-      alert(`Done. Moved ${stats.moved}/${stats.planned} • errors: ${stats.errors.length}`);
+      window.alert(
+        `Moved ${stats.moved} of ${stats.planned} files.\n` +
+        `Errors: ${stats.errors.length}` +
+        (backupFirst ? `\n\nTag backup saved.` : ""),
+      );
       setPlan(null);
     } catch (e) {
       fail(String(e));
@@ -116,7 +145,7 @@ export function OrganizeView() {
           {plan && (
             <button
               className="btn-primary"
-              onClick={handleExecute}
+              onClick={handleExecuteClick}
               disabled={active !== null || plan.moves.length === 0}
             >
               <Play className="w-4 h-4" />
@@ -207,6 +236,56 @@ export function OrganizeView() {
 
         {plan && <PlanPreview plan={plan} />}
       </div>
+
+      <ConfirmModal
+        open={showConfirm && !!plan}
+        variant="danger"
+        icon={Play}
+        title={plan ? `Move ${plan.moves.length} files?` : "Move files?"}
+        message={
+          plan && (
+            <div className="space-y-2">
+              <p>
+                Vibechek will move <strong>{plan.moves.length}</strong> files into
+                folders under{" "}
+                <code className="font-mono text-xs text-white/90">{plan.base_dir}</code>.
+              </p>
+              <p className="text-xs text-white/60">
+                First few moves:
+              </p>
+              <ul className="text-[11px] font-mono text-white/50 space-y-0.5 max-h-32 overflow-auto">
+                {plan.moves.slice(0, 5).map((m) => (
+                  <li key={m.source}>
+                    {m.source.split(/[/\\]/).pop()} → {m.destination.replace(plan.base_dir, "").replace(/^[/\\]+/, "")}
+                  </li>
+                ))}
+                {plan.moves.length > 5 && <li>... and {plan.moves.length - 5} more</li>}
+              </ul>
+              <p className="text-accent-yellow">There is no automatic undo.</p>
+            </div>
+          )
+        }
+        extra={
+          <label className="flex items-start gap-2 cursor-pointer text-sm text-white/80">
+            <input
+              type="checkbox"
+              checked={backupFirst}
+              onChange={(e) => setBackupFirst(e.target.checked)}
+              className="mt-0.5 accent-accent"
+            />
+            <div>
+              <div>Back up all tags first <span className="text-xs text-accent-green">(recommended)</span></div>
+              <div className="text-xs text-white/50">
+                You'll be prompted for a save location. The backup lets you restore tags later if anything looks wrong.
+              </div>
+            </div>
+          </label>
+        }
+        confirmLabel="Yes, move files"
+        cancelLabel="Cancel"
+        onConfirm={performExecute}
+        onCancel={() => setShowConfirm(false)}
+      />
     </div>
   );
 }

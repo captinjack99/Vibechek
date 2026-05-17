@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from mutagen import File as MutagenFile
+
 from vibechek.config import DuplicateConfig
 from vibechek.utils import (
     ProgressCallback,
@@ -51,6 +53,12 @@ class FileInfo:
     size_mb: float
     file_hash: str | None = None
     audio_fingerprint: str | None = None
+    # Extra metadata used by the auto-keeper rules in the GUI.
+    # Best-effort: all may be None if the file is unreadable.
+    codec: str | None = None           # "flac" | "mp3" | "wav" | ...
+    bitrate_kbps: int | None = None    # average bitrate (lossless: computed)
+    duration_s: float | None = None
+    modified_time: float | None = None  # epoch seconds
 
 
 @dataclass
@@ -142,12 +150,34 @@ def audio_fingerprint(filepath: Path, fpcalc_cmd: str, duration: int = 120) -> s
 
 def _file_info(filepath: Path) -> FileInfo:
     stat = filepath.stat()
-    return FileInfo(
+    info = FileInfo(
         path=str(filepath),
         filename=filepath.name,
         size_bytes=stat.st_size,
         size_mb=round(stat.st_size / (1024 * 1024), 2),
+        codec=filepath.suffix.lower().lstrip("."),
+        modified_time=stat.st_mtime,
     )
+
+    # Best-effort bitrate / duration via mutagen. Catch broadly — corrupt
+    # files shouldn't break the whole dedupe scan.
+    try:
+        audio = MutagenFile(str(filepath))
+        if audio and getattr(audio, "info", None):
+            duration = float(getattr(audio.info, "length", 0) or 0)
+            if duration > 0:
+                info.duration_s = round(duration, 1)
+            bitrate = getattr(audio.info, "bitrate", None)
+            if bitrate:
+                info.bitrate_kbps = int(bitrate // 1000)
+            elif duration > 0:
+                # Lossless formats don't expose .bitrate; derive from file size
+                # bytes/sec → bits/sec → kbps
+                info.bitrate_kbps = int((stat.st_size * 8) / duration / 1000)
+    except Exception as e:  # noqa: BLE001
+        log.debug("metadata probe failed for %s: %s", filepath, e)
+
+    return info
 
 
 def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:

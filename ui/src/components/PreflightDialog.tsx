@@ -18,14 +18,14 @@
  * dialog auto-dismisses and the original Analyze action proceeds.
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   X, CheckCircle2, AlertCircle, Download, Copy, ExternalLink, Loader2,
-  Terminal, Cpu,
+  Terminal, Cpu, StopCircle,
 } from "lucide-react";
 
-import { rpc } from "../hooks/useSidecar";
+import { rpc, useSidecarProgress } from "../hooks/useSidecar";
 import { useOperationStore } from "../stores";
 import type { InstallResult, PreflightResult, WSLStatus } from "../types";
 
@@ -45,6 +45,33 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
 
   const [busyAction, setBusyAction] = useState<Action>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  // Live log lines accumulated from sidecar:progress while a step is running.
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const logRef = useRef<HTMLDivElement>(null);
+
+  // Subscribe to progress notifications; only collect while a step is busy
+  useSidecarProgress((evt) => {
+    if (!busyAction) return;
+    setLogLines((prev) => {
+      const next = [...prev, evt.message || `${evt.current}/${evt.total}`];
+      return next.length > 200 ? next.slice(-200) : next;
+    });
+  });
+
+  // Auto-scroll the log to the bottom on new lines
+  useEffect(() => {
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [logLines]);
+
+  const handleCancel = async () => {
+    try {
+      await rpc("cancel_operation");
+    } catch {
+      /* nothing to do; server will surface the error if any */
+    }
+  };
 
   const isWindows = preflight.wsl?.is_windows ?? false;
 
@@ -62,6 +89,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   ): Promise<T | null> => {
     setBusyAction(action);
     setActionMessage(null);
+    setLogLines([]);
     begin("download-models"); // generic "busy" indicator
     try {
       const result = await rpc<T>(method, params);
@@ -171,6 +199,33 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
               {actionMessage}
             </div>
           )}
+
+          {busyAction && logLines.length > 0 && (
+            <div className="panel">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
+                <div className="flex items-center gap-2 text-xs text-white/60">
+                  <Terminal className="w-3.5 h-3.5" />
+                  Live progress
+                </div>
+                <button
+                  onClick={handleCancel}
+                  className="text-xs text-accent-red hover:underline flex items-center gap-1"
+                  title="Stop this step"
+                >
+                  <StopCircle className="w-3.5 h-3.5" />
+                  Cancel
+                </button>
+              </div>
+              <div
+                ref={logRef}
+                className="px-3 py-2 max-h-32 overflow-auto font-mono text-[11px] text-white/60 space-y-0.5"
+              >
+                {logLines.map((line, i) => (
+                  <div key={i} className="truncate">{line}</div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Footer */}
@@ -184,8 +239,8 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             )}
           </div>
           <div className="flex items-center gap-2">
-            <button className="btn-ghost" onClick={onClose}>
-              Cancel
+            <button className="btn-ghost" onClick={onClose} disabled={!!busyAction}>
+              Close
             </button>
             <button
               className="btn-primary"

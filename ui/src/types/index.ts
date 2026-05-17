@@ -12,10 +12,16 @@
 export interface FileInfo {
   path: string;
   filename: string;
-  extension: string;
+  extension?: string;
+  size_bytes?: number;
   size_mb: number;
   file_hash?: string | null;
   audio_fingerprint?: string | null;
+  // Metadata used to auto-pick keepers (best-effort; any may be null)
+  codec?: string | null;
+  bitrate_kbps?: number | null;
+  duration_s?: number | null;
+  modified_time?: number | null;  // epoch seconds
 }
 
 export interface MLResult {
@@ -186,7 +192,7 @@ export interface VibechekConfig {
 // View state
 // ---------------------------------------------------------------------------
 
-export type ViewMode = "library" | "duplicates" | "organize" | "settings";
+export type ViewMode = "library" | "duplicates" | "organize" | "tags" | "settings";
 
 export interface ProgressEvent {
   current: number;

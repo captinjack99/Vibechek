@@ -135,7 +135,9 @@ export const useUIStore = create<UIState>((set) => ({
 
 interface ConfigState {
   config: VibechekConfig;
-  setConfig: (c: VibechekConfig) => void;
+  /** True after first successful load from disk. Until then we don't auto-save. */
+  loaded: boolean;
+  setConfig: (c: VibechekConfig, markLoaded?: boolean) => void;
   updateAnalysis: (patch: Partial<VibechekConfig["analysis"]>) => void;
   updateTagging: (patch: Partial<VibechekConfig["tagging"]>) => void;
   updateDuplicates: (patch: Partial<VibechekConfig["duplicates"]>) => void;
@@ -167,7 +169,8 @@ const DEFAULT_CONFIG: VibechekConfig = {
 
 export const useConfigStore = create<ConfigState>((set) => ({
   config: DEFAULT_CONFIG,
-  setConfig: (c) => set({ config: c }),
+  loaded: false,
+  setConfig: (c, markLoaded = false) => set({ config: c, ...(markLoaded ? { loaded: true } : {}) }),
   updateAnalysis: (patch) =>
     set((s) => ({ config: { ...s.config, analysis: { ...s.config.analysis, ...patch } } })),
   updateTagging: (patch) =>

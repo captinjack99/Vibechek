@@ -1,4 +1,4 @@
-import { Music, Copy, FolderTree, Settings as SettingsIcon, Disc3 } from "lucide-react";
+import { Music, Copy, FolderTree, Archive, Settings as SettingsIcon, Disc3 } from "lucide-react";
 import { clsx } from "clsx";
 
 import { useUIStore, useLibraryStore, useOperationStore } from "../stores";
@@ -37,6 +37,11 @@ export function Sidebar() {
       label: "Organize",
       icon: <FolderTree className="w-5 h-5" />,
       badge: () => (organizePlan ? String(organizePlan.moves.length) : null),
+    },
+    {
+      id: "tags",
+      label: "Tags",
+      icon: <Archive className="w-5 h-5" />,
     },
     {
       id: "settings",

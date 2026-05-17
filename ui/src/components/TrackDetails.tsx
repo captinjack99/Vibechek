@@ -18,6 +18,7 @@ import { useLibraryStore, useUIStore, useConfigStore, useOperationStore } from "
 import { rpc } from "../hooks/useSidecar";
 import type { TrackAnalysis, ExistingTags, MLResult } from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
+import { AudioPreview } from "./AudioPreview";
 
 export function TrackDetails() {
   const selectedPath = useUIStore((s) => s.selectedTrackPath);
@@ -109,6 +110,8 @@ function DetailContent({
         {ml?.ml_error && (
           <Notice kind="error">ML failed: {ml.ml_error}</Notice>
         )}
+
+        <AudioPreview path={track.path} />
 
         <FileSection track={track} />
 

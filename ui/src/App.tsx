@@ -5,6 +5,7 @@ import { Sidebar } from "./components/Sidebar";
 import { LibraryBrowser } from "./components/LibraryBrowser";
 import { DuplicatesView } from "./components/DuplicatesView";
 import { OrganizeView } from "./components/OrganizeView";
+import { TagsView } from "./components/TagsView";
 import { Settings } from "./components/Settings";
 import { AnalysisProgress } from "./components/AnalysisProgress";
 import { TrackDetails } from "./components/TrackDetails";
@@ -12,6 +13,7 @@ import { ErrorToast } from "./components/ErrorToast";
 
 import { useUIStore, useOperationStore } from "./stores";
 import { useSidecarProgress } from "./hooks/useSidecar";
+import { useConfigPersistence } from "./hooks/useConfigPersistence";
 
 export default function App() {
   const viewMode = useUIStore((s) => s.viewMode);
@@ -20,6 +22,9 @@ export default function App() {
   // Pipe every sidecar progress notification into the operation store. Any
   // component can read it; the progress overlay does so.
   useSidecarProgress((evt) => setProgress(evt));
+
+  // Load config from disk on startup, then auto-save (debounced) on change.
+  useConfigPersistence();
 
   // Esc closes overlays / clears selection
   useEffect(() => {
@@ -40,6 +45,7 @@ export default function App() {
           {viewMode === "library" && <LibraryBrowser />}
           {viewMode === "duplicates" && <DuplicatesView />}
           {viewMode === "organize" && <OrganizeView />}
+          {viewMode === "tags" && <TagsView />}
           {viewMode === "settings" && <Settings />}
         </main>
         <TrackDetails />

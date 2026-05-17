@@ -1,7 +1,8 @@
 import { motion } from "framer-motion";
-import { Loader2 } from "lucide-react";
+import { Loader2, StopCircle } from "lucide-react";
 
 import { useOperationStore } from "../stores";
+import { rpc } from "../hooks/useSidecar";
 
 const KIND_LABELS: Record<string, string> = {
   analyze: "Analyzing library",
@@ -50,6 +51,14 @@ export function AnalysisProgress() {
               {pct}%
             </div>
           )}
+          <button
+            onClick={() => { void rpc("cancel_operation"); }}
+            className="text-white/40 hover:text-accent-red flex items-center gap-1 text-xs"
+            title="Cancel this operation"
+          >
+            <StopCircle className="w-4 h-4" />
+            Cancel
+          </button>
         </div>
 
         {/* Progress bar */}

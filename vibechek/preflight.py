@@ -133,7 +133,10 @@ def preflight(models_dir: Path | None = None) -> PreflightResult:
     """
     essentia = check_essentia()
     models = check_models(models_dir)
-    wsl_status = detect_wsl()  # cheap no-op on non-Windows
+    # Quick WSL check: skip per-distro probes so preflight always returns
+    # in under a second. The GUI calls `wsl_status` separately for the
+    # full probe with a loading indicator.
+    wsl_status = detect_wsl(quick=True)
 
     have_native = essentia.installed
     have_wsl = wsl_status.can_run_vibechek
