@@ -7,7 +7,7 @@ import {
 
 import { useConfigStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
-import type { SystemResources } from "../types";
+import type { PreflightResult, SystemResources } from "../types";
 
 export function Settings() {
   const cfg = useConfigStore((s) => s.config);
@@ -23,18 +23,25 @@ export function Settings() {
 
   const [sidecarBinary, setSidecarBinary] = useState<string | null>(null);
   const [sysInfo, setSysInfo] = useState<SystemResources | null>(null);
+  const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
+
+  const refreshPreflight = () => {
+    rpc<PreflightResult>("preflight", {})
+      .then(setPreflightResult)
+      .catch(() => {});
+  };
 
   useEffect(() => {
     sidecarStatus().then((s) => setSidecarBinary(s.binary)).catch(() => {});
     rpc<SystemResources>("system_info")
       .then((info) => {
         setSysInfo(info);
-        // If workers is still 0 (unconfigured), bump it to the recommended count
         if (cfg.analysis.workers === 0) {
           updateAnalysis({ workers: info.recommended_workers });
         }
       })
       .catch(() => {});
+    refreshPreflight();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -45,6 +52,7 @@ export function Settings() {
         models_dir: cfg.analysis.models_dir || undefined,
       });
       finish();
+      refreshPreflight();
     } catch (e) {
       fail(String(e));
     }
@@ -63,6 +71,8 @@ export function Settings() {
         <SettingsIcon className="w-6 h-6 text-accent" />
         Settings
       </h1>
+
+      <PreflightSection preflight={preflightResult} onRefresh={refreshPreflight} />
 
       <ResourcesSection sysInfo={sysInfo} />
 
@@ -347,6 +357,83 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function Hint({ children }: { children: React.ReactNode }) {
   return <div className="text-xs text-white/40 mt-1">{children}</div>;
+}
+
+/**
+ * Live readiness banner: shows whether analyze can actually run right now.
+ * Sits at the top of Settings so the user always knows if something's wrong.
+ */
+function PreflightSection({
+  preflight,
+  onRefresh,
+}: {
+  preflight: PreflightResult | null;
+  onRefresh: () => void;
+}) {
+  if (!preflight) {
+    return (
+      <Section icon={<Cpu className="w-5 h-5" />} title="Ready to analyze?" subtitle="checking...">
+        <div className="text-sm text-white/40">Loading preflight...</div>
+      </Section>
+    );
+  }
+
+  const ready = preflight.ready;
+
+  return (
+    <Section
+      icon={
+        ready ? (
+          <CheckCircle2 className="w-5 h-5 text-accent-green" />
+        ) : (
+          <AlertTriangle className="w-5 h-5 text-accent-yellow" />
+        )
+      }
+      title={ready ? "Ready to analyze" : "Not ready to analyze"}
+      subtitle={ready ? "all prerequisites satisfied" : "see below"}
+    >
+      <Row
+        ok={preflight.essentia.installed}
+        label="Essentia"
+        detail={
+          preflight.essentia.installed
+            ? `installed${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`
+            : (preflight.essentia.error ?? "not installed")
+        }
+      />
+      <Row
+        ok={preflight.models.missing.length === 0}
+        label="ML models"
+        detail={
+          preflight.models.missing.length === 0
+            ? `${preflight.models.found.length} models, ${preflight.models.total_size_mb.toFixed(0)} MB`
+            : `${preflight.models.missing.length} of ${preflight.models.found.length + preflight.models.missing.length} missing`
+        }
+      />
+
+      <div className="flex justify-end">
+        <button className="btn-ghost text-xs" onClick={onRefresh}>
+          Re-check
+        </button>
+      </div>
+    </Section>
+  );
+}
+
+function Row({ ok, label, detail }: { ok: boolean; label: string; detail: string }) {
+  return (
+    <div className="flex items-center gap-3">
+      {ok ? (
+        <CheckCircle2 className="w-4 h-4 text-accent-green flex-none" />
+      ) : (
+        <AlertTriangle className="w-4 h-4 text-accent-yellow flex-none" />
+      )}
+      <div className="text-sm text-white">{label}</div>
+      <div className={`flex-1 text-xs ${ok ? "text-white/50" : "text-accent-yellow/90"} truncate`}>
+        {detail}
+      </div>
+    </div>
+  );
 }
 
 /**

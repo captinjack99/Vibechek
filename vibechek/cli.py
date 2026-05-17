@@ -386,6 +386,26 @@ def download_models_cmd(models_dir: Path | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# preflight
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option("--models-dir", type=click.Path(path_type=Path), default=None,
+              help="Override the ML model directory (defaults to user data dir).")
+def preflight(models_dir: Path | None) -> None:
+    """Verify Vibechek is ready to run `analyze` (essentia + model files)."""
+    from vibechek.preflight import preflight as run_preflight, summary_lines
+
+    result = run_preflight(models_dir)
+    for line in summary_lines(result):
+        console.print(line)
+
+    if not result.ready:
+        raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
 # system-info
 # ---------------------------------------------------------------------------
 

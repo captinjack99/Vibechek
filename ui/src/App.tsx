@@ -8,6 +8,7 @@ import { OrganizeView } from "./components/OrganizeView";
 import { Settings } from "./components/Settings";
 import { AnalysisProgress } from "./components/AnalysisProgress";
 import { TrackDetails } from "./components/TrackDetails";
+import { ErrorToast } from "./components/ErrorToast";
 
 import { useUIStore, useOperationStore } from "./stores";
 import { useSidecarProgress } from "./hooks/useSidecar";
@@ -46,6 +47,7 @@ export default function App() {
 
       <AnimatePresence>
         <AnalysisProgress />
+        <ErrorToast />
       </AnimatePresence>
     </div>
   );

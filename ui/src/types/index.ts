@@ -198,3 +198,37 @@ export interface ReadyEvent {
   version: string;
   methods: string[];
 }
+
+// ---------------------------------------------------------------------------
+// Preflight (vibechek/preflight.py)
+// ---------------------------------------------------------------------------
+
+export interface EssentiaCheck {
+  installed: boolean;
+  version: string | null;
+  error: string | null;
+}
+
+export interface ModelCheck {
+  name: string;
+  present: boolean;
+  weights_path: string;
+  metadata_path: string;
+  size_mb: number;
+}
+
+export interface ModelsCheck {
+  models_dir: string;
+  found: string[];
+  missing: string[];
+  total_size_mb: number;
+  per_model: ModelCheck[];
+}
+
+export interface PreflightResult {
+  ready: boolean;
+  essentia: EssentiaCheck;
+  models: ModelsCheck;
+  platform: string;
+  reasons_not_ready: string[];
+}
