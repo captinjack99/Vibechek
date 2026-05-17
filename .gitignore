@@ -1,0 +1,73 @@
+# --- Vibechek data files (kept locally, not committed) ---
+# Personal library analysis output (32MB+, contains track paths)
+analysis.json
+analysis.zip
+analysis_*.json
+analysis_diff.txt
+tags_backup.json
+safe_duplicates.json
+suspect_duplicates.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# --- Node / Frontend (when prototype is revived) ---
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# --- Rust / Tauri (if revived) ---
+target/
+
+# --- ML models (downloaded on first run, ~800MB) ---
+models/
+*.pb
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Misc ---
+*.log
+.env
+.env.local
+
+# Staged for manual review/deletion (duplicate of files already in docs/)
+_to_review/

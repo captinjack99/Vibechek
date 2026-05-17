@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vibechek"
+version = "0.1.0-dev"
+description = "ML-powered DJ library organizer — analyze, tag, and organize music collections"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Jack" }]
+keywords = ["dj", "music", "rekordbox", "essentia", "ml", "audio-analysis"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+]
+
+dependencies = [
+    "mutagen>=1.47",
+    "click>=8.1",
+    "rich>=13.7",
+    "platformdirs>=4.2",
+]
+
+[project.optional-dependencies]
+# Heavy ML dependency; installed separately because of platform/CUDA caveats.
+# Install with: pip install vibechek[ml]
+ml = [
+    "essentia-tensorflow>=2.1b6.dev1110; platform_system != 'Windows'",
+]
+# Dev / tests
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+vibechek = "vibechek.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/vibechek"
+Issues = "https://github.com/yourusername/vibechek/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vibechek"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

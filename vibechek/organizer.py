@@ -1,0 +1,272 @@
+"""Folder organization — move analyzed tracks into a genre/subgenre tree.
+
+Two modes:
+- `organize_from_analysis`: move an analyzed library into a new genre/subgenre tree.
+- `route_new_tracks`: copy manually-tagged tracks from a staging folder into the
+  matching genre folder of an already-organized library (by reading existing tags).
+
+Source: ports of `legacy/organize_by_genre.py` and `legacy/copy_to_genre_folders.py`.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from mutagen.aiff import AIFF
+from mutagen.flac import FLAC
+from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4
+
+from vibechek.config import OrganizationConfig
+from vibechek.utils import (
+    ProgressCallback,
+    find_audio_files,
+    report_progress,
+    sanitize_folder_name,
+)
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class PlannedMove:
+    source: Path
+    destination: Path
+    genre: str
+    subgenre: str
+    reason: str  # e.g. "rare genre → Other/", "match by ML genre"
+
+
+@dataclass
+class OrganizePlan:
+    base_dir: Path
+    moves: list[PlannedMove] = field(default_factory=list)
+    small_genres: set[str] = field(default_factory=set)
+    genre_counts: dict[str, int] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class OrganizeStats:
+    planned: int = 0
+    moved: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Planning (read-only — no filesystem changes)
+# ---------------------------------------------------------------------------
+
+
+def plan_organization(
+    analysis_data: dict[str, Any],
+    config: OrganizationConfig,
+    base_dir: Path | None = None,
+) -> OrganizePlan:
+    """Compute the file moves `organize_from_analysis` would perform.
+
+    Resolution order for `base_dir`:
+      1. Explicit argument (test / GUI override).
+      2. `config.target_root`.
+      3. Parent of the first track's path in the analysis.
+    """
+    tracks = analysis_data.get("tracks", [])
+
+    if base_dir is None:
+        if config.target_root is not None:
+            base_dir = Path(config.target_root)
+        elif tracks:
+            base_dir = Path(tracks[0]["path"]).parent
+        else:
+            raise ValueError("No tracks in analysis and no base_dir / target_root set")
+
+    base_dir = Path(base_dir)
+
+    # First pass: count genres so we know which ones are "small"
+    genre_counts: dict[str, int] = defaultdict(int)
+    for track in tracks:
+        ml = track.get("ml_analysis", {})
+        genre = sanitize_folder_name(ml.get("ml_genre"))
+        genre_counts[genre] += 1
+
+    small_genres = {
+        g for g, count in genre_counts.items()
+        if count < config.min_genre_size
+    }
+
+    plan = OrganizePlan(
+        base_dir=base_dir,
+        small_genres=small_genres,
+        genre_counts=dict(genre_counts),
+    )
+
+    for track in tracks:
+        source = Path(track["path"])
+        if not source.exists():
+            plan.errors.append(f"File not found: {source}")
+            continue
+
+        ml = track.get("ml_analysis", {})
+        genre = sanitize_folder_name(ml.get("ml_genre"))
+        subgenre = sanitize_folder_name(ml.get("ml_subgenre"))
+
+        if genre in small_genres:
+            dest_folder = base_dir / "Other" / genre
+            reason = f"rare genre (<{config.min_genre_size} tracks) → Other/"
+        elif config.use_subgenres and subgenre and subgenre != genre:
+            dest_folder = base_dir / genre / subgenre
+            reason = "ML genre + subgenre"
+        else:
+            dest_folder = base_dir / genre
+            reason = "ML genre"
+
+        dest = dest_folder / source.name
+        if source == dest:
+            continue  # Already in the right place
+
+        if dest.exists() and source != dest:
+            dest = _unique_destination(dest)
+
+        plan.moves.append(PlannedMove(
+            source=source,
+            destination=dest,
+            genre=genre,
+            subgenre=subgenre,
+            reason=reason,
+        ))
+
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+
+
+def organize_from_analysis(
+    analysis_data: dict[str, Any],
+    config: OrganizationConfig,
+    on_progress: ProgressCallback | None = None,
+    dry_run: bool = False,
+    base_dir: Path | None = None,
+) -> OrganizeStats:
+    """Plan and execute the genre-folder reorganization."""
+    plan = plan_organization(analysis_data, config, base_dir=base_dir)
+    stats = OrganizeStats(planned=len(plan.moves))
+
+    if dry_run:
+        return stats
+
+    for i, move in enumerate(plan.moves):
+        report_progress(on_progress, i + 1, len(plan.moves), move.source.name)
+        try:
+            move.destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(move.source), str(move.destination))
+            stats.moved += 1
+        except OSError as e:
+            stats.errors.append(f"{move.source.name}: {e}")
+
+    return stats
+
+
+def route_new_tracks(
+    staging_dir: Path,
+    library_root: Path,
+    on_progress: ProgressCallback | None = None,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Copy each tagged track from `staging_dir` into a `library_root/<Genre>/` folder.
+
+    Genre is read from the file's existing tag. Tracks without a genre tag are
+    skipped (with a log entry). File-name collisions are silently skipped to avoid
+    overwriting whatever is already there.
+    """
+    staging_dir = Path(staging_dir)
+    library_root = Path(library_root)
+    files = find_audio_files(staging_dir)
+    summary = {"copied": 0, "skipped_no_genre": 0, "skipped_exists": 0, "errors": 0}
+
+    for i, fp in enumerate(files):
+        report_progress(on_progress, i + 1, len(files), fp.name)
+
+        genre = _read_genre_tag(fp)
+        if not genre:
+            summary["skipped_no_genre"] += 1
+            log.info("No genre tag, skipping: %s", fp.name)
+            continue
+
+        dest_folder = library_root / sanitize_folder_name(genre)
+        dest_file = dest_folder / fp.name
+        if dest_file.exists():
+            summary["skipped_exists"] += 1
+            continue
+
+        if dry_run:
+            summary["copied"] += 1
+            continue
+
+        try:
+            dest_folder.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(fp), str(dest_file))
+            summary["copied"] += 1
+        except OSError as e:
+            log.warning("Copy failed for %s: %s", fp, e)
+            summary["errors"] += 1
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_genre_tag(filepath: Path) -> str | None:
+    """Return the main genre tag from a file, or None if missing/unreadable."""
+    ext = filepath.suffix.lower()
+    try:
+        if ext == ".mp3":
+            audio = MP3(filepath)
+            if audio.tags and "TCON" in audio.tags:
+                return str(audio.tags["TCON"])
+        elif ext == ".flac":
+            audio = FLAC(filepath)
+            if audio.tags and "genre" in audio.tags:
+                return audio.tags["genre"][0]
+        elif ext == ".m4a":
+            audio = MP4(filepath)
+            if audio.tags and "\xa9gen" in audio.tags:
+                return audio.tags["\xa9gen"][0]
+        elif ext in (".aiff", ".aif"):
+            audio = AIFF(filepath)
+            if audio.tags and "TCON" in audio.tags:
+                return str(audio.tags["TCON"])
+    except Exception as e:  # noqa: BLE001
+        log.debug("Could not read genre from %s: %s", filepath, e)
+    return None
+
+
+def _unique_destination(path: Path) -> Path:
+    """Append _1, _2, ... until `path` doesn't exist."""
+    stem, suffix = path.stem, path.suffix
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{stem}_{counter}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+__all__ = [
+    "PlannedMove",
+    "OrganizePlan",
+    "OrganizeStats",
+    "plan_organization",
+    "organize_from_analysis",
+    "route_new_tracks",
+]
