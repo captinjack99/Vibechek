@@ -231,4 +231,41 @@ export interface PreflightResult {
   models: ModelsCheck;
   platform: string;
   reasons_not_ready: string[];
+  wsl: WSLStatus | null;
+  analyze_via: "native" | "wsl" | null;
+}
+
+// ---------------------------------------------------------------------------
+// WSL (vibechek/wsl.py) — Windows-only meaningful
+// ---------------------------------------------------------------------------
+
+export interface DistroInfo {
+  name: string;
+  version: string | null;
+  state: string;
+  is_default: boolean;
+  vibechek_installed: boolean;
+  essentia_installed: boolean;
+  vibechek_path: string | null;
+}
+
+export interface WSLStatus {
+  is_windows: boolean;
+  wsl_available: boolean;       // wsl.exe exists
+  wsl_feature_enabled: boolean; // WSL feature is on
+  distros: DistroInfo[];
+  default_distro: string | null;
+  recommended_distro: string | null;
+  error: string | null;
+  can_run_vibechek: boolean;
+  usable_distro: string | null;
+}
+
+export interface InstallResult {
+  ok: boolean;
+  error?: string;
+  distro?: string;
+  note?: string;
+  tail?: string;
+  stderr?: string;
 }
