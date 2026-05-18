@@ -24,7 +24,6 @@ $0 forever  •  no account  •  no upload  •  AGPL-3.0  •  CPU or GPU
 
 ## What Vibechek does that the paid tools don't
 
-Stacking the two most popular paid tools together (Mixed In Key + Lexicon DJ) still costs ~$58 up front + $10-20/month — and *still* doesn't ML-classify genre, *still* doesn't tag timeslot, *still* doesn't do acoustic dedup. Vibechek does all three, runs locally, and ships it open source.
 | Capability                                          | Vibechek     | Mixed In Key | Lexicon       | Rekordbox    | beaTunes | Tunebat     |
 | --------------------------------------------------- |:------------:|:------------:|:-------------:|:------------:|:--------:|:-----------:|
 | ML genre + subgenre (Discogs-400 taxonomy)          | ✅            | —            | —             | —            | —        | —           |
