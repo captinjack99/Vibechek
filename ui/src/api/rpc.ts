@@ -1,0 +1,427 @@
+/**
+ * Typed wrappers for every JSON-RPC method exposed by the Python sidecar.
+ *
+ * --- Why this exists ---
+ * Before this module, every component called the untyped transport directly:
+ *
+ *     await rpc<AnalysisReport>("analyze_directory", { path, workers, ... });
+ *
+ * Two failure modes kept showing up in audits:
+ *   1. Method name typos / wrong-shaped params — the second arg is `object`,
+ *      so anything compiles and the error only shows up at runtime.
+ *   2. Drifting between the Python handler and the TS caller — Python adds
+ *      a new param, TS forgets to send it; or Python returns a renamed field
+ *      and TS keeps reading the old name.
+ *
+ * Wrapping each method in a typed function gives us:
+ *   - Compile-time checking on the param shape.
+ *   - A single grep target ("api.analyzeDirectory") when a method's contract
+ *     changes — no more hunting through string literals.
+ *   - A canonical list (RPC_METHODS in ./methods) we can audit against the
+ *     Python METHODS dict to catch missed wrappers.
+ *
+ * --- Adding a new RPC method ---
+ *   (a) Add the handler in vibechek/rpc.py and register in METHODS.
+ *   (b) Add a param interface (+ append the name to RPC_METHODS) in ./methods.
+ *   (c) Add a wrapper function here.
+ *
+ * Components MUST NOT call the low-level `rpc(string, ...)` directly.
+ * (Existing call sites will be migrated in a follow-up pass.)
+ */
+
+import { rpc } from "../hooks/useSidecar";
+import type {
+  AnalysisReport,
+  AnalyzeDirectoryRequest,
+  ApplyMlTagsRequest,
+  BackupHistory,
+  BackupTagsRequest,
+  CancelOperationResult,
+  DownloadModelsRequest,
+  DownloadModelsResult,
+  DuplicateReport,
+  EngineGpuInfo,
+  EngineGpuStatusRequest,
+  FindDuplicatesRequest,
+  ForgetBackupRequest,
+  ForgetBackupResult,
+  ForgetLibraryRequest,
+  ForgetLibraryResult,
+  GetLogTailRequest,
+  GetLogTailResult,
+  HandleDuplicatesRequest,
+  InstallCudaLibsInWSLRequest,
+  InstallResultPayload,
+  InstallVibechekInWSLRequest,
+  InstallWSLRequest,
+  LibraryState,
+  LoadRecentAnalysisRequest,
+  LoadRecentAnalysisResult,
+  NativeVenvStatus,
+  OrganizeRequest,
+  OrganizeStats,
+  OrganizePlan,
+  PingResult,
+  PlanOrganizationRequest,
+  PreflightRequest,
+  PreflightResult,
+  RepairWSLShimRequest,
+  RestoreDefaultConfigResult,
+  RestoreTagsRequest,
+  RestoreTagsWithRemapRequest,
+  SaveConfigRequest,
+  SaveConfigResult,
+  ScanDirectoryRequest,
+  ScanDirectoryResult,
+  ScanOnlyRequest,
+  SystemResources,
+  TagApplyStats,
+  TagBackupStats,
+  TagRemapRestoreStats,
+  TagRestoreStats,
+  VersionResult,
+  VibechekConfig,
+  WSLStatus,
+  WSLStatusRequest,
+} from "./methods";
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/** Liveness check. Round-trips through the sidecar and returns its version. */
+export function ping(): Promise<PingResult> {
+  return rpc<PingResult>("ping");
+}
+
+/** Sidecar version (matches `vibechek.__version__`). */
+export function version(): Promise<VersionResult> {
+  return rpc<VersionResult>("version");
+}
+
+/** Host-side CPU / memory / GPU detection. Fast (~ms). */
+export function systemInfo(): Promise<SystemResources> {
+  return rpc<SystemResources>("system_info");
+}
+
+/**
+ * Probe the analyze engine for GPU visibility. On Windows this runs inside
+ * WSL and can take ~10s the first time (cached for 5 min server-side).
+ */
+export function engineGpuStatus(
+  params: EngineGpuStatusRequest = {},
+): Promise<EngineGpuInfo> {
+  return rpc<EngineGpuInfo>("engine_gpu_status", params);
+}
+
+/**
+ * Check whether essentia + models are ready for `analyze_directory`.
+ * Default `quick=true` is sub-second. Pass `quick:false` after an install.
+ */
+export function preflight(
+  params: PreflightRequest = {},
+): Promise<PreflightResult> {
+  return rpc<PreflightResult>("preflight", params);
+}
+
+/** Detect WSL availability and per-distro vibechek/essentia install state. */
+export function wslStatus(
+  params: WSLStatusRequest = {},
+): Promise<WSLStatus> {
+  return rpc<WSLStatus>("wsl_status", params);
+}
+
+/** Detect what's installed in the managed `~/.vibechek/venv/`. */
+export function nativeVenvStatus(): Promise<NativeVenvStatus> {
+  return rpc<NativeVenvStatus>("native_venv_status");
+}
+
+// ---------------------------------------------------------------------------
+// Install — all cancellable; all return an InstallResultPayload variant.
+// ---------------------------------------------------------------------------
+
+/** Install WSL + a distro via elevated PowerShell (triggers UAC). Cancellable. */
+export function installWSL(
+  params: InstallWSLRequest = {},
+): Promise<InstallResultPayload> {
+  return rpc<InstallResultPayload>("install_wsl", params);
+}
+
+/** Install vibechek + essentia-tensorflow + chromaprint inside a WSL distro. Cancellable. */
+export function installVibechekInWSL(
+  params: InstallVibechekInWSLRequest,
+): Promise<InstallResultPayload> {
+  return rpc<InstallResultPayload>("install_vibechek_in_wsl", params);
+}
+
+/** Install the CUDA runtime libs essentia's bundled TF needs. Cancellable. */
+export function installCudaLibsInWSL(
+  params: InstallCudaLibsInWSLRequest,
+): Promise<InstallResultPayload> {
+  return rpc<InstallResultPayload>("install_cuda_libs_in_wsl", params);
+}
+
+/** Install essentia + vibechek into the managed native venv (Linux/macOS). Cancellable. */
+export function installEssentiaNative(): Promise<InstallResultPayload> {
+  return rpc<InstallResultPayload>("install_essentia_native");
+}
+
+/** One-shot diagnostic repair of a broken venv shim left by older installers. */
+export function repairWSLShim(
+  params: RepairWSLShimRequest,
+): Promise<InstallResultPayload> {
+  return rpc<InstallResultPayload>("repair_wsl_shim", params);
+}
+
+// ---------------------------------------------------------------------------
+// Analysis
+// ---------------------------------------------------------------------------
+
+/** Enumerate audio files under `path`. No ML; very fast. */
+export function scanDirectory(
+  params: ScanDirectoryRequest,
+): Promise<ScanDirectoryResult> {
+  return rpc<ScanDirectoryResult>("scan_directory", params);
+}
+
+/**
+ * Cheap library load — filename-parsed hints + existing tags, no ML.
+ * Cancellable. Returns the same AnalysisReport shape as `analyze_directory`.
+ */
+export function scanOnly(params: ScanOnlyRequest): Promise<AnalysisReport> {
+  return rpc<AnalysisReport>("scan_only", params);
+}
+
+/**
+ * Full ML analysis. Emits `sidecar:progress` notifications while running.
+ * Cancellable via {@link cancelOperation}.
+ */
+export function analyzeDirectory(
+  params: AnalyzeDirectoryRequest,
+): Promise<AnalysisReport> {
+  return rpc<AnalysisReport>("analyze_directory", params);
+}
+
+// ---------------------------------------------------------------------------
+// Duplicates
+// ---------------------------------------------------------------------------
+
+/**
+ * Find exact + audio-fingerprint duplicates under `path`. Cancellable.
+ * Returns the wire-form `DuplicateReport` (see types/index.ts).
+ */
+export function findDuplicates(
+  params: FindDuplicatesRequest,
+): Promise<DuplicateReport> {
+  return rpc<DuplicateReport>("find_duplicates", params);
+}
+
+/**
+ * Apply the configured action (report/delete/move) to a previously-computed
+ * `DuplicateReport`. Returns a per-action stats dict.
+ */
+export function handleDuplicates(
+  params: HandleDuplicatesRequest,
+): Promise<Record<string, number>> {
+  return rpc<Record<string, number>>("handle_duplicates", params);
+}
+
+// ---------------------------------------------------------------------------
+// Organize
+// ---------------------------------------------------------------------------
+
+/** Compute (but don't execute) an organize plan from an analysis. */
+export function planOrganization(
+  params: PlanOrganizationRequest,
+): Promise<OrganizePlan> {
+  return rpc<OrganizePlan>("plan_organization", params);
+}
+
+/** Execute the moves for an organize plan. Cancellable. */
+export function organize(params: OrganizeRequest): Promise<OrganizeStats> {
+  return rpc<OrganizeStats>("organize", params);
+}
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+/** Apply ML-derived tags to the on-disk files. Cancellable. */
+export function applyMlTags(
+  params: ApplyMlTagsRequest,
+): Promise<TagApplyStats> {
+  return rpc<TagApplyStats>("apply_ml_tags", params);
+}
+
+/** Snapshot all on-disk tags under `path` into a JSON backup file. Cancellable. */
+export function backupTags(
+  params: BackupTagsRequest,
+): Promise<TagBackupStats> {
+  return rpc<TagBackupStats>("backup_tags", params);
+}
+
+/** Replay a tag backup verbatim. Cancellable. */
+export function restoreTags(
+  params: RestoreTagsRequest,
+): Promise<TagRestoreStats> {
+  return rpc<TagRestoreStats>("restore_tags", params);
+}
+
+/**
+ * Restore a backup against a possibly-moved library — the tagger re-matches
+ * each backup entry to its current on-disk file. Cancellable.
+ */
+export function restoreTagsWithRemap(
+  params: RestoreTagsWithRemapRequest,
+): Promise<TagRemapRestoreStats> {
+  return rpc<TagRemapRestoreStats>("restore_tags_with_remap", params);
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+/** Download the essentia model weights (~200 MB). Cancellable. */
+export function downloadModels(
+  params: DownloadModelsRequest = {},
+): Promise<DownloadModelsResult> {
+  return rpc<DownloadModelsResult>("download_models", params);
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/** Load the on-disk VibechekConfig (or the defaults if no file exists yet). */
+export function getConfig(): Promise<VibechekConfig> {
+  return rpc<VibechekConfig>("get_config");
+}
+
+/** Persist a VibechekConfig to disk. */
+export function saveConfig(
+  params: SaveConfigRequest,
+): Promise<SaveConfigResult> {
+  return rpc<SaveConfigResult>("save_config", params);
+}
+
+/** Reset config to defaults and persist. */
+export function restoreDefaultConfig(): Promise<RestoreDefaultConfigResult> {
+  return rpc<RestoreDefaultConfigResult>("restore_default_config");
+}
+
+// ---------------------------------------------------------------------------
+// Operation control
+// ---------------------------------------------------------------------------
+
+/** Request cancellation of the currently-running long operation. */
+export function cancelOperation(): Promise<CancelOperationResult> {
+  return rpc<CancelOperationResult>("cancel_operation");
+}
+
+// ---------------------------------------------------------------------------
+// Library state
+// ---------------------------------------------------------------------------
+
+/** List the recent-libraries the user has opened. */
+export function libraryState(): Promise<LibraryState> {
+  return rpc<LibraryState>("library_state");
+}
+
+/** Drop a library from the recent list. */
+export function forgetLibrary(
+  params: ForgetLibraryRequest,
+): Promise<ForgetLibraryResult> {
+  return rpc<ForgetLibraryResult>("forget_library", params);
+}
+
+/** Load a saved analysis JSON, either by library_path or analysis_path. */
+export function loadRecentAnalysis(
+  params: LoadRecentAnalysisRequest,
+): Promise<LoadRecentAnalysisResult> {
+  return rpc<LoadRecentAnalysisResult>("load_recent_analysis", params);
+}
+
+// ---------------------------------------------------------------------------
+// Logging / history
+// ---------------------------------------------------------------------------
+
+/** Fetch the last `n` lines of the sidecar log (default 200). */
+export function getLogTail(
+  params: GetLogTailRequest = {},
+): Promise<GetLogTailResult> {
+  return rpc<GetLogTailResult>("get_log_tail", params);
+}
+
+/** List every tag backup the user has made via Vibechek. */
+export function backupHistory(): Promise<BackupHistory> {
+  return rpc<BackupHistory>("backup_history");
+}
+
+/** Drop a backup from the history (does not delete the file). */
+export function forgetBackup(
+  params: ForgetBackupRequest,
+): Promise<ForgetBackupResult> {
+  return rpc<ForgetBackupResult>("forget_backup", params);
+}
+
+// ---------------------------------------------------------------------------
+// Convenience: namespace import for call sites that prefer `api.xxx`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Default namespace export — lets call sites write:
+ *
+ *     import api from "../api/rpc";
+ *     await api.analyzeDirectory({ path });
+ *
+ * Equivalent to named imports; pick whichever style suits the file.
+ */
+const api = {
+  // diagnostics
+  ping,
+  version,
+  systemInfo,
+  engineGpuStatus,
+  preflight,
+  wslStatus,
+  nativeVenvStatus,
+  // install
+  installWSL,
+  installVibechekInWSL,
+  installCudaLibsInWSL,
+  installEssentiaNative,
+  repairWSLShim,
+  // analysis
+  scanDirectory,
+  scanOnly,
+  analyzeDirectory,
+  // duplicates
+  findDuplicates,
+  handleDuplicates,
+  // organize
+  planOrganization,
+  organize,
+  // tags
+  applyMlTags,
+  backupTags,
+  restoreTags,
+  restoreTagsWithRemap,
+  // models
+  downloadModels,
+  // config
+  getConfig,
+  saveConfig,
+  restoreDefaultConfig,
+  // ops
+  cancelOperation,
+  // library state
+  libraryState,
+  forgetLibrary,
+  loadRecentAnalysis,
+  // logging / history
+  getLogTail,
+  backupHistory,
+  forgetBackup,
+};
+
+export default api;

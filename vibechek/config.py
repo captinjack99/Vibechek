@@ -4,21 +4,29 @@ Every knob the legacy scripts expose as a CLI flag should live here, with a
 sane default, so the future GUI can render them as form fields without
 needing to know which subcommand they belong to.
 
-Persistence: TOML round-trip via tomllib (read) + tomli_w (write). The default
-location is `<user_config_dir>/vibechek/config.toml`. Load is graceful — a
-missing or unparseable file falls back to defaults rather than raising.
+Persistence: JSON round-trip via the stdlib `json` module. The default location
+is `<user_config_dir>/vibechek/config.json`. Older `config.toml` files (from
+before 0.3.0) are read as a one-time migration fallback and rewritten as JSON
+on the next save. Load is graceful — a missing or unparseable file falls back
+to defaults rather than raising.
+
+Why JSON instead of TOML: TOML has no null type, which forces an awkward "drop
+the key" round-trip every time a field defaults to `None` — silently lossy and
+a future-bug magnet (audit #10). JSON has native null, primitive types, and is
+stdlib-only.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import tomllib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-import tomli_w
 from platformdirs import user_config_dir, user_data_dir
+
+from vibechek.io import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +34,9 @@ APP_NAME = "Vibechek"
 CONFIG_DIR = Path(user_config_dir(APP_NAME))
 DATA_DIR = Path(user_data_dir(APP_NAME))
 MODELS_DIR = DATA_DIR / "models"
-CONFIG_FILE = CONFIG_DIR / "config.toml"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+# Pre-0.3.0 TOML file — read as one-time migration if config.json is absent.
+LEGACY_CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 
 @dataclass
@@ -51,10 +61,23 @@ class TaggingConfig:
     """Controls for writing tags back to files."""
 
     genre_confidence_threshold: float = 0.85  # 85% — matches legacy default
+    # Two-stage confidence: if subgenre confidence is below the strict 85%
+    # threshold above but the PARENT GENRE confidence (i.e. the summed
+    # family score) clears this floor, we write the parent genre into the
+    # genre field instead of leaving the track tagless. Empirically lifts
+    # coverage from ~53% to ~85% on the test library — a track whose model
+    # is genuinely confused between Deep House and Tech House should still
+    # get tagged "House" rather than dropped entirely.
+    parent_genre_confidence_threshold: float = 0.50
     write_subgenre_as_main_genre: bool = True  # Rekordbox can only sort by main genre
     preserve_rekordbox_frames: bool = True  # GEOB / PRIV — cue points, beat grids
     backup_before_write: bool = True
     skip_bpm_and_key: bool = True  # Trust Rekordbox over the ML BPM/key models
+    # ID3 text-frame encoding for MP3 writes. 0 = ISO-8859-1, 1 = UTF-16,
+    # 3 = UTF-8 (mutagen's `Encoding.UTF8`). Rekordbox 5 and some older DJ
+    # software only read encoding 0 or 1 — UTF-8 frames look empty to them.
+    # Default stays UTF-8 (modern); users on old Rekordbox can switch to 1.
+    id3_text_encoding: int = 3
 
 
 @dataclass
@@ -104,32 +127,73 @@ class VibechekConfig:
         """Load config from disk, falling back to defaults on any error.
 
         Never raises — corrupted user config shouldn't break the app.
-        """
-        target = path or CONFIG_FILE
-        if not target.exists():
-            return cls()
 
+        Resolution order:
+          1. If `path` is given, load that file (JSON).
+          2. Otherwise, try `CONFIG_FILE` (JSON).
+          3. Otherwise, fall back to `LEGACY_CONFIG_FILE` (TOML) for a one-time
+             migration. The next `save()` rewrites it as JSON.
+        """
+        if path is not None:
+            return cls._load_json(path)
+
+        if CONFIG_FILE.exists():
+            return cls._load_json(CONFIG_FILE)
+
+        if LEGACY_CONFIG_FILE.exists():
+            log.info(
+                "Migrating legacy TOML config from %s — next save will write JSON.",
+                LEGACY_CONFIG_FILE,
+            )
+            return cls._load_toml(LEGACY_CONFIG_FILE)
+
+        return cls()
+
+    @classmethod
+    def _load_json(cls, target: Path) -> "VibechekConfig":
         try:
-            raw = tomllib.loads(target.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as e:
+            raw = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
             log.warning("Could not load config from %s: %s — using defaults", target, e)
             return cls()
-
         try:
             return cls._from_dict(raw)
         except Exception as e:  # noqa: BLE001
             log.warning("Could not parse config from %s: %s — using defaults", target, e)
             return cls()
 
+    @classmethod
+    def _load_toml(cls, target: Path) -> "VibechekConfig":
+        # Import lazily — tomllib is only needed for the rare migration path,
+        # and we want module import to stay cheap.
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover — Python <3.11; we require 3.10+
+            log.warning("tomllib unavailable; cannot read legacy %s", target)
+            return cls()
+        try:
+            raw = tomllib.loads(target.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            log.warning("Could not load legacy TOML config from %s: %s — using defaults", target, e)
+            return cls()
+        try:
+            return cls._from_dict(raw)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not parse legacy TOML config from %s: %s — using defaults", target, e)
+            return cls()
+
     def save(self, path: Path | None = None) -> Path:
-        """Write the current config to disk as TOML.
+        """Write the current config to disk as JSON.
 
         Returns the final destination path. Creates parent dirs as needed.
         """
         target = path or CONFIG_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
-        payload = _to_toml_dict(self)
-        target.write_bytes(tomli_w.dumps(payload).encode("utf-8"))
+        payload = _to_jsonable(self)
+        # Atomic write: a kill-during-write of config.json used to leave an
+        # empty file that the next launch read as "use defaults", silently
+        # erasing the user's settings.
+        atomic_write_json(target, payload, indent=2, sort_keys=True)
         return target
 
     @classmethod
@@ -149,30 +213,98 @@ class VibechekConfig:
 
 
 def _subset(cls: type, data: dict[str, Any]) -> Any:
-    """Build `cls` from `data`, dropping unknown keys + coercing Paths.
+    """Build `cls` from `data`, dropping unknown keys + coercing field types.
 
-    Lets us evolve the dataclass without breaking older config files.
+    Lets us evolve the dataclass without breaking older config files. On a
+    coercion failure we fall back to the dataclass default for that field
+    rather than crashing — the user sees a warning naming the bad value.
     """
-    valid_fields = {f.name: f.type for f in fields(cls)}
+    valid_fields = {f.name: f for f in fields(cls)}
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
         if key not in valid_fields:
             continue  # Unknown / removed field — ignore
-        ftype = valid_fields[key]
-        kwargs[key] = _coerce(ftype, value)
+        f = valid_fields[key]
+        try:
+            kwargs[key] = _coerce(f.type, value)
+        except (TypeError, ValueError) as e:
+            log.warning(
+                "Config field %s.%s has invalid value %r (%s); using default",
+                cls.__name__, key, value, e,
+            )
+            # Falling through without setting kwargs[key] uses the dataclass default.
     return cls(**kwargs)
 
 
 def _coerce(ftype: Any, value: Any) -> Any:
-    """Bring TOML-decoded primitives back to their dataclass types."""
+    """Bring a decoded primitive back to its dataclass type.
+
+    Handles:
+      - `None` passthrough (Optional fields).
+      - `Path` (str → Path).
+      - `bool` (accepts truthy/falsy strings, case-insensitive).
+      - `int` / `float` (numeric strings coerced; non-numeric raises).
+      - `str` (anything → str via `str()`).
+      - Anything else → passthrough.
+
+    Raises `TypeError` or `ValueError` on coercion failure; `_subset` catches
+    those and falls back to the field default.
+    """
+    if value is None:
+        return None
+
     type_str = str(ftype)
-    if "Path" in type_str and value is not None and not isinstance(value, Path):
+
+    # Path (or Optional[Path]) — the dataclass field annotation is a string
+    # under `from __future__ import annotations`, so substring match is what
+    # we have without `typing.get_type_hints` (which fails on lazy hints here).
+    if "Path" in type_str:
+        if isinstance(value, Path):
+            return value
         return Path(str(value))
+
+    # bool BEFORE int — `bool` is a subclass of `int` in Python, and `isinstance`
+    # checks would treat True/False as ints. Match by type string.
+    if "bool" in type_str:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in ("true", "yes", "1", "on"):
+                return True
+            if lowered in ("false", "no", "0", "off"):
+                return False
+            raise ValueError(f"cannot interpret {value!r} as bool")
+        raise TypeError(f"cannot coerce {type(value).__name__} to bool")
+
+    if "int" in type_str:
+        if isinstance(value, bool):
+            # `True`/`False` shouldn't sneak into an int field as 1/0; treat
+            # as a config mistake.
+            raise TypeError("bool given for int field")
+        return int(value)
+
+    if "float" in type_str:
+        if isinstance(value, bool):
+            raise TypeError("bool given for float field")
+        return float(value)
+
+    if "str" in type_str:
+        if isinstance(value, str):
+            return value
+        return str(value)
+
     return value
 
 
-def _to_toml_dict(cfg: VibechekConfig) -> dict[str, Any]:
-    """Convert config → JSON-safe dict that tomli_w can serialize."""
+def _to_jsonable(cfg: VibechekConfig) -> dict[str, Any]:
+    """Convert config → JSON-safe dict.
+
+    Paths become strings; None passes through (JSON has native null). Used for
+    on-disk persistence AND for the RPC wire shape (via `_stringify_paths`).
+    """
     out: dict[str, Any] = {}
     for section_name, section_value in asdict(cfg).items():
         out[section_name] = _stringify_paths(section_value)
@@ -180,13 +312,18 @@ def _to_toml_dict(cfg: VibechekConfig) -> dict[str, Any]:
 
 
 def _stringify_paths(value: Any) -> Any:
-    """Make a value safe for tomli_w: stringify Paths, drop None (TOML has no null)."""
+    """Make a value JSON-safe by stringifying Paths.
+
+    None passes through (JSON encodes it as `null`). Nested dicts/lists are
+    walked recursively. This was previously stripping None from dicts to
+    accommodate TOML — that's no longer needed under JSON.
+    """
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
-        return {k: _stringify_paths(v) for k, v in value.items() if v is not None}
+        return {k: _stringify_paths(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [_stringify_paths(v) for v in value if v is not None]
+        return [_stringify_paths(v) for v in value]
     return value
 
 
@@ -196,6 +333,7 @@ __all__ = [
     "DATA_DIR",
     "MODELS_DIR",
     "CONFIG_FILE",
+    "LEGACY_CONFIG_FILE",
     "AnalysisConfig",
     "TaggingConfig",
     "DuplicateConfig",

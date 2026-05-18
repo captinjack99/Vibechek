@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a new feature or improvement.
+title: "[feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you'd like
+      placeholder: "Describe the feature."
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What's the DJ workflow / use case this unlocks?
+      placeholder: "When I'm prepping a 2-hour open-format set, I want to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've tried
+      placeholder: "I currently work around this by..."
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Rough scope guess
+      options:
+        - I have no idea
+        - Small (UI tweak, new config option)
+        - Medium (new view, new RPC method)
+        - Large (architectural change)

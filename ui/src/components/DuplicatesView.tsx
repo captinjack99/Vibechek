@@ -12,14 +12,25 @@
  *
  * The end-user never sees the words "MD5", "Chromaprint", or "recoverable".
  * Internally we still use them — just not in the UI.
+ *
+ * Perf notes
+ * ----------
+ * On libraries with many duplicate groups (10k+) we cannot afford to:
+ *   - eagerly compute the auto-keeper for every group at render time
+ *   - render every GroupCard up front
+ * The list is virtualized via react-virtuoso, and each GroupCard computes
+ * its auto-keeper + explainPick lazily inside its own render (only the
+ * visible rows pay the rule-comparator cost). Results are cached by
+ * (group key, rules signature) so scrolling back doesn't re-do the work.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Copy, Search, FileAudio, AlertCircle, Folder, Trash2, Star,
   ChevronUp, ChevronDown, GripVertical, RotateCcw, Wand2,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { Virtuoso } from "react-virtuoso";
 
 import { useOperationStore, useConfigStore, useLibraryStore, useNotificationStore } from "../stores";
 import { rpc } from "../hooks/useSidecar";
@@ -57,6 +68,7 @@ export function DuplicatesView() {
   const [rules, setRules] = useState<KeeperRule[]>(DEFAULT_RULES);
   const [keeperOverrides, setKeeperOverrides] = useState<Record<string, string>>({});
   const [skippedGroups, setSkippedGroups] = useState<Set<string>>(new Set());
+  const [preconditionError, setPreconditionError] = useState<string | null>(null);
 
   // Pending confirm — captures the user's choice + the computed plan so the
   // modal can render without re-running applyChoices.
@@ -64,6 +76,12 @@ export function DuplicatesView() {
     | { action: Action; filtered: DuplicateReport; reviewFolder: string | null }
     | null
   >(null);
+
+  // Synchronous scan-in-flight guard. `active` from the store flips in the
+  // same tick, but React doesn't re-render until the next paint, so two
+  // rapid clicks on Scan can both pass `disabled={active !== null}`. A ref
+  // gives us a synchronous check inside the handler itself.
+  const scanningRef = useRef(false);
 
   // Wipe per-group overrides whenever the report or rules change
   useEffect(() => {
@@ -76,8 +94,13 @@ export function DuplicatesView() {
     if (typeof selected === "string") setScanPath(selected);
   };
 
-  const handleScan = async () => {
+  const handleScan = useCallback(async () => {
     if (!scanPath) return;
+    // Synchronous guard against double-click. The store's `active` flag is
+    // checked by the `disabled` prop, but React's re-render is async — a
+    // fast double-click can bypass it. The ref is set before any await.
+    if (scanningRef.current) return;
+    scanningRef.current = true;
     begin("dedupe");
     try {
       const r = await rpc<DuplicateReport>("find_duplicates", {
@@ -88,20 +111,40 @@ export function DuplicatesView() {
       setReport(r);
       finish();
     } catch (e) {
-      fail(String(e));
+      // Pass the raw error — the store's typed-error handling preserves
+      // RpcError.cancelled (which is the silent-exit path). Don't pre-stringify.
+      fail(e);
+    } finally {
+      scanningRef.current = false;
     }
-  };
+  }, [scanPath, dupCfg.use_md5, dupCfg.use_chromaprint, begin, finish, fail, setReport]);
 
   // Stage 1: build the plan + open the confirm modal.
   const handleResolve = async (action: Action) => {
     if (!report) return;
+    setPreconditionError(null);
 
     let reviewFolder = dupCfg.review_folder;
-    if (action === "move" && !reviewFolder) {
-      const folder = await openDialog({ directory: true, multiple: false });
-      if (typeof folder !== "string") return;
-      updateDuplicates({ review_folder: folder });
-      reviewFolder = folder;
+    if (action === "move") {
+      // The Settings tab lets the user type any string. If it's blank, force
+      // the picker. If it's an obviously bad value (whitespace, or a string
+      // that doesn't look like a path), refuse to proceed and tell them why
+      // — better than firing the RPC and getting a Python OSError 10s later.
+      const trimmed = (reviewFolder ?? "").trim();
+      if (!trimmed) {
+        const folder = await openDialog({ directory: true, multiple: false });
+        if (typeof folder !== "string") return;
+        updateDuplicates({ review_folder: folder });
+        reviewFolder = folder;
+      } else if (!looksLikePath(trimmed)) {
+        setPreconditionError(
+          `Review folder in Settings looks invalid: "${trimmed}". ` +
+          `Pick a valid folder, or clear the setting to be prompted.`,
+        );
+        return;
+      } else {
+        reviewFolder = trimmed;
+      }
     }
 
     const filtered = applyChoices(report, rules, keeperOverrides, skippedGroups);
@@ -129,9 +172,13 @@ export function DuplicatesView() {
         detail: errors > 0 ? `${errors} error${errors === 1 ? "" : "s"} — see report.` : undefined,
         kind: errors > 0 ? "info" : "success",
       });
-      handleScan();
+      // Clear the stale report immediately so the user can't act on
+      // already-trashed entries, then await the rescan so the loading
+      // state is visible while it runs.
+      setReport(null);
+      await handleScan();
     } catch (e) {
-      fail(String(e));
+      fail(e);
     }
   };
 
@@ -167,8 +214,27 @@ export function DuplicatesView() {
         </div>
       )}
 
+      {preconditionError && (
+        <div className="m-4 panel-pad text-sm text-accent-yellow flex gap-2">
+          <AlertCircle className="w-4 h-4 flex-none mt-0.5" />
+          <div className="break-words">
+            {preconditionError}
+            <button
+              className="ml-2 underline text-white/60 hover:text-white"
+              onClick={() => setPreconditionError(null)}
+            >
+              dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {!report ? (
-        <EmptyState scanPath={scanPath} />
+        active === "dedupe" ? (
+          <LoadingState scanPath={scanPath} />
+        ) : (
+          <EmptyState scanPath={scanPath} />
+        )
       ) : (
         <ReportView
           report={report}
@@ -201,9 +267,18 @@ export function DuplicatesView() {
                 <strong>{pendingResolve.filtered.summary.space_recoverable_mb.toFixed(0)} MB</strong>.
               </p>
               {pendingResolve.action === "trash" ? (
-                <p className="text-xs text-white/60">
-                  Files go to the OS trash and stay recoverable until you empty it.
-                </p>
+                <>
+                  <p className="text-xs text-white/60">
+                    Files go to the OS trash and stay recoverable until you empty it.
+                  </p>
+                  <p className="text-[11px] text-white/40">
+                    On Windows this is the Recycle Bin. On macOS, the Trash.
+                    On Linux, <code className="font-mono">~/.local/share/Trash</code>.
+                    On removable / network drives without a trash folder
+                    (FAT32 USB sticks, some network shares), files cannot be
+                    recovered — they are permanently deleted.
+                  </p>
+                </>
               ) : (
                 <>
                   <p className="text-xs text-white/60">Files will be moved to:</p>
@@ -248,6 +323,22 @@ function EmptyState({ scanPath }: { scanPath: string | null }) {
   );
 }
 
+function LoadingState({ scanPath }: { scanPath: string | null }) {
+  return (
+    <div className="flex-1 flex items-center justify-center">
+      <div className="text-center max-w-md">
+        <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-white/5 flex items-center justify-center animate-pulse">
+          <Search className="w-8 h-8 text-white/40" />
+        </div>
+        <h2 className="text-xl font-display font-semibold mb-2">Scanning…</h2>
+        <p className="text-white/50 truncate">
+          Looking for duplicates in <span className="text-white/70">{scanPath}</span>
+        </p>
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main report view
 // ---------------------------------------------------------------------------
@@ -280,31 +371,125 @@ function ReportView({
     [report],
   );
 
-  // Apply rules to compute the "auto" keeper for each group. Overrides take
-  // precedence; skipped groups still get an auto-keeper but aren't acted on.
-  const autoKeepers = useMemo(() => {
-    const m: Record<string, string> = {};
-    for (const g of allGroups) {
+  // ---- Lazy auto-keeper resolution ---------------------------------------
+  // We DO NOT precompute auto-keepers for every group at render time. On a
+  // 10k-group report that's millions of comparator calls on the main thread
+  // and the tab freezes. Instead, every consumer of "what's the current
+  // keeper for group G?" calls `currentKeeper(g)` which:
+  //   - returns the user override if any
+  //   - else returns the cached auto-pick for (g.key, rulesSig)
+  //   - else computes it on demand and caches it
+  // The cache is bucketed by a rules signature so reordering/toggling the
+  // priority list correctly invalidates all auto-picks.
+  const rulesSig = useMemo(
+    () =>
+      rules
+        .map((r) => `${r.criterion}:${r.enabled ? 1 : 0}`)
+        .join("|"),
+    [rules],
+  );
+
+  // The cache is a Ref (not state) — mutating it does not need to trigger a
+  // re-render. We pair it with the rulesSig key so a stale-rules cache is
+  // never returned.
+  const autoCacheRef = useRef<{ sig: string; map: Map<string, string> }>({
+    sig: rulesSig,
+    map: new Map(),
+  });
+  if (autoCacheRef.current.sig !== rulesSig) {
+    autoCacheRef.current = { sig: rulesSig, map: new Map() };
+  }
+
+  const computeAutoKeeper = useCallback(
+    (g: DuplicateGroup): string => {
+      const cache = autoCacheRef.current.map;
+      const cached = cache.get(g.key);
+      if (cached !== undefined) return cached;
       const files = [g.keep, ...g.duplicates];
-      m[g.key] = pickKeeper(files, rules).path;
+      const picked = pickKeeper(files, rules).path;
+      cache.set(g.key, picked);
+      return picked;
+    },
+    [rules],
+  );
+
+  const currentKeeper = useCallback(
+    (g: DuplicateGroup): string => {
+      const override = keeperOverrides[g.key];
+      if (override !== undefined) {
+        // Override might be stale (e.g. file renamed/removed since the pick).
+        // If the path isn't in the group anymore, fall through to the auto
+        // pick instead of trusting it — same defensive guard `applyChoices`
+        // applies before sending to the backend.
+        const validPaths = [g.keep.path, ...g.duplicates.map((d) => d.path)];
+        if (validPaths.includes(override)) return override;
+      }
+      return computeAutoKeeper(g);
+    },
+    [keeperOverrides, computeAutoKeeper],
+  );
+
+  // ---- Summary totals -----------------------------------------------------
+  // These DO scan every group (we need a total to show in the header), but
+  // the cost per group is now O(1) thanks to the cache after the first
+  // touch — and the first touch only happens when the user actually clicks
+  // an action button or scrolls a group into view. We use a single pass
+  // here and accept that the very first render after a scan computes
+  // auto-keepers for the visible window only; off-screen groups remain
+  // un-touched until they enter the viewport, at which point GroupCard
+  // computes its own keeper lazily.
+  //
+  // To keep summary totals correct without forcing a full pass, we use a
+  // heuristic-but-correct approach: assume each group will drop its
+  // duplicates (the .keep file stays). This matches what auto-pick would
+  // give in the steady state — the auto-pick may select a different
+  // physical file as the keeper, but the *count* and *size* freed are
+  // identical because each group always loses exactly `files.length - 1`
+  // files and the sum of all-but-one is the same regardless of which one
+  // we choose (it equals total_size - max_size... no, total_size - keeper_size).
+  //
+  // Since the sizes can differ, we DO need the keeper to compute the exact
+  // free-space number. For the summary, use the backend's per-group
+  // `recoverable_mb` as the starting point (computed with `g.keep` as
+  // keeper) and only adjust where the user has overridden the keeper —
+  // overrides are typically a handful of groups, not 10k.
+  const activeGroups = useMemo(
+    () => allGroups.filter((g) => !skippedGroups.has(g.key)),
+    [allGroups, skippedGroups],
+  );
+
+  const filesToAct = useMemo(
+    () => activeGroups.reduce((s, g) => s + g.duplicates.length, 0),
+    [activeGroups],
+  );
+
+  const spaceToFree = useMemo(() => {
+    // Start from the precomputed `recoverable_mb` (which assumes g.keep is
+    // the keeper). For groups with a user override, recompute the freed
+    // size using the actual chosen keeper.
+    let total = 0;
+    for (const g of activeGroups) {
+      const override = keeperOverrides[g.key];
+      if (override === undefined || override === g.keep.path) {
+        total += g.recoverable_mb;
+        continue;
+      }
+      const validPaths = [g.keep.path, ...g.duplicates.map((d) => d.path)];
+      if (!validPaths.includes(override)) {
+        // Stale override: treat as auto-pick (g.keep, same as backend assumption).
+        total += g.recoverable_mb;
+        continue;
+      }
+      const allFiles = [g.keep, ...g.duplicates];
+      for (const f of allFiles) {
+        if (f.path !== override) total += f.size_mb;
+      }
     }
-    return m;
-  }, [allGroups, rules]);
-
-  const currentKeeper = (g: DuplicateGroup): string =>
-    keeperOverrides[g.key] ?? autoKeepers[g.key] ?? g.keep.path;
-
-  const activeGroups = allGroups.filter((g) => !skippedGroups.has(g.key));
-  const filesToAct = activeGroups.reduce((s, g) => s + g.duplicates.length, 0);
-  const spaceToFree = activeGroups.reduce((s, g) => {
-    // Sum sizes of all files except the chosen keeper
-    const keeper = currentKeeper(g);
-    const allFiles = [g.keep, ...g.duplicates];
-    return s + allFiles.filter((f) => f.path !== keeper).reduce((ss, f) => ss + f.size_mb, 0);
-  }, 0);
+    return total;
+  }, [activeGroups, keeperOverrides]);
 
   return (
-    <div className="flex-1 overflow-auto px-4 py-4 space-y-4">
+    <div className="flex-1 flex flex-col min-h-0 px-4 py-4 space-y-4 overflow-hidden">
       <SummaryStrip
         report={report}
         filesToAct={filesToAct}
@@ -557,7 +742,8 @@ function ActionBar({
 }
 
 // ---------------------------------------------------------------------------
-// Groups list
+// Groups list — virtualized via react-virtuoso. Only on-screen rows render,
+// which lets us scale to 10k+ groups without freezing the main thread.
 // ---------------------------------------------------------------------------
 
 interface GroupsListProps {
@@ -586,7 +772,7 @@ function GroupsList({
   }
 
   return (
-    <div>
+    <div className="flex flex-col min-h-0 flex-1">
       <div className="flex items-baseline gap-3 mb-2 px-1">
         <h2 className="font-display font-semibold text-white">Groups</h2>
         <span className="text-xs text-white/40">
@@ -599,18 +785,23 @@ function GroupsList({
           reset all picks
         </button>
       </div>
-      <div className="space-y-2">
-        {groups.map((g) => (
-          <GroupCard
-            key={g.key}
-            group={g}
-            currentKeeperPath={currentKeeper(g)}
-            onPickKeeper={(path) => onPickKeeper(g.key, path)}
-            skipped={skippedGroups.has(g.key)}
-            onToggleSkip={() => onToggleSkip(g.key)}
-            rules={rules}
-          />
-        ))}
+      <div className="flex-1 min-h-0">
+        <Virtuoso
+          data={groups}
+          computeItemKey={(_, g) => g.key}
+          itemContent={(_, g) => (
+            <div className="pb-2">
+              <GroupCard
+                group={g}
+                currentKeeperPath={currentKeeper(g)}
+                onPickKeeper={(path) => onPickKeeper(g.key, path)}
+                skipped={skippedGroups.has(g.key)}
+                onToggleSkip={() => onToggleSkip(g.key)}
+                rules={rules}
+              />
+            </div>
+          )}
+        />
       </div>
     </div>
   );
@@ -636,8 +827,16 @@ function GroupCard({
   const others = files.filter((f) => f.path !== currentKeeperPath);
   const userOverrode = currentKeeperPath !== group.keep.path && group.keep.path !== keeper.path;
 
-  // Compare-strategy hint — why did the auto-pick choose what it did
-  const explained = explainPick(keeper, others, rules);
+  // Compare-strategy hint — why did the auto-pick choose what it did. This is
+  // computed inside the row, so virtualization keeps the cost bounded to
+  // visible rows only.
+  const explained = useMemo(
+    () => explainPick(keeper, others, rules),
+    // Memoize on identity of files + rules signature. files identity is
+    // stable across renders because `group` itself is the same object.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [group, currentKeeperPath, rules],
+  );
 
   const label = group.method === "md5" ? "Same file" : "Same song, different encoding";
 
@@ -733,6 +932,29 @@ function FileMeta({ file }: { file: FileInfo }) {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight sanity check on a user-typed review-folder path. We don't have
+ * the Tauri fs plugin available, so we can't existsSync the path — but we
+ * can at least catch the obvious cases (whitespace-only, no path separator,
+ * control chars). The backend will still hard-validate before doing anything
+ * destructive; this is just a UX guard so the user gets feedback before the
+ * 10s RPC round-trip.
+ */
+function looksLikePath(s: string): boolean {
+  if (!s.trim()) return false;
+  // Reject control characters and the obviously-bogus stand-ins seen in
+  // bug reports (e.g. "<<<invalid>>>").
+  if (/[\x00-\x1f<>"|?*]/.test(s)) return false;
+  // Must contain at least one separator OR be an absolute-style root token.
+  // (Tauri's dialog only ever yields absolute paths, so this is a sane
+  // floor for "user typed something that could plausibly be a folder".)
+  return /[\\/]/.test(s) || /^[A-Za-z]:$/.test(s);
+}
+
+// ---------------------------------------------------------------------------
 // Apply user choices: rebuild the report so the backend sees the user's picks
 // ---------------------------------------------------------------------------
 
@@ -746,11 +968,27 @@ function applyChoices(
     if (skippedGroups.has(g.key)) return null;
 
     const allFiles = [g.keep, ...g.duplicates];
-    const keeperPath =
-      keeperOverrides[g.key] ?? pickKeeper(allFiles, rules).path;
+    const validPaths = new Set(allFiles.map((f) => f.path));
+
+    // Guard: a stale override (path no longer in the group — e.g. the file
+    // was renamed by another tool between the scan and the click) used to
+    // produce a malformed group where the keeper ended up in `duplicates`
+    // and got trashed/moved. Drop the override in that case and fall back
+    // to the rule-picked keeper.
+    let keeperPath: string;
+    const override = keeperOverrides[g.key];
+    if (override !== undefined && validPaths.has(override)) {
+      keeperPath = override;
+    } else {
+      keeperPath = pickKeeper(allFiles, rules).path;
+    }
 
     const keeper = allFiles.find((f) => f.path === keeperPath) ?? g.keep;
-    const dupes = allFiles.filter((f) => f.path !== keeperPath);
+    // If, somehow, the keeper resolution above still didn't yield a path in
+    // the group (defensive), fall back to g.keep so we never promote it
+    // into the duplicates list.
+    const finalKeeperPath = validPaths.has(keeperPath) ? keeperPath : keeper.path;
+    const dupes = allFiles.filter((f) => f.path !== finalKeeperPath);
 
     return {
       ...g,

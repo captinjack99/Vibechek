@@ -37,13 +37,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
+from vibechek.platform import IS_LINUX, IS_MAC, IS_WINDOWS
+
 log = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int, str], None]
-
-IS_WINDOWS = sys.platform == "win32"
-IS_MAC = sys.platform == "darwin"
-IS_LINUX = sys.platform.startswith("linux")
 
 # Skip the whole module on Windows — WSL is the path there.
 IS_SUPPORTED = IS_MAC or IS_LINUX
@@ -203,14 +201,31 @@ def install_essentia_native(
 
     host_python = _find_host_python()
     if not host_python:
+        # Build OS-specific guidance so the user sees the right command.
+        if IS_MAC:
+            hint = (
+                "On macOS, install Homebrew first (https://brew.sh) then:\n"
+                "    brew install python@3.12\n"
+                "Or use the official installer at https://www.python.org/downloads/macos/\n"
+                "(Vibechek needs Python 3.10 or newer; macOS doesn't ship "
+                "Python by default anymore.)"
+            )
+        elif IS_LINUX:
+            hint = (
+                "On Debian/Ubuntu: sudo apt install python3 python3-pip python3-venv\n"
+                "On Fedora/RHEL:   sudo dnf install python3 python3-pip\n"
+                "On Arch:          sudo pacman -S python python-pip\n"
+                "Vibechek needs Python 3.10 or newer."
+            )
+        else:
+            hint = "Install Python 3.10 or newer for your OS."
         return {
             "ok": False,
-            "error": (
-                "No Python 3.10+ found on PATH. Install Python 3.10 or newer "
-                "(e.g. `brew install python@3.12` on macOS, "
-                "`sudo apt install python3` on Debian/Ubuntu) and try again."
-            ),
+            "error": f"No Python 3.10+ found on PATH.\n\n{hint}",
         }
+
+    # Lazy import — same dependency-direction reasoning as _run_with_progress.
+    from vibechek import cancellation
 
     if on_progress:
         on_progress(0, 100, f"Using host Python: {host_python}")
@@ -221,17 +236,16 @@ def install_essentia_native(
     if not (VENV_DIR / "bin" / "python3").exists() and not (VENV_DIR / "bin" / "python").exists():
         if on_progress:
             on_progress(5, 100, f"Creating venv at {VENV_DIR}...")
-        try:
-            result = subprocess.run(
-                [host_python, "-m", "venv", str(VENV_DIR)],
-                capture_output=True, text=True, timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired) as e:
-            return {"ok": False, "error": f"venv creation failed: {e}"}
-        if result.returncode != 0:
+        rc, _stdout, stderr, cancelled = _run_subprocess_cancellable(
+            [host_python, "-m", "venv", str(VENV_DIR)],
+            timeout=120,
+        )
+        if cancelled or cancellation.is_cancelled():
+            return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+        if rc != 0:
             return {
                 "ok": False,
-                "error": f"venv creation exited with {result.returncode}\n{result.stderr[-1000:]}",
+                "error": f"venv creation exited with {rc}\n{stderr[-1000:]}",
             }
     elif on_progress:
         on_progress(10, 100, f"Venv already exists at {VENV_DIR}, reusing")
@@ -250,6 +264,8 @@ def install_essentia_native(
         on_progress=lambda line: on_progress and on_progress(15, 100, line[:120]),
         timeout=120,
     )
+    if cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
     if rc != 0:
         return _fail("pip/wheel upgrade", rc, tail)
 
@@ -263,6 +279,8 @@ def install_essentia_native(
         ),
         timeout=60 * 15,  # 15 min ceiling — usually ~3-5 min on a decent connection
     )
+    if cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
     if rc != 0:
         return _fail("essentia-tensorflow install", rc, tail)
 
@@ -275,6 +293,8 @@ def install_essentia_native(
         on_progress=lambda line: on_progress and on_progress(90, 100, line[:120]),
         timeout=60 * 10,
     )
+    if cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
     if rc != 0:
         return _fail("vibechek install", rc, tail)
 
@@ -282,17 +302,25 @@ def install_essentia_native(
     if on_progress:
         on_progress(95, 100, "Verifying install...")
     venv_vibechek = VENV_DIR / "bin" / "vibechek"
-    try:
-        version_result = subprocess.run(
-            [str(venv_vibechek), "--version"],
-            capture_output=True, text=True, timeout=10,
-        )
-        essentia_result = subprocess.run(
-            [str(venv_python), "-c", "import essentia; print(essentia.__version__)"],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return {"ok": False, "error": f"verification failed: {e}"}
+    v_rc, v_stdout, v_stderr, v_cancel = _run_subprocess_cancellable(
+        [str(venv_vibechek), "--version"], timeout=10,
+    )
+    if v_cancel or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+    e_rc, e_stdout, e_stderr, e_cancel = _run_subprocess_cancellable(
+        [str(venv_python), "-c", "import essentia; print(essentia.__version__)"],
+        timeout=30,
+    )
+    if e_cancel or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+    # Build a CompletedProcess-shaped result so the existing code path below
+    # doesn't need to change shape.
+    version_result = subprocess.CompletedProcess(
+        [str(venv_vibechek), "--version"], v_rc, v_stdout, v_stderr,
+    )
+    essentia_result = subprocess.CompletedProcess(
+        [str(venv_python), "-c", "import essentia"], e_rc, e_stdout, e_stderr,
+    )
 
     if version_result.returncode != 0 or essentia_result.returncode != 0:
         return {
@@ -355,7 +383,19 @@ def _run_with_progress(
 
     Returns (returncode, last-N-lines). On timeout, kills the process and
     returns -1 plus whatever we collected.
+
+    Cooperatively cancellable: a watchdog thread polls
+    `vibechek.cancellation.is_cancelled()` every 500ms and terminates the
+    child process if the user requests cancel. Without this, the GUI's Cancel
+    button would flip the flag but the (potentially multi-minute) pip install
+    would keep running, holding the long-op lock. Returns rc=-1 with a
+    `cancelled by user` marker line so callers can surface it cleanly.
     """
+    # Local import — keeps this module importable without pulling the
+    # cancellation module in (it's tiny but the dependency direction matters
+    # for the wsl module too).
+    from vibechek import cancellation
+
     try:
         proc = subprocess.Popen(
             args,
@@ -387,13 +427,108 @@ def _run_with_progress(
 
     drainer = _threading.Thread(target=_drain, daemon=True)
     drainer.start()
+
+    # Watchdog: tear the child down on cancel. Same pattern as
+    # run_vibechek_in_native_venv / run_vibechek_in_wsl.
+    cancel_done = _threading.Event()
+    cancelled_flag: dict[str, bool] = {"v": False}
+
+    def _watch_cancel() -> None:
+        while not cancel_done.is_set() and proc.poll() is None:
+            if cancellation.is_cancelled():
+                cancelled_flag["v"] = True
+                log.info(
+                    "Install subprocess cancellation requested — terminating PID %s",
+                    proc.pid,
+                )
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                return
+            cancel_done.wait(0.5)
+
+    watchdog = _threading.Thread(target=_watch_cancel, daemon=True)
+    watchdog.start()
+
     try:
         rc = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
+        cancel_done.set()
         return -1, tail + [f"Killed after {timeout}s timeout"]
+    cancel_done.set()
     drainer.join(timeout=5)
+    if cancelled_flag["v"]:
+        return -1, tail + ["Cancelled by user"]
     return rc, tail
+
+
+def _run_subprocess_cancellable(
+    args: list[str],
+    timeout: int,
+) -> tuple[int, str, str, bool]:
+    """Run a non-streaming subprocess with cancellation polling.
+
+    For short, capture_output-style calls (venv create, --version checks).
+    Same watchdog pattern as `_run_with_progress`. Returns
+    `(returncode, stdout, stderr, cancelled)`.
+    """
+    from vibechek import cancellation
+
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as e:
+        return -1, "", str(e), False
+
+    cancel_done = _threading.Event()
+    cancelled_flag: dict[str, bool] = {"v": False}
+
+    def _watch_cancel() -> None:
+        while not cancel_done.is_set() and proc.poll() is None:
+            if cancellation.is_cancelled():
+                cancelled_flag["v"] = True
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                return
+            cancel_done.wait(0.5)
+
+    watchdog = _threading.Thread(target=_watch_cancel, daemon=True)
+    watchdog.start()
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        cancel_done.set()
+        return -1, "", "timeout", False
+    cancel_done.set()
+    return rc, stdout or "", stderr or "", cancelled_flag["v"]
 
 
 # ---------------------------------------------------------------------------

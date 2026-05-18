@@ -99,11 +99,19 @@ state and exposes a one-click fix:
 1. Open **Settings → System**.
 2. If you have an NVIDIA GPU but the engine probe shows:
    *"…is visible to WSL, but TensorFlow can&apos;t use it — required CUDA
-   libraries are missing"*, click **Enable GPU (install CUDA libs)**.
-3. The installer adds NVIDIA's apt repo and installs ~600 MB of runtime libs
-   in your WSL Ubuntu. Takes ~5 min on a typical connection.
+   libraries are missing"*, click **Enable GPU (install CUDA wheels)**.
+3. The installer downloads NVIDIA's CUDA runtime wheels from PyPI
+   (`nvidia-cublas-cu11`, `nvidia-cudnn-cu11`, `nvidia-cufft-cu11`,
+   `nvidia-cusparse-cu11`) into the managed venv — about 200 MB total,
+   ~30 seconds on a normal connection.
 4. The probe automatically re-runs; the row turns green and shows your card
    name (e.g. "NVIDIA GeForce RTX 4070 Laptop GPU").
+
+The pip-wheel approach works on **every Linux distribution**: Ubuntu 20.04,
+22.04, 24.04, Debian, anything WSL can run. No apt repo configuration, no
+NVIDIA keyring, no root required. The wheels ship the `.so` files directly,
+Vibechek generates `~/.vibechek/cuda-env.sh` to expose them to TF, and the
+venv's `vibechek` shim is patched to source it on launch.
 
 Vibechek will not lie to you about the GPU. If your card is visible to the
 host but Essentia can't actually use it (driver / lib version mismatch), the
@@ -114,14 +122,13 @@ cores in use.
 **Doing it by hand:**
 
 ```bash
-wsl -d Ubuntu -u root -- bash -lc '
-  curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/k.deb &&
-  dpkg -i /tmp/k.deb && rm /tmp/k.deb &&
-  apt update &&
-  apt install -y libcublas-11-8 libcufft-11-8 libcudnn8 libcusparse-11-8'
+wsl -d Ubuntu -- bash -lc '
+  ~/.vibechek/venv/bin/pip install \
+    nvidia-cublas-cu11 nvidia-cudnn-cu11 \
+    nvidia-cufft-cu11 nvidia-cusparse-cu11'
 ```
 
-(Substitute `ubuntu2204` / `ubuntu2004` for older Ubuntu versions.)
+Then set `LD_LIBRARY_PATH` to include the resulting `~/.vibechek/venv/lib/python3.*/site-packages/nvidia/*/lib` directories, or just re-run the GUI "Enable GPU" button and it'll regenerate `cuda-env.sh` for you.
 
 ### Skipping analyze entirely
 

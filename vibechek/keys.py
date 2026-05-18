@@ -52,6 +52,10 @@ KEY_SHORTHAND: dict[str, str] = {
 _CAMELOT_RE = re.compile(r"^([1-9]|1[0-2])([AB])$", re.IGNORECASE)
 _KEY_PARSE_RE = re.compile(r"^([A-Ga-g][#b]?)\s*(maj|min|major|minor|m)?", re.IGNORECASE)
 
+# Valid harmonic-mixing modes. Each picks a different set of "compatible"
+# Camelot wheels relative to a starting key. Order roughly: tightest to loosest.
+COMPATIBLE_MODES = ("strict", "harmonic", "energy", "energy-boost")
+
 
 def key_to_camelot(key_str: str | None) -> str | None:
     """Normalize any key representation to Camelot (e.g. '8A', '11B').
@@ -82,4 +86,104 @@ def key_to_camelot(key_str: str | None) -> str | None:
     return None
 
 
-__all__ = ["KEY_TO_CAMELOT", "KEY_SHORTHAND", "key_to_camelot"]
+def _parse_camelot(value: str | None) -> tuple[int, str] | None:
+    """Return (number, letter) for a Camelot string, or None for garbage input.
+
+    Accepts both raw Camelot (`"8A"`) and any free-form key that resolves
+    through `key_to_camelot` (`"C minor"` → `("5", "A")`). Anything that
+    doesn't parse returns None — callers should treat that as "no compatible
+    keys" rather than raising, so the UI degrades gracefully on dirty data.
+    """
+    camelot = key_to_camelot(value)
+    if camelot is None:
+        return None
+    m = _CAMELOT_RE.match(camelot)
+    if m is None:
+        return None
+    return int(m.group(1)), m.group(2).upper()
+
+
+def _wrap_camelot(number: int, letter: str) -> str:
+    """Camelot wheel wraps 12 → 1, 0 → 12. Used by every neighbour calculation."""
+    n = ((number - 1) % 12) + 1
+    return f"{n}{letter}"
+
+
+def _flip_letter(letter: str) -> str:
+    return "B" if letter == "A" else "A"
+
+
+def compatible_camelot(key: str | None, mode: str = "energy") -> list[str]:
+    """Return Camelot wheels harmonically compatible with `key` for DJ mixing.
+
+    Modes (matches the LibraryFilters mode toggle):
+      - `strict`        : just the relative key across A/B (8A → [8B]).
+      - `harmonic`      : same letter, ±1 step (8A → [7A, 9A]).
+      - `energy`        : harmonic + relative (8A → [7A, 9A, 8B]). Default.
+      - `energy-boost`  : energy + a +1-semitone modulation (8A → [7A, 9A, 8B, 3A]).
+                          Camelot semitone-up is +7 on the wheel within the same letter.
+
+    Returns `[]` for invalid / missing input rather than raising — the helper
+    is called from filter chips that fire on every render. Order is stable
+    (used directly in the UI for chip placement); no duplicates.
+    """
+    parsed = _parse_camelot(key)
+    if parsed is None:
+        return []
+    number, letter = parsed
+    if mode not in COMPATIBLE_MODES:
+        # Unknown mode → default to the safest "energy" behaviour.
+        mode = "energy"
+
+    result: list[str] = []
+
+    def add(wheel: str) -> None:
+        if wheel not in result:
+            result.append(wheel)
+
+    if mode == "strict":
+        add(_wrap_camelot(number, _flip_letter(letter)))
+        return result
+
+    if mode == "harmonic":
+        add(_wrap_camelot(number - 1, letter))
+        add(_wrap_camelot(number + 1, letter))
+        return result
+
+    # "energy" (and the base of "energy-boost"): ±1 step + relative
+    add(_wrap_camelot(number - 1, letter))
+    add(_wrap_camelot(number + 1, letter))
+    add(_wrap_camelot(number, _flip_letter(letter)))
+
+    if mode == "energy-boost":
+        # +1 semitone modulation: same letter, +7 on the wheel (wraps).
+        add(_wrap_camelot(number + 7, letter))
+
+    return result
+
+
+def is_compatible_with(a: str | None, b: str | None, mode: str = "energy") -> bool:
+    """Symmetric compatibility check. True iff b ∈ compatible(a) OR a == b.
+
+    "Same key" is always compatible — DJs mix tracks in identical keys all the
+    time. Either input being unparseable returns False (no half-known matches).
+    """
+    a_parsed = _parse_camelot(a)
+    b_parsed = _parse_camelot(b)
+    if a_parsed is None or b_parsed is None:
+        return False
+    a_camelot = _wrap_camelot(*a_parsed)
+    b_camelot = _wrap_camelot(*b_parsed)
+    if a_camelot == b_camelot:
+        return True
+    return b_camelot in compatible_camelot(a_camelot, mode=mode)
+
+
+__all__ = [
+    "KEY_TO_CAMELOT",
+    "KEY_SHORTHAND",
+    "COMPATIBLE_MODES",
+    "key_to_camelot",
+    "compatible_camelot",
+    "is_compatible_with",
+]

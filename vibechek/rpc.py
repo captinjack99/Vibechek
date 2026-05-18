@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 import traceback
@@ -42,6 +43,12 @@ log = logging.getLogger(__name__)
 # by the cancellation singleton (one at a time), but quick reads (config,
 # system_info, preflight) can interleave so the GUI stays responsive.
 _DISPATCH_WORKERS = 8
+
+# Held while we check-and-reserve the cancellation singleton — see _dispatch.
+# Without this, two cancellable RPCs landing on the thread pool simultaneously
+# both pass the `is current_kind() None` check, both call `begin(kind)`, and
+# the second clobbers the first's `_current_kind` entry.
+_LONG_OP_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +94,31 @@ def _json_default(o: Any) -> Any:
     raise TypeError(f"{type(o).__name__} is not JSON serializable")
 
 
+# Throttle state for _emit_progress. Long ops (analyze) can emit thousands of
+# notifications per second; if the Tauri stdout reader falls behind (frontend
+# unfocused / OS context switch), the pipe buffer fills and
+# `_StdoutWriter.write` blocks the worker thread, stalling the whole analyze.
+# Audit #24.
+_LAST_PROGRESS_TIME = 0.0
+_PROGRESS_MIN_INTERVAL_SEC = 0.05  # 20/sec cap
+_PROGRESS_LOCK = threading.Lock()
+
+
 def _emit_progress(current: int, total: int, message: str = "") -> None:
+    """Send a progress notification, throttled to ~20/sec.
+
+    The final tick (current == total) is always allowed through even if
+    rate-limited, so the UI sees completion.
+    """
+    import time as _time
+    global _LAST_PROGRESS_TIME
+    now = _time.monotonic()
+    is_final = total > 0 and current >= total
+    with _PROGRESS_LOCK:
+        if not is_final and (now - _LAST_PROGRESS_TIME) < _PROGRESS_MIN_INTERVAL_SEC:
+            return  # rate-limited
+        _LAST_PROGRESS_TIME = now
+
     _write_message({
         "jsonrpc": "2.0",
         "method": "progress",
@@ -306,6 +337,18 @@ def _native_venv_status(_params: dict) -> dict:
     return to_dict(probe_native_venv())
 
 
+def _repair_wsl_shim(params: dict) -> dict:
+    """Strip the (broken) cuda-env.sh source line from the venv's vibechek shim.
+
+    Diagnostic + repair tool for users whose install_cuda_libs_in_wsl ran on
+    a pre-beta.10 build that incorrectly patched a Python entry point with
+    bash. Safe to call repeatedly; no-op if already clean.
+    """
+    from vibechek.wsl import repair_wsl_shim
+    distro = str(params["distro"])
+    return repair_wsl_shim(distro)
+
+
 def _install_cuda_libs_in_wsl(params: dict) -> dict:
     """Install missing CUDA runtime libs (libcublas/libcufft/libcudnn/...) in WSL.
 
@@ -443,6 +486,10 @@ def _apply_ml_tags(params: dict) -> dict:
         genre_confidence_threshold=float(params.get("confidence", 0.85)),
         skip_bpm_and_key=bool(params.get("skip_bpm_and_key", True)),
         preserve_rekordbox_frames=bool(params.get("preserve_rekordbox_frames", True)),
+        # ID3 text-frame encoding: useApplyTags now forwards this from
+        # cfg.tagging.id3_text_encoding (added in beta.9, wired in beta.11).
+        # 3 = UTF-8 default; 1 = UTF-16 for Rekordbox 5 compat; 0 = ISO-8859-1.
+        id3_text_encoding=int(params.get("id3_text_encoding", 3)),
     )
     analysis_data = _load_analysis_payload(params)
     stats = apply_ml_tags(
@@ -474,6 +521,24 @@ def _restore_tags(params: dict) -> dict:
     from vibechek.tagger import restore_tags
 
     stats = restore_tags(Path(params["backup_path"]), on_progress=_emit_progress)
+    return asdict(stats)
+
+
+def _restore_tags_with_remap(params: dict) -> dict:
+    """Restore a tag backup with auto-remap for moved libraries (audit #19).
+
+    Params: {backup_path: str, library_root: str}. The Tags view exposes this
+    as the "Restore (auto-detect moved files)" flow — the user picks both the
+    backup JSON and the directory they want to restore *into*, and the tagger
+    figures out which on-disk file matches each backup entry.
+    """
+    from vibechek.tagger import restore_tags_with_remap
+
+    stats = restore_tags_with_remap(
+        Path(params["backup_path"]),
+        Path(params["library_root"]),
+        on_progress=_emit_progress,
+    )
     return asdict(stats)
 
 
@@ -531,6 +596,179 @@ def _forget_library(params: dict) -> dict:
 
     removed = library_state.forget(params["path"])
     return {"removed": removed}
+
+
+def _rename_library(params: dict) -> dict:
+    """Set a friendly display name on a recent library.
+
+    Params: {path: str, name: str}. Returns {renamed: bool, record?: {...}}.
+    A no-op `renamed=False` when the path isn't in the recent list — this
+    is an instant non-cancellable op so the GUI can fire-and-forget after
+    inline edits.
+    """
+    from vibechek import library_state
+
+    path = params["path"]
+    name = str(params.get("name") or "")
+    record = library_state.rename_library(path, name)
+    if record is None:
+        return {"renamed": False}
+    return {"renamed": True, "record": asdict(record)}
+
+
+def _tag_library(params: dict) -> dict:
+    """Replace the user-assigned tag list on a recent library.
+
+    Params: {path: str, tags: list[str]}. Returns {tagged: bool, record?:
+    {...}}. `tagged=False` when the path isn't in the recent list. Tags
+    are de-duplicated and stripped server-side — callers can pass raw
+    user input.
+    """
+    from vibechek import library_state
+
+    path = params["path"]
+    tags = params.get("tags") or []
+    if not isinstance(tags, list):
+        raise ValueError("tags must be a list of strings")
+    record = library_state.tag_library(path, [str(t) for t in tags])
+    if record is None:
+        return {"tagged": False}
+    return {"tagged": True, "record": asdict(record)}
+
+
+def _doctor(_params: dict) -> dict:
+    """Render the `vibechek doctor` diagnostic report as paste-friendly markdown.
+
+    The UI's planned "Copy diagnostic" button calls this and writes the
+    string straight to the clipboard. Schema: {"markdown": str}.
+    """
+    from vibechek.doctor import build_report, render_markdown
+    return {"markdown": render_markdown(build_report())}
+
+
+def _verify_models(_params: dict) -> dict:
+    """Verify every downloaded model's SHA256 against the pinned table.
+
+    Returns {"results": [{name, suffix, ok, expected, computed}, ...]}.
+    `ok=True` for files matching MODEL_SHA256[name][suffix], `ok=None` for
+    files we have no pin for yet (the table is populated on the release
+    build), `ok=False` for actual mismatches.
+    """
+    import hashlib as _hashlib
+    from vibechek.analyzer import MODELS, MODEL_SHA256
+    from vibechek.config import MODELS_DIR
+
+    results: list[dict] = []
+    for name in MODELS:
+        for suffix in ("pb", "json"):
+            path = MODELS_DIR / f"{name}.{suffix}"
+            if not path.exists():
+                results.append({
+                    "name": name, "suffix": suffix, "ok": False,
+                    "reason": "missing",
+                })
+                continue
+            h = _hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            computed = h.hexdigest()
+            expected = MODEL_SHA256.get(name, {}).get(suffix)
+            if expected is None:
+                results.append({
+                    "name": name, "suffix": suffix, "ok": None,
+                    "computed": computed,
+                    "reason": "no pin (release-build pass populates these)",
+                })
+            else:
+                results.append({
+                    "name": name, "suffix": suffix,
+                    "ok": computed.lower() == expected.lower(),
+                    "expected": expected, "computed": computed,
+                })
+    return {"results": results}
+
+
+def _list_profiles(_params: dict) -> dict:
+    """Return the built-in DJ profiles. Used by Settings to render a picker."""
+    from vibechek.profiles import list_profiles
+    return {"profiles": list_profiles()}
+
+
+def _load_profile(params: dict) -> dict:
+    """Apply a built-in profile to the user's config + save.
+
+    Params: {name: str}. Returns the new config dict + the profile that was
+    applied. Raises INVALID_PARAMS for unknown profile names.
+    """
+    from vibechek.profiles import load_profile
+    try:
+        result = load_profile(str(params["name"]))
+    except KeyError as e:
+        raise ValueError(f"Unknown profile: {e}") from e
+    return result
+
+
+def _count_new_tracks(params: dict) -> dict:
+    """How many audio files on disk are *not* in the saved analysis?
+
+    Params: {library_path: str}. Returns {new_count, total_count,
+    analyzed_count}. Compares the current filesystem against the most
+    recent saved analysis report so the GUI can show a "🆕 86 new tracks"
+    banner without re-running ML.
+
+    Cheap: just walks the filesystem and reads one JSON file — no decoding,
+    no fingerprinting. Safe to call after every library load.
+    """
+    from vibechek import library_state
+    from vibechek.utils import find_audio_files
+
+    library_path = Path(params["library_path"])
+    if not library_path.exists():
+        # Don't raise — the GUI calls this opportunistically after every
+        # library load and we shouldn't blow up if the user just unplugged
+        # an external drive.
+        return {"new_count": 0, "total_count": 0, "analyzed_count": 0,
+                "reason": "library path missing"}
+
+    state = library_state.load_state()
+    record = next((r for r in state.recent if r.path == str(library_path)), None)
+
+    # Walk the filesystem first — that's the "total" we're comparing against.
+    try:
+        on_disk = find_audio_files(library_path)
+    except (OSError, FileNotFoundError) as e:
+        return {"new_count": 0, "total_count": 0, "analyzed_count": 0,
+                "reason": str(e)}
+    total = len(on_disk)
+    on_disk_set = {str(p) for p in on_disk}
+
+    if record is None:
+        # No prior analysis means every file is "new" — but emitting that as
+        # a banner is misleading (the user hasn't analyzed anything yet, so
+        # there's nothing to be "new" relative to). Surface zero new so the
+        # banner stays hidden; the empty-state UI already handles the "no
+        # analysis yet" case.
+        return {"new_count": 0, "total_count": total, "analyzed_count": 0,
+                "reason": "no prior analysis"}
+
+    report = library_state.load_analysis(record)
+    if not report:
+        return {"new_count": 0, "total_count": total, "analyzed_count": 0,
+                "reason": "analysis file missing"}
+
+    analyzed_paths = {
+        t.get("path") for t in (report.get("tracks") or []) if t.get("path")
+    }
+    # "New" = on disk now AND not in the saved analysis. We don't count
+    # tracks that vanished from disk as "new" (negative number would be
+    # silly); the GUI's incremental analyze handles ghost pruning.
+    new_count = len(on_disk_set - analyzed_paths)
+    return {
+        "new_count": new_count,
+        "total_count": total,
+        "analyzed_count": len(analyzed_paths & on_disk_set),
+    }
 
 
 def _load_recent_analysis(params: dict) -> dict:
@@ -620,6 +858,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "install_cuda_libs_in_wsl": _install_cuda_libs_in_wsl,
     "install_essentia_native": _install_essentia_native,
     "native_venv_status": _native_venv_status,
+    "repair_wsl_shim": _repair_wsl_shim,
     "scan_directory": _scan_directory,
     "scan_only": _scan_only,
     "analyze_directory": _analyze_directory,
@@ -630,6 +869,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "apply_ml_tags": _apply_ml_tags,
     "backup_tags": _backup_tags,
     "restore_tags": _restore_tags,
+    "restore_tags_with_remap": _restore_tags_with_remap,
     "download_models": _download_models,
     "get_config": _get_config,
     "save_config": _save_config,
@@ -638,9 +878,16 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "library_state": _library_state,
     "forget_library": _forget_library,
     "load_recent_analysis": _load_recent_analysis,
+    "rename_library": _rename_library,
+    "tag_library": _tag_library,
+    "count_new_tracks": _count_new_tracks,
     "get_log_tail": _get_log_tail,
     "backup_history": _backup_history,
     "forget_backup": _forget_backup,
+    "doctor": _doctor,
+    "verify_models": _verify_models,
+    "list_profiles": _list_profiles,
+    "load_profile": _load_profile,
 }
 
 # Methods that run long ops and should be cancellable.
@@ -652,6 +899,7 @@ _CANCELLABLE_METHODS = {
     "apply_ml_tags": "tag",
     "backup_tags": "backup",
     "restore_tags": "restore",
+    "restore_tags_with_remap": "restore",
     "download_models": "download-models",
     "install_wsl": "install-wsl",
     "install_vibechek_in_wsl": "install-essentia",
@@ -690,7 +938,23 @@ def _dispatch(request: dict[str, Any]) -> None:
 
     kind = _CANCELLABLE_METHODS.get(method)
     if kind is not None:
-        cancellation.begin(kind)
+        # The cancellation module is a process-wide singleton (one flag, one
+        # `_current_kind`). If a second cancellable op tries to run while one
+        # is already in progress, `begin()` would clobber the first's kind and
+        # then `end()` from op 1 would clear the flag for op 2. Reject the
+        # second op cleanly instead.
+        with _LONG_OP_LOCK:
+            existing = cancellation.current_kind()
+            if existing is not None:
+                _err(
+                    req_id,
+                    INVALID_REQUEST,
+                    f"Another long-running operation ({existing!r}) is already "
+                    f"in progress. Cancel it before starting {kind!r}.",
+                    data={"busy": True, "running": existing},
+                )
+                return
+            cancellation.begin(kind)
 
     try:
         result = handler(params)
@@ -710,6 +974,136 @@ def _dispatch(request: dict[str, Any]) -> None:
             cancellation.end()
 
 
+# ---------------------------------------------------------------------------
+# Startup hygiene: install-path probe (audit #18)
+# ---------------------------------------------------------------------------
+
+
+# Substrings (case-insensitive) that almost always mean the install lives on a
+# virtual filesystem with no mmap support — PyInstaller bootloader can hang
+# or crash on first launch loading shared libs from these paths.
+_RISKY_PATH_SUBSTRINGS: tuple[str, ...] = (
+    "my drive",   # Google Drive File Stream
+    "googledrive",
+    "onedrive",
+    "icloud",
+    "dropbox",    # also virtual under "Online-only" mode
+)
+
+# Heuristic thresholds. > 200 chars is a real Windows MAX_PATH ceiling concern
+# (CreateProcess / dlopen quirks); > 2 spaces is anecdotal but correlates
+# strongly with bizarre quoting bugs in downstream Popen invocations.
+_RISKY_PATH_MAX_LEN: int = 200
+_RISKY_PATH_MAX_SPACES: int = 2
+
+
+_DEFAULT_EXECUTABLE: Any = object()  # sentinel — see _probe_install_path docstring
+
+
+def _probe_install_path(executable: Any = _DEFAULT_EXECUTABLE) -> dict | None:
+    """Inspect `sys.executable` for known-problematic install locations.
+
+    Returns a `notify`-shaped params dict (without the JSON-RPC envelope), or
+    `None` if the path looks fine. Caller wraps in `{"jsonrpc":..., "method":
+    "notify", "params": ...}` and writes to stdout.
+
+    The probe is intentionally cheap and conservative — false positives here
+    are mildly annoying (a banner appears that the user dismisses), but a
+    missed positive means the sidecar may hang on first launch with no
+    explanation.
+
+    Pass `None` (or `""`) explicitly to mean "no resolvable path" — that's
+    the PyInstaller-frozen edge case where `sys.executable` is falsy and
+    we have nothing to inspect.
+    """
+    if executable is _DEFAULT_EXECUTABLE:
+        path = sys.executable
+    else:
+        path = executable
+    if not path:
+        return None
+    # We compare against a normalized form so e.g. "C:/Users/Jack/My Drive"
+    # and "C:\\Users\\Jack\\My Drive" both match the substring rule.
+    norm = path.replace("\\", "/")
+    norm_lower = norm.lower()
+
+    reasons: list[str] = []
+    for needle in _RISKY_PATH_SUBSTRINGS:
+        if needle in norm_lower:
+            # Capitalize for the human-readable detail. We don't need to
+            # preserve the exact original casing — the path itself is in the
+            # `path` field already.
+            reasons.append(f"contains '{needle}'")
+            break  # one match is enough; further substrings would be redundant
+    if path.count(" ") > _RISKY_PATH_MAX_SPACES:
+        reasons.append(f"has {path.count(' ')} spaces in the path")
+    if len(path) > _RISKY_PATH_MAX_LEN:
+        reasons.append(f"is {len(path)} characters long (>{_RISKY_PATH_MAX_LEN})")
+
+    if not reasons:
+        return None
+
+    return {
+        "level": "warning",
+        "message": (
+            "Vibechek is installed in a location that may cause launch "
+            "issues. If the app behaves erratically, try reinstalling to "
+            "a simple path like C:\\Vibechek\\."
+        ),
+        "detail": "Install path " + ", ".join(reasons) + ".",
+        "path": path,
+        "reasons": reasons,
+    }
+
+
+def _silence_native_logs() -> None:
+    """Reduce native stdout noise that breaks JSON-RPC framing (audit #15).
+
+    TensorFlow, CUDA, and essentia C++ code write directly to fd 1 via
+    `printf()` / `fprintf(stdout, ...)`, bypassing Python's `sys.stdout`
+    and our `_StdoutWriter` lock. When that happens mid-frame, the Rust
+    side's line-delimited JSON parser sees a malformed line and (until
+    audit #15's Rust-side fix) loses the response that follows.
+
+    These env vars only suppress the loudest sources — they MUST be set
+    before any of the offending libraries import. Setting them here in
+    `serve()` is early enough because we only import `tensorflow` /
+    `essentia` lazily inside the method handlers.
+    """
+    # 0=all, 1=info, 2=warning, 3=error+. 3 silences the noisy device-init
+    # and op-placement logs TF emits to stdout on startup.
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    # NVIDIA cuDNN's own logger. 0=disable, 3=error+.
+    os.environ.setdefault("CUDNN_LOGLEVEL_DBG", "0")
+    # CUDA driver runtime: suppress non-fatal log messages.
+    os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+
+
+def _cleanup_stale_tempfiles() -> None:
+    """Best-effort sweep of `vibechek-wsl-*` files older than 24h.
+
+    Audit #7: `_stage_script_for_wsl` and `run_vibechek_in_wsl` write tempfiles
+    that are normally `unlink`'d in a `finally` block, but a hard kill (Tauri
+    crash, OS reboot, force-quit) leaks them. Sweeps `%TEMP%` so they don't
+    accumulate over months.
+    """
+    import tempfile as _tempfile
+    import time as _time
+    try:
+        tmp = Path(_tempfile.gettempdir())
+        cutoff = _time.time() - 24 * 3600
+        for pattern in ("vibechek-wsl-*.sh", "vibechek-wsl-pid-*.txt",
+                        "vibechek-wsl-*.json"):
+            for f in tmp.glob(pattern):
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                except OSError:
+                    pass
+    except Exception as e:  # noqa: BLE001
+        log.debug("Tempfile sweep failed (non-fatal): %s", e)
+
+
 def serve(stdin=None, stdout=None) -> None:
     """Read JSON-RPC requests from stdin and write responses to stdout.
 
@@ -720,6 +1114,11 @@ def serve(stdin=None, stdout=None) -> None:
 
     Blocks until EOF on stdin (i.e. parent process closes our stdin).
     """
+    # Silence native (TF/CUDA/essentia) printf-to-stdout noise BEFORE any
+    # of those libraries get a chance to import (audit #15). Setting these
+    # after first import is a no-op — the libs cache the value.
+    _silence_native_logs()
+
     # Configure logging early so anything emitted during startup goes to file
     try:
         from vibechek import logging_setup
@@ -727,6 +1126,11 @@ def serve(stdin=None, stdout=None) -> None:
     except Exception:  # noqa: BLE001
         # Logging is nice-to-have; don't take down the sidecar over it
         pass
+
+    # Sweep stale tempfiles from previous sidecar runs (audit #7). Cheap;
+    # bounded by `vibechek-wsl-*` glob + 24h age cutoff. If sidecar was
+    # force-killed mid-WSL-install, these accumulate forever.
+    _cleanup_stale_tempfiles()
 
     stdin = stdin or sys.stdin
 
@@ -739,6 +1143,19 @@ def serve(stdin=None, stdout=None) -> None:
         "method": "ready",
         "params": {"version": __version__, "methods": sorted(METHODS.keys())},
     })
+
+    # Probe our own install path for known-bad locations (audit #18). If
+    # PyInstaller's bootloader is going to hang or crash on first launch
+    # (My Drive, OneDrive, iCloud, > 200 char paths, etc.), warn the user
+    # so they can move the install before hitting it. Non-blocking: this is
+    # a `notify` event the frontend can route to its notification store.
+    warning = _probe_install_path()
+    if warning is not None:
+        _write_message({
+            "jsonrpc": "2.0",
+            "method": "notify",
+            "params": warning,
+        })
 
     log.info("Sidecar serving on stdin/stdout (workers=%d, methods=%d)",
              _DISPATCH_WORKERS, len(METHODS))

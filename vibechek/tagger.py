@@ -9,6 +9,12 @@ Three responsibilities:
 3. **Apply** ML analysis results back to files with confidence filtering,
    while preserving any Rekordbox binary frames that already exist.
 
+ID3 text-frame encoding for writes is controlled by
+`TaggingConfig.id3_text_encoding` (0 = ISO-8859-1, 1 = UTF-16, 3 = UTF-8).
+Modern players read UTF-8 fine, but Rekordbox 5 and some older DJ software
+only recognize encoding 0 or 1 — users on old Rekordbox can switch to UTF-16
+so genre/subgenre changes show up in the app.
+
 Source: ports of `legacy/backup_tags.py` and `legacy/apply_tags_filtered.py`.
 """
 
@@ -38,6 +44,7 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 
 from vibechek.config import TaggingConfig
+from vibechek.io import atomic_write_json
 from vibechek.utils import (
     SUPPORTED_EXTENSIONS,
     ProgressCallback,
@@ -77,6 +84,12 @@ class RestoreStats:
 class ApplyStats:
     total: int = 0
     genre_applied: int = 0
+    # Bumped when the strict subgenre threshold fails but the parent-genre
+    # fallback hits (`parent_genre_confidence_threshold`). The track gets
+    # tagged with the parent genre and no subgenre; we count it separately
+    # so the UI can show "X confident, Y parent-only, Z unconfident" instead
+    # of conflating fallback-tagged with strictly-tagged.
+    genre_applied_parent_only: int = 0
     genre_skipped_low_confidence: int = 0
     other_tags_applied: int = 0
     errors: list[str] = field(default_factory=list)
@@ -194,12 +207,21 @@ def _first(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def write_all_tags(filepath: Path, tags: dict[str, Any]) -> tuple[bool, str | None]:
-    """Restore tag snapshot from `tags` onto `filepath`. Returns (success, error)."""
+def write_all_tags(
+    filepath: Path,
+    tags: dict[str, Any],
+    config: TaggingConfig | None = None,
+) -> tuple[bool, str | None]:
+    """Restore tag snapshot from `tags` onto `filepath`. Returns (success, error).
+
+    `config` controls the ID3 text-frame encoding used for MP3 writes; when
+    omitted we use a fresh `TaggingConfig()` (UTF-8). FLAC/M4A ignore it.
+    """
     ext = filepath.suffix.lower()
+    cfg = config or TaggingConfig()
     try:
         if ext == ".mp3":
-            _write_mp3_tags(filepath, tags)
+            _write_mp3_tags(filepath, tags, cfg)
         elif ext == ".flac":
             _write_flac_tags(filepath, tags)
         elif ext == ".m4a":
@@ -211,10 +233,12 @@ def write_all_tags(filepath: Path, tags: dict[str, Any]) -> tuple[bool, str | No
         return False, str(e)
 
 
-def _write_mp3_tags(filepath: Path, tags: dict[str, Any]) -> None:
+def _write_mp3_tags(filepath: Path, tags: dict[str, Any], config: TaggingConfig) -> None:
     audio = MP3(filepath)
     if audio.tags is None:
         audio.add_tags()
+
+    enc = config.id3_text_encoding
 
     text_frame_writers = {
         "title": (TIT2, "TIT2"),
@@ -227,12 +251,12 @@ def _write_mp3_tags(filepath: Path, tags: dict[str, Any]) -> None:
     }
     for field_name, (frame_cls, frame_id) in text_frame_writers.items():
         if field_name in tags:
-            audio.tags[frame_id] = frame_cls(encoding=3, text=str(tags[field_name]))
+            audio.tags[frame_id] = frame_cls(encoding=enc, text=str(tags[field_name]))
 
     for key, val in tags.items():
         if key.startswith("txxx_"):
             tag_name = key[5:].upper()
-            audio.tags.add(TXXX(encoding=3, desc=tag_name, text=str(val)))
+            audio.tags.add(TXXX(encoding=enc, desc=tag_name, text=str(val)))
         elif key.startswith("geob_"):
             audio.tags.add(GEOB(
                 encoding=val["encoding"],
@@ -301,7 +325,13 @@ def backup_tags(
         "files": {},
     }
 
+    # Lazy import so tagger stays usable as a library outside the sidecar.
+    from vibechek import cancellation
+
     for i, filepath in enumerate(files):
+        # Cancel must actually stop backing up — without this, a Cancel click
+        # on a 12k-file backup runs to completion regardless.
+        cancellation.check()
         report_progress(on_progress, i + 1, stats.total, filepath.name)
         try:
             backup["files"][str(filepath)] = read_all_tags(filepath)
@@ -309,23 +339,57 @@ def backup_tags(
         except Exception as e:  # noqa: BLE001
             stats.errors.append(f"{filepath.name}: {e}")
 
-    Path(output_path).write_text(
-        json.dumps(backup, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    # Atomic write: a kill-during-write of a tag backup leaves the user
+    # unable to restore their original tags (audit Tags#1). The history-record
+    # only fires after we're back from this function, so partial backups
+    # never get indexed. Uses the shared `atomic_write_json` helper so the
+    # crash-safety pattern lives in exactly one place across the codebase.
+    output_path = Path(output_path)
+    atomic_write_json(output_path, backup, indent=2, ensure_ascii=False)
     return stats
 
 
 def restore_tags(
     backup_path: Path,
     on_progress: ProgressCallback | None = None,
+    config: TaggingConfig | None = None,
 ) -> RestoreStats:
-    """Restore tags from a backup created by `backup_tags`."""
-    data = json.loads(Path(backup_path).read_text(encoding="utf-8"))
+    """Restore tags from a backup created by `backup_tags`.
+
+    `config` is forwarded to `write_all_tags` so MP3 restores honor the user's
+    chosen ID3 text-frame encoding. Defaults to a fresh `TaggingConfig()`.
+
+    Raises `ValueError` (with a user-friendly message) on corrupt / wrong-shape
+    backup files, rather than letting `json.loads` or `data["files"]` leak a
+    raw KeyError to the GUI (audit Tags#2).
+    """
+    from vibechek import cancellation
+
+    path = Path(backup_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Backup file not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"Backup file is empty: {path}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Backup file at {path} is not valid JSON ({e}). "
+            f"It may be truncated or corrupted; check the original "
+            f"backup attempt's log for write errors."
+        ) from e
+    if not isinstance(data, dict) or "files" not in data:
+        raise ValueError(
+            f"Backup file at {path} is not in vibechek backup format "
+            f"(missing 'files' key). Got top-level keys: "
+            f"{list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+        )
     files = data["files"]
     stats = RestoreStats(total=len(files))
 
     for i, (filepath_str, tags) in enumerate(files.items()):
+        cancellation.check()
         report_progress(on_progress, i + 1, stats.total, Path(filepath_str).name)
 
         if "_error" in tags:
@@ -336,7 +400,7 @@ def restore_tags(
             stats.skipped_missing += 1
             continue
 
-        success, error = write_all_tags(path, tags)
+        success, error = write_all_tags(path, tags, config)
         if success:
             stats.restored += 1
         else:
@@ -367,10 +431,13 @@ def apply_ml_tags(
     - GEOB / PRIV frames are always preserved on MP3 when
       `preserve_rekordbox_frames` is True.
     """
+    from vibechek import cancellation
+
     tracks = analysis_data.get("tracks", [])
     stats = ApplyStats(total=len(tracks))
 
     for i, track in enumerate(tracks):
+        cancellation.check()
         report_progress(on_progress, i + 1, stats.total, Path(track.get("path", "")).name)
 
         filepath = Path(track["path"])
@@ -382,17 +449,63 @@ def apply_ml_tags(
         if not ml:
             continue
 
-        genre_conf = ml.get("ml_genre_confidence") or 0.0
-        subgenre = ml.get("ml_subgenre", "")
-        apply_genre = (
-            genre_conf >= config.genre_confidence_threshold
+        # Two-stage genre confidence.
+        #
+        # Stage 1 (strict): If the *subgenre* (raw, single-class) confidence
+        # clears `genre_confidence_threshold` (default 0.85), write the
+        # subgenre as the genre. This is the legacy behaviour.
+        #
+        # Stage 2 (parent fallback): If stage 1 fails BUT the parent-family
+        # confidence (`ml_genre_confidence` — the summed score across related
+        # subgenres) clears `parent_genre_confidence_threshold` (default 0.50),
+        # write the PARENT genre into the genre field with no subgenre. This
+        # is the case where the model knows the track is unambiguously House
+        # but can't decide Deep House vs. Tech House — historically that
+        # left the track tagless (~47% of a typical library). Now those land
+        # under their parent, dramatically improving coverage.
+        #
+        # `ml_genre_raw_confidence` is set by analyzer.py from
+        # `GenreResult.raw_confidence` (top single Discogs class). It may be
+        # absent on older analysis reports — in that case we fall back to
+        # `ml_genre_confidence` for both stages, which yields the legacy
+        # behaviour exactly.
+        family_conf = ml.get("ml_genre_confidence") or 0.0
+        subgenre_conf = ml.get("ml_genre_raw_confidence")
+        if subgenre_conf is None:
+            # Backward-compat for analysis reports written before raw_confidence
+            # was plumbed. Use family confidence as the stage-1 input so we
+            # don't accidentally over-tag.
+            subgenre_conf = family_conf
+
+        subgenre = ml.get("ml_subgenre", "") or ""
+        parent_genre = ml.get("ml_genre", "") or ""
+
+        apply_subgenre = (
+            subgenre_conf >= config.genre_confidence_threshold
             and bool(subgenre)
         )
+        apply_parent_only = (
+            not apply_subgenre
+            and family_conf >= config.parent_genre_confidence_threshold
+            and bool(parent_genre)
+        )
 
-        if apply_genre:
+        # `genre_to_write` is what actually lands in the TCON / GENRE frame.
+        # For stage 2 we want the parent genre (no subgenre) so Rekordbox sees
+        # "House" rather than "Deep House" — the user can still browse the
+        # parent bucket while tracks the model couldn't subgenre-classify
+        # don't pollute it.
+        if apply_subgenre:
+            genre_to_write = subgenre
             stats.genre_applied += 1
+        elif apply_parent_only:
+            genre_to_write = parent_genre
+            stats.genre_applied_parent_only += 1
         else:
+            genre_to_write = ""
             stats.genre_skipped_low_confidence += 1
+
+        apply_genre = apply_subgenre or apply_parent_only
 
         if dry_run:
             continue
@@ -400,10 +513,10 @@ def apply_ml_tags(
         ext = filepath.suffix.lower()
         try:
             if ext == ".mp3":
-                _apply_mp3(filepath, ml, apply_genre, subgenre, config)
+                _apply_mp3(filepath, ml, apply_genre, genre_to_write, config)
                 stats.other_tags_applied += 1
             elif ext == ".flac":
-                _apply_flac(filepath, ml, apply_genre, subgenre, config)
+                _apply_flac(filepath, ml, apply_genre, genre_to_write, config)
                 stats.other_tags_applied += 1
             else:
                 stats.errors.append(f"{filepath.name}: unsupported format {ext}")
@@ -417,12 +530,14 @@ def _apply_mp3(
     filepath: Path,
     ml: dict[str, Any],
     apply_genre: bool,
-    subgenre: str,
+    genre_value: str,
     config: TaggingConfig,
 ) -> None:
     audio = MP3(filepath)
     if audio.tags is None:
         audio.add_tags()
+
+    enc = config.id3_text_encoding
 
     # Snapshot binary frames to restore after destructive writes
     preserved: list[tuple[str, Any]] = []
@@ -435,23 +550,30 @@ def _apply_mp3(
 
     if apply_genre:
         audio.tags.delall("TCON")
-        audio.tags.add(TCON(encoding=3, text=[subgenre]))
-        audio.tags.delall("TIT1")
-        audio.tags.add(TIT1(encoding=3, text=[subgenre]))
+        audio.tags.add(TCON(encoding=enc, text=[genre_value]))
+        # Only write TIT1 (subgenre frame) when the value we're writing is
+        # genuinely a subgenre — i.e. when stage-1 (strict subgenre conf)
+        # passed. When we fall back to the parent genre under stage 2 we
+        # leave TIT1 untouched so we don't mislabel an unclear track with
+        # a confident-looking subgenre tag.
+        ml_subgenre = ml.get("ml_subgenre", "") or ""
+        if genre_value == ml_subgenre:
+            audio.tags.delall("TIT1")
+            audio.tags.add(TIT1(encoding=enc, text=[genre_value]))
 
     if not config.skip_bpm_and_key:
         if ml.get("ml_bpm"):
             audio.tags.delall("TBPM")
-            audio.tags.add(TBPM(encoding=3, text=[str(int(round(ml["ml_bpm"])))]))
+            audio.tags.add(TBPM(encoding=enc, text=[str(int(round(ml["ml_bpm"])))]))
         if ml.get("ml_key"):
             audio.tags.delall("TKEY")
-            audio.tags.add(TKEY(encoding=3, text=[ml["ml_key"]]))
+            audio.tags.add(TKEY(encoding=enc, text=[ml["ml_key"]]))
 
     for tag_name in ("ENERGY", "MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
         val = ml.get(f"ml_{tag_name.lower()}")
         if val is not None:
             audio.tags.delall(f"TXXX:{tag_name}")
-            audio.tags.add(TXXX(encoding=3, desc=tag_name, text=[str(val)]))
+            audio.tags.add(TXXX(encoding=enc, desc=tag_name, text=[str(val)]))
 
     for key, frame in preserved:
         if key not in audio.tags:
@@ -464,13 +586,18 @@ def _apply_flac(
     filepath: Path,
     ml: dict[str, Any],
     apply_genre: bool,
-    subgenre: str,
+    genre_value: str,
     config: TaggingConfig,
 ) -> None:
     audio = FLAC(filepath)
     if apply_genre:
-        audio["GENRE"] = subgenre
-        audio["CONTENTGROUP"] = subgenre
+        audio["GENRE"] = genre_value
+        # CONTENTGROUP is the FLAC analog of MP3's TIT1 (subgenre) — only
+        # populate it when the value we're writing is genuinely a subgenre.
+        # Stage-2 parent-only fallback should NOT pollute CONTENTGROUP.
+        ml_subgenre = ml.get("ml_subgenre", "") or ""
+        if genre_value == ml_subgenre:
+            audio["CONTENTGROUP"] = genre_value
 
     if not config.skip_bpm_and_key:
         if ml.get("ml_bpm"):
@@ -486,14 +613,195 @@ def _apply_flac(
     audio.save()
 
 
+@dataclass
+class RemapRestoreStats:
+    """Result of restore_tags_with_remap.
+
+    Adds per-strategy match counts on top of `RestoreStats`, plus a per-file
+    breakdown so the UI can show which files needed remapping (and why others
+    were skipped).
+    """
+
+    total: int = 0
+    restored: int = 0
+    skipped_missing: int = 0
+    skipped_size_mismatch: int = 0
+    matched_exact: int = 0
+    matched_filename_size: int = 0
+    matched_filename: int = 0
+    errors: list[str] = field(default_factory=list)
+    # One entry per backup file: {"original": str, "matched": str|None,
+    # "strategy": "exact"|"filename_size"|"filename"|"missing"|"size_mismatch"
+    #              |"ambiguous"|"backup_error"|"write_error",
+    # "error": str|None}.
+    matches: list[dict[str, Any]] = field(default_factory=list)
+
+
+def restore_tags_with_remap(
+    backup_path: Path,
+    library_root: Path,
+    on_progress: ProgressCallback | None = None,
+) -> RemapRestoreStats:
+    """Restore a tag backup with automatic remap for moved libraries.
+
+    Audit #19: `restore_tags` keys exclusively on the original absolute path
+    captured at backup time. If the user backed up `D:\\Music\\foo.mp3` then
+    renamed the drive to `E:\\` (or moved the whole library), restore skips
+    every file. This function walks `library_root`, then for each backup entry
+    attempts three strategies in order:
+
+    1. **Exact path** — the backup's original path exists on disk verbatim.
+    2. **Filename + size** — a file under `library_root` has the same name
+       AND the same byte size as the backup entry. This covers moved-but-
+       unmodified libraries (drive rename, folder relocation).
+    3. **Filename alone** — a single file under `library_root` has the same
+       name (no other file in the library shares the name). Last-resort
+       fallback for libraries where file sizes have drifted (e.g., a tagger
+       changed bytes after the backup).
+
+    A backup entry whose `filename + size` matches *multiple* files in
+    `library_root` is marked `ambiguous` (skipped) — restoring to the wrong
+    file would silently corrupt tags.
+    """
+    data = json.loads(Path(backup_path).read_text(encoding="utf-8"))
+    files: dict[str, dict[str, Any]] = data["files"]
+    stats = RemapRestoreStats(total=len(files))
+
+    # Build an index of the destination library so we can resolve moved files.
+    # `find_audio_files` returns sorted Paths; we group by basename so both the
+    # filename+size and filename-only strategies are O(1) per backup entry.
+    library_root = Path(library_root)
+    library_files = find_audio_files(library_root)
+    by_name: dict[str, list[Path]] = {}
+    for p in library_files:
+        by_name.setdefault(p.name.lower(), []).append(p)
+
+    # Lazy size lookup — only `stat()` files we actually consider. On a 12k
+    # library that's the difference between 12k unconditional stats and ~N
+    # stats where N is the number of backup entries we couldn't exact-match.
+    sizes: dict[Path, int] = {}
+
+    def size_of(path: Path) -> int | None:
+        if path not in sizes:
+            try:
+                sizes[path] = path.stat().st_size
+            except OSError:
+                return None
+        return sizes[path]
+
+    for i, (filepath_str, tags) in enumerate(files.items()):
+        original = Path(filepath_str)
+        report_progress(on_progress, i + 1, stats.total, original.name)
+
+        match_record: dict[str, Any] = {
+            "original": filepath_str,
+            "matched": None,
+            "strategy": None,
+            "error": None,
+        }
+
+        if "_error" in tags:
+            match_record["strategy"] = "backup_error"
+            stats.matches.append(match_record)
+            continue
+
+        # Strategy 1: exact path
+        target: Path | None = None
+        strategy: str = ""
+        if original.exists():
+            target = original
+            strategy = "exact"
+        else:
+            candidates = by_name.get(original.name.lower(), [])
+            backup_size = _backup_entry_size(tags)
+
+            # Strategy 2: filename + size (only when backup recorded a size).
+            # The current backup format doesn't store size per entry, so we
+            # tolerate either a missing `_size` (skip strategy 2) or a real one.
+            if backup_size is not None:
+                size_matches = [p for p in candidates if size_of(p) == backup_size]
+                if len(size_matches) == 1:
+                    target = size_matches[0]
+                    strategy = "filename_size"
+                elif len(size_matches) > 1:
+                    # Ambiguous on (name, size). Don't gamble — the user can
+                    # rerun against a smaller library_root, or recreate the
+                    # backup. Falling back to filename-alone here would be
+                    # even less safe.
+                    match_record["strategy"] = "ambiguous"
+                    stats.skipped_size_mismatch += 1
+                    stats.matches.append(match_record)
+                    continue
+
+            # Strategy 3: filename alone — only safe when unique in the library.
+            if target is None:
+                if len(candidates) == 1:
+                    target = candidates[0]
+                    strategy = "filename"
+                elif len(candidates) > 1:
+                    match_record["strategy"] = "ambiguous"
+                    stats.matches.append(match_record)
+                    # Treat as skip_missing for top-line stat (no write happened)
+                    stats.skipped_missing += 1
+                    continue
+
+        if target is None:
+            match_record["strategy"] = "missing"
+            stats.matches.append(match_record)
+            stats.skipped_missing += 1
+            continue
+
+        match_record["matched"] = str(target)
+        match_record["strategy"] = strategy
+
+        # Tally the *match* strategy regardless of whether the write succeeds —
+        # the user wants to know "12 files were remapped via filename" even if
+        # one of them then failed to write. Write failures are reported
+        # separately via `errors` + a `substrategy=write_error` on the record.
+        if strategy == "exact":
+            stats.matched_exact += 1
+        elif strategy == "filename_size":
+            stats.matched_filename_size += 1
+        elif strategy == "filename":
+            stats.matched_filename += 1
+
+        success, error = write_all_tags(target, tags)
+        if success:
+            stats.restored += 1
+        else:
+            match_record["substrategy"] = "write_error"
+            match_record["error"] = error
+            stats.errors.append(f"{target.name}: {error}")
+
+        stats.matches.append(match_record)
+
+    return stats
+
+
+def _backup_entry_size(tags: dict[str, Any]) -> int | None:
+    """Return the backup-recorded byte size of a file, if present.
+
+    The current `read_all_tags` format does not capture file size, so this
+    almost always returns None today. Plumbing it through here means a future
+    bump to the backup format (adding `_size`) lights up the strategy 2 path
+    automatically — no further code changes needed.
+    """
+    raw = tags.get("_size")
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    return None
+
+
 __all__ = [
     "BackupStats",
     "RestoreStats",
+    "RemapRestoreStats",
     "ApplyStats",
     "read_all_tags",
     "write_all_tags",
     "backup_tags",
     "restore_tags",
+    "restore_tags_with_remap",
     "apply_ml_tags",
     "SUPPORTED_EXTENSIONS",
 ]

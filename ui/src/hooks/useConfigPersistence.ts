@@ -7,8 +7,8 @@
 
 import { useEffect, useRef } from "react";
 
-import { useConfigStore } from "../stores";
-import { rpc } from "./useSidecar";
+import { useConfigStore, useNotificationStore } from "../stores";
+import { isCancellation, rpc } from "./useSidecar";
 import type { VibechekConfig } from "../types";
 
 const SAVE_DEBOUNCE_MS = 500;
@@ -19,6 +19,10 @@ export function useConfigPersistence() {
   const setConfig = useConfigStore((s) => s.setConfig);
 
   const saveTimer = useRef<number | null>(null);
+  // Throttle the "could not save" toast so a persistent failure (disk full,
+  // permission denied) doesn't spam the user every 500ms while they tweak a
+  // slider. One notification, then stay quiet for 30s.
+  const lastNotifiedAt = useRef<number>(0);
 
   // Load on mount — single shot.
   useEffect(() => {
@@ -44,8 +48,22 @@ export function useConfigPersistence() {
       window.clearTimeout(saveTimer.current);
     }
     saveTimer.current = window.setTimeout(() => {
-      rpc("save_config", { config }).catch(() => {
-        /* surfaced via global error toast */
+      rpc("save_config", { config }).catch((e) => {
+        // A save failure that gets eaten silently is the worst kind of bug —
+        // the user thinks their tweaks stuck. Surface it via a toast (info,
+        // not the scary red error toast — the operation will retry on the
+        // next change). Cancellations are impossible here but check anyway.
+        if (isCancellation(e)) return;
+        const now = Date.now();
+        if (now - lastNotifiedAt.current < 30_000) return;
+        lastNotifiedAt.current = now;
+        const msg =
+          typeof e === "object" && e !== null && "message" in e
+            ? String((e as { message: unknown }).message)
+            : String(e);
+        useNotificationStore
+          .getState()
+          .notify(`Settings could not save: ${msg}`, { kind: "info" });
       });
     }, SAVE_DEBOUNCE_MS);
     return () => {

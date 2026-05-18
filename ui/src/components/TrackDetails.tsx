@@ -10,7 +10,7 @@
  * selected.
  */
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, ChevronRight, FileAudio, AlertTriangle, CheckCircle2 } from "lucide-react";
 
@@ -19,6 +19,11 @@ import { useApplyTags } from "../hooks/useApplyTags";
 import type { TrackAnalysis, ExistingTags, MLResult } from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
 import { AudioPreview } from "./AudioPreview";
+import {
+  compatibleCamelot,
+  useLibraryFiltersStore,
+  type CamelotMode,
+} from "./LibraryFilters";
 
 export function TrackDetails() {
   const selectedPath = useUIStore((s) => s.selectedTrackPath);
@@ -29,6 +34,16 @@ export function TrackDetails() {
     () => tracks.find((t) => t.path === selectedPath) ?? null,
     [tracks, selectedPath],
   );
+
+  // If the selected path no longer exists in the tracks list (e.g. after a
+  // re-scan dropped it, or a forget-and-reload swapped libraries), clear the
+  // selection rather than leaving the panel in a zombie state where it
+  // unmounts but the store still claims a path is selected.
+  useEffect(() => {
+    if (selectedPath && !track) {
+      setSelected(null);
+    }
+  }, [selectedPath, track, setSelected]);
 
   return (
     <AnimatePresence>
@@ -59,19 +74,31 @@ function DetailContent({
   const notify = useNotificationStore((s) => s.notify);
   const { apply: applyTags } = useApplyTags();
 
+  // Local re-entrancy guard. The store-wide `active` flag flips once the
+  // RPC actually starts, but useApplyTags has a tick of setup before that —
+  // a fast double click would fire two RPCs before `active` updated. Track
+  // it locally and disable the button immediately.
+  const [applying, setApplying] = useState(false);
+
   const handleApplyOne = async () => {
-    const result = await applyTags([track]);
-    if (!result) return; // failure already surfaced via useOperationStore.error
-    const wrote = result.applied + result.other;
-    if (wrote === 0 && result.skipped > 0) {
-      notify("Genre skipped — confidence below threshold", {
-        detail: "Lower the threshold in Settings if you want it written anyway.",
-        kind: "info",
-      });
-    } else {
-      notify(`Tags applied to ${track.filename}`, {
-        kind: result.errors.length > 0 ? "info" : "success",
-      });
+    if (applying) return;
+    setApplying(true);
+    try {
+      const result = await applyTags([track]);
+      if (!result) return; // failure already surfaced via useOperationStore.error
+      const wrote = result.applied + result.other;
+      if (wrote === 0 && result.skipped > 0) {
+        notify("Genre skipped — confidence below threshold", {
+          detail: "Lower the threshold in Settings if you want it written anyway.",
+          kind: "info",
+        });
+      } else {
+        notify(`Tags applied to ${track.filename}`, {
+          kind: result.errors.length > 0 ? "info" : "success",
+        });
+      }
+    } finally {
+      setApplying(false);
     }
   };
 
@@ -116,7 +143,10 @@ function DetailContent({
         <FileSection track={track} />
 
         {ml ? (
-          <DiffSection existing={ext} ml={ml} confidenceThreshold={taggingCfg.genre_confidence_threshold} />
+          <>
+            <DiffSection existing={ext} ml={ml} confidenceThreshold={taggingCfg.genre_confidence_threshold} />
+            <CompatibleKeysSection mlKey={ml.ml_key} />
+          </>
         ) : (
           <Notice kind="info">
             No ML analysis for this track yet. Run analyze on the library to populate.
@@ -127,9 +157,9 @@ function DetailContent({
           <button
             className="btn-primary w-full justify-center"
             onClick={handleApplyOne}
-            disabled={active !== null}
+            disabled={active !== null || applying}
           >
-            Apply ML tags to this file
+            {applying ? "Applying…" : "Apply ML tags to this file"}
           </button>
         )}
       </div>
@@ -143,7 +173,7 @@ function FileSection({ track }: { track: TrackAnalysis }) {
   return (
     <Section title="File">
       <Row label="Path" value={track.path} mono small />
-      <Row label="Size" value={`${track.size_mb.toFixed(1)} MB`} />
+      <Row label="Size" value={`${(track.size_mb ?? 0).toFixed(1)} MB`} />
       {track.filename_bpm && <Row label="BPM (from filename)" value={String(track.filename_bpm)} />}
       {track.filename_key && <Row label="Key (from filename)" value={track.filename_key} />}
       {track.filename_mix && <Row label="Mix type" value={track.filename_mix} />}
@@ -206,7 +236,10 @@ interface DiffRowData {
 }
 
 function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
-  return [
+  // Annotate the literal so the union widens the badge color to the named
+  // literal type (otherwise the energy row's extra `renderNext` shape causes
+  // TS to widen `badgeColor: "purple"` to `string`).
+  const rows: DiffRowData[] = [
     {
       label: "Genre",
       existing: existing.genre,
@@ -219,13 +252,21 @@ function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
       label: "Energy",
       existing: existing.energy as number | string | null | undefined,
       next: ml.ml_energy,
-      renderNext: (v) => <EnergyBar level={Number(v)} />,
+      // `v` is whatever `next` resolved to. Number(undefined) is NaN which
+      // EnergyBar's Math.max(0,…) coerces to 0 — explicit guard keeps
+      // intent clear and avoids future drift if EnergyBar's input contract
+      // tightens.
+      renderNext: (v: string | number) => {
+        const n = Number(v);
+        return <EnergyBar level={Number.isFinite(n) ? n : 0} />;
+      },
     },
     { label: "Mood", existing: existing.mood, next: ml.ml_mood, badgeColor: "purple" },
     { label: "Timeslot", existing: existing.timeslot, next: ml.ml_timeslot },
     { label: "Direction", existing: existing.direction, next: ml.ml_direction },
     { label: "Vocal", existing: existing.vocal, next: ml.ml_vocal },
-  ].filter((r) => r.existing != null || r.next != null);
+  ];
+  return rows.filter((r) => r.existing != null || r.next != null);
 }
 
 function DiffRow({ row }: { row: DiffRowData }) {
@@ -260,6 +301,49 @@ function DiffRow({ row }: { row: DiffRowData }) {
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Compact "Compatible keys" panel under the diff section.
+ *
+ * Shows the harmonic-mix neighbours of `mlKey` per the current Camelot mode.
+ * Clicking a pill writes the key into the library filter store, scoping the
+ * library browser to just that key — same UX as picking it from the Camelot
+ * chip grid. Renders nothing for tracks with no parseable key (which is
+ * always the bulk of any DJ library).
+ */
+function CompatibleKeysSection({ mlKey }: { mlKey: string | null | undefined }) {
+  const setFilters = useLibraryFiltersStore((s) => s.setFilters);
+  const filters = useLibraryFiltersStore((s) => s.filters);
+  const compatible = useMemo(
+    () => compatibleCamelot(mlKey, filters.camelotMode as CamelotMode),
+    [mlKey, filters.camelotMode],
+  );
+  if (compatible.length === 0) return null;
+
+  const onPick = (key: string) => {
+    // Replace the current camelot selection rather than appending — the user
+    // clicked one pill to scope, not to layer onto an existing multi-select.
+    setFilters({ ...filters, camelot: new Set([key]) });
+  };
+
+  return (
+    <Section title="Compatible keys" subtitle={filters.camelotMode}>
+      <div className="flex flex-wrap gap-1.5">
+        {compatible.map((k) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => onPick(k)}
+            className="text-[11px] font-mono px-2 py-1 rounded bg-white/5 text-white/80 border border-white/10 hover:bg-accent/20 hover:text-accent hover:border-accent/30"
+            title={`Filter library to ${k}`}
+          >
+            {k}
+          </button>
+        ))}
+      </div>
+    </Section>
   );
 }
 

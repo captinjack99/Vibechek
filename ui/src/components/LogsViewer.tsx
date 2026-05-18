@@ -13,6 +13,7 @@ import { motion } from "framer-motion";
 import { X, Copy, Check, RefreshCw, Filter as FilterIcon } from "lucide-react";
 
 import { rpc } from "../hooks/useSidecar";
+import { useNotificationStore } from "../stores";
 
 interface Props {
   open: boolean;
@@ -70,13 +71,33 @@ export function LogsViewer({ open, onClose }: Props) {
 
   const filtered = useMemo(() => {
     if (filter === "ALL") return lines;
-    return lines.filter((l) => l.includes(` ${filter.padEnd(7)} `) || l.includes(` ${filter} `));
+    // Tolerant matcher: looks for the level token surrounded by whitespace
+    // (or at line boundaries) so it works regardless of the formatter's
+    // exact column-padding rules. WARN also matches WARNING (Python's
+    // logging module emits the full word, but `logging.WARN` is also
+    // valid — both should match the same filter button).
+    const tokens = filter === "WARN" ? ["WARN", "WARNING"] : [filter];
+    const re = new RegExp(`(^|\\s)(?:${tokens.join("|")})(\\s|$)`);
+    return lines.filter((l) => re.test(l));
   }, [lines, filter]);
 
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(filtered.join("\n"));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    try {
+      await navigator.clipboard.writeText(filtered.join("\n"));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      // navigator.clipboard rejects when the document isn't focused or the
+      // user denied clipboard permission. Surface so the user knows the
+      // copy didn't happen rather than silently swallowing it.
+      const msg =
+        typeof e === "object" && e !== null && "message" in e
+          ? String((e as { message: unknown }).message)
+          : String(e);
+      useNotificationStore
+        .getState()
+        .notify(`Could not copy logs: ${msg}`, { kind: "info" });
+    }
   };
 
   if (!open) return null;

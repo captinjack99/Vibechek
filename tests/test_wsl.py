@@ -657,6 +657,151 @@ def test_generated_cuda_script_parses_as_bash() -> None:
     )
 
 
+def test_repair_wsl_shim_returns_not_windows_off_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """repair_wsl_shim short-circuits on non-Windows hosts."""
+    from vibechek.wsl import repair_wsl_shim
+    monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", False)
+    result = repair_wsl_shim("Ubuntu")
+    assert result["ok"] is False
+    assert "windows" in result["error"].lower()
+
+
+def test_repair_wsl_shim_handles_missing_wsl_exe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If wsl.exe isn't on PATH, repair returns a clean error not an exception."""
+    from vibechek.wsl import repair_wsl_shim
+    monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", True)
+    monkeypatch.setattr("vibechek.wsl.shutil.which", lambda _: None)
+    result = repair_wsl_shim("Ubuntu")
+    assert result["ok"] is False
+    assert "wsl.exe" in result["error"].lower()
+
+
+def test_install_cuda_libs_bootstrap_does_not_patch_python_shim() -> None:
+    """Regression: beta.6-9 inserted `. cuda-env.sh` into the venv's vibechek
+    shim, which is a Python entry point — bash syntax inside Python = SyntaxError
+    on every run. The bootstrap must NEVER contain code that mutates the shim
+    in a way that injects shell syntax."""
+    from vibechek.wsl import _CUDA_LIBS_PIP_BOOTSTRAP
+
+    # The old (broken) pattern: `awk -v env=$ENV_FILE` followed by writes back
+    # to the shim. The new bootstrap must contain NO awk-rewrite-into-shim block.
+    # It IS allowed to grep-and-strip the line (the in-bootstrap repair).
+    forbidden_patterns = [
+        # Adding a sourcing line to a Python script — what bit us:
+        "print \". \" env",
+        "echo \". $ENV_FILE\" >>",
+        "echo \"source",
+    ]
+    for pattern in forbidden_patterns:
+        assert pattern not in _CUDA_LIBS_PIP_BOOTSTRAP, (
+            f"CUDA bootstrap contains a forbidden shim-mutation pattern: "
+            f"{pattern!r}. See the beta.10 bug — bash injected into a Python "
+            f"entry point breaks every subsequent run with SyntaxError."
+        )
+
+
+def test_resolve_cuda_packages_routes_to_cu11_for_tf25_soname() -> None:
+    """TF 2.5 (essentia's bundled version) dlopens libcublas.so.11, libcudnn.so.8.
+    Those .so suffixes route to the cu11 wheel set."""
+    from vibechek.wsl import _resolve_cuda_packages
+
+    pkgs, unknown = _resolve_cuda_packages([
+        "libcublas.so.11", "libcublasLt.so.11",
+        "libcufft.so.10", "libcusparse.so.11", "libcudnn.so.8",
+    ])
+    assert unknown == []
+    assert all(p.endswith("-cu11") for p in pkgs), \
+        f"Expected all cu11 packages, got {pkgs}"
+    assert "nvidia-cublas-cu11" in pkgs
+    assert "nvidia-cudnn-cu11" in pkgs
+
+
+def test_resolve_cuda_packages_routes_to_cu12_for_tf213_soname() -> None:
+    """When essentia upgrades to TF 2.13+, it'll dlopen libcublas.so.12,
+    libcudnn.so.9. Those route to cu12 wheels — audit #3."""
+    from vibechek.wsl import _resolve_cuda_packages
+
+    pkgs, unknown = _resolve_cuda_packages([
+        "libcublas.so.12", "libcudnn.so.9", "libcufft.so.11",
+    ])
+    assert unknown == []
+    assert all(p.endswith("-cu12") for p in pkgs), \
+        f"Expected all cu12 packages, got {pkgs}"
+
+
+def test_resolve_cuda_packages_handles_unknown_libs() -> None:
+    from vibechek.wsl import _resolve_cuda_packages
+    pkgs, unknown = _resolve_cuda_packages(["libimaginary.so.99", "libcublas.so.11"])
+    assert "nvidia-cublas-cu11" in pkgs
+    assert "libimaginary.so.99" in unknown
+
+
+def test_cuda_libs_have_pip_wheel_mapping() -> None:
+    """Every CUDA lib essentia needs maps to a PyPI nvidia wheel.
+
+    The pip wheels are the *primary* install path (apt is gone): they work on
+    every Linux distribution without requiring NVIDIA's apt repo to be
+    correctly registered.
+    """
+    from vibechek.wsl import _CUDA_PIP_PACKAGES_BY_LIB
+
+    required = [
+        "libcublas.so.11", "libcublasLt.so.11",
+        "libcufft.so.10", "libcurand.so.10",
+        "libcusolver.so.11", "libcusparse.so.11",
+        "libcudnn.so.8",
+    ]
+    for lib in required:
+        wheel = _CUDA_PIP_PACKAGES_BY_LIB.get(lib)
+        assert wheel is not None, f"No pip wheel mapping for {lib}"
+        assert wheel.startswith("nvidia-") and wheel.endswith("-cu11"), (
+            f"Wheel name {wheel!r} doesn't follow the nvidia-<lib>-cu11 pattern"
+        )
+
+
+def test_cuda_pip_bootstrap_has_single_placeholder() -> None:
+    """The __PACKAGES__ placeholder must appear exactly once in the bootstrap.
+
+    We hit this bug in beta.5: the bootstrap had __PACKAGES__ in both the
+    echo line and the pip install line, count=1 replace only fixed the first,
+    pip got 'install __PACKAGES__' literally and errored out.
+    """
+    from vibechek.wsl import _CUDA_LIBS_PIP_BOOTSTRAP
+
+    count = _CUDA_LIBS_PIP_BOOTSTRAP.count("__PACKAGES__")
+    assert count == 1, (
+        f"_CUDA_LIBS_PIP_BOOTSTRAP must have exactly 1 __PACKAGES__ "
+        f"occurrence (so count=1 replace is safe); found {count}. "
+        f"If you need it multiple times, set a bash variable once and reuse it."
+    )
+
+
+def test_generated_pip_cuda_script_parses_as_bash() -> None:
+    """The new pip bootstrap is syntactically valid bash."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+    from vibechek.wsl import _CUDA_LIBS_PIP_BOOTSTRAP
+
+    bash = _shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this host")
+
+    script = _CUDA_LIBS_PIP_BOOTSTRAP.replace(
+        "__PACKAGES__",
+        "nvidia-cublas-cu11 nvidia-cudnn-cu11",
+        1,
+    )
+    result = _subprocess.run(
+        [bash, "-n"],
+        input=script.encode("utf-8"),
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 0, (
+        f"Pip CUDA bootstrap has a bash syntax error.\n"
+        f"stderr: {result.stderr.decode('utf-8', errors='replace')}"
+    )
+
+
 def test_cuda_lib_map_prefers_meta_package() -> None:
     """All CUDA toolkit libs should try `cuda-libraries-11-8` first.
 
@@ -780,6 +925,207 @@ def test_install_essentia_native_unsupported_platform(monkeypatch: pytest.Monkey
     result = native_install.install_essentia_native()
     assert result["ok"] is False
     assert "not supported" in result["error"].lower()
+
+
+def test_native_install_run_with_progress_cancellation_terminates_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting the cancellation flag mid-run kills the child process.
+
+    Audit #1: previously the install subprocesses ran with no cancellation
+    polling, so a Cancel click left them running for up to 30 minutes while
+    the long-op lock stayed held. The watchdog now fires within 500ms.
+    """
+    import sys as _sys
+    import time as _time
+    from vibechek import cancellation
+    from vibechek.native_install import _run_with_progress
+
+    cancellation.end()  # clean slate
+    cancellation.begin("install-test")
+
+    # A child process that just sleeps — would normally run for the full
+    # 10-second timeout. With cancellation, it should die within ~1s.
+    sleeper = [_sys.executable, "-c", "import time; time.sleep(10)"]
+
+    # Fire the cancel from a background thread once the child has had a
+    # moment to spawn.
+    import threading as _threading
+
+    def _trigger_cancel() -> None:
+        _time.sleep(0.2)
+        cancellation.cancel()
+
+    _threading.Thread(target=_trigger_cancel, daemon=True).start()
+
+    start = _time.time()
+    rc, tail = _run_with_progress(sleeper, on_progress=lambda _line: None, timeout=10)
+    elapsed = _time.time() - start
+
+    # The watchdog polls every 500ms — should fire well before the 10s timeout.
+    assert elapsed < 5.0, f"Cancellation took {elapsed:.1f}s; expected < 5s"
+    # rc == -1 is the "killed" sentinel from the helper
+    assert rc == -1
+    assert any("Cancelled by user" in line for line in tail), \
+        f"Expected 'Cancelled by user' marker in tail; got {tail[-3:]}"
+    cancellation.end()
+
+
+def test_native_install_run_subprocess_cancellable_terminates_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Short-running cancellable wrapper also honors mid-run cancellation."""
+    import sys as _sys
+    import time as _time
+    import threading as _threading
+    from vibechek import cancellation
+    from vibechek.native_install import _run_subprocess_cancellable
+
+    cancellation.end()
+    cancellation.begin("install-test")
+
+    sleeper = [_sys.executable, "-c", "import time; time.sleep(10)"]
+
+    def _trigger() -> None:
+        _time.sleep(0.2)
+        cancellation.cancel()
+
+    _threading.Thread(target=_trigger, daemon=True).start()
+
+    start = _time.time()
+    rc, _stdout, _stderr, cancelled = _run_subprocess_cancellable(sleeper, timeout=10)
+    elapsed = _time.time() - start
+
+    assert elapsed < 5.0
+    assert cancelled is True
+    assert rc == -1 or rc != 0  # killed; exact code is OS-dependent
+    cancellation.end()
+
+
+def test_install_essentia_native_returns_cancelled_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When cancellation fires during venv creation, install returns ok=False, cancelled=True."""
+    from vibechek import cancellation, native_install
+
+    cancellation.end()
+    cancellation.begin("install-test")
+
+    # Force the supported flag and a fake host python
+    monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
+    monkeypatch.setattr(native_install, "_find_host_python", lambda: "python3")
+    # Pretend the venv doesn't exist yet so we go through step 1
+    monkeypatch.setattr(
+        native_install.Path,
+        "exists",
+        lambda self: False,
+        raising=False,
+    )
+
+    # Replace the cancellable subprocess wrapper to simulate a cancelled run
+    def fake_run(args, timeout):
+        cancellation.cancel()
+        return -1, "", "killed", True
+
+    monkeypatch.setattr(native_install, "_run_subprocess_cancellable", fake_run)
+
+    result = native_install.install_essentia_native()
+    assert result["ok"] is False
+    assert result.get("cancelled") is True
+    cancellation.end()
+
+
+# ---------------------------------------------------------------------------
+# WSL install cancellation
+# ---------------------------------------------------------------------------
+
+
+def test_wsl_install_cancellation_watchdog_kills_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_start_cancellation_watchdog terminates a long-running child on cancel.
+
+    The watchdog is the shared piece behind install_wsl, install_vibechek_in_wsl,
+    install_cuda_libs_in_wsl, and repair_wsl_shim.
+    """
+    import subprocess as _subprocess
+    import sys as _sys
+    import threading as _threading
+    import time as _time
+    from vibechek import cancellation
+    from vibechek.wsl import _start_cancellation_watchdog
+
+    cancellation.end()
+    cancellation.begin("install-test")
+
+    proc = _subprocess.Popen(
+        [_sys.executable, "-c", "import time; time.sleep(10)"],
+        stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
+    )
+
+    cancel_done, state = _start_cancellation_watchdog(proc)
+
+    def _trigger() -> None:
+        _time.sleep(0.2)
+        cancellation.cancel()
+
+    _threading.Thread(target=_trigger, daemon=True).start()
+
+    start = _time.time()
+    proc.wait(timeout=10)
+    elapsed = _time.time() - start
+    cancel_done.set()
+
+    assert elapsed < 5.0
+    assert state["v"] is True
+    assert proc.returncode is not None and proc.returncode != 0
+    cancellation.end()
+
+
+def test_wsl_install_wsl_returns_cancelled_dict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """install_wsl surfaces cancellation as `cancelled: True`."""
+    import sys as _sys
+    import threading as _threading
+    import time as _time
+    from vibechek import cancellation
+    from vibechek import wsl as wsl_mod
+
+    cancellation.end()
+    cancellation.begin("install-test")
+    monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
+
+    real_popen = wsl_mod.subprocess.Popen
+
+    def fake_popen(args, **kwargs):
+        # Replace the PowerShell command with a long-running sleep so the
+        # watchdog actually has something to kill.
+        sleep_cmd = [_sys.executable, "-c", "import time; time.sleep(10)"]
+        return real_popen(
+            sleep_cmd,
+            stdin=kwargs.get("stdin"),
+            stdout=kwargs.get("stdout"),
+            stderr=kwargs.get("stderr"),
+            text=kwargs.get("text", False),
+            encoding=kwargs.get("encoding"),
+            errors=kwargs.get("errors"),
+        )
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", fake_popen)
+
+    def _trigger() -> None:
+        _time.sleep(0.3)
+        cancellation.cancel()
+
+    _threading.Thread(target=_trigger, daemon=True).start()
+
+    start = _time.time()
+    result = wsl_mod.install_wsl("Ubuntu-24.04")
+    elapsed = _time.time() - start
+
+    assert elapsed < 5.0, f"install_wsl took {elapsed:.1f}s after cancel"
+    assert result["ok"] is False
+    assert result.get("cancelled") is True
+    cancellation.end()
 
 
 def test_native_venv_status_to_dict_is_jsonable() -> None:

@@ -1,10 +1,13 @@
-"""Generate TypeScript interfaces from Vibechek's Python dataclasses.
+"""Generate TypeScript interfaces and shared constants from Vibechek's Python source.
 
 Run with:
     ./.venv/Scripts/python.exe scripts/generate_ts_types.py
 
-Writes to `ui/src/types/generated.ts`. The file is auto-overwritten; do not
-hand-edit it. To extend the mapping, edit this script.
+Outputs (auto-overwritten; do not hand-edit):
+    - `ui/src/types/generated.ts`     — TS interfaces for every dataclass
+    - `ui/src/lib/keeperConstants.ts` — JSON-compatible constants shared with TS
+
+To extend the mapping, edit this script.
 
 Type mapping (Python -> TS)
 ---------------------------
@@ -26,12 +29,27 @@ Type mapping (Python -> TS)
 @property methods on dataclasses are emitted as readonly fields when they
 appear in `PROPERTY_FIELDS` below — manually maintained because property
 return types aren't preserved by `dataclasses.fields()`.
+
+Sharing a Python constant with the UI
+-------------------------------------
+The `SHARED_CONSTANTS` list below names a Python attribute and the TS symbol
+it should be exported as. Each entry is:
+
+    ("vibechek.module", "_PYTHON_NAME", "TS_EXPORT_NAME", "TS type annotation")
+
+The value must be JSON-serializable (dict/list/str/int/float/bool/None). At
+generation time we `import` the module, read the attribute, and emit it via
+`json.dumps()` into `ui/src/lib/keeperConstants.ts`. Add a new entry, re-run
+the script, and the constant is available in TS — no hand-translation, no
+drift.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import importlib
+import json
+import re
 import sys
 import types
 import typing
@@ -75,7 +93,46 @@ PROPERTY_FIELDS: dict[str, list[tuple[str, str]]] = {
 #   - TrackAnalysis: uses __ts_overrides__ to type existing_tags / ml_analysis
 SKIP_CLASSES: set[str] = set()
 
+# Types referenced by `__ts_overrides__` that are declared in the hand-written
+# shim (`ui/src/types/index.ts`) rather than generated here. We emit a permissive
+# forward-declaration stub for each into `generated.ts` so the file type-checks
+# standalone; the shim's narrower declarations shadow these for consumers, since
+# `index.ts` does `export * from "./generated"` then re-declares them locally,
+# and TS resolves the local declaration in favor of the re-export on conflict.
+#
+# Add a name here when an `__ts_overrides__` entry references a type that lives
+# only in the shim. Anything not in this set and not a generated dataclass will
+# fail validation at generation time (see `_validate_override` below).
+EXTERNAL_TYPES: set[str] = {"ExistingTags"}
+
+# TS identifiers that are not user-defined types and should be ignored when
+# validating override strings. Anything else in an override must resolve to a
+# generated dataclass or an EXTERNAL_TYPES entry.
+_TS_BUILTINS: set[str] = {
+    "string", "number", "boolean", "null", "undefined", "void", "any",
+    "never", "unknown", "object",
+    "Record", "Array", "Partial", "Required", "Readonly", "Pick", "Omit",
+    "ReadonlyArray", "Map", "Set",
+    "true", "false",
+}
+
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 OUTPUT_PATH = ROOT / "ui" / "src" / "types" / "generated.ts"
+
+# Shared constants emitted to ui/src/lib/keeperConstants.ts.
+# Each tuple: (python_module, python_attribute, ts_export_name, ts_type_annotation).
+# The value at the named attribute must be JSON-serializable.
+SHARED_CONSTANTS: list[tuple[str, str, str, str]] = [
+    (
+        "vibechek.duplicates",
+        "_KEEPER_FORMAT_PRIORITY",
+        "KEEPER_FORMAT_PRIORITY",
+        "Record<string, number>",
+    ),
+]
+
+CONSTANTS_OUTPUT_PATH = ROOT / "ui" / "src" / "lib" / "keeperConstants.ts"
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +253,26 @@ def collect_dataclasses(module_names: list[str]) -> list[type]:
     return list(seen.values())
 
 
+def _validate_override(cls_name: str, field_name: str, ts: str, known: set[str]) -> None:
+    """Raise if `ts` references identifiers that won't resolve in `generated.ts`.
+
+    Override strings are emitted verbatim — if they name a type that isn't a
+    generated dataclass and isn't declared as an EXTERNAL_TYPES stub, the
+    resulting `generated.ts` won't compile. Catch it here instead.
+    """
+    unresolved = {
+        ident for ident in _IDENT_RE.findall(ts)
+        if ident not in _TS_BUILTINS and ident not in known
+    }
+    if unresolved:
+        raise ValueError(
+            f"__ts_overrides__ on {cls_name}.{field_name} references unknown "
+            f"type(s) {sorted(unresolved)}: not a generated dataclass and not "
+            f"in EXTERNAL_TYPES. Either generate the type, or add it to "
+            f"EXTERNAL_TYPES in scripts/generate_ts_types.py."
+        )
+
+
 def emit_interface(cls: type, known: set[str]) -> str:
     """Emit a TS interface for a single dataclass.
 
@@ -217,6 +294,7 @@ def emit_interface(cls: type, known: set[str]) -> str:
     for f in dataclasses.fields(cls):
         if f.name in overrides:
             ts = overrides[f.name]
+            _validate_override(cls.__name__, f.name, ts, known)
         else:
             tp = hints.get(f.name, f.type)
             ts = translate(tp, known)
@@ -226,6 +304,26 @@ def emit_interface(cls: type, known: set[str]) -> str:
         lines.append(f"  readonly {prop_name}: {ts};")
 
     lines.append("}")
+    return "\n".join(lines)
+
+
+def emit_external_stubs() -> str:
+    """Emit permissive forward declarations for shim-declared types.
+
+    These are referenced by `__ts_overrides__` but live in `ui/src/types/index.ts`.
+    The stubs let `generated.ts` type-check standalone; the shim re-declares
+    them locally with their real shape and TypeScript resolves the local
+    declaration in favor of the `export *` re-export on conflict.
+    """
+    if not EXTERNAL_TYPES:
+        return ""
+    lines = [
+        "// External types — declared in the hand-written shim (./index.ts).",
+        "// These permissive stubs let generated.ts type-check standalone; the",
+        "// shim re-declares each with its real shape and shadows the re-export.",
+    ]
+    for name in sorted(EXTERNAL_TYPES):
+        lines.append(f"export interface {name} {{ [key: string]: unknown; }}")
     return "\n".join(lines)
 
 
@@ -242,12 +340,53 @@ HEADER = """// AUTO-GENERATED — do not edit. Run scripts/generate_ts_types.py 
 // dataclass.
 """
 
+CONSTANTS_HEADER = """// AUTO-GENERATED — do not edit. Run scripts/generate_ts_types.py to regenerate.
+//
+// Source of truth: Python attributes listed in SHARED_CONSTANTS in
+// scripts/generate_ts_types.py. Re-run the script after editing the Python
+// values so the UI picks them up.
+"""
+
+
+def emit_shared_constants() -> str:
+    """Build the contents of `keeperConstants.ts` from `SHARED_CONSTANTS`.
+
+    Each entry imports the named module, reads the attribute, validates that
+    the value is JSON-serializable, and emits a TS `export const` with the
+    declared type annotation. Drift between Python and TS is impossible by
+    construction — there is only one copy of the value.
+    """
+    blocks = [CONSTANTS_HEADER]
+    for module_name, attr_name, ts_name, ts_type in SHARED_CONSTANTS:
+        module = importlib.import_module(module_name)
+        if not hasattr(module, attr_name):
+            raise AttributeError(
+                f"{module_name} has no attribute {attr_name!r} "
+                f"(check SHARED_CONSTANTS in scripts/generate_ts_types.py)"
+            )
+        value = getattr(module, attr_name)
+        try:
+            # `sort_keys` keeps the output stable across runs so diffs stay clean.
+            literal = json.dumps(value, indent=2, sort_keys=True)
+        except TypeError as e:
+            raise TypeError(
+                f"{module_name}.{attr_name} is not JSON-serializable: {e}. "
+                f"SHARED_CONSTANTS values must be plain dict/list/str/int/float/bool/None."
+            ) from e
+        blocks.append(
+            f"export const {ts_name}: {ts_type} = {literal};"
+        )
+    return "\n\n".join(blocks) + "\n"
+
 
 def main() -> int:
     classes = collect_dataclasses(MODULES)
-    known = {c.__name__ for c in classes}
+    known = {c.__name__ for c in classes} | EXTERNAL_TYPES
 
     blocks = [HEADER]
+    stubs = emit_external_stubs()
+    if stubs:
+        blocks.append(stubs)
     for cls in classes:
         blocks.append(emit_interface(cls, known))
     output = "\n\n".join(blocks) + "\n"
@@ -257,6 +396,11 @@ def main() -> int:
 
     print(f"Wrote {OUTPUT_PATH} ({len(classes)} dataclasses, "
           f"{output.count(chr(10)) + 1} lines)")
+
+    constants_output = emit_shared_constants()
+    CONSTANTS_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONSTANTS_OUTPUT_PATH.write_text(constants_output, encoding="utf-8")
+    print(f"Wrote {CONSTANTS_OUTPUT_PATH} ({len(SHARED_CONSTANTS)} constants)")
     return 0
 
 

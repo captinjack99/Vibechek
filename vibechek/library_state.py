@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from vibechek.config import CONFIG_DIR, DATA_DIR
+from vibechek.io import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +34,15 @@ ANALYSES_DIR = DATA_DIR / "analyses"
 
 @dataclass
 class LibraryRecord:
-    """One row in the recent-libraries list."""
+    """One row in the recent-libraries list.
+
+    Has a friendly `name` (defaults to the folder's basename via
+    `display_name()`) and a list of user-assigned `tags` ("Friday Set",
+    "Brunch", "Wedding") so DJs can organise multiple gigging libraries.
+    Both are pure metadata — the rest of the engine still keys off `path`.
+    Optional fields are last so older state files that lack them deserialize
+    fine via the constructor defaults.
+    """
 
     path: str                # The library folder
     analysis_path: str       # Where the saved analysis.json lives
@@ -41,6 +50,14 @@ class LibraryRecord:
     analyzed_count: int = 0  # Tracks that have ml_analysis
     last_opened: float = 0.0      # epoch seconds
     last_analyzed: float = 0.0    # epoch seconds; 0 if never analyzed
+    name: str = ""                # Friendly display name; "" → use basename(path)
+    tags: list[str] = field(default_factory=list)  # User-assigned: "Brunch", "Wedding"
+
+    def display_name(self) -> str:
+        """Friendly label for the UI. Falls back to the folder basename."""
+        if self.name:
+            return self.name
+        return Path(self.path).name or self.path
 
 
 @dataclass
@@ -75,7 +92,10 @@ def save_state(state: LibraryState) -> None:
     """Write the index to disk. Creates the config dir as needed."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {"recent": [asdict(r) for r in state.recent]}
-    STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Atomic write: this index points at the saved analysis files, so a
+    # corrupted index strands every prior analysis (the user sees "no recent
+    # libraries" even though the 32MB analysis JSONs are still on disk).
+    atomic_write_json(STATE_FILE, payload, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -108,10 +128,10 @@ def record_analysis(library_path: Path | str, report: dict[str, Any]) -> Library
     path_str = str(library_path)
     analysis_path = _analysis_path_for(path_str)
     analysis_path.parent.mkdir(parents=True, exist_ok=True)
-    analysis_path.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    # Atomic write: this is the THE file we most cannot afford to corrupt —
+    # it represents 30+ minutes of GPU time on a 12k-track library, and a
+    # truncated 32 MB JSON makes the entire library "lost" on next launch.
+    atomic_write_json(analysis_path, report, indent=2, ensure_ascii=False)
 
     state = load_state()
     existing = _find(state, path_str)
@@ -141,6 +161,58 @@ def forget(library_path: Path | str) -> bool:
     state.recent = [r for r in state.recent if r.path != path_str]
     save_state(state)
     return len(state.recent) < before
+
+
+def rename_library(library_path: Path | str, new_name: str) -> LibraryRecord | None:
+    """Set the friendly display name for a library.
+
+    An empty `new_name` ("" or whitespace-only) clears the override so the
+    UI falls back to the folder basename. Returns the updated record, or
+    `None` if the library isn't in the recent list (don't promote an
+    unknown library just because the user renamed it).
+    """
+    state = load_state()
+    path_str = str(library_path)
+    record = _find(state, path_str)
+    if record is None:
+        return None
+    # Strip whitespace — leading/trailing spaces in a UI text field are
+    # almost always typos, never intentional. Empty string is the sentinel
+    # for "use the basename" (see LibraryRecord.display_name).
+    record.name = (new_name or "").strip()
+    save_state(state)
+    return record
+
+
+def tag_library(library_path: Path | str, tags: list[str]) -> LibraryRecord | None:
+    """Replace the tag list for a library.
+
+    Tags are deduplicated (preserving first-occurrence order so the UI
+    doesn't reshuffle the user's order), stripped, and empty entries are
+    dropped. Returns the updated record, or `None` if the library isn't
+    in the recent list.
+    """
+    state = load_state()
+    path_str = str(library_path)
+    record = _find(state, path_str)
+    if record is None:
+        return None
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for t in tags or []:
+        s = str(t).strip()
+        if not s:
+            continue
+        # Case-insensitive dedupe — "Friday Set" and "friday set" are the
+        # same gig in the user's head; collapse them.
+        key = s.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(s)
+    record.tags = cleaned
+    save_state(state)
+    return record
 
 
 def load_analysis(record: LibraryRecord) -> dict[str, Any] | None:
@@ -197,4 +269,6 @@ __all__ = [
     "record_analysis",
     "forget",
     "load_analysis",
+    "rename_library",
+    "tag_library",
 ]

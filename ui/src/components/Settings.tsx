@@ -1,17 +1,26 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield,
   Zap, AlertTriangle, CheckCircle2, RotateCcw, ChevronDown, ChevronRight,
-  FileText, Wrench,
+  FileText, Wrench, StopCircle, HelpCircle,
 } from "lucide-react";
 import { AnimatePresence } from "framer-motion";
 
-import { useConfigStore, useOperationStore } from "../stores";
-import { rpc, sidecarStatus } from "../hooks/useSidecar";
-import type { EngineGpuInfo, PreflightResult, SystemResources, VibechekConfig } from "../types";
+import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
+import { isCancellation, rpc, sidecarStatus, useSidecarProgress } from "../hooks/useSidecar";
+import type { EngineGpuInfo, GpuDevice, PreflightResult, SystemResources, VibechekConfig } from "../types";
+import { ConfirmModal } from "./ConfirmModal";
 import { LogsViewer } from "./LogsViewer";
 import { PreflightDialog } from "./PreflightDialog";
+
+// AUDIT_SETTINGS_TAB #11: the workers slider used to cap at sysInfo.cpu_count,
+// which silently truncated a user-set value when sysInfo loaded asynchronously
+// (race: type 32, sysInfo arrives with cpu_count=8, slider clamps to 8). Use
+// a generous static ceiling instead — anyone with > 96 cores is going to set
+// this via config.toml anyway, and we now display a warning when their value
+// exceeds the detected core count.
+const WORKERS_MAX = 96;
 
 export function Settings() {
   const cfg = useConfigStore((s) => s.config);
@@ -29,19 +38,48 @@ export function Settings() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [showPreflightDialog, setShowPreflightDialog] = useState(false);
+  // AUDIT_SETTINGS_TAB #12: restoring all defaults is destructive — gate it
+  // behind a confirm modal so a stray click can't wipe a tweaked setup.
+  const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
+
+  // AUDIT_SETTINGS_TAB #7: track mount so async preflight / sysInfo callbacks
+  // don't call setState after the component unmounts (the user switched
+  // tabs while the slow WSL probe was in flight).
+  const isMounted = useRef(true);
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  // AUDIT_SETTINGS_TAB #15: handleDownloadModels used to close over the
+  // initial `cfg.analysis.models_dir`. If the user edited the field after
+  // the component mounted, the closure kept the old value. Read from the
+  // store at call time via a ref instead.
+  const cfgRef = useRef(cfg);
+  useEffect(() => {
+    cfgRef.current = cfg;
+  }, [cfg]);
 
   const handleRestoreAll = async () => {
+    setShowRestoreConfirm(false);
     try {
       const result = await rpc<{ config: VibechekConfig }>("restore_default_config");
+      if (!isMounted.current) return;
       setConfig(result.config, true);
     } catch (e) {
-      fail(String(e));
+      fail(e);
     }
   };
 
   const [sidecarBinary, setSidecarBinary] = useState<string | null>(null);
   const [sysInfo, setSysInfo] = useState<SystemResources | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
+  // AUDIT_SETTINGS_TAB #9: models_dir is a free-text input. Validate on blur
+  // (cheap `scan_directory` quick call) so an obvious typo or stale path
+  // surfaces before the user kicks off a download or analyze.
+  const [modelsDirWarning, setModelsDirWarning] = useState<string | null>(null);
   // Engine-side GPU truth — what TF inside WSL (or native) actually sees.
   // Probed lazily after preflight resolves; null means "haven't asked yet",
   // engineProbing=true means "asking, ~10s wait".
@@ -55,76 +93,102 @@ export function Settings() {
    * Cached server-side for 5 min — `force=true` bypasses.
    */
   const refreshEngineGpu = (distro: string | null, force = false) => {
+    if (!isMounted.current) return;
     setEngineProbing(true);
     rpc<EngineGpuInfo>("engine_gpu_status", { distro, force })
-      .then((info) => setEngineGpu(info))
-      .catch((e) => setEngineGpu({
-        engine: distro ? "wsl" : "native",
-        distro,
-        ok: false,
-        gpu_available: false,
-        gpu_count: 0,
-        devices: [],
-        gpu_hardware_visible: false,
-        missing_cuda_libs: [],
-        tf_version: null,
-        tf_built_with_cuda: null,
-        nvidia_driver: null,
-        nvidia_smi_available: false,
-        error: String(e),
-        probed_at: Date.now() / 1000,
-      }))
-      .finally(() => setEngineProbing(false));
+      .then((info) => {
+        if (isMounted.current) setEngineGpu(info);
+      })
+      .catch((e) => {
+        if (!isMounted.current) return;
+        setEngineGpu({
+          engine: distro ? "wsl" : "native",
+          distro,
+          ok: false,
+          gpu_available: false,
+          gpu_count: 0,
+          devices: [],
+          gpu_hardware_visible: false,
+          missing_cuda_libs: [],
+          tf_version: null,
+          tf_built_with_cuda: null,
+          nvidia_driver: null,
+          nvidia_smi_available: false,
+          error: String(e),
+          probed_at: Date.now() / 1000,
+        });
+      })
+      .finally(() => {
+        if (isMounted.current) setEngineProbing(false);
+      });
   };
 
   const refreshPreflight = () => {
-    // Two-phase load: fast preflight first (returns in <1s), then trigger the
-    // slower per-distro WSL probe in the background and merge results.
-    rpc<PreflightResult>("preflight", {})
+    // Two-phase load: fast quick=true preflight for instant UI feedback,
+    // then upgrade with a full quick=false call so we know the real WSL
+    // state and can pick the right engine GPU probe target.
+    rpc<PreflightResult>("preflight", { quick: true })
       .then((quick) => {
+        if (!isMounted.current) return;
         setPreflightResult(quick);
-        // Kick off the slow probe only on Windows where it matters
-        if (quick.wsl?.is_windows) {
-          rpc<PreflightResult["wsl"]>("wsl_status", { quick: false })
-            .then((wsl) => {
-              setPreflightResult((prev) => {
-                if (!prev) return prev;
-                // Recompute the readiness fields now that we know the real
-                // WSL state (quick mode couldn't tell us if essentia is in
-                // a distro). Mirrors the logic in vibechek/preflight.py.
-                const wslReady = wsl?.can_run_vibechek ?? false;
-                const ready =
-                  (prev.essentia.installed || wslReady) &&
-                  prev.models.missing.length === 0;
-                const analyze_via: "native" | "wsl" | null = prev.essentia.installed
-                  ? "native"
-                  : wslReady
-                  ? "wsl"
-                  : null;
-                // Now that we know where analyze will run, ask the actual
-                // engine what GPUs it sees. The cached probe is cheap;
-                // first call inside WSL takes ~10s while TF loads.
-                if (analyze_via === "wsl" && wsl?.usable_distro) {
-                  refreshEngineGpu(wsl.usable_distro);
-                } else if (analyze_via === "native") {
-                  refreshEngineGpu(null);
-                }
-                return { ...prev, wsl, ready, analyze_via };
-              });
-            })
-            .catch(() => {});
-        } else if (quick.essentia.installed) {
-          // Non-Windows: probe the native engine directly.
-          refreshEngineGpu(null);
-        }
+        // Upgrade: full preflight (slow WSL probe on Windows, ~5-10s).
+        // AUDIT_SETTINGS_TAB #8: the full preflight can take up to ~10s
+        // for cold WSL probes; sidecar.rs::timeout_for() categorises
+        // "preflight" as QUICK (60s) which is enough headroom even when a
+        // distro hasn't been booted in a while. If users start hitting
+        // the 60s ceiling we'll need to either bump it or split preflight
+        // into preflight + preflight_full with their own timeouts.
+        rpc<PreflightResult>("preflight", { quick: false })
+          .then((full) => {
+            if (!isMounted.current) return;
+            setPreflightResult(full);
+            // Now that we know where analyze will run, ask the actual
+            // engine what GPUs it sees. The probe is cached server-side;
+            // first call inside WSL takes ~10s while TF loads.
+            if (full.analyze_via === "wsl" && full.wsl?.usable_distro) {
+              refreshEngineGpu(full.wsl.usable_distro);
+            } else if (full.analyze_via === "native" || full.analyze_via === "native_venv") {
+              refreshEngineGpu(null);
+            }
+          })
+          .catch(() => {});
       })
       .catch(() => {});
   };
 
+  const validateModelsDir = async (path: string) => {
+    if (!path.trim()) {
+      setModelsDirWarning(null);
+      return;
+    }
+    try {
+      // scan_directory is QUICK-tier on the sidecar (~instant). On error or
+      // for a missing path the RPC rejects, which we treat as "warn the user
+      // but don't block — they may be about to point at a directory the
+      // download will create".
+      await rpc("scan_directory", { path, recursive: false });
+      if (isMounted.current) setModelsDirWarning(null);
+    } catch (e) {
+      if (!isMounted.current) return;
+      const msg =
+        typeof e === "object" && e !== null && "message" in e
+          ? String((e as { message: unknown }).message)
+          : String(e);
+      setModelsDirWarning(
+        `Couldn't read this directory: ${msg}. Vibechek will try to create it on download.`,
+      );
+    }
+  };
+
   useEffect(() => {
-    sidecarStatus().then((s) => setSidecarBinary(s.binary)).catch(() => {});
+    sidecarStatus()
+      .then((s) => {
+        if (isMounted.current) setSidecarBinary(s.binary);
+      })
+      .catch(() => {});
     rpc<SystemResources>("system_info")
       .then((info) => {
+        if (!isMounted.current) return;
         setSysInfo(info);
         if (cfg.analysis.workers === 0) {
           updateAnalysis({ workers: info.recommended_workers });
@@ -138,13 +202,15 @@ export function Settings() {
   const handleDownloadModels = async () => {
     begin("download-models");
     try {
+      // AUDIT_SETTINGS_TAB #15: read the latest models_dir from the store
+      // via cfgRef so we don't ship a stale value from the original render.
       await rpc("download_models", {
-        models_dir: cfg.analysis.models_dir || undefined,
+        models_dir: cfgRef.current.analysis.models_dir || undefined,
       });
       finish();
       refreshPreflight();
     } catch (e) {
-      fail(String(e));
+      fail(e);
     }
   };
 
@@ -175,15 +241,21 @@ export function Settings() {
         analyzeVia={
           // Narrow the wire-level `string | null` to the literal union the
           // component expects. Anything unexpected falls back to null.
+          // AUDIT_SETTINGS_TAB #20: `native_venv` is a real value but the
+          // old check dropped it, which made the engine GPU block render
+          // the wrong copy when analyze routed through the managed venv.
           preflightResult?.analyze_via === "wsl" ||
-          preflightResult?.analyze_via === "native"
+          preflightResult?.analyze_via === "native" ||
+          preflightResult?.analyze_via === "native_venv"
             ? preflightResult.analyze_via
             : null
         }
+        preflight={preflightResult}
         onRefreshEngine={() => {
           const distro = preflightResult?.wsl?.usable_distro ?? null;
           refreshEngineGpu(distro, true);
         }}
+        onRefreshPreflight={refreshPreflight}
       />
 
       <Section
@@ -196,7 +268,11 @@ export function Settings() {
             <input
               type="range"
               min={1}
-              max={sysInfo?.cpu_count ?? 32}
+              // AUDIT_SETTINGS_TAB #11: static high ceiling instead of
+              // sysInfo.cpu_count, which used to snap a user-set value
+              // (e.g. 32) down when sysInfo loaded asynchronously with a
+              // smaller cpu_count. Warning below if value > cpu_count.
+              max={WORKERS_MAX}
               step={1}
               value={Math.max(1, cfg.analysis.workers)}
               onChange={(e) => updateAnalysis({ workers: Number(e.target.value) })}
@@ -222,25 +298,58 @@ export function Settings() {
             <code>cpu_count − 1</code> for a responsive system,{" "}
             <code>cpu_count</code> for max throughput.
           </Hint>
+          {sysInfo && cfg.analysis.workers > sysInfo.cpu_count && (
+            <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
+              <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+              <span>
+                {cfg.analysis.workers} workers exceeds the {sysInfo.cpu_count}{" "}
+                CPU cores Vibechek detected. The extra workers will compete
+                for CPU time rather than add throughput.
+              </span>
+            </div>
+          )}
         </Field>
 
         <Field label="GPU acceleration">
           <div className="flex gap-2">
-            {(["auto", "on", "off"] as const).map((mode) => (
-              <button
-                key={mode}
-                onClick={() => updateAnalysis({ use_gpu: mode })}
-                className={`btn ${
-                  cfg.analysis.use_gpu === mode
-                    ? "bg-accent text-white"
-                    : "bg-white/5 text-white/70 hover:bg-white/10"
-                }`}
-              >
-                {mode === "auto" && <Zap className="w-3.5 h-3.5" />}
-                <span className="capitalize">{mode}</span>
-              </button>
-            ))}
+            {(["auto", "on", "off"] as const).map((mode) => {
+              // AUDIT_SETTINGS_TAB #10: when no GPU is available "on" silently
+              // falls back to CPU. Disable the button (with a tooltip) so the
+              // user understands why their choice doesn't stick.
+              const noGpu = engineGpu?.ok === true && engineGpu.gpu_available === false;
+              const disabled = mode === "on" && noGpu;
+              return (
+                <button
+                  key={mode}
+                  onClick={() => !disabled && updateAnalysis({ use_gpu: mode })}
+                  disabled={disabled}
+                  title={
+                    disabled
+                      ? "No GPU available — analyze will run on CPU regardless."
+                      : undefined
+                  }
+                  className={`btn ${
+                    cfg.analysis.use_gpu === mode
+                      ? "bg-accent text-white"
+                      : "bg-white/5 text-white/70 hover:bg-white/10"
+                  } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
+                >
+                  {mode === "auto" && <Zap className="w-3.5 h-3.5" />}
+                  <span className="capitalize">{mode}</span>
+                </button>
+              );
+            })}
           </div>
+          {/* Extra warning when use_gpu="on" is selected and engine reports no GPU */}
+          {cfg.analysis.use_gpu === "on" && engineGpu?.ok && !engineGpu.gpu_available && (
+            <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
+              <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+              <span>
+                "On" is selected but the analyze engine reports no usable GPU.
+                Analyze will fall back to CPU.
+              </span>
+            </div>
+          )}
           <Hint>
             {(() => {
               // The engine probe is ground truth — it asks TF (in WSL or
@@ -276,15 +385,27 @@ export function Settings() {
               value={cfg.analysis.models_dir}
               placeholder="(default: user data dir)"
               onChange={(e) => updateAnalysis({ models_dir: e.target.value })}
+              onBlur={(e) => void validateModelsDir(e.target.value)}
             />
             <button
               className="btn-ghost"
-              onClick={() => handlePickDir((p) => updateAnalysis({ models_dir: p }))}
+              onClick={() => {
+                handlePickDir((p) => {
+                  updateAnalysis({ models_dir: p });
+                  void validateModelsDir(p);
+                });
+              }}
             >
               <FolderOpen className="w-4 h-4" />
             </button>
           </div>
           <Hint>~800 MB total when downloaded.</Hint>
+          {modelsDirWarning && (
+            <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
+              <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+              <span>{modelsDirWarning}</span>
+            </div>
+          )}
           <button
             className="btn-primary mt-2"
             onClick={handleDownloadModels}
@@ -357,6 +478,31 @@ export function Settings() {
           checked={cfg.tagging.backup_before_write}
           onChange={(v) => updateTagging({ backup_before_write: v })}
         />
+
+        {/* AUDIT_TAGS_TAB #4: surface id3_text_encoding so users on legacy
+            software (especially Rekordbox 5, which only reads UTF-16 frames)
+            can switch off the modern UTF-8 default without editing
+            config.toml by hand. */}
+        <Field label="ID3 text encoding">
+          <select
+            className="input"
+            value={cfg.tagging.id3_text_encoding}
+            onChange={(e) =>
+              updateTagging({ id3_text_encoding: Number(e.target.value) })
+            }
+          >
+            <option value={3}>UTF-8 (modern, default)</option>
+            <option value={1}>UTF-16 (Rekordbox 5 compatible)</option>
+            <option value={0}>ISO-8859-1 (legacy, ASCII only)</option>
+          </select>
+          <Hint>
+            Controls the encoding flag written to ID3v2 text frames. UTF-8 is
+            the universal default; pick UTF-16 if your DJ software (e.g.
+            Rekordbox 5) can't read non-ASCII characters in genre/title
+            tags. ISO-8859-1 is for legacy compatibility only and will
+            strip accented characters.
+          </Hint>
+        </Field>
       </Section>
 
       <Section
@@ -455,13 +601,34 @@ export function Settings() {
 
       <div className="mb-6">
         <button
-          onClick={handleRestoreAll}
+          onClick={() => setShowRestoreConfirm(true)}
           className="btn-ghost text-sm"
         >
           <RotateCcw className="w-4 h-4" />
           Restore all settings to defaults
         </button>
       </div>
+
+      <ConfirmModal
+        open={showRestoreConfirm}
+        title="Restore all settings?"
+        message={
+          <>
+            <p>
+              Every setting on this page will go back to its default value:
+              analysis, tagging, duplicates, organization, UI preferences.
+            </p>
+            <p className="text-white/60 text-xs">
+              This doesn't touch your library files or analysis results — only
+              configuration.
+            </p>
+          </>
+        }
+        confirmLabel="Restore defaults"
+        variant="danger"
+        onConfirm={handleRestoreAll}
+        onCancel={() => setShowRestoreConfirm(false)}
+      />
 
       <Section title="About" subtitle="">
         <div className="text-xs text-white/40 font-mono break-all">
@@ -682,13 +849,17 @@ function ResourcesSection({
   engineGpu,
   engineProbing,
   analyzeVia,
+  preflight,
   onRefreshEngine,
+  onRefreshPreflight,
 }: {
   sysInfo: SystemResources | null;
   engineGpu: EngineGpuInfo | null;
   engineProbing: boolean;
-  analyzeVia: "native" | "wsl" | null;
+  analyzeVia: "native" | "native_venv" | "wsl" | null;
+  preflight: PreflightResult | null;
   onRefreshEngine: () => void;
+  onRefreshPreflight: () => void;
 }) {
   if (!sysInfo) {
     return (
@@ -759,8 +930,29 @@ function ResourcesSection({
         engineGpu={engineGpu}
         engineProbing={engineProbing}
         analyzeVia={analyzeVia}
+        preflightDistro={preflight?.wsl?.usable_distro ?? null}
         onRefresh={onRefreshEngine}
       />
+
+      {/* Cross-vendor inventory + honesty callout. Surfaces every GPU the
+          host has, not just the NVIDIA one TF can use. Renders nothing
+          (and shows nothing in the UI) when no GPUs of any kind exist. */}
+      <CrossVendorGpuInventory sysInfo={sysInfo} />
+
+      {/* AUDIT_SETTINGS_TAB #4: troubleshooting affordance for the broken
+          venv shim case (pre-beta.10 cuda-env.sh patch). Tiny low-visibility
+          row — mirrors the one in PreflightDialog so users who keep Settings
+          open can repair without re-opening the setup dialog. */}
+      {(preflight?.wsl?.distros.length ?? 0) > 0 && (
+        <TroubleshootingRow
+          distro={
+            preflight?.wsl?.usable_distro
+            ?? preflight?.wsl?.distros[0]?.name
+            ?? null
+          }
+          onRepaired={onRefreshPreflight}
+        />
+      )}
 
       <div className="mt-3 text-[11px] text-white/30 font-mono break-all">
         {sysInfo.platform}
@@ -770,48 +962,168 @@ function ResourcesSection({
 }
 
 /**
+ * AUDIT_SETTINGS_TAB #4: explicit RPC button for `repair_wsl_shim`.
+ *
+ * Keeps the user out of the docs/manual-repair path if their analyze starts
+ * failing with a SyntaxError caused by the pre-beta.10 cuda-env.sh patch.
+ */
+function TroubleshootingRow({
+  distro,
+  onRepaired,
+}: {
+  distro: string | null;
+  onRepaired: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const notify = useNotificationStore((s) => s.notify);
+
+  const handleClick = async () => {
+    if (!distro) {
+      notify("No WSL distro detected to repair.", { kind: "info" });
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await rpc<{
+        ok: boolean;
+        repaired?: boolean;
+        message?: string;
+        error?: string;
+      }>("repair_wsl_shim", { distro });
+      if (r.ok) {
+        notify(r.message ?? "Shim repair completed.", { kind: "success" });
+        onRepaired();
+      } else {
+        notify(`Repair failed: ${r.error ?? "unknown"}`, { kind: "info" });
+      }
+    } catch (e) {
+      if (!isCancellation(e)) {
+        const msg =
+          typeof e === "object" && e !== null && "message" in e
+            ? String((e as { message: unknown }).message)
+            : String(e);
+        notify(`Repair failed: ${msg}`, { kind: "info" });
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 text-[11px] text-white/40 flex items-center gap-2">
+      <Wrench className="w-3 h-3" />
+      <span>Analyze failing with a SyntaxError in WSL?</span>
+      <button
+        onClick={handleClick}
+        disabled={busy}
+        className="underline hover:text-white/70 disabled:opacity-50"
+      >
+        {busy ? "Repairing…" : "Repair WSL shim"}
+      </button>
+    </div>
+  );
+}
+
+/**
  * State: GPU hardware visible to TF but TF refuses to register it (missing
  * CUDA libs inside the engine). We tell the user what's missing and offer
  * an "Enable GPU" button that installs the libs.
+ *
+ * AUDIT_SETTINGS_TAB #5 + #16: shows live progress + Cancel while installing.
+ * The install timeout is one hour (sidecar.rs MEDIUM tier) but most installs
+ * complete in 30-60 sec; we still want a Cancel button so a user on a flaky
+ * mirror isn't stuck.
+ *
+ * AUDIT_SETTINGS_TAB #22: re-derive distro from the latest preflight result
+ * instead of the (possibly stale) engineGpu.distro snapshot. After a
+ * successful install_essentia_native call on Windows, engineGpu can flip to
+ * "native" while preflight.wsl?.usable_distro still names the right target.
  */
 function EngineGpuFixableBlock({
   engineGpu,
+  preflightDistro,
   onRefresh,
 }: {
   engineGpu: EngineGpuInfo;
+  preflightDistro: string | null;
   onRefresh: () => void;
 }) {
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [installResult, setInstallResult] = useState<string | null>(null);
+  const [latestProgress, setLatestProgress] = useState<string>("");
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useSidecarProgress((evt) => {
+    if (!installing) return;
+    setLatestProgress(evt.message || `${evt.current}/${evt.total}`);
+  });
+
+  // Re-derive the distro target every render — engineGpu.distro may be stale
+  // after a successful native essentia install switched the engine.
+  const distro = engineGpu.distro ?? preflightDistro;
+  // Cross-vendor guard: the CUDA-libs install path is meaningless for an
+  // AMD/Intel/Apple card. The "missing CUDA libs" state only fires when TF
+  // saw an NVIDIA card — so only offer the install button when the first
+  // visible NVIDIA device is the subject of the message.
+  const hasNvidiaDevice = engineGpu.devices.some((d) => d.vendor === "nvidia");
+  const canInstall = engineGpu.engine === "wsl" && !!distro && hasNvidiaDevice;
+
+  const handleCancel = async () => {
+    try {
+      await rpc("cancel_operation");
+    } catch {
+      /* user-cancel — sidecar handles its own logging */
+    }
+  };
 
   const handleInstall = async () => {
-    if (engineGpu.engine !== "wsl" || !engineGpu.distro) return;
+    if (!canInstall || !distro) return;
     setInstalling(true);
     setInstallError(null);
     setInstallResult(null);
+    setLatestProgress("");
     try {
       const result = await rpc<{
         ok: boolean;
         error?: string;
         packages_installed?: string[];
       }>("install_cuda_libs_in_wsl", {
-        distro: engineGpu.distro,
+        distro,
         missing_libs: engineGpu.missing_cuda_libs,
       });
+      if (!mountedRef.current) return;
       if (result.ok) {
         setInstallResult(
           `Installed ${result.packages_installed?.length ?? 0} package(s). Re-probing…`,
         );
         // Trigger a re-probe — the engine cache was cleared server-side.
-        setTimeout(onRefresh, 500);
+        setTimeout(() => {
+          if (mountedRef.current) onRefresh();
+        }, 500);
       } else {
         setInstallError(result.error ?? "Install failed");
       }
     } catch (e) {
-      setInstallError(String(e));
+      if (!mountedRef.current) return;
+      if (isCancellation(e)) {
+        setInstallError("Install cancelled.");
+      } else {
+        const msg =
+          typeof e === "object" && e !== null && "message" in e
+            ? String((e as { message: unknown }).message)
+            : String(e);
+        setInstallError(msg);
+      }
     } finally {
-      setInstalling(false);
+      if (mountedRef.current) setInstalling(false);
     }
   };
 
@@ -831,10 +1143,17 @@ function EngineGpuFixableBlock({
           </div>
         )}
         <div className="text-white/40 mt-1">
-          Analysis will fall back to CPU. Install the missing CUDA libraries
-          to enable GPU acceleration.
+          Analysis will fall back to CPU. Click below and Vibechek will install
+          NVIDIA&apos;s CUDA runtime wheels from PyPI into the WSL venv
+          (~200&nbsp;MB, ~30&nbsp;sec). Works on any Ubuntu, no apt repo
+          configuration needed.
         </div>
 
+        {installing && latestProgress && (
+          <div className="text-white/60 mt-2 font-mono break-all">
+            {latestProgress}
+          </div>
+        )}
         {installError && (
           <div className="text-accent-red mt-2 font-mono break-all">
             {installError}
@@ -845,13 +1164,23 @@ function EngineGpuFixableBlock({
         )}
 
         <div className="flex gap-2 mt-2">
-          {engineGpu.engine === "wsl" && engineGpu.distro && (
+          {canInstall && (
             <button
               className="btn-primary text-xs"
               onClick={handleInstall}
               disabled={installing}
             >
-              {installing ? "Installing… (~5 min)" : "Enable GPU (install CUDA libs)"}
+              {installing ? "Installing… (~30 sec)" : "Enable GPU (install CUDA wheels)"}
+            </button>
+          )}
+          {installing && (
+            <button
+              className="btn-ghost text-xs text-accent-red"
+              onClick={handleCancel}
+              title="Stop the CUDA install"
+            >
+              <StopCircle className="w-3.5 h-3.5" />
+              Cancel
             </button>
           )}
           <button className="btn-ghost text-xs" onClick={onRefresh} disabled={installing}>
@@ -872,12 +1201,14 @@ function EngineGpuBlock({
   engineGpu,
   engineProbing,
   analyzeVia,
+  preflightDistro,
   onRefresh,
 }: {
   sysInfo: SystemResources;
   engineGpu: EngineGpuInfo | null;
   engineProbing: boolean;
-  analyzeVia: "native" | "wsl" | null;
+  analyzeVia: "native" | "native_venv" | "wsl" | null;
+  preflightDistro: string | null;
   onRefresh: () => void;
 }) {
   // No engine probe yet — show host view but tell the user the truth.
@@ -901,10 +1232,13 @@ function EngineGpuBlock({
         </div>
       );
     }
+    // Even when no accelerable (NVIDIA) GPU exists, the user may still have
+    // an AMD/Intel/Apple card. The CrossVendorGpuInventory below this block
+    // surfaces it; here we just say "CPU" without lying about lack of GPUs.
     return (
       <div className="mt-3 text-xs text-white/40">
-        No NVIDIA GPU detected on the host. Analysis will run on CPU — still
-        fast with enough workers.
+        No NVIDIA GPU detected — analysis will run on CPU (still fast with
+        enough workers).
       </div>
     );
   }
@@ -949,10 +1283,18 @@ function EngineGpuBlock({
   // This is the most important state to surface: the user has a GPU, the
   // hardware is visible to WSL, but analyze won't actually use it. We offer
   // an Enable GPU button that installs the missing libs.
-  if (engineGpu.gpu_hardware_visible && !engineGpu.gpu_available) {
+  //
+  // Cross-vendor guard: the missing-CUDA-libs install path only makes sense
+  // for an NVIDIA card. If the only visible "GPU" is AMD/Intel/Apple, fall
+  // through to the unsupported-vendor branch below instead of showing the
+  // install button that can never succeed for them.
+  const visibleVendors = new Set(engineGpu.devices.map((d) => d.vendor || "nvidia"));
+  const hasNvidiaVisible = visibleVendors.has("nvidia");
+  if (engineGpu.gpu_hardware_visible && !engineGpu.gpu_available && hasNvidiaVisible) {
     return (
       <EngineGpuFixableBlock
         engineGpu={engineGpu}
+        preflightDistro={preflightDistro}
         onRefresh={onRefresh}
       />
     );
@@ -1010,6 +1352,145 @@ function EngineGpuBlock({
           {engineGpu.engine === "wsl" ? ` (inside ${engineGpu.distro})` : ""}.
           Analysis will run on CPU.
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Cross-vendor inventory of every detected GPU/APU, with an honesty callout
+ * for non-NVIDIA cards plus an expandable "why isn't my GPU used?" explainer.
+ *
+ * Sourced from `sysInfo.gpu_devices` (the cross-vendor list populated by
+ * `vibechek.gpu_detect`). We deliberately use sysInfo here rather than
+ * engineGpu.devices because the host enumeration is fast/synchronous and
+ * always reflects every vendor — the engine probe only attempts to surface
+ * non-NVIDIA cards from inside WSL via lspci, which often misses them.
+ *
+ * Vendor icons are intentionally text glyphs (no logo files needed); the
+ * intent is to be honest about which vendor a row belongs to, not to brand.
+ */
+function CrossVendorGpuInventory({ sysInfo }: { sysInfo: SystemResources }) {
+  const [showExplainer, setShowExplainer] = useState(false);
+
+  const devices = sysInfo.gpu_devices ?? [];
+  if (devices.length === 0) return null;
+
+  const hasUnsupported = (sysInfo.unsupported_gpu_count ?? 0) > 0;
+
+  return (
+    <div className="mt-4 border-t border-white/10 pt-3">
+      <div className="text-[11px] uppercase tracking-wider text-white/40 mb-2">
+        Detected GPUs ({devices.length})
+      </div>
+      <div className="space-y-1.5">
+        {devices.map((g, i) => (
+          <GpuInventoryRow key={`${g.vendor}-${g.name}-${i}`} device={g} />
+        ))}
+      </div>
+
+      {/* Cross-vendor honesty callout. Only shows when there's at least one
+          non-NVIDIA card the user might reasonably expect to be used. */}
+      {hasUnsupported && (
+        <div className="mt-3 flex items-start gap-2 text-xs rounded border border-white/10 bg-white/5 p-2.5">
+          <AlertTriangle className="w-4 h-4 flex-none text-accent-yellow mt-0.5" />
+          <div className="text-white/70">
+            Vibechek&apos;s ML engine (essentia-tensorflow) only supports NVIDIA
+            GPUs today. AMD/Intel/Apple GPU acceleration is on the roadmap via
+            ONNX Runtime — see{" "}
+            <span className="font-mono text-white/50">docs/ONNX_MIGRATION.md</span>.
+          </div>
+        </div>
+      )}
+
+      {/* Expandable explainer — only useful when at least one card is
+          flagged unsupported. */}
+      {hasUnsupported && (
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={() => setShowExplainer((v) => !v)}
+            className="flex items-center gap-1.5 text-[11px] text-white/50 hover:text-white/80"
+          >
+            {showExplainer
+              ? <ChevronDown className="w-3 h-3" />
+              : <ChevronRight className="w-3 h-3" />}
+            <HelpCircle className="w-3 h-3" />
+            Why is my AMD/Intel GPU not used?
+          </button>
+          {showExplainer && (
+            <div className="mt-2 text-[11px] text-white/60 leading-relaxed pl-5 max-w-3xl">
+              <p>
+                Vibechek runs all music analysis through{" "}
+                <span className="font-mono">essentia-tensorflow</span>, which
+                vendors TensorFlow 2.5 built only with CUDA support. There is
+                no public TF 2.5 build that ships ROCm (AMD), oneDNN-GPU (Intel),
+                or Metal (Apple) backends — so even though your card is
+                detected, the inference graph has no way to dispatch to it.
+              </p>
+              <p className="mt-1.5">
+                The migration to ONNX Runtime will fix this. ONNX Runtime
+                supports DirectML on Windows (any DX12 GPU, including AMD &amp;
+                Intel), CoreML on macOS (Apple Silicon &amp; AMD eGPUs), and
+                ROCm/OpenVINO on Linux. Tracking issue and progress live in{" "}
+                <span className="font-mono">docs/ONNX_MIGRATION.md</span>.
+              </p>
+              <p className="mt-1.5">
+                Until then, analysis falls back to CPU — which is still fast
+                on a modern multi-core machine. Bump the worker count in the
+                Analysis section above to use all your cores.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One row in the cross-vendor inventory. Shows the vendor glyph, the marketing
+ * name, VRAM (when known), and either an "accelerated" badge or a "CPU-only"
+ * tag with the limitation reason.
+ */
+function GpuInventoryRow({ device }: { device: GpuDevice }) {
+  const vendor = device.vendor || "unknown";
+  // Vendor glyph: text-only to avoid shipping logos. Color coded so the eye
+  // can scan a mixed-vendor list quickly.
+  const vendorGlyph = (() => {
+    switch (vendor) {
+      case "nvidia":
+        return <span className="font-mono text-[10px] text-accent-green w-12 inline-block">NVIDIA</span>;
+      case "amd":
+        return <span className="font-mono text-[10px] text-red-400 w-12 inline-block">AMD</span>;
+      case "intel":
+        return <span className="font-mono text-[10px] text-blue-400 w-12 inline-block">INTEL</span>;
+      case "apple":
+        return <span className="font-mono text-[10px] text-white/60 w-12 inline-block">APPLE</span>;
+      default:
+        return <span className="font-mono text-[10px] text-white/40 w-12 inline-block">GPU</span>;
+    }
+  })();
+
+  const accelerated = device.accelerated_by_vibechek;
+  return (
+    <div className="flex items-start gap-2 text-xs" title={device.unsupported_reason ?? ""}>
+      {vendorGlyph}
+      <div className="flex-1 min-w-0">
+        <div className="text-white/80 truncate">{device.name}</div>
+        <div className="text-white/40 text-[10px]">
+          {device.device_kind}
+          {device.memory_mb ? ` · ${(device.memory_mb / 1024).toFixed(1)} GB VRAM` : ""}
+        </div>
+      </div>
+      {accelerated ? (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent-green/20 text-accent-green font-mono uppercase tracking-wider">
+          accelerated
+        </span>
+      ) : (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-white/50 font-mono uppercase tracking-wider">
+          CPU-only (essentia limitation)
+        </span>
       )}
     </div>
   );

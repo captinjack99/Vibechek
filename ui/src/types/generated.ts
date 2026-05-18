@@ -6,10 +6,19 @@
 // dataclass.
 
 
+// External types — declared in the hand-written shim (./index.ts).
+// These permissive stubs let generated.ts type-check standalone; the
+// shim re-declares each with its real shape and shadows the re-export.
+export interface ExistingTags { [key: string]: unknown; }
+
 export interface GpuDevice {
   name: string;
   backend: string;
   memory_mb: number | null;
+  vendor: string;
+  device_kind: string;
+  accelerated_by_vibechek: boolean;
+  unsupported_reason: string | null;
 }
 
 export interface SystemResources {
@@ -20,6 +29,8 @@ export interface SystemResources {
   gpu_available: boolean;
   gpu_devices: GpuDevice[];
   cuda_runtime: string | null;
+  accelerated_gpu_count: number;
+  unsupported_gpu_count: number;
   readonly recommended_workers: number;
 }
 
@@ -45,10 +56,12 @@ export interface OrganizationConfig {
 
 export interface TaggingConfig {
   genre_confidence_threshold: number;
+  parent_genre_confidence_threshold: number;
   write_subgenre_as_main_genre: boolean;
   preserve_rekordbox_frames: boolean;
   backup_before_write: boolean;
   skip_bpm_and_key: boolean;
+  id3_text_encoding: number;
 }
 
 export interface UIConfig {
@@ -78,6 +91,7 @@ export interface EngineGpuDevice {
   backend: string;
   compute_capability: string | null;
   memory_mb: number | null;
+  vendor: string;
 }
 
 export interface EngineGpuInfo {
@@ -243,6 +257,7 @@ export interface PlannedMove {
   genre: string;
   subgenre: string;
   reason: string;
+  relative_destination: string;
 }
 
 export interface LibraryRecord {
@@ -252,6 +267,8 @@ export interface LibraryRecord {
   analyzed_count: number;
   last_opened: number;
   last_analyzed: number;
+  name: string;
+  tags: string[];
 }
 
 export interface LibraryState {

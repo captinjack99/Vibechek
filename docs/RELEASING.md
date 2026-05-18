@@ -159,6 +159,76 @@ If a release is already **published**, do not delete — issue a `v0.3.0-beta.2`
 
 ---
 
+## Codesigning + notarization (one-time CI setup)
+
+Without codesigning, **macOS Gatekeeper kills the sidecar on first launch** with a generic "can't be opened because Apple cannot check it for malicious software" dialog — most users misread that as malware and uninstall. On Windows, **Defender SmartScreen** triggers similar warnings. The release workflow (`.github/workflows/release.yml`) is wired to pass certs through `tauri-action` when these repo secrets are set:
+
+### macOS
+
+You need an **Apple Developer account** ($99/year). One-time setup:
+
+1. In Xcode → Preferences → Accounts, add your Apple ID.
+2. Create a **Developer ID Application** certificate at <https://developer.apple.com/account/resources/certificates>.
+3. Download and double-click to install in Keychain.
+4. Export it: Keychain Access → right-click the cert → Export → `.p12` format → set a password.
+5. Base64-encode it:
+   ```bash
+   base64 -i ~/Downloads/DeveloperID.p12 | pbcopy
+   ```
+6. Create an **app-specific password** for notarization at <https://appleid.apple.com/account/manage> → App-Specific Passwords.
+7. Find your Team ID at <https://developer.apple.com/account> → Membership.
+
+Then add these as GitHub repo secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `APPLE_CERTIFICATE` | The base64 from step 5 |
+| `APPLE_CERTIFICATE_PASSWORD` | The password from step 4 |
+| `APPLE_SIGNING_IDENTITY` | Something like `Developer ID Application: Your Name (TEAMID)` |
+| `APPLE_ID` | Your Apple ID email |
+| `APPLE_PASSWORD` | The app-specific password from step 6 |
+| `APPLE_TEAM_ID` | The team ID from step 7 |
+
+After the next release, the `.dmg` will be signed and notarized. Users get no scary dialog.
+
+### Windows
+
+You need an **Authenticode code-signing certificate** (~$70-$400/year from DigiCert, Sectigo, or SSL.com). EV certs cost more but skip the SmartScreen reputation-building period.
+
+1. Buy + download the cert as `.pfx`.
+2. Base64-encode it:
+   ```powershell
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\cert.pfx")) | clip
+   ```
+3. Add as GitHub repo secrets:
+
+| Secret | Value |
+|---|---|
+| `WINDOWS_CERTIFICATE` | The base64 from step 2 |
+| `WINDOWS_CERTIFICATE_PASSWORD` | The .pfx password |
+
+After the next release, `.exe` and `.msi` installers will be Authenticode-signed.
+
+### If you don't have certs yet
+
+CI will still build, just unsigned. Users will see Gatekeeper / SmartScreen warnings on first launch and have to right-click → Open (macOS) or click "More info" → "Run anyway" (Windows). Mention this in your release notes so users aren't surprised. The unsigned-build warning shows up in the CI log under the "Build Tauri bundles" step.
+
+### Verifying a signed build
+
+After downloading from a Release:
+
+```bash
+# macOS — should print "accepted" with no warnings
+codesign --verify --deep --strict --verbose=2 /Applications/Vibechek.app
+spctl --assess --verbose=4 /Applications/Vibechek.app
+
+# Windows — right-click .exe → Properties → Digital Signatures tab
+# OR via signtool:
+signtool verify /pa /v Vibechek_0.3.0-beta.8_x64-setup.exe
+```
+
+---
+
 ## Troubleshooting CI failures
 
 **PyInstaller fails on macOS** with `'_decimal' module not found`: macOS runner Python image is being upgraded; pin Python in the workflow to 3.12 explicitly (already done).

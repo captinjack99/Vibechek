@@ -402,29 +402,9 @@ def preflight(models_dir: Path | None, quick: bool) -> None:
     `--quick` to skip that probe (returns in <1 sec but won't tell you whether
     essentia is installed inside your WSL distros).
     """
-    from vibechek.preflight import check_essentia, check_models, summary_lines
-    from vibechek.preflight import PreflightResult
-    from vibechek.wsl import detect_wsl
-    import platform as _platform
+    from vibechek.preflight import preflight as run_preflight, summary_lines
 
-    # We inline what `preflight()` does so we can pass quick= to detect_wsl,
-    # which preflight() hardcodes to True for sub-second GUI responsiveness.
-    essentia = check_essentia()
-    models = check_models(models_dir)
-    wsl_status = detect_wsl(quick=quick)
-    have_native = essentia.installed
-    have_wsl = wsl_status.can_run_vibechek
-    ready = (have_native or have_wsl) and not models.missing
-    analyze_via = "native" if have_native else ("wsl" if have_wsl else None)
-
-    result = PreflightResult(
-        ready=ready,
-        essentia=essentia,
-        models=models,
-        platform=_platform.platform(),
-        wsl=wsl_status,
-        analyze_via=analyze_via,
-    )
+    result = run_preflight(models_dir, quick_wsl=quick)
     for line in summary_lines(result):
         console.print(line)
 
@@ -472,6 +452,246 @@ def system_info_cmd() -> None:
     # Also dump as JSON for scripting
     import json as _json
     console.print(f"\n[dim]{_json.dumps(to_dict(info), indent=2, default=str)}[/]")
+
+
+# ---------------------------------------------------------------------------
+# doctor — paste-friendly diagnostic report
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Write the report to a file (default: print to stdout).")
+@click.option("--models-dir", type=click.Path(path_type=Path), default=None,
+              help="Override the ML model directory (defaults to user data dir).")
+def doctor(output: Path | None, models_dir: Path | None) -> None:
+    """Print a paste-friendly diagnostic report.
+
+    Use this when filing a bug — the markdown body is safe to copy into a
+    GitHub issue (paths + sizes + versions only, no file contents or
+    credentials). The default prints to stdout; pass `--output` to save
+    to a file you can attach.
+    """
+    from vibechek.doctor import run as run_doctor
+
+    md = run_doctor(output=output, models_dir=models_dir)
+    if output:
+        console.print(f"[green]Wrote diagnostic to[/] [cyan]{output}[/]")
+    else:
+        # Print raw so the markdown is paste-able from the terminal scrollback
+        # without Rich's box-drawing junk.
+        click.echo(md)
+
+
+# ---------------------------------------------------------------------------
+# verify-models — hash the on-disk models against the expected table
+# ---------------------------------------------------------------------------
+
+
+@main.command("verify-models")
+@click.option("--models-dir", type=click.Path(path_type=Path), default=None,
+              help="Override the ML model directory (defaults to user data dir).")
+def verify_models_cmd(models_dir: Path | None) -> None:
+    """Hash each model file on disk and check against the expected SHA256.
+
+    If `analyzer.MODEL_SHA256` is present in this build (added by the
+    analyzer agent), each file is verified. Otherwise the computed hashes
+    are printed so you can mail them to the maintainer.
+
+    Exits non-zero if any file is missing or mismatched.
+    """
+    import hashlib
+
+    from vibechek.analyzer import MODELS
+    from vibechek.config import MODELS_DIR
+
+    # Optional table — gracefully handle the case where the analyzer agent
+    # hasn't landed MODEL_SHA256 yet.
+    expected: dict[str, str] = {}
+    try:
+        from vibechek.analyzer import MODEL_SHA256 as _MODEL_SHA256  # type: ignore[attr-defined]
+        expected = dict(_MODEL_SHA256)
+    except ImportError:
+        pass
+
+    target = models_dir or MODELS_DIR
+    console.print(f"Verifying models in [cyan]{target}[/]")
+    if not expected:
+        console.print("[yellow]No MODEL_SHA256 table yet — printing computed hashes only.[/]")
+
+    failures = 0
+    for name in MODELS:
+        for suffix in (".pb", ".json"):
+            fname = f"{name}{suffix}"
+            fp = target / fname
+            if not fp.exists():
+                console.print(f"  [red]{fname}: MISSING[/]")
+                failures += 1
+                continue
+            try:
+                h = hashlib.sha256(fp.read_bytes()).hexdigest()
+            except OSError as e:
+                console.print(f"  [red]{fname}: READ ERROR — {e}[/]")
+                failures += 1
+                continue
+            exp = expected.get(fname)
+            if exp is None:
+                console.print(f"  {fname}: sha256={h}")
+            elif exp == h:
+                console.print(f"  [green]{fname}: OK[/] (sha256={h})")
+            else:
+                console.print(
+                    f"  [red]{fname}: MISMATCH[/] "
+                    f"(expected={exp}, got={h}) — redownload via "
+                    f"`vibechek download-models`."
+                )
+                failures += 1
+
+    if failures > 0:
+        raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# export — flatten analysis.json into CSV / JSON / m3u8
+# ---------------------------------------------------------------------------
+
+
+# Columns for the flat CSV export. Order matters — it's the column order
+# users see in Excel / Numbers / their CSV tool of choice. Kept stable so
+# downstream scripts can rely on positional access.
+_EXPORT_CSV_COLUMNS = [
+    "path", "filename", "ext", "size_mb",
+    "existing_genre", "existing_bpm", "existing_key",
+    "ml_genre", "ml_subgenre", "ml_genre_confidence",
+    "ml_bpm", "ml_key", "ml_energy", "ml_mood",
+    "ml_timeslot", "ml_direction", "ml_vocal", "ml_danceability",
+    "error",
+]
+
+
+def _track_to_csv_row(track: dict) -> dict:
+    """Flatten one analysis.json record into the CSV's flat dict shape."""
+    ml = track.get("ml_analysis") or {}
+    existing = track.get("existing_tags") or {}
+    error = track.get("error") or ml.get("ml_error") or ""
+    return {
+        "path": track.get("path", ""),
+        "filename": track.get("filename", ""),
+        "ext": track.get("extension", ""),
+        "size_mb": track.get("size_mb", ""),
+        "existing_genre": existing.get("genre", "") or "",
+        "existing_bpm": existing.get("bpm", "") or "",
+        "existing_key": existing.get("key", "") or "",
+        "ml_genre": ml.get("ml_genre", "") or "",
+        "ml_subgenre": ml.get("ml_subgenre", "") or "",
+        "ml_genre_confidence": ml.get("ml_genre_confidence", "") or "",
+        "ml_bpm": ml.get("ml_bpm", "") or "",
+        "ml_key": ml.get("ml_key", "") or "",
+        "ml_energy": ml.get("ml_energy", "") or "",
+        "ml_mood": ml.get("ml_mood", "") or "",
+        "ml_timeslot": ml.get("ml_timeslot", "") or "",
+        "ml_direction": ml.get("ml_direction", "") or "",
+        "ml_vocal": ml.get("ml_vocal", "") or "",
+        "ml_danceability": ml.get("ml_danceability", "") or "",
+        "error": error,
+    }
+
+
+@main.command("export")
+@click.argument("analysis_json", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--format", "fmt", type=click.Choice(["csv", "json", "m3u8"]), default="csv",
+              show_default=True, help="Output format.")
+@click.option("--output", "-o", type=click.Path(path_type=Path), default=None,
+              help="Destination file. Defaults to <analysis>.<format>.")
+def export_cmd(analysis_json: Path, fmt: str, output: Path | None) -> None:
+    """Export an analysis.json to CSV, JSON, or m3u8.
+
+    - `csv`: one row per track, columns documented in `_EXPORT_CSV_COLUMNS`.
+    - `json`: passthrough of the analysis file (useful for testing tooling).
+    - `m3u8`: simple playlist — one file path per line, no extended tags.
+              Treat as a placeholder; future versions may emit `#EXTINF`.
+    """
+    import csv
+
+    data = json.loads(analysis_json.read_text(encoding="utf-8"))
+    tracks = data.get("tracks") if isinstance(data, dict) else None
+    if tracks is None:
+        # Allow callers to pass a bare list of tracks too.
+        tracks = data if isinstance(data, list) else []
+
+    if output is None:
+        output = analysis_json.with_suffix(f".{fmt}")
+
+    if fmt == "csv":
+        with output.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=_EXPORT_CSV_COLUMNS)
+            writer.writeheader()
+            for track in tracks:
+                writer.writerow(_track_to_csv_row(track))
+    elif fmt == "json":
+        output.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    elif fmt == "m3u8":
+        # Minimal — just paths. We deliberately *don't* prefix with `#EXTM3U`
+        # yet because some DJ apps (rekordbox) get confused by m3u8 without
+        # full EXTINF lines. Document as basic for now.
+        lines = [t.get("path", "") for t in tracks if t.get("path")]
+        output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    console.print(f"[green]Exported {len(tracks)} tracks[/] → [cyan]{output}[/] ({fmt})")
+
+
+# ---------------------------------------------------------------------------
+# profile — list + load built-in DJ profiles
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def profile() -> None:
+    """Manage built-in DJ profiles (house-dj, disco-dj, edm-festival, …)."""
+
+
+@profile.command("list")
+def profile_list_cmd() -> None:
+    """List every built-in profile + the current config snapshot."""
+    from vibechek.config import VibechekConfig
+    from vibechek.profiles import list_profiles
+
+    cfg = VibechekConfig.load()
+    console.print("[bold]Built-in profiles[/]")
+    for p in list_profiles():
+        console.print(
+            f"  [cyan]{p['name']:14}[/] {p['description']}\n"
+            f"     conf={p['genre_confidence_threshold']} "
+            f"min_genre={p['min_genre_size']} gpu={p['use_gpu']}"
+        )
+    console.print(
+        f"\n[bold]Current config[/]\n"
+        f"  genre_confidence_threshold = {cfg.tagging.genre_confidence_threshold}\n"
+        f"  min_genre_size             = {cfg.organization.min_genre_size}\n"
+        f"  use_gpu                    = {cfg.analysis.use_gpu}"
+    )
+
+
+@profile.command("load")
+@click.argument("name")
+def profile_load_cmd(name: str) -> None:
+    """Apply a profile's overrides to the saved config (and write to disk)."""
+    from vibechek.profiles import load_profile
+
+    try:
+        result = load_profile(name)
+    except KeyError as e:
+        raise click.UsageError(str(e)) from e
+    console.print(
+        f"[green]Loaded profile[/] [cyan]{result['loaded']}[/] → "
+        f"[dim]{result['saved_to']}[/]"
+    )
+    applied = result["applied"]
+    console.print(
+        f"  genre_confidence_threshold = {applied['genre_confidence_threshold']}\n"
+        f"  min_genre_size             = {applied['min_genre_size']}\n"
+        f"  use_gpu                    = {applied['use_gpu']}"
+    )
 
 
 # ---------------------------------------------------------------------------
