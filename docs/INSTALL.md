@@ -36,13 +36,25 @@ pip install -e .
 
 Essentia is the ML library that detects genre, mood, energy, etc. It's not bundled with the Vibechek installer because the TensorFlow runtime it depends on adds 500+ MB and behaves differently on each OS.
 
-### Linux & macOS (easy)
+### Linux & macOS (handled by the desktop app)
 
-```
+The desktop app handles Essentia install for you, the same way it does on
+Windows — no terminal needed. The first time you click **Analyze**, a setup
+dialog appears with a one-click **Install Essentia** button. It creates a
+managed venv at `~/.vibechek/venv/`, installs `essentia-tensorflow` +
+`vibechek` into it, and routes analysis through that venv transparently.
+
+The venv is hermetic — Vibechek does *not* touch your system Python or
+whatever venv you might be developing in. Delete `~/.vibechek/` to wipe the
+managed install entirely.
+
+If you'd rather do it by hand (CLI use, server setup, custom Python
+environment), the equivalents are:
+
+```bash
 pip install essentia-tensorflow
+vibechek download-models     # one-time, ~200 MB
 ```
-
-That's it. Then run `vibechek download-models` once to fetch the model weights (~800 MB to a per-user data directory).
 
 ### Windows (now fully automated)
 
@@ -55,6 +67,8 @@ through the whole thing — no terminal required:
 2. **Install Vibechek + Essentia inside Ubuntu** — one click, ~3-5 min,
    runs entirely inside WSL with no extra prompts.
 3. **Download ML models** — one click, ~200 MB.
+4. **(Optional) Enable GPU acceleration** — one click in **Settings → System**.
+   See the GPU section below.
 
 After setup, when you analyze a library on `C:\Music\Tracks` the app
 automatically routes that analyze through WSL, translates the path to
@@ -73,6 +87,41 @@ wsl -d Ubuntu-24.04 -- bash -lc '
   pip install essentia-tensorflow vibechek &&
   vibechek --version'
 ```
+
+### Enabling GPU acceleration (optional, NVIDIA only)
+
+Essentia's bundled TensorFlow (2.5) can use an NVIDIA GPU to speed up
+analysis by ~3-10× — useful if you have a 5 000+ track library. The runtime
+libraries TF needs (`libcublas`, `libcufft`, `libcudnn`, `libcusparse`) are
+**not** installed by default on WSL Ubuntu. Vibechek detects this exact
+state and exposes a one-click fix:
+
+1. Open **Settings → System**.
+2. If you have an NVIDIA GPU but the engine probe shows:
+   *"…is visible to WSL, but TensorFlow can&apos;t use it — required CUDA
+   libraries are missing"*, click **Enable GPU (install CUDA libs)**.
+3. The installer adds NVIDIA's apt repo and installs ~600 MB of runtime libs
+   in your WSL Ubuntu. Takes ~5 min on a typical connection.
+4. The probe automatically re-runs; the row turns green and shows your card
+   name (e.g. "NVIDIA GeForce RTX 4070 Laptop GPU").
+
+Vibechek will not lie to you about the GPU. If your card is visible to the
+host but Essentia can't actually use it (driver / lib version mismatch), the
+UI says so plainly and tells you what's wrong. CPU mode is fast enough on a
+modern multi-core system — typical throughput is ~25-40 tracks/min with all
+cores in use.
+
+**Doing it by hand:**
+
+```bash
+wsl -d Ubuntu -u root -- bash -lc '
+  curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/k.deb &&
+  dpkg -i /tmp/k.deb && rm /tmp/k.deb &&
+  apt update &&
+  apt install -y libcublas-11-8 libcufft-11-8 libcudnn8 libcusparse-11-8'
+```
+
+(Substitute `ubuntu2204` / `ubuntu2004` for older Ubuntu versions.)
 
 ### Skipping analyze entirely
 

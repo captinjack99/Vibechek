@@ -17,6 +17,7 @@ from pathlib import Path
 
 from vibechek.analyzer import MODELS
 from vibechek.config import MODELS_DIR
+from vibechek.native_install import NativeVenvStatus, probe_native_venv
 from vibechek.wsl import WSLStatus, detect_wsl
 
 log = logging.getLogger(__name__)
@@ -56,14 +57,29 @@ class PreflightResult:
     # WSL status — only meaningful on Windows. On other OSes wsl.is_windows
     # is False and the rest can be ignored.
     wsl: WSLStatus | None = None
-    # How analyze will actually run when ready=True: "native" or "wsl"
+    # Managed-venv status — only meaningful on Linux/macOS. The GUI uses this
+    # to render an "Install Essentia" button equivalent to the Windows WSL
+    # flow. On Windows native_venv.supported is False.
+    native_venv: NativeVenvStatus | None = None
+    # How analyze will actually run when ready=True:
+    #   "native"      — essentia in the sidecar's own Python (rare)
+    #   "wsl"         — Windows + essentia inside a WSL distro
+    #   "native_venv" — Linux/macOS + essentia inside ~/.vibechek/venv/
     analyze_via: str | None = None
 
     @property
     def reasons_not_ready(self) -> list[str]:
         out: list[str] = []
-        if not self.essentia.installed and not (self.wsl and self.wsl.can_run_vibechek):
-            out.append("essentia-tensorflow is not installed (native or in WSL)")
+        have_engine = (
+            self.essentia.installed
+            or (self.wsl and self.wsl.can_run_vibechek)
+            or (self.native_venv and self.native_venv.essentia_installed)
+        )
+        if not have_engine:
+            out.append(
+                "essentia-tensorflow is not installed "
+                "(native, in WSL, or in the managed venv)"
+            )
         if self.models.missing:
             out.append(f"{len(self.models.missing)} ML model file(s) missing")
         return out
@@ -126,24 +142,36 @@ def check_models(models_dir: Path | None = None) -> ModelsCheck:
 def preflight(models_dir: Path | None = None) -> PreflightResult:
     """Full check; ready=True iff analyze can actually run.
 
-    "Ready" means EITHER:
-      - Native essentia is installed AND models are present, OR
-      - We're on Windows, WSL has vibechek + essentia, AND models are present
-        (models live on the Windows side and are mounted into WSL via /mnt/c)
+    "Ready" means ONE of:
+      - Native essentia is installed in the sidecar's Python AND models present
+      - Windows: WSL has vibechek + essentia AND models present (models live on
+        the Windows side, mounted into WSL via /mnt/c)
+      - Linux/macOS: managed venv at ~/.vibechek/venv/ has essentia AND
+        models present
+
+    The native_venv check is fast (disk-only, no subprocess) so we include it
+    in this quick preflight. WSL stays quick=True; full distro probe is done
+    by the separate `wsl_status` RPC.
     """
     essentia = check_essentia()
     models = check_models(models_dir)
-    # Quick WSL check: skip per-distro probes so preflight always returns
-    # in under a second. The GUI calls `wsl_status` separately for the
-    # full probe with a loading indicator.
     wsl_status = detect_wsl(quick=True)
+    native_venv = probe_native_venv()
 
     have_native = essentia.installed
     have_wsl = wsl_status.can_run_vibechek
-    have_engine = have_native or have_wsl
+    have_native_venv = native_venv.essentia_installed and native_venv.vibechek_installed
+    have_engine = have_native or have_wsl or have_native_venv
 
     ready = have_engine and not models.missing
-    analyze_via = "native" if have_native else ("wsl" if have_wsl else None)
+    if have_native:
+        analyze_via = "native"
+    elif have_wsl:
+        analyze_via = "wsl"
+    elif have_native_venv:
+        analyze_via = "native_venv"
+    else:
+        analyze_via = None
 
     return PreflightResult(
         ready=ready,
@@ -151,6 +179,7 @@ def preflight(models_dir: Path | None = None) -> PreflightResult:
         models=models,
         platform=platform.platform(),
         wsl=wsl_status,
+        native_venv=native_venv,
         analyze_via=analyze_via,
     )
 
@@ -164,6 +193,29 @@ def to_dict(r: PreflightResult) -> dict:
         d["wsl"]["can_run_vibechek"] = r.wsl.can_run_vibechek
         d["wsl"]["usable_distro"] = r.wsl.usable_distro
     return d
+
+
+def _native_install_summary_lines(r: PreflightResult) -> list[str]:
+    """Render the native_venv block of the CLI preflight output."""
+    lines: list[str] = []
+    nv = r.native_venv
+    if nv is None or not nv.supported:
+        return lines
+    lines.append("")
+    lines.append("Managed venv (Linux/macOS auto-install path):")
+    if nv.essentia_installed and nv.vibechek_installed:
+        lines.append(
+            f"  OK ({nv.venv_dir}: vibechek {nv.vibechek_version or '?'} + "
+            f"essentia {nv.essentia_version or '?'})"
+        )
+    elif nv.vibechek_installed:
+        lines.append(f"  Partial: vibechek installed at {nv.venv_dir}, essentia missing")
+        lines.append("  In the desktop app: Settings → System → Install Essentia")
+    else:
+        lines.append(f"  Not installed at {nv.venv_dir}")
+        lines.append("  In the desktop app: Settings → System → Install Essentia")
+        lines.append("  Or by hand: pip install essentia-tensorflow")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +250,9 @@ def summary_lines(r: PreflightResult) -> list[str]:
         if len(r.models.missing) > 8:
             lines.append(f"    ... and {len(r.models.missing) - 8} more")
         lines.append("  Run: vibechek download-models")
+
+    # Linux/macOS auto-install path
+    lines.extend(_native_install_summary_lines(r))
 
     if r.wsl and r.wsl.is_windows:
         lines.append("")

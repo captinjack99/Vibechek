@@ -49,3 +49,48 @@ def test_organize_dry_run(synthetic_analysis: dict, tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "moves planned" in result.output
+
+
+def test_preflight_quick_mode_skips_distro_probes(monkeypatch) -> None:
+    """`vibechek preflight --quick` skips the slow per-distro WSL probe."""
+    from vibechek import wsl
+
+    # Drop a sentinel: detect_wsl(quick=True) returns an empty status fast.
+    probe_calls: list[bool] = []
+
+    def fake_detect(quick: bool = False) -> wsl.WSLStatus:
+        probe_calls.append(quick)
+        return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
+
+    monkeypatch.setattr(wsl, "detect_wsl", fake_detect)
+    # The CLI does a `from vibechek.wsl import detect_wsl` inside the command
+    # function, so monkeypatch on the source module is enough — Click invokes
+    # the function fresh each call.
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["preflight", "--quick"])
+    # Exit may be 0 or 1 depending on model state; we care that it ran.
+    assert result.exit_code in (0, 1), result.output
+    assert "Vibechek preflight" in result.output
+    assert any(call is True for call in probe_calls), \
+        f"Expected detect_wsl(quick=True) call, got: {probe_calls}"
+
+
+def test_preflight_full_mode_does_distro_probes(monkeypatch) -> None:
+    """`vibechek preflight` (default) does the full probe — quick=False."""
+    from vibechek import wsl
+
+    probe_calls: list[bool] = []
+
+    def fake_detect(quick: bool = False) -> wsl.WSLStatus:
+        probe_calls.append(quick)
+        return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
+
+    monkeypatch.setattr(wsl, "detect_wsl", fake_detect)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["preflight"])
+    assert result.exit_code in (0, 1)
+    # Default is --full, which means quick=False
+    assert any(call is False for call in probe_calls), \
+        f"Expected detect_wsl(quick=False) call, got: {probe_calls}"

@@ -810,6 +810,13 @@ def analyze_directory(
             distro=pf.wsl.usable_distro,  # type: ignore[union-attr]
         )
 
+    # If native essentia is missing but the managed Linux/macOS venv has it,
+    # route through that venv. Mirrors the WSL path; no path translation needed.
+    if pf.analyze_via == "native_venv":
+        return _analyze_via_native_venv(
+            library_path, config, on_progress, output_path, skip, limit,
+        )
+
     file_strs = [str(f) for f in files]
     results: list[dict[str, Any]] = []
 
@@ -858,6 +865,83 @@ def analyze_directory(
             json.dumps(report, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    return report
+
+
+def _analyze_via_native_venv(
+    library_path: Path,
+    config: AnalysisConfig,
+    on_progress: ProgressCallback | None,
+    output_path: Path | None,
+    skip: int,
+    limit: int | None,
+) -> dict[str, Any]:
+    """Route analyze to the managed `~/.vibechek/venv/bin/vibechek` on Linux/macOS.
+
+    No path translation needed (unlike `_analyze_via_wsl`) — the venv runs in
+    the host filesystem. We just shell out, stream progress, and read the
+    result JSON back.
+    """
+    import json as _json
+    import re
+    import tempfile
+
+    from vibechek.native_install import run_vibechek_in_native_venv
+
+    if output_path is None:
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".json", prefix="vibechek-venv-", delete=False,
+        )
+        tmp.close()
+        local_output = Path(tmp.name)
+    else:
+        local_output = Path(output_path)
+
+    workers = config.workers if config.workers and config.workers > 0 else 0
+
+    args = [
+        "analyze", str(library_path),
+        "-o", str(local_output),
+        "--gpu", config.use_gpu,
+        "--models-dir", str(config.models_dir),
+    ]
+    if workers > 0:
+        args += ["--workers", str(workers)]
+    if skip:
+        args += ["--skip", str(skip)]
+    if limit:
+        args += ["--limit", str(limit)]
+
+    progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+    def on_line(line: str) -> None:
+        if not line:
+            return
+        m = progress_re.search(line)
+        if m and on_progress:
+            on_progress(int(m.group(1)), int(m.group(2)), line[:80])
+
+    result = run_vibechek_in_native_venv(args, on_stderr_line=on_line)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"vibechek analyze in managed venv exited with "
+            f"{result.returncode}. stdout tail:\n{result.stdout[-1500:]}"
+        )
+
+    if not local_output.exists():
+        raise RuntimeError(
+            f"managed-venv analyze finished but no output file at {local_output}"
+        )
+
+    report = _json.loads(local_output.read_text(encoding="utf-8"))
+
+    if output_path is None:
+        try:
+            local_output.unlink()
+        except OSError:
+            pass
+
     return report
 
 

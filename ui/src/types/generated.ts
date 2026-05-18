@@ -109,6 +109,18 @@ export interface WSLStatus {
   readonly usable_distro: string | null;
 }
 
+export interface NativeVenvStatus {
+  supported: boolean;
+  venv_dir: string;
+  venv_python: string | null;
+  venv_vibechek: string | null;
+  essentia_installed: boolean;
+  essentia_version: string | null;
+  vibechek_installed: boolean;
+  vibechek_version: string | null;
+  error: string | null;
+}
+
 export interface EssentiaCheck {
   installed: boolean;
   version: string | null;
@@ -137,6 +149,7 @@ export interface PreflightResult {
   models: ModelsCheck;
   platform: string;
   wsl: WSLStatus | null;
+  native_venv: NativeVenvStatus | null;
   analyze_via: string | null;
   readonly reasons_not_ready: string[];
 }

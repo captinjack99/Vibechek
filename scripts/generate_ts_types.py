@@ -46,6 +46,7 @@ MODULES = [
     "vibechek.resources",
     "vibechek.config",
     "vibechek.wsl",
+    "vibechek.native_install",
     "vibechek.preflight",
     "vibechek.analyzer",
     "vibechek.duplicates",

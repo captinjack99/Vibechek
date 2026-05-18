@@ -393,11 +393,38 @@ def download_models_cmd(models_dir: Path | None) -> None:
 @main.command()
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
               help="Override the ML model directory (defaults to user data dir).")
-def preflight(models_dir: Path | None) -> None:
-    """Verify Vibechek is ready to run `analyze` (essentia + model files)."""
-    from vibechek.preflight import preflight as run_preflight, summary_lines
+@click.option("--quick/--full", default=False, show_default=True,
+              help="Skip per-distro WSL probes (faster, less accurate).")
+def preflight(models_dir: Path | None, quick: bool) -> None:
+    """Verify Vibechek is ready to run `analyze` (essentia + model files).
 
-    result = run_preflight(models_dir)
+    Does a full WSL distro probe by default so the output is accurate. Pass
+    `--quick` to skip that probe (returns in <1 sec but won't tell you whether
+    essentia is installed inside your WSL distros).
+    """
+    from vibechek.preflight import check_essentia, check_models, summary_lines
+    from vibechek.preflight import PreflightResult
+    from vibechek.wsl import detect_wsl
+    import platform as _platform
+
+    # We inline what `preflight()` does so we can pass quick= to detect_wsl,
+    # which preflight() hardcodes to True for sub-second GUI responsiveness.
+    essentia = check_essentia()
+    models = check_models(models_dir)
+    wsl_status = detect_wsl(quick=quick)
+    have_native = essentia.installed
+    have_wsl = wsl_status.can_run_vibechek
+    ready = (have_native or have_wsl) and not models.missing
+    analyze_via = "native" if have_native else ("wsl" if have_wsl else None)
+
+    result = PreflightResult(
+        ready=ready,
+        essentia=essentia,
+        models=models,
+        platform=_platform.platform(),
+        wsl=wsl_status,
+        analyze_via=analyze_via,
+    )
     for line in summary_lines(result):
         console.print(line)
 
