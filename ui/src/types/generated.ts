@@ -73,6 +73,30 @@ export interface DistroInfo {
   vibechek_path: string | null;
 }
 
+export interface EngineGpuDevice {
+  name: string;
+  backend: string;
+  compute_capability: string | null;
+  memory_mb: number | null;
+}
+
+export interface EngineGpuInfo {
+  engine: string;
+  distro: string | null;
+  ok: boolean;
+  gpu_available: boolean;
+  gpu_count: number;
+  devices: EngineGpuDevice[];
+  gpu_hardware_visible: boolean;
+  missing_cuda_libs: string[];
+  tf_version: string | null;
+  tf_built_with_cuda: boolean | null;
+  nvidia_driver: string | null;
+  nvidia_smi_available: boolean;
+  error: string | null;
+  probed_at: number;
+}
+
 export interface WSLStatus {
   is_windows: boolean;
   wsl_available: boolean;
