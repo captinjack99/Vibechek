@@ -812,6 +812,47 @@ def wsl_to_win_path(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Script staging — write bash scripts to a Windows tempfile WSL can read
+# ---------------------------------------------------------------------------
+
+
+def _stage_script_for_wsl(script: str) -> Path:
+    """Write `script` to a Windows tempfile and return the host-side Path.
+
+    The caller translates the path to WSL form (via `win_to_wsl_path`) and
+    invokes `bash <wsl-path>` directly — *no stdin pipe*. This sidesteps two
+    cross-platform bugs at once:
+
+      1. apt postinst scripts (especially nvidia-cudnn's) read from stdin
+         during their dpkg run. If we piped our bash script via stdin
+         (`bash -s`), they'd eat bytes we hadn't read yet, truncating the
+         script and causing mid-install syntax errors.
+      2. `wsl.exe -c "<multi-line bash with $(...)>"` on Windows silently
+         empties out variable assignments. Tempfile staging avoids needing
+         `bash -c` at all.
+
+    The script content is line-ending normalized (CRLF/CR → LF) before write
+    because Drive sync can flip files to CRLF and Linux bash chokes on `\r`.
+
+    Caller is responsible for `path.unlink(missing_ok=True)` after use.
+    """
+    import tempfile
+
+    clean = script.replace("\r\n", "\n").replace("\r", "\n")
+    # delete=False so we can close + reopen across the WSL subprocess boundary
+    # without Windows tearing the file down between handle drops.
+    fd = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n",
+        suffix=".sh", prefix="vibechek-wsl-", delete=False,
+    )
+    try:
+        fd.write(clean)
+    finally:
+        fd.close()
+    return Path(fd.name)
+
+
+# ---------------------------------------------------------------------------
 # Install: WSL itself
 # ---------------------------------------------------------------------------
 
@@ -955,51 +996,52 @@ def install_vibechek_in_wsl(
     step_pct = {"[1/4]": 10, "[2/4]": 25, "[3/4]": 40, "[4/4]": 60, "DONE": 95}
     full_tail: list[str] = []
 
-    def _run_phase(args: list[str], script: str, label: str) -> tuple[int, list[str]]:
+    def _run_phase(distro_args: list[str], script: str, label: str) -> tuple[int, list[str]]:
+        """Stage `script` to a Windows tempfile, run via `wsl bash <wsl-path>`.
+
+        Why not pipe via stdin? See `_stage_script_for_wsl` — apt postinst
+        scripts read from stdin and would eat parts of our bash script.
+        Stdin is closed for the WSL bash process; the script is read from
+        the staged file instead.
+        """
         if on_progress:
             on_progress(step_pct.get("[1/4]" if "ROOT" in label else "[3/4]", 0), 100, label)
+        script_path = _stage_script_for_wsl(script)
+        wsl_script_path = win_to_wsl_path(str(script_path))
         try:
-            # Use BINARY stdin and stdout. On Windows, text-mode Popen
-            # silently converts \n → \r\n in writes, which makes bash on
-            # the Linux side see a \r at the end of every line and choke
-            # (`set: -\r: invalid option`, `case ... in\r: syntax error`).
-            proc = subprocess.Popen(
-                args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                # No text=True — we manage encoding ourselves to keep \n pristine
-            )
-        except OSError as e:
-            return -1, [f"Could not invoke wsl: {e}"]
-        assert proc.stdin and proc.stdout
+            try:
+                proc = subprocess.Popen(
+                    distro_args + ["bash", wsl_script_path],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+            except OSError as e:
+                return -1, [f"Could not invoke wsl: {e}"]
+            assert proc.stdout
 
-        # Belt-and-suspenders: strip any \r that snuck into the script source
-        # (Drive sync sometimes converts files to CRLF) and write as raw bytes.
-        clean = script.replace("\r\n", "\n").replace("\r", "\n")
-        proc.stdin.write(clean.encode("utf-8"))
-        proc.stdin.close()
-        tail: list[str] = []
-        for raw_line in proc.stdout:
-            # stdout is bytes now (no text=True) — decode + strip both \r and \n
-            line = raw_line.decode("utf-8", errors="replace")
-            stripped = line.rstrip("\r\n")
-            tail.append(stripped)
-            full_tail.append(stripped)
-            if len(full_tail) > 200:
-                full_tail.pop(0)
-            for marker, pct in step_pct.items():
-                if stripped.startswith(marker):
-                    if on_progress:
-                        on_progress(pct, 100, stripped)
-                    break
-        rc = proc.wait(timeout=60 * 30)
-        return rc, tail
+            tail: list[str] = []
+            for raw_line in proc.stdout:
+                line = raw_line.decode("utf-8", errors="replace")
+                stripped = line.rstrip("\r\n")
+                tail.append(stripped)
+                full_tail.append(stripped)
+                if len(full_tail) > 200:
+                    full_tail.pop(0)
+                for marker, pct in step_pct.items():
+                    if stripped.startswith(marker):
+                        if on_progress:
+                            on_progress(pct, 100, stripped)
+                        break
+            rc = proc.wait(timeout=60 * 30)
+            return rc, tail
+        finally:
+            script_path.unlink(missing_ok=True)
 
     # ---- Phase 1: apt as root ----
     log.info("WSL install phase 1 (apt as root) in %s", distro)
     rc, tail = _run_phase(
-        [wsl, "-d", distro, "-u", "root", "--", "bash", "-s"],
+        [wsl, "-d", distro, "-u", "root", "--"],
         _ROOT_BOOTSTRAP,
         "Phase 1: ROOT — installing system packages",
     )
@@ -1013,7 +1055,7 @@ def install_vibechek_in_wsl(
     # ---- Phase 2: pip as default user ----
     log.info("WSL install phase 2 (pip as default user) in %s", distro)
     rc, tail = _run_phase(
-        [wsl, "-d", distro, "--", "bash", "-s"],
+        [wsl, "-d", distro, "--"],
         _USER_BOOTSTRAP,
         "Phase 2: USER — installing Vibechek + Essentia (slow)",
     )
@@ -1041,19 +1083,21 @@ def install_vibechek_in_wsl(
 # packages on different Ubuntu/CUDA-repo versions.
 #
 # Notes:
-# - libcublas / libcufft / libcusparse: in NVIDIA's cuda-keyring repo as
-#   `<lib>-11-8` (CUDA 11.8 runtime). Reliably available on Ubuntu 22.04/24.04.
+# - `cuda-libraries-11-8` is the NVIDIA meta-package that pulls in cublas,
+#   cufft, curand, cusolver, cusparse, npp, nvjpeg, etc. in one shot. We try
+#   it first because the per-library `libX-11-8` packages aren't reachable
+#   on every Ubuntu/keyring combination (Ubuntu 24.04 in particular often
+#   lacks them, the user hit `E: Unable to locate package libcufft-11-8`).
 # - libcudnn8 is NOT in the cuda-keyring repo — cuDNN has a separate
 #   distribution. We try `libcudnn8` (works if cuDNN repo is configured),
-#   `nvidia-cudnn` (Ubuntu multiverse), then fall back to a clear error
-#   pointing the user at the manual install.
+#   `nvidia-cudnn` (Ubuntu multiverse), then fall back to a clear error.
 _CUDA_APT_PACKAGES_BY_LIB = {
-    "libcublas.so.11":   ["libcublas-11-8"],
-    "libcublasLt.so.11": ["libcublas-11-8"],   # ships with libcublas
-    "libcufft.so.10":    ["libcufft-11-8"],
-    "libcurand.so.10":   ["libcurand-11-8"],
-    "libcusolver.so.11": ["libcusolver-11-8"],
-    "libcusparse.so.11": ["libcusparse-11-8"],
+    "libcublas.so.11":   ["cuda-libraries-11-8", "libcublas-11-8"],
+    "libcublasLt.so.11": ["cuda-libraries-11-8", "libcublas-11-8"],
+    "libcufft.so.10":    ["cuda-libraries-11-8", "libcufft-11-8"],
+    "libcurand.so.10":   ["cuda-libraries-11-8", "libcurand-11-8"],
+    "libcusolver.so.11": ["cuda-libraries-11-8", "libcusolver-11-8"],
+    "libcusparse.so.11": ["cuda-libraries-11-8", "libcusparse-11-8"],
     "libcudnn.so.8":     ["libcudnn8", "nvidia-cudnn"],
 }
 
@@ -1207,48 +1251,62 @@ def install_cuda_libs_in_wsl(
     installed_packages: list[str] = []
     failed_libs: list[str] = []
 
+    # *Critical:* we cannot `bash -s` + pipe the script via stdin. apt postinst
+    # scripts (notably nvidia-cudnn's `update-nvidia-cudnn`) read from stdin
+    # during their dpkg run, eating bytes of OUR bash script that haven't been
+    # read yet. Symptom: a mid-install syntax error like
+    # `bash: line 122: syntax error near unexpected token 'substitution.'`
+    # where the missing bytes are whatever apt slurped.
+    #
+    # Workaround: stage the script as a Windows tempfile under %TEMP%, which
+    # WSL auto-mounts at /mnt/c/..., then invoke bash *with no stdin pipe at
+    # all*. We can't use the cleaner `bash -c "mktemp; cat > $T; bash $T"`
+    # pattern because wsl.exe on Windows has a long-standing bug where
+    # command substitution in a multi-line `bash -c` argument returns empty.
+    script_path = _stage_script_for_wsl(script)
+    wsl_script_path = win_to_wsl_path(str(script_path))
     try:
-        proc = subprocess.Popen(
-            [wsl, "-d", distro, "-u", "root", "--", "bash", "-s"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-    except OSError as e:
-        return {"ok": False, "error": f"Could not invoke wsl: {e}"}
-    assert proc.stdin and proc.stdout
+        try:
+            proc = subprocess.Popen(
+                [wsl, "-d", distro, "-u", "root", "--", "bash", wsl_script_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError as e:
+            return {"ok": False, "error": f"Could not invoke wsl: {e}"}
+        assert proc.stdout
+        for raw_line in proc.stdout:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            tail.append(line)
+            if len(tail) > 400:
+                tail.pop(0)
+            for marker, pct in step_pct.items():
+                if line.startswith(marker):
+                    if on_progress:
+                        on_progress(pct, 100, line[:120])
+                    break
+            # Parse the script's structured markers
+            if line.startswith("INSTALLED: "):
+                installed_packages = line[len("INSTALLED: "):].split()
+            elif line.startswith("PARTIAL: "):
+                # Format: PARTIAL: installed=[a b c] failed=[x y]
+                import re as _re
+                inst = _re.search(r"installed=\[([^\]]*)\]", line)
+                fail = _re.search(r"failed=\[([^\]]*)\]", line)
+                if inst:
+                    installed_packages = inst.group(1).split()
+                if fail:
+                    failed_libs = fail.group(1).split()
 
-    clean = script.replace("\r\n", "\n").replace("\r", "\n")
-    proc.stdin.write(clean.encode("utf-8"))
-    proc.stdin.close()
-    for raw_line in proc.stdout:
-        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-        tail.append(line)
-        if len(tail) > 400:
-            tail.pop(0)
-        for marker, pct in step_pct.items():
-            if line.startswith(marker):
-                if on_progress:
-                    on_progress(pct, 100, line[:120])
-                break
-        # Parse the script's structured markers
-        if line.startswith("INSTALLED: "):
-            installed_packages = line[len("INSTALLED: "):].split()
-        elif line.startswith("PARTIAL: "):
-            # Format: PARTIAL: installed=[a b c] failed=[x y]
-            import re as _re
-            inst = _re.search(r"installed=\[([^\]]*)\]", line)
-            fail = _re.search(r"failed=\[([^\]]*)\]", line)
-            if inst:
-                installed_packages = inst.group(1).split()
-            if fail:
-                failed_libs = fail.group(1).split()
-
-    try:
-        rc = proc.wait(timeout=60 * 30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return {"ok": False, "error": "CUDA lib install timed out after 30 min"}
+        try:
+            rc = proc.wait(timeout=60 * 30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return {"ok": False, "error": "CUDA lib install timed out after 30 min"}
+    finally:
+        # Always clean up the staged tempfile, even on early return / exception.
+        script_path.unlink(missing_ok=True)
 
     # Hard failure (couldn't even get to the install step — keyring, apt update,
     # or distro issue). Surface the tail so the user can see the actual error.
