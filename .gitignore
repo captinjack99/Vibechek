@@ -100,3 +100,4 @@ _to_review/
 # OS-level junk inside the repo (rare but possible)
 **/.DS_Store
 **/Thumbs.db
+.claude/worktrees/vigilant-pare-92eb80/
