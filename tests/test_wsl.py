@@ -355,3 +355,264 @@ def test_detect_wsl_quick_mode_skips_probes(monkeypatch: pytest.MonkeyPatch) -> 
     assert status.wsl_feature_enabled is True
     assert status.default_distro == "Ubuntu-24.04"
     assert probe_called == []
+
+
+# ---------------------------------------------------------------------------
+# Path-translation edge cases (paths the user might actually have)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "win,wsl",
+    [
+        # Spaces — common in Windows user paths like "My Drive"
+        ("C:\\Users\\Jack\\My Drive\\Vibechek", "/mnt/c/Users/Jack/My Drive/Vibechek"),
+        # Mixed separators
+        ("C:\\a/mixed\\slashes.mp3", "/mnt/c/a/mixed/slashes.mp3"),
+        # Special chars that don't need quoting in paths themselves
+        ("C:\\Path with (parens) & chars!.mp3", "/mnt/c/Path with (parens) & chars!.mp3"),
+        # Drive root with backslash
+        ("C:\\", "/mnt/c/"),
+    ],
+)
+def test_win_to_wsl_edge_cases(win: str, wsl: str) -> None:
+    assert win_to_wsl_path(win) == wsl
+
+
+def test_win_to_wsl_drive_only_passes_through() -> None:
+    # "C:" without a separator is ambiguous (CWD on drive). We leave it alone.
+    assert win_to_wsl_path("C:") == "C:"
+
+
+def test_win_to_wsl_unc_paths_pass_through() -> None:
+    # UNC paths (\\server\share\...) don't have a clean /mnt/c/-style equivalent
+    # in WSL. We leave them alone rather than producing a broken path.
+    assert win_to_wsl_path(r"\\server\share\file.mp3") == r"\\server\share\file.mp3"
+
+
+def test_round_trip_paths_with_spaces() -> None:
+    original = "C:\\Users\\Jack\\My Drive\\Music\\track 1.mp3"
+    assert wsl_to_win_path(win_to_wsl_path(original)) == original
+
+
+def test_round_trip_paths_with_non_ascii() -> None:
+    # Non-ASCII paths (umlauts, Polish, etc.) round-trip cleanly.
+    original = "D:\\Müsik\\trąck.mp3"
+    assert wsl_to_win_path(win_to_wsl_path(original)) == original
+
+
+# ---------------------------------------------------------------------------
+# Engine GPU probe — native (no WSL)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_gpu_native_returns_native_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On non-Windows hosts, distro=None falls back to native resources.detect()."""
+    from vibechek.wsl import EngineGpuInfo, probe_engine_gpu
+
+    # Bypass the cache so the test is deterministic
+    monkeypatch.setattr("vibechek.wsl._ENGINE_GPU_CACHE", {})
+
+    # Force a clean reply from resources.detect()
+    from vibechek import resources
+
+    fake = resources.SystemResources(
+        platform="Linux-test",
+        cpu_count=8,
+        memory_total_mb=16384,
+        memory_available_mb=8192,
+        gpu_available=False,
+        gpu_devices=[],
+        cuda_runtime=None,
+    )
+    monkeypatch.setattr(resources, "detect", lambda: fake)
+
+    info = probe_engine_gpu(None, force=True)
+    assert isinstance(info, EngineGpuInfo)
+    assert info.engine == "native"
+    assert info.ok is True
+    assert info.gpu_available is False
+    assert info.devices == []
+
+
+def test_engine_gpu_native_reports_devices(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vibechek.wsl import probe_engine_gpu
+    from vibechek import resources
+
+    monkeypatch.setattr("vibechek.wsl._ENGINE_GPU_CACHE", {})
+
+    fake = resources.SystemResources(
+        platform="Linux-test",
+        cpu_count=8,
+        memory_total_mb=16384,
+        memory_available_mb=8192,
+        gpu_available=True,
+        gpu_devices=[
+            resources.GpuDevice(name="NVIDIA GeForce RTX 4070", backend="cuda", memory_mb=8192),
+        ],
+        cuda_runtime="535.183",
+    )
+    monkeypatch.setattr(resources, "detect", lambda: fake)
+
+    info = probe_engine_gpu(None, force=True)
+    assert info.engine == "native"
+    assert info.ok is True
+    assert info.gpu_available is True
+    assert info.gpu_count == 1
+    assert info.devices[0].name == "NVIDIA GeForce RTX 4070"
+    assert info.devices[0].backend == "cuda"
+    assert info.nvidia_driver == "535.183"
+    assert info.nvidia_smi_available is True
+
+
+def test_engine_gpu_caches_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Second call within TTL hits the cache."""
+    from vibechek.wsl import probe_engine_gpu
+    from vibechek import resources
+
+    monkeypatch.setattr("vibechek.wsl._ENGINE_GPU_CACHE", {})
+
+    call_count = {"n": 0}
+
+    def counted_detect():
+        call_count["n"] += 1
+        return resources.SystemResources(
+            platform="x", cpu_count=1, memory_total_mb=None,
+            memory_available_mb=None, gpu_available=False, gpu_devices=[],
+            cuda_runtime=None,
+        )
+
+    monkeypatch.setattr(resources, "detect", counted_detect)
+
+    probe_engine_gpu(None)
+    probe_engine_gpu(None)  # should hit cache
+    probe_engine_gpu(None)  # should hit cache
+    assert call_count["n"] == 1
+
+
+def test_engine_gpu_force_bypasses_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vibechek.wsl import probe_engine_gpu
+    from vibechek import resources
+
+    monkeypatch.setattr("vibechek.wsl._ENGINE_GPU_CACHE", {})
+
+    call_count = {"n": 0}
+
+    def counted_detect():
+        call_count["n"] += 1
+        return resources.SystemResources(
+            platform="x", cpu_count=1, memory_total_mb=None,
+            memory_available_mb=None, gpu_available=False, gpu_devices=[],
+            cuda_runtime=None,
+        )
+
+    monkeypatch.setattr(resources, "detect", counted_detect)
+
+    probe_engine_gpu(None)
+    probe_engine_gpu(None, force=True)  # bypasses cache
+    assert call_count["n"] == 2
+
+
+def test_engine_gpu_info_to_dict_is_jsonable() -> None:
+    """The wire form must round-trip through json so the GUI can read it."""
+    import json
+    from vibechek.wsl import EngineGpuDevice, EngineGpuInfo, engine_gpu_info_to_dict
+
+    info = EngineGpuInfo(
+        engine="wsl",
+        distro="Ubuntu-24.04",
+        ok=True,
+        gpu_available=True,
+        gpu_count=1,
+        devices=[EngineGpuDevice(name="RTX 4070", backend="cuda", compute_capability="8.9")],
+        tf_version="2.5.0",
+        tf_built_with_cuda=True,
+        nvidia_driver="591.94",
+        nvidia_smi_available=True,
+        probed_at=1234567.0,
+    )
+    d = engine_gpu_info_to_dict(info)
+    # Must be JSON-serializable
+    s = json.dumps(d)
+    rt = json.loads(s)
+    assert rt["engine"] == "wsl"
+    assert rt["distro"] == "Ubuntu-24.04"
+    assert rt["devices"][0]["name"] == "RTX 4070"
+    assert rt["devices"][0]["compute_capability"] == "8.9"
+    # New fields added when we discovered the "hardware-visible but missing libs" state
+    assert "gpu_hardware_visible" in rt
+    assert "missing_cuda_libs" in rt
+
+
+def test_engine_gpu_info_distinguishes_skipped_from_available() -> None:
+    """The data model captures the three states we care about."""
+    from vibechek.wsl import EngineGpuDevice, EngineGpuInfo
+
+    # State: HW visible but TF skipped registering (missing CUDA libs)
+    skipped = EngineGpuInfo(
+        engine="wsl",
+        distro="Ubuntu",
+        ok=True,  # probe succeeded
+        gpu_available=False,  # TF won't use it
+        gpu_hardware_visible=True,
+        missing_cuda_libs=["libcudnn.so.8", "libcublas.so.11"],
+        nvidia_driver="591.94",
+        nvidia_smi_available=True,
+    )
+    assert skipped.ok is True
+    assert skipped.gpu_available is False
+    assert skipped.gpu_hardware_visible is True
+    assert len(skipped.missing_cuda_libs) == 2
+
+    # State: GPU fully usable
+    usable = EngineGpuInfo(
+        engine="native", ok=True, gpu_available=True,
+        gpu_hardware_visible=True, gpu_count=1,
+        devices=[EngineGpuDevice(name="RTX 4070", backend="cuda")],
+    )
+    assert usable.gpu_available is True
+    assert not usable.missing_cuda_libs
+
+    # State: No GPU at all
+    none = EngineGpuInfo(engine="native", ok=True)
+    assert none.gpu_available is False
+    assert none.gpu_hardware_visible is False
+    assert not none.missing_cuda_libs
+
+
+# ---------------------------------------------------------------------------
+# CUDA library installer translation
+# ---------------------------------------------------------------------------
+
+
+def test_cuda_libs_translation_to_apt_packages() -> None:
+    """Every lib in the typical 'missing' set should map to a known apt pkg."""
+    from vibechek.wsl import _CUDA_APT_PACKAGES_BY_LIB
+
+    # The libs essentia's bundled TF 2.5 tries to dlopen on a fresh WSL Ubuntu
+    typical_missing = [
+        "libcublas.so.11", "libcublasLt.so.11",
+        "libcufft.so.10", "libcusparse.so.11", "libcudnn.so.8",
+    ]
+    packages: set[str] = set()
+    for lib in typical_missing:
+        assert lib in _CUDA_APT_PACKAGES_BY_LIB, f"{lib} has no apt mapping"
+        packages.update(_CUDA_APT_PACKAGES_BY_LIB[lib])
+    # Critical libs all map to *something* installable
+    assert "libcudnn8" in packages
+    assert any("libcublas" in p for p in packages)
+
+
+def test_install_cuda_libs_in_wsl_no_packages_for_unknown_libs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the user passes libs we don't know how to install, return a useful error."""
+    from vibechek.wsl import install_cuda_libs_in_wsl
+
+    # Pretend we're on Windows so the early non-Windows return doesn't fire
+    monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", True)
+    monkeypatch.setattr("vibechek.wsl.shutil.which", lambda _: "C:\\fake\\wsl.exe")
+
+    result = install_cuda_libs_in_wsl("Ubuntu", ["libimaginary.so.99"])
+    assert result["ok"] is False
+    assert "libimaginary.so.99" in result["error"]

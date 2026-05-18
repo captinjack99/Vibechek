@@ -119,40 +119,17 @@ def _memory_total_fallback_mb() -> int | None:
 
 
 def _gpu_devices() -> list[GpuDevice]:
-    """Enumerate GPUs visible to us, in priority order:
+    """Enumerate GPUs visible to us via `nvidia-smi`.
 
-    1. TensorFlow's view (so it matches what Essentia would actually use).
-    2. `nvidia-smi` parse (works without TF installed).
-    3. Empty list.
+    *Deliberately does NOT import TensorFlow.* Importing TF has the side-effect
+    of initializing CUDA with the *current* value of `CUDA_VISIBLE_DEVICES`,
+    which is set by `apply_gpu_preference()` right before model load. If
+    `system_info` were to import TF here, every subsequent analyze would
+    inherit whatever GPU visibility TF first saw — making `--gpu off` a no-op.
+    The engine-side GPU probe (vibechek.wsl.probe_engine_gpu) is the right
+    place to do an actual TF query, and runs in a *separate subprocess*.
     """
-    devices = _gpu_devices_from_tensorflow()
-    if devices:
-        return devices
     return _gpu_devices_from_nvidia_smi()
-
-
-def _gpu_devices_from_tensorflow() -> list[GpuDevice]:
-    """Ask TensorFlow what it sees — most accurate signal for whether ML can use the GPU."""
-    try:
-        # Importing TF is heavy (~3 sec). Only do it if essentia is installed
-        # since that's the only path that benefits from GPU.
-        import essentia  # noqa: F401, PLC0415
-        import tensorflow as tf  # noqa: PLC0415
-    except ImportError:
-        return []
-    except Exception as e:  # noqa: BLE001
-        log.debug("TF probe failed: %s", e)
-        return []
-
-    out: list[GpuDevice] = []
-    try:
-        gpus = tf.config.list_physical_devices("GPU")
-        for g in gpus:
-            backend = "cuda" if "GPU" in g.device_type else g.device_type.lower()
-            out.append(GpuDevice(name=g.name, backend=backend))
-    except Exception as e:  # noqa: BLE001
-        log.debug("TF GPU enumeration failed: %s", e)
-    return out
 
 
 def _gpu_devices_from_nvidia_smi() -> list[GpuDevice]:

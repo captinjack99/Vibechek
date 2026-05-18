@@ -222,9 +222,34 @@ def _analyze_directory(params: dict) -> dict:
 
 
 def _system_info(_params: dict) -> dict:
-    """Report detected CPU / memory / GPU resources to the GUI."""
+    """Report detected CPU / memory / GPU resources to the GUI.
+
+    The base payload is the host-side view from `vibechek.resources.detect()`.
+    On Windows where analyze will route through WSL, the GPU as seen by TF
+    inside WSL is the ground truth — but probing it costs ~10s of TF import.
+    We do NOT probe TF here so this RPC stays snappy. The GUI calls
+    `engine_gpu_status` separately after the first render.
+    """
     from vibechek.resources import detect, to_dict
     return to_dict(detect())
+
+
+def _engine_gpu_status(params: dict) -> dict:
+    """Report what the analyze engine actually sees for GPUs.
+
+    On Linux/macOS (or Windows with native essentia) this just reuses the
+    host-side detection. On Windows where analyze routes through WSL, this
+    runs a TensorFlow probe *inside the WSL distro* — which is the truth
+    for whether GPU acceleration will actually happen.
+
+    Cached for 5 minutes — see vibechek.wsl._ENGINE_GPU_CACHE_TTL_SEC.
+    """
+    from vibechek.wsl import engine_gpu_info_to_dict, probe_engine_gpu
+
+    distro = params.get("distro")
+    force = bool(params.get("force", False))
+    info = probe_engine_gpu(distro, force=force)
+    return engine_gpu_info_to_dict(info)
 
 
 def _preflight(params: dict) -> dict:
@@ -257,6 +282,20 @@ def _install_vibechek_in_wsl(params: dict) -> dict:
     from vibechek.wsl import install_vibechek_in_wsl
     distro = str(params["distro"])
     return install_vibechek_in_wsl(distro, on_progress=_emit_progress)
+
+
+def _install_cuda_libs_in_wsl(params: dict) -> dict:
+    """Install missing CUDA runtime libs (libcublas/libcufft/libcudnn/...) in WSL.
+
+    Called by the GUI's "Enable GPU" button after `engine_gpu_status` reports
+    `gpu_hardware_visible=True` but `gpu_available=False` with a populated
+    `missing_cuda_libs` list. Adds the NVIDIA apt repo + installs the runtime
+    packages essentia's bundled TF needs to register the GPU.
+    """
+    from vibechek.wsl import install_cuda_libs_in_wsl
+    distro = str(params["distro"])
+    missing = list(params.get("missing_libs") or [])
+    return install_cuda_libs_in_wsl(distro, missing, on_progress=_emit_progress)
 
 
 def _find_duplicates(params: dict) -> dict:
@@ -551,10 +590,12 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "ping": _ping,
     "version": _version,
     "system_info": _system_info,
+    "engine_gpu_status": _engine_gpu_status,
     "preflight": _preflight,
     "wsl_status": _wsl_status,
     "install_wsl": _install_wsl,
     "install_vibechek_in_wsl": _install_vibechek_in_wsl,
+    "install_cuda_libs_in_wsl": _install_cuda_libs_in_wsl,
     "scan_directory": _scan_directory,
     "scan_only": _scan_only,
     "analyze_directory": _analyze_directory,
@@ -590,6 +631,7 @@ _CANCELLABLE_METHODS = {
     "download_models": "download-models",
     "install_wsl": "install-wsl",
     "install_vibechek_in_wsl": "install-essentia",
+    "install_cuda_libs_in_wsl": "install-cuda",
 }
 
 # JSON-RPC error codes
