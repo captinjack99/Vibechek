@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / discussion
+    url: https://github.com/papapew/Vibechek/discussions
+    about: For general questions, ideas, or "how do I…" — please use Discussions.
+  - name: Security vulnerability
+    url: https://github.com/papapew/Vibechek/security/policy
+    about: Do not file a public issue for security bugs. See SECURITY.md.

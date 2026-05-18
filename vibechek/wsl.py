@@ -23,6 +23,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -33,14 +34,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from vibechek.platform import IS_WINDOWS
+
 # Distros that aren't real Linux environments — probing them with bash will
 # either fail with garbage output or hang for the full subprocess timeout.
 # Add new known-bad names here as we encounter them.
 _NON_LINUX_DISTROS = {"docker-desktop", "docker-desktop-data", "rancher-desktop"}
 
 log = logging.getLogger(__name__)
-
-IS_WINDOWS = sys.platform == "win32"
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -207,9 +208,24 @@ def _probe_distro(distro: DistroInfo, wsl_exe: str) -> None:
     # that breaks variable assignment in multi-line `-c` scripts (the LHS
     # variable ends up empty). The install path uses `bash -s` for the
     # same reason — see install_vibechek_in_wsl.
+    # Self-healing: if the venv's vibechek shim contains the broken
+    # `. cuda-env.sh` line (a bug that shipped in beta.6-beta.9), strip it
+    # in-place. Without this, every analyze through WSL crashes with
+    # `SyntaxError: invalid syntax` and the user gets a useless "Invalid
+    # params: Expecting value" toast. The repair is a single-line sed, idempotent,
+    # and safe — `cuda-env.sh` should never appear in a Python entry point.
     script = r"""
 HOME_DIR="$(printenv HOME)"
-for p in "$HOME_DIR/.vibechek/venv/bin/vibechek" "$HOME_DIR/.local/bin/vibechek"; do
+SHIM="$HOME_DIR/.vibechek/venv/bin/vibechek"
+if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
+    # Strip the bad line. Done at probe time so users don't have to think.
+    TMP="$(mktemp)"
+    grep -v "cuda-env.sh" "$SHIM" > "$TMP"
+    cat "$TMP" > "$SHIM"
+    rm -f "$TMP"
+    printf 'repaired=1\n'
+fi
+for p in "$SHIM" "$HOME_DIR/.local/bin/vibechek"; do
   if [ -x "$p" ]; then
     printf 'vibechek=%s\n' "$p"
     break
@@ -240,7 +256,10 @@ done
     if proc.returncode != 0:
         return
 
-    # Decode like _wsl_run does — wsl can emit UTF-16 LE on some setups
+    # Decode like _wsl_run does — wsl can emit UTF-16 LE on some setups.
+    # (Audit #22: removed the dead _R wrapper class + tautological rc check
+    # that used to live here. The proc.returncode check above already
+    # short-circuits all non-zero exits.)
     stdout = ""
     for enc in ("utf-8", "utf-16-le", "cp1252"):
         try:
@@ -248,23 +267,20 @@ done
             break
         except UnicodeDecodeError:
             continue
-    # Build a fake result object with .stdout so the rest of the function works
-    class _R:
-        pass
-    result = _R()
-    result.stdout = stdout
-    result.returncode = 0
 
-    if result.returncode != 0:
-        return
-
-    for line in result.stdout.splitlines():
+    for line in stdout.splitlines():
         line = line.strip()
         if line.startswith("vibechek=") and len(line) > len("vibechek="):
             distro.vibechek_installed = True
             distro.vibechek_path = line[len("vibechek="):]
         elif line.startswith("essentia=") and len(line) > len("essentia="):
             distro.essentia_installed = True
+        elif line == "repaired=1":
+            log.warning(
+                "Auto-repaired broken vibechek shim in distro %s (stripped "
+                "stale `. cuda-env.sh` line from a pre-beta.10 CUDA install)",
+                distro.name,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +290,17 @@ done
 
 @dataclass
 class EngineGpuDevice:
-    """A single GPU as seen by the analyze engine."""
+    """A single GPU as seen by the analyze engine.
+
+    `vendor` was added when GPU detection went cross-vendor: TF can only
+    actually accelerate on NVIDIA today, but the *probe* may surface
+    AMD/Intel/Apple cards that exist on the host so the UI can be honest.
+    """
     name: str
     backend: str  # "cuda" | "rocm" | "metal" | "unknown"
     compute_capability: str | None = None
     memory_mb: int | None = None
+    vendor: str = "nvidia"  # nvidia | amd | intel | apple | unknown
 
 
 @dataclass
@@ -505,6 +527,39 @@ if not out["devices"]:
 if not out["ok"] and "error" not in out:
     out["error"] = "no probe layer succeeded"
 
+# ---- Layer 4: cross-vendor inventory (AMD/Intel/etc) via lspci ----
+# This runs *inside* the WSL distro so it sees the GPU as the Linux kernel
+# sees it (typically only the NVIDIA card under WSLg + dxg passthrough; AMD
+# iGPUs sometimes appear, Intel iGPUs almost never). Surfaces non-NVIDIA
+# devices to the UI so we can be honest that they're not accelerated.
+out["other_gpus"] = []
+try:
+    lspci_out = subprocess.run(
+        ["bash", "-c", "command -v lspci >/dev/null 2>&1 && lspci || true"],
+        capture_output=True, text=True, timeout=5,
+    ).stdout or ""
+except Exception:
+    lspci_out = ""
+for ln in lspci_out.splitlines():
+    if not re.search(r"\b(VGA compatible controller|3D controller|Display controller)\b", ln):
+        continue
+    vendor = None
+    if re.search(r"(Advanced Micro Devices|AMD|ATI)", ln, flags=re.IGNORECASE):
+        vendor = "amd"
+    elif re.search(r"Intel Corporation", ln):
+        vendor = "intel"
+    elif re.search(r"NVIDIA", ln, flags=re.IGNORECASE):
+        # NVIDIA already covered by the TF probe; skip to avoid double-counting.
+        continue
+    else:
+        vendor = "unknown"
+    m = re.search(r"\[([^\[\]]+)\]\s*(?:\(rev\s+[^\)]+\))?\s*$", ln)
+    if m:
+        name = m.group(1).strip()
+    else:
+        name = ln.split(":", 2)[-1].strip() or "GPU"
+    out["other_gpus"].append({"vendor": vendor, "name": name})
+
 print(json.dumps(out))
 """
 
@@ -599,8 +654,22 @@ def _probe_native_engine_gpu() -> EngineGpuInfo:
             name=d.get("device_name") or d.get("name", "?"),
             backend="cuda",
             compute_capability=d.get("compute_capability"),
+            vendor="nvidia",
         ))
-    info.gpu_count = int(tf_out.get("gpu_count") or len(info.devices))
+    # Cross-vendor inventory from Layer 4 (lspci inside the venv host).
+    for og in tf_out.get("other_gpus", []):
+        info.devices.append(EngineGpuDevice(
+            name=og.get("name", "?"),
+            backend={
+                "amd": "rocm",
+                "intel": "unknown",
+                "apple": "metal",
+            }.get(og.get("vendor", "unknown"), "unknown"),
+            vendor=og.get("vendor", "unknown"),
+        ))
+    info.gpu_count = int(tf_out.get("gpu_count") or sum(
+        1 for d in info.devices if d.vendor == "nvidia"
+    ))
     info.gpu_available = info.gpu_count > 0
 
     # nvidia-smi truth (separate from TF probe — works on Linux/macOS too)
@@ -631,16 +700,24 @@ def _probe_host_only_native_gpu() -> EngineGpuInfo:
         return EngineGpuInfo(engine="native", ok=False, error=f"{type(e).__name__}: {e}")
 
     devices = [
-        EngineGpuDevice(name=g.name, backend=g.backend, memory_mb=g.memory_mb)
+        EngineGpuDevice(
+            name=g.name,
+            backend=g.backend,
+            memory_mb=g.memory_mb,
+            vendor=getattr(g, "vendor", "nvidia"),
+        )
         for g in res.gpu_devices
     ]
+    # gpu_count and gpu_available stay NVIDIA-scoped — they mean "engine can
+    # accelerate". A discovered AMD card adds a device row but not to the count.
+    nvidia_count = sum(1 for d in devices if d.vendor == "nvidia")
     return EngineGpuInfo(
         engine="native",
         ok=True,
-        gpu_available=res.gpu_available,
-        gpu_count=len(devices),
+        gpu_available=nvidia_count > 0,
+        gpu_count=nvidia_count,
         devices=devices,
-        gpu_hardware_visible=res.gpu_available,
+        gpu_hardware_visible=nvidia_count > 0,
         nvidia_driver=res.cuda_runtime,
         nvidia_smi_available=res.cuda_runtime is not None,
     )
@@ -680,6 +757,9 @@ if [ ! -x "$VENV_PY" ]; then
     echo "TF_JSON={\"ok\":false,\"error\":\"venv python missing: $VENV_PY\"}"
     exit 0
 fi
+# Source the CUDA env file so TF sees the wheels we pip-installed via
+# install_cuda_libs_in_wsl. Silent no-op if no GPU install happened yet.
+. "$HOME_DIR/.vibechek/cuda-env.sh" 2>/dev/null || true
 echo "TF_JSON=$("$VENV_PY" - <<'PY' 2>/dev/null
 __PROBE__
 PY
@@ -754,8 +834,22 @@ PY
                     name=d.get("device_name") or d.get("name", "?"),
                     backend="cuda",  # essentia's bundled TF is CUDA-only on Linux
                     compute_capability=d.get("compute_capability"),
+                    vendor="nvidia",
                 ))
             info.gpu_count = int(tf_out.get("gpu_count") or len(info.devices))
+            # Layer 4: cross-vendor inventory. AMD/Intel cards discovered via
+            # lspci inside WSL are appended *after* NVIDIA devices, with
+            # backend="unknown" so the UI knows they're not accelerated.
+            for og in tf_out.get("other_gpus", []):
+                info.devices.append(EngineGpuDevice(
+                    name=og.get("name", "?"),
+                    backend={
+                        "amd": "rocm",
+                        "intel": "unknown",
+                        "apple": "metal",
+                    }.get(og.get("vendor", "unknown"), "unknown"),
+                    vendor=og.get("vendor", "unknown"),
+                ))
             # `gpu_available` means "TF will actually use this GPU at runtime".
             # When hardware is visible but TF skipped it (missing libs), that's
             # False — analyze will silently fall back to CPU.
@@ -860,6 +954,90 @@ def _stage_script_for_wsl(script: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _start_cancellation_watchdog(
+    proc: subprocess.Popen,
+    *,
+    on_cancel: Callable[[], None] | None = None,
+) -> tuple[threading.Event, dict[str, bool]]:
+    """Start a daemon thread that terminates `proc` when cancellation flips.
+
+    Polls `cancellation.is_cancelled()` every 500ms — the same cadence as
+    `run_vibechek_in_wsl`. Without this, the 5 install functions could run for
+    up to 30 minutes after the user clicked Cancel (the long-op lock would
+    stay held that whole time). See `_LONG_OP_LOCK` in rpc.py.
+
+    Returns `(cancel_event, state)`. Caller signals work done by `cancel_event.set()`;
+    `state["v"]` is True if cancellation actually fired.
+
+    `on_cancel` runs *before* the process termination — used by WSL ops to
+    `wsl kill -TERM` the bash process group via the token-file pattern, so
+    workers inside the distro die before we lose the parent's PID handle.
+    """
+    from vibechek import cancellation  # noqa: PLC0415
+
+    cancel_done = threading.Event()
+    state: dict[str, bool] = {"v": False}
+
+    def _watch() -> None:
+        while not cancel_done.is_set() and proc.poll() is None:
+            if cancellation.is_cancelled():
+                state["v"] = True
+                log.info(
+                    "Install subprocess cancellation requested — terminating PID %s",
+                    proc.pid,
+                )
+                if on_cancel is not None:
+                    try:
+                        on_cancel()
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_cancel hook raised")
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                return
+            cancel_done.wait(0.5)
+
+    threading.Thread(target=_watch, daemon=True).start()
+    return cancel_done, state
+
+
+def _kill_wsl_pgid(wsl_exe: str, distro: str, token_file: Path) -> None:
+    """Tear down the bash + child process group running inside `distro`.
+
+    Same pattern as `run_vibechek_in_wsl._kill_wsl_tree`: reads the PID we
+    wrote at launch (via setsid, so bash is the process-group leader) and
+    sends SIGTERM then SIGKILL to the negative pgid. Just terminating the
+    Windows-side wsl.exe wrapper would leave bash + workers running until the
+    WSL VM eventually reaps them.
+    """
+    if not token_file.exists():
+        return
+    try:
+        bash_pid = token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if not bash_pid.isdigit():
+        return
+    for sig in ("-TERM", "-KILL"):
+        try:
+            subprocess.run(
+                [wsl_exe, "-d", distro, "--", "kill", sig, f"-{bash_pid}"],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if sig == "-TERM":
+            time.sleep(0.5)
+
+
 def install_wsl(
     distro: str = "Ubuntu-24.04",
     on_progress: ProgressCallback | None = None,
@@ -869,10 +1047,19 @@ def install_wsl(
     Triggers a UAC prompt. Blocks until the install completes (or fails). The
     user may need to reboot afterward.
 
+    Cooperatively cancellable: a watchdog polls `cancellation.is_cancelled()`
+    every 500ms and terminates the PowerShell wrapper if the user cancels.
+    Note that the elevated wsl.exe spawned by Start-Process runs in a separate
+    UAC-elevated process — once UAC is granted we can only terminate our
+    PowerShell launcher; the actual WSL install may continue under its own
+    SYSTEM/elevated process. Best-effort.
+
     Returns a dict suitable for direct RPC return.
     """
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
+
+    from vibechek import cancellation  # noqa: PLC0415
 
     if on_progress:
         on_progress(0, 100, "Requesting admin elevation...")
@@ -890,22 +1077,36 @@ def install_wsl(
         on_progress(10, 100, "Installing WSL (admin prompt + ~5-15 min download)...")
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["powershell.exe", "-NoProfile", "-Command", ps_command],
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=60 * 30,  # WSL install can be slow on first run
+            encoding="utf-8",
+            errors="replace",
         )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "WSL install timed out after 30 min"}
     except OSError as e:
         return {"ok": False, "error": f"Could not invoke PowerShell: {e}"}
 
-    if result.returncode != 0:
+    cancel_done, cancel_state = _start_cancellation_watchdog(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=60 * 30)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        cancel_done.set()
+        return {"ok": False, "error": "WSL install timed out after 30 min"}
+    cancel_done.set()
+
+    if cancel_state["v"] or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+
+    if rc != 0:
         return {
             "ok": False,
-            "error": f"WSL install exited with {result.returncode}",
-            "stderr": result.stderr[-2000:] if result.stderr else "",
+            "error": f"WSL install exited with {rc}",
+            "stderr": (stderr or "")[-2000:],
         }
 
     if on_progress:
@@ -992,6 +1193,8 @@ def install_vibechek_in_wsl(
     if not wsl:
         return {"ok": False, "error": "wsl.exe not found"}
 
+    from vibechek import cancellation  # noqa: PLC0415
+
     if on_progress:
         on_progress(0, 100, f"Starting install inside {distro}...")
 
@@ -999,29 +1202,64 @@ def install_vibechek_in_wsl(
     step_pct = {"[1/4]": 10, "[2/4]": 25, "[3/4]": 40, "[4/4]": 60, "DONE": 95}
     full_tail: list[str] = []
 
-    def _run_phase(distro_args: list[str], script: str, label: str) -> tuple[int, list[str]]:
+    def _run_phase(
+        distro_args: list[str],
+        script: str,
+        label: str,
+        run_as_root: bool,
+    ) -> tuple[int, list[str], bool]:
         """Stage `script` to a Windows tempfile, run via `wsl bash <wsl-path>`.
 
         Why not pipe via stdin? See `_stage_script_for_wsl` — apt postinst
         scripts read from stdin and would eat parts of our bash script.
         Stdin is closed for the WSL bash process; the script is read from
         the staged file instead.
+
+        Wraps the install in a setsid+token-file launcher so the cancellation
+        watchdog can pkill the bash process group inside WSL — without this,
+        a Cancel click leaves apt / pip running for the full 30-min timeout.
+        Returns `(rc, tail, cancelled)`.
         """
+        import tempfile as _tempfile
+
         if on_progress:
             on_progress(step_pct.get("[1/4]" if "ROOT" in label else "[3/4]", 0), 100, label)
-        script_path = _stage_script_for_wsl(script)
-        wsl_script_path = win_to_wsl_path(str(script_path))
+        # Token file: setsid writes the bash pgid here; the watchdog reads it
+        # and `wsl kill -TERM -<pgid>` to take down apt / pip cleanly.
+        token_file = Path(_tempfile.gettempdir()) / (
+            f"vibechek-wsl-install-pid-{os.getpid()}-{id(script)}.txt"
+        )
+        wsl_token = win_to_wsl_path(str(token_file))
+        launcher = (
+            "#!/usr/bin/env bash\n"
+            "set -e\n"
+            f'echo $$ > {_shell_quote(wsl_token)}\n'
+            'trap "kill -TERM 0 2>/dev/null; exit 130" SIGTERM SIGINT\n'
+            f"exec bash {_shell_quote(win_to_wsl_path(str(_stage_script_for_wsl(script))))}\n"
+        )
+        # We staged the script above; recover its path so we can clean up.
+        # Re-parse from the launcher line.
+        launcher_path = _stage_script_for_wsl(launcher)
+        wsl_launcher = win_to_wsl_path(str(launcher_path))
+        # Extract the script path so we delete it too. Cheap: it's the last
+        # arg of the exec line.
+        inner_script_wsl = launcher.rstrip().splitlines()[-1].split()[-1].strip("'")
         try:
             try:
                 proc = subprocess.Popen(
-                    distro_args + ["bash", wsl_script_path],
+                    distro_args + ["setsid", "bash", wsl_launcher],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                 )
             except OSError as e:
-                return -1, [f"Could not invoke wsl: {e}"]
+                return -1, [f"Could not invoke wsl: {e}"], False
             assert proc.stdout
+
+            cancel_done, cancel_state = _start_cancellation_watchdog(
+                proc,
+                on_cancel=lambda: _kill_wsl_pgid(wsl, distro, token_file),
+            )
 
             tail: list[str] = []
             for raw_line in proc.stdout:
@@ -1036,18 +1274,37 @@ def install_vibechek_in_wsl(
                         if on_progress:
                             on_progress(pct, 100, stripped)
                         break
-            rc = proc.wait(timeout=60 * 30)
-            return rc, tail
+            try:
+                rc = proc.wait(timeout=60 * 30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                cancel_done.set()
+                return -1, tail + ["Killed after 30 min timeout"], False
+            cancel_done.set()
+            return rc, tail, cancel_state["v"]
         finally:
-            script_path.unlink(missing_ok=True)
+            launcher_path.unlink(missing_ok=True)
+            # The inner script was staged with its own NamedTemporaryFile path
+            # via _stage_script_for_wsl; convert back from the WSL form so we
+            # can unlink the Windows-side copy.
+            try:
+                inner_win = wsl_to_win_path(inner_script_wsl)
+                Path(inner_win).unlink(missing_ok=True)
+            except OSError:
+                pass
+            token_file.unlink(missing_ok=True)
 
     # ---- Phase 1: apt as root ----
     log.info("WSL install phase 1 (apt as root) in %s", distro)
-    rc, tail = _run_phase(
+    rc, tail, cancelled = _run_phase(
         [wsl, "-d", distro, "-u", "root", "--"],
         _ROOT_BOOTSTRAP,
         "Phase 1: ROOT — installing system packages",
+        run_as_root=True,
     )
+    if cancelled or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True,
+                "tail": "\n".join(full_tail)}
     if rc != 0:
         return {
             "ok": False,
@@ -1057,11 +1314,15 @@ def install_vibechek_in_wsl(
 
     # ---- Phase 2: pip as default user ----
     log.info("WSL install phase 2 (pip as default user) in %s", distro)
-    rc, tail = _run_phase(
+    rc, tail, cancelled = _run_phase(
         [wsl, "-d", distro, "--"],
         _USER_BOOTSTRAP,
         "Phase 2: USER — installing Vibechek + Essentia (slow)",
+        run_as_root=False,
     )
+    if cancelled or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True,
+                "tail": "\n".join(full_tail)}
     if rc != 0:
         return {
             "ok": False,
@@ -1080,20 +1341,85 @@ def install_vibechek_in_wsl(
 # ---------------------------------------------------------------------------
 
 
-# Maps essentia's bundled TF 2.5 dlopen targets → Ubuntu apt package names.
-# Each value is a list of *fallback* package names — we try them in order until
-# one installs. This handles the fact that the same lib lives in different
-# packages on different Ubuntu/CUDA-repo versions.
+# Maps essentia's bundled TF 2.5 dlopen targets → the PyPI nvidia wheel that
+# ships the .so file inside it. We install via pip into the WSL venv rather
+# than via apt because:
 #
-# Notes:
-# - `cuda-libraries-11-8` is the NVIDIA meta-package that pulls in cublas,
-#   cufft, curand, cusolver, cusparse, npp, nvjpeg, etc. in one shot. We try
-#   it first because the per-library `libX-11-8` packages aren't reachable
-#   on every Ubuntu/keyring combination (Ubuntu 24.04 in particular often
-#   lacks them, the user hit `E: Unable to locate package libcufft-11-8`).
-# - libcudnn8 is NOT in the cuda-keyring repo — cuDNN has a separate
-#   distribution. We try `libcudnn8` (works if cuDNN repo is configured),
-#   `nvidia-cudnn` (Ubuntu multiverse), then fall back to a clear error.
+#   1. apt's per-library packages (libcublas-11-8, libcufft-11-8, ...) aren't
+#      reachable on every Ubuntu version. Ubuntu 24.04 in particular has no
+#      CUDA 11.x packages in NVIDIA's apt repo at all (they only ship 12.x
+#      for noble). The user hits `E: Unable to locate package` and the
+#      install fails before installing anything.
+#   2. pip wheels are platform-agnostic — they include the .so file directly,
+#      installed to `~/.vibechek/venv/lib/python*/site-packages/nvidia/<lib>/lib/`.
+#      Works on any Linux distribution, any Ubuntu version, no apt repo
+#      configuration, no NVIDIA keyring, no root required.
+#
+# We map both the .so name and an optional minimum version. The CUDA 11.x
+# wheels pin to ~11.10 / cuDNN 8.6 which works fine with TF 2.5 thanks to
+# CUDA's binary compatibility guarantees.
+_CUDA_PIP_PACKAGES_BY_LIB = {
+    "libcudart.so.11.0": "nvidia-cuda-runtime-cu11",
+    "libcublas.so.11":   "nvidia-cublas-cu11",
+    "libcublasLt.so.11": "nvidia-cublas-cu11",   # ships with libcublas
+    "libcufft.so.10":    "nvidia-cufft-cu11",
+    "libcurand.so.10":   "nvidia-curand-cu11",
+    "libcusolver.so.11": "nvidia-cusolver-cu11",
+    "libcusparse.so.11": "nvidia-cusparse-cu11",
+    "libcudnn.so.8":     "nvidia-cudnn-cu11",
+}
+
+# Future-proofing for TF 2.13+ which bundles CUDA 12 and dlopens libcudart.so.12,
+# libcudnn.so.9, etc. The probe's `missing_cuda_libs` would list those .so names,
+# and we route to the cu12 wheels. Detected via the .so suffix — no separate
+# TF-version branching needed.
+_CUDA12_PIP_PACKAGES_BY_LIB = {
+    "libcudart.so.12":   "nvidia-cuda-runtime-cu12",
+    "libcublas.so.12":   "nvidia-cublas-cu12",
+    "libcublasLt.so.12": "nvidia-cublas-cu12",
+    "libcufft.so.11":    "nvidia-cufft-cu12",
+    "libcurand.so.10":   "nvidia-curand-cu12",
+    "libcusolver.so.11": "nvidia-cusolver-cu12",
+    "libcusparse.so.12": "nvidia-cusparse-cu12",
+    "libcudnn.so.9":     "nvidia-cudnn-cu12",
+    "libcudnn.so.8":     "nvidia-cudnn-cu12",  # cu12 wheel covers older soname
+}
+
+
+def _resolve_cuda_packages(missing_libs: list[str]) -> tuple[list[str], list[str]]:
+    """Translate missing .so names to pip wheel names, handling cu11 + cu12.
+
+    Returns (wheel_packages_sorted, unknown_libs). Routing rule:
+      - Any `.so.12`-suffixed lib → cu12 wheel set
+      - Any `.so.11.0` / `.so.11` / `.so.10` / `.so.8` → cu11 wheel set
+      - Mixed: pick cu12 (forward-compatible — cu12 runtime supports cu11
+        apps via CUDA's binary compat guarantee)
+    """
+    has_cu12 = any(
+        lib in _CUDA12_PIP_PACKAGES_BY_LIB and ".so.12" in lib or ".so.9" in lib
+        for lib in missing_libs
+    )
+    table = _CUDA12_PIP_PACKAGES_BY_LIB if has_cu12 else _CUDA_PIP_PACKAGES_BY_LIB
+    packages: set[str] = set()
+    unknown: list[str] = []
+    for lib in missing_libs:
+        wheel = table.get(lib)
+        if wheel:
+            packages.add(wheel)
+        else:
+            # Fall back to the OTHER table — handles mixed-soname situations
+            other = (_CUDA_PIP_PACKAGES_BY_LIB
+                     if table is _CUDA12_PIP_PACKAGES_BY_LIB
+                     else _CUDA12_PIP_PACKAGES_BY_LIB)
+            wheel = other.get(lib)
+            if wheel:
+                packages.add(wheel)
+            else:
+                unknown.append(lib)
+    return sorted(packages), unknown
+
+# Legacy apt mapping retained for the regression tests and any callers that
+# might still reference it. New code paths use the pip mapping above.
 _CUDA_APT_PACKAGES_BY_LIB = {
     "libcublas.so.11":   ["cuda-libraries-11-8", "libcublas-11-8"],
     "libcublasLt.so.11": ["cuda-libraries-11-8", "libcublas-11-8"],
@@ -1104,10 +1430,105 @@ _CUDA_APT_PACKAGES_BY_LIB = {
     "libcudnn.so.8":     ["libcudnn8", "nvidia-cudnn"],
 }
 
-# The CUDA repo isn't enabled by default on most WSL Ubuntu installs. We add
-# NVIDIA's keyring + repo, then try each requested package in turn. A failure
-# on one doesn't abort the rest — we collect what worked vs. what didn't so
-# the UI can show progress even on partial success.
+# Pip-based bootstrap: install NVIDIA's CUDA runtime wheels into the WSL venv,
+# then generate `~/.vibechek/cuda-env.sh` which sets LD_LIBRARY_PATH so
+# essentia's bundled TF can find the .so files at runtime.
+#
+# Why pip and not apt? Apt's CUDA 11.x packages aren't available on Ubuntu
+# 24.04 at all, and on 22.04 the keyring registration silently fails on many
+# WSL installs. Pip wheels work on every Linux, no exceptions.
+_CUDA_LIBS_PIP_BOOTSTRAP = r"""
+set -e
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+export PIP_ROOT_USER_ACTION=ignore
+
+PIP="$HOME/.vibechek/venv/bin/pip"
+PYTHON="$HOME/.vibechek/venv/bin/python"
+
+if [ ! -x "$PIP" ]; then
+    echo "ERROR: vibechek venv not found at ~/.vibechek/venv."
+    echo "ERROR: Install Essentia first (Settings -> Set up now)."
+    exit 2
+fi
+
+echo "[1/3] Installing NVIDIA CUDA runtime wheels into managed venv..."
+PACKAGES="__PACKAGES__"
+echo "      Packages: $PACKAGES"
+# --upgrade so we replace stale versions if the user re-runs after an upgrade.
+# Each package is ~50-800 MB; cudnn is the heaviest.
+if ! "$PIP" install --upgrade --no-warn-script-location $PACKAGES 2>&1; then
+    echo "ERROR: pip install of NVIDIA wheels failed."
+    echo "ERROR: Check internet connectivity inside WSL: wsl -- curl https://pypi.org"
+    exit 3
+fi
+
+echo "[2/3] Locating installed library directories..."
+LIB_DIRS=$("$PYTHON" -c "
+import os
+try:
+    import nvidia
+except ImportError:
+    raise SystemExit('nvidia namespace package missing after pip install')
+base = os.path.dirname(nvidia.__file__)
+dirs = []
+for sub in sorted(os.listdir(base)):
+    libdir = os.path.join(base, sub, 'lib')
+    if os.path.isdir(libdir):
+        dirs.append(libdir)
+print(':'.join(dirs))
+")
+if [ -z "$LIB_DIRS" ]; then
+    echo "ERROR: wheels installed but no nvidia/*/lib directories found."
+    exit 4
+fi
+echo "      Found $(echo "$LIB_DIRS" | tr ':' '\n' | wc -l) directories"
+
+echo "[3/3] Generating ~/.vibechek/cuda-env.sh..."
+ENV_FILE="$HOME/.vibechek/cuda-env.sh"
+# Use printf so the redirect doesn't expand subshells. The leading colon trick
+# (${LD_LIBRARY_PATH:+...}) appends if LD_LIBRARY_PATH was already set, else
+# leaves it as just our paths.
+printf '%s\n' \
+    '# Auto-generated by Vibechek. Source this to make NVIDIA CUDA runtime' \
+    '# libraries visible to essentia-tensorflow.' \
+    "export LD_LIBRARY_PATH=\"${LIB_DIRS}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\"" \
+    > "$ENV_FILE"
+chmod +x "$ENV_FILE"
+
+# SHIM PATCHING REMOVED. The previous version of this script inserted a bash
+# `source` line into the venv's vibechek shim — but the shim is a Python
+# script (pip-generated entry point), not bash. The injected line turned every
+# subsequent invocation into a SyntaxError ("invalid syntax") at line 2,
+# silently breaking analyze for every user who ran the GPU install.
+#
+# The sourcing now happens exclusively from the launcher generated by
+# `run_vibechek_in_wsl` (which is a real bash file, where bash syntax is
+# valid). That's the only path that needs LD_LIBRARY_PATH set, because
+# essentia + TF only load when `vibechek analyze` actually runs.
+#
+# If you're tempted to add `source` to a Python entry point: DON'T. The
+# launcher pattern is intentional.
+#
+# Repair shim if it was broken by the old version of this code:
+SHIM="$HOME/.vibechek/venv/bin/vibechek"
+if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
+    echo "      Repairing previously-corrupted vibechek shim..."
+    # Strip any line containing cuda-env.sh from the shim.
+    TMP_SHIM="$(mktemp)"
+    grep -v "cuda-env.sh" "$SHIM" > "$TMP_SHIM"
+    cat "$TMP_SHIM" > "$SHIM"
+    rm -f "$TMP_SHIM"
+    echo "      Shim repaired."
+fi
+
+echo "INSTALLED: ${LIB_DIRS}"
+echo "DONE"
+"""
+
+
+# The legacy apt-based bootstrap. Kept around for reference / regression tests
+# but new installs go through the pip path. Marked underscore-prefixed and not
+# called by install_cuda_libs_in_wsl anymore.
 _CUDA_LIBS_BOOTSTRAP = r"""
 set +e  # don't bail on individual package failures
 export DEBIAN_FRONTEND=noninteractive
@@ -1224,18 +1645,15 @@ def _build_try_chain(missing_libs: list[str]) -> tuple[str, list[str]]:
     return "\n".join(lines), sorted(all_pkgs)
 
 
-def install_cuda_libs_in_wsl(
-    distro: str,
-    missing_libs: list[str],
-    on_progress: ProgressCallback | None = None,
-) -> dict:
-    """Install the CUDA runtime libs essentia's bundled TF needs to use the GPU.
+def repair_wsl_shim(distro: str) -> dict:
+    """Strip any `cuda-env.sh` source line from the venv's vibechek shim.
 
-    `missing_libs` is the `missing_cuda_libs` list from `probe_engine_gpu`.
-    We translate each lib name to its apt package, install them as root, then
-    invalidate the engine GPU cache so the next probe sees the new state.
+    The pre-beta.10 CUDA installer mistakenly injected a bash `. cuda-env.sh`
+    line into the venv's vibechek shim, which is a *Python* script. The
+    injection turned every subsequent run into a SyntaxError, silently
+    breaking analyze. This function detects and removes the bad line.
 
-    This is the "Enable GPU" button in the UI.
+    Safe to call repeatedly — if no broken line is present, it's a no-op.
     """
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
@@ -1244,54 +1662,155 @@ def install_cuda_libs_in_wsl(
     if not wsl:
         return {"ok": False, "error": "wsl.exe not found"}
 
-    # Build the per-library try-chain. Each lib has 1-N fallback packages;
-    # the bash script tries them in order and tracks what worked.
-    try_chain, all_packages = _build_try_chain(missing_libs)
-    unknown = [lib for lib in missing_libs if lib not in _CUDA_APT_PACKAGES_BY_LIB]
+    # Use a staged tempfile so the bash one-liner doesn't trip wsl.exe's
+    # variable-substitution quirk.
+    script = r"""#!/usr/bin/env bash
+SHIM="$HOME/.vibechek/venv/bin/vibechek"
+if [ ! -f "$SHIM" ]; then
+    echo "NO_SHIM"
+    exit 0
+fi
+if grep -q "cuda-env.sh" "$SHIM"; then
+    TMP="$(mktemp)"
+    grep -v "cuda-env.sh" "$SHIM" > "$TMP"
+    cat "$TMP" > "$SHIM"
+    rm -f "$TMP"
+    echo "REPAIRED"
+else
+    echo "ALREADY_OK"
+fi
+"""
+    from vibechek import cancellation  # noqa: PLC0415
 
-    if not all_packages:
-        return {
-            "ok": False,
-            "error": (
-                f"No installable packages mapped for: {', '.join(missing_libs)}. "
-                f"You may need to install them manually."
-            ),
-        }
-
-    # Defensive: only replace the FIRST occurrence so any future mention of
-    # the placeholder name in comments doesn't get its tail spliced into bash
-    # (we hit this exact bug once — the comment ".. via __TRY_CHAIN__ substitution."
-    # produced a literal `fi substitution.` on line 158 and broke the install).
-    script = _CUDA_LIBS_BOOTSTRAP.replace("__TRY_CHAIN__", try_chain, 1)
-
-    if on_progress:
-        on_progress(0, 100, f"Installing CUDA libs in {distro}...")
-
-    # Step markers in the new bootstrap: [1/4] keyring, [2/4] multiverse,
-    # [3/4] apt update, [4/4] install.
-    step_pct = {"[1/4]": 5, "[2/4]": 15, "[3/4]": 25, "[4/4]": 40, "DONE": 95, "PARTIAL": 95}
-    tail: list[str] = []
-    installed_packages: list[str] = []
-    failed_libs: list[str] = []
-
-    # *Critical:* we cannot `bash -s` + pipe the script via stdin. apt postinst
-    # scripts (notably nvidia-cudnn's `update-nvidia-cudnn`) read from stdin
-    # during their dpkg run, eating bytes of OUR bash script that haven't been
-    # read yet. Symptom: a mid-install syntax error like
-    # `bash: line 122: syntax error near unexpected token 'substitution.'`
-    # where the missing bytes are whatever apt slurped.
-    #
-    # Workaround: stage the script as a Windows tempfile under %TEMP%, which
-    # WSL auto-mounts at /mnt/c/..., then invoke bash *with no stdin pipe at
-    # all*. We can't use the cleaner `bash -c "mktemp; cat > $T; bash $T"`
-    # pattern because wsl.exe on Windows has a long-standing bug where
-    # command substitution in a multi-line `bash -c` argument returns empty.
     script_path = _stage_script_for_wsl(script)
     wsl_script_path = win_to_wsl_path(str(script_path))
     try:
         try:
             proc = subprocess.Popen(
-                [wsl, "-d", distro, "-u", "root", "--", "bash", wsl_script_path],
+                [wsl, "-d", distro, "--", "bash", wsl_script_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as e:
+            return {"ok": False, "error": f"Could not invoke wsl: {e}"}
+
+        cancel_done, cancel_state = _start_cancellation_watchdog(proc)
+        try:
+            stdout_bytes, _stderr = proc.communicate(timeout=30)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            cancel_done.set()
+            return {"ok": False, "error": "Shim repair timed out after 30s"}
+        cancel_done.set()
+
+        if cancel_state["v"] or cancellation.is_cancelled():
+            return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+
+        result = subprocess.CompletedProcess(
+            [wsl, "-d", distro, "--", "bash", wsl_script_path],
+            rc, stdout_bytes, b"",
+        )
+    finally:
+        script_path.unlink(missing_ok=True)
+
+    stdout = result.stdout.decode("utf-8", errors="replace").strip()
+    if "REPAIRED" in stdout:
+        return {"ok": True, "repaired": True,
+                "message": "Shim repaired. Analyze should work now."}
+    if "ALREADY_OK" in stdout:
+        return {"ok": True, "repaired": False,
+                "message": "Shim is already clean — no action needed."}
+    if "NO_SHIM" in stdout:
+        return {"ok": False, "error": "vibechek shim not found in WSL venv. "
+                "Run the Essentia install first."}
+    return {"ok": False, "error": f"Unexpected output: {stdout[:200]}"}
+
+
+def install_cuda_libs_in_wsl(
+    distro: str,
+    missing_libs: list[str],
+    on_progress: ProgressCallback | None = None,
+) -> dict:
+    """Install the CUDA runtime libs essentia's bundled TF needs to use the GPU.
+
+    Uses NVIDIA's PyPI wheels (`nvidia-cublas-cu11`, `nvidia-cudnn-cu11`, ...)
+    installed into the user's WSL venv. Pip wheels are platform-agnostic —
+    they ship the .so file inside the wheel — so this works on every Ubuntu
+    version regardless of whether NVIDIA's apt repo is reachable.
+
+    After install we generate `~/.vibechek/cuda-env.sh` which exports the
+    correct `LD_LIBRARY_PATH`, and patch the venv's vibechek shim to source
+    it on launch. Net effect: the GPU "just works" the next time analyze
+    runs, with no further user action.
+
+    `missing_libs` is the `missing_cuda_libs` list from `probe_engine_gpu`.
+    """
+    if not IS_WINDOWS:
+        return {"ok": False, "error": "Not running on Windows"}
+
+    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    if not wsl:
+        return {"ok": False, "error": "wsl.exe not found"}
+
+    # Translate missing .so names to PyPI wheel names. Routes to cu12 wheels
+    # automatically when TF dlopens .so.12 / .so.9 — future-proofs against
+    # the inevitable essentia-tensorflow upgrade to TF 2.13+.
+    pip_packages, unknown = _resolve_cuda_packages(missing_libs)
+
+    if not pip_packages:
+        return {
+            "ok": False,
+            "error": (
+                f"No PyPI wheels mapped for: {', '.join(missing_libs)}. "
+                f"You may need to install them manually."
+            ),
+            "unknown_libs": unknown,
+        }
+
+    # count=1 so a future comment mentioning `__PACKAGES__` can't get its
+    # tail spliced into the script (we hit that exact bug with __TRY_CHAIN__).
+    script = _CUDA_LIBS_PIP_BOOTSTRAP.replace("__PACKAGES__", " ".join(pip_packages), 1)
+
+    if on_progress:
+        on_progress(0, 100,
+                    f"Installing {len(pip_packages)} CUDA wheel(s) into {distro} venv...")
+
+    # Step markers from the pip bootstrap: [1/3] pip install (slow),
+    # [2/3] locate dirs, [3/3] write env file.
+    step_pct = {"[1/3]": 10, "[2/3]": 75, "[3/3]": 85, "DONE": 95}
+    tail: list[str] = []
+    installed_lib_dirs: list[str] = []
+
+    from vibechek import cancellation  # noqa: PLC0415
+
+    # See _stage_script_for_wsl for why we don't pipe via stdin.
+    # We run as the *default user* (not root) because pip installs into the
+    # user's venv at ~/.vibechek/venv/.
+    script_path = _stage_script_for_wsl(script)
+    wsl_script_path = win_to_wsl_path(str(script_path))
+
+    # Watchdog setup: token file holds the bash pgid so a Cancel reaches
+    # every pip download inside WSL (a 1+ GB cudnn wheel pull would otherwise
+    # finish even after the user clicked Cancel).
+    import tempfile as _tempfile
+    token_file = Path(_tempfile.gettempdir()) / f"vibechek-wsl-cuda-pid-{os.getpid()}.txt"
+    wsl_token = win_to_wsl_path(str(token_file))
+    launcher_script = (
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        f'echo $$ > {_shell_quote(wsl_token)}\n'
+        'trap "kill -TERM 0 2>/dev/null; exit 130" SIGTERM SIGINT\n'
+        f"exec bash {_shell_quote(wsl_script_path)}\n"
+    )
+    launcher_path = _stage_script_for_wsl(launcher_script)
+    wsl_launcher = win_to_wsl_path(str(launcher_path))
+
+    try:
+        try:
+            proc = subprocess.Popen(
+                [wsl, "-d", distro, "--", "setsid", "bash", wsl_launcher],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1299,90 +1818,77 @@ def install_cuda_libs_in_wsl(
         except OSError as e:
             return {"ok": False, "error": f"Could not invoke wsl: {e}"}
         assert proc.stdout
+
+        cancel_done, cancel_state = _start_cancellation_watchdog(
+            proc,
+            on_cancel=lambda: _kill_wsl_pgid(wsl, distro, token_file),
+        )
+
         for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
             tail.append(line)
-            if len(tail) > 400:
+            if len(tail) > 600:
                 tail.pop(0)
             for marker, pct in step_pct.items():
                 if line.startswith(marker):
                     if on_progress:
                         on_progress(pct, 100, line[:120])
                     break
-            # Parse the script's structured markers
+            # Bottom marker emitted right before DONE: list of lib dirs we
+            # registered into cuda-env.sh.
             if line.startswith("INSTALLED: "):
-                installed_packages = line[len("INSTALLED: "):].split()
-            elif line.startswith("PARTIAL: "):
-                # Format: PARTIAL: installed=[a b c] failed=[x y]
-                import re as _re
-                inst = _re.search(r"installed=\[([^\]]*)\]", line)
-                fail = _re.search(r"failed=\[([^\]]*)\]", line)
-                if inst:
-                    installed_packages = inst.group(1).split()
-                if fail:
-                    failed_libs = fail.group(1).split()
+                installed_lib_dirs = line[len("INSTALLED: "):].split(":")
+            elif on_progress and line.startswith("  "):
+                # Surface pip's per-package progress lines to the GUI
+                on_progress(40, 100, line[:120])
 
         try:
             rc = proc.wait(timeout=60 * 30)
         except subprocess.TimeoutExpired:
             proc.kill()
-            return {"ok": False, "error": "CUDA lib install timed out after 30 min"}
-    finally:
-        # Always clean up the staged tempfile, even on early return / exception.
-        script_path.unlink(missing_ok=True)
+            cancel_done.set()
+            return {"ok": False, "error": "CUDA wheel install timed out after 30 min"}
+        cancel_done.set()
 
-    # Hard failure (couldn't even get to the install step — keyring, apt update,
-    # or distro issue). Surface the tail so the user can see the actual error.
+        if cancel_state["v"] or cancellation.is_cancelled():
+            return {"ok": False, "error": "Cancelled by user", "cancelled": True,
+                    "tail": "\n".join(tail[-100:])}
+    finally:
+        script_path.unlink(missing_ok=True)
+        launcher_path.unlink(missing_ok=True)
+        token_file.unlink(missing_ok=True)
+
     if rc != 0:
-        last_lines = "\n".join(tail[-20:])
+        last_lines = "\n".join(tail[-25:])
         return {
             "ok": False,
             "error": (
-                f"CUDA lib install exited with {rc} before the install step.\n"
-                f"Last output:\n{last_lines}"
+                f"CUDA wheel install exited with {rc}.\n\n"
+                f"Last output:\n{last_lines}\n\n"
+                f"If pip couldn't reach PyPI, check WSL's network: "
+                f"  wsl -d {distro} -- curl https://pypi.org\n"
+                f"If the venv doesn't exist, install Essentia first via "
+                f"Settings -> Set up now."
             ),
-            "tail": "\n".join(tail[-60:]),
+            "tail": "\n".join(tail[-100:]),
             "unknown_libs": unknown,
-            "packages_attempted": all_packages,
+            "packages_attempted": pip_packages,
         }
 
-    # Invalidate the engine GPU cache so the next probe reflects the new state
+    # Invalidate engine GPU cache so the next probe sees the new libs
     with _ENGINE_GPU_CACHE_LOCK:
         _ENGINE_GPU_CACHE.clear()
 
-    # Partial success: some libs failed to install. Still useful (any installed
-    # libs help TF) but we tell the user which ones to fix manually.
-    if failed_libs:
-        last_lines = "\n".join(tail[-20:])
-        return {
-            "ok": False,  # partial = not ok from the UI's perspective
-            "partial": True,
-            "error": (
-                f"Installed {len(installed_packages)} package(s) but "
-                f"{len(failed_libs)} library/libraries couldn't be installed: "
-                f"{', '.join(failed_libs)}.\n\n"
-                f"libcudnn8 is the most common one to fail — it's not in NVIDIA's "
-                f"CUDA repo. You can install it manually with:\n"
-                f"  wsl -d {distro} -u root -- apt install -y nvidia-cudnn\n"
-                f"(after enabling the multiverse repo). Or download from "
-                f"https://developer.nvidia.com/cudnn .\n\n"
-                f"Last output:\n{last_lines}"
-            ),
-            "tail": "\n".join(tail[-60:]),
-            "packages_installed": installed_packages,
-            "failed_libs": failed_libs,
-            "unknown_libs": unknown,
-        }
-
     if on_progress:
-        on_progress(100, 100, "CUDA libs installed; re-probe GPU to verify")
+        on_progress(100, 100, "CUDA wheels installed; re-probing GPU...")
 
     return {
         "ok": True,
         "distro": distro,
-        "packages_installed": installed_packages or all_packages,
+        "packages_installed": pip_packages,
+        "lib_dirs": installed_lib_dirs,
         "unknown_libs": unknown,
-        "tail": "\n".join(tail[-60:]),
+        "tail": "\n".join(tail[-100:]),
     }
 
 
@@ -1437,8 +1943,71 @@ def run_vibechek_in_wsl(
     if not wsl:
         raise FileNotFoundError("wsl.exe not on PATH")
 
-    cmd_str = "vibechek " + " ".join(_shell_quote(a) for a in args)
-    proc_cmd = [wsl, "-d", distro, "--", "bash", "-lc", cmd_str]
+    # We stage the launcher as a Windows tempfile rather than using
+    # `bash -lc <multi-line cmd>` because wsl.exe on Windows mangles
+    # variable substitution in multi-line `-c` strings (see
+    # _stage_script_for_wsl). The launcher:
+    #
+    #   - Calls `setsid` to start a new process group so SIGTERM to our PID
+    #     kills the whole tree (bash + python workers).
+    #   - Writes its PID to a token file the watchdog reads on cancel.
+    #   - Optionally sources cuda-env.sh (only if GPU mode is on — skipping
+    #     it for --gpu off keeps CUDA libs out of LD_LIBRARY_PATH so TF
+    #     doesn't pre-init).
+    #   - execs vibechek with the user's args.
+    import tempfile as _tempfile
+    token_file = Path(_tempfile.gettempdir()) / f"vibechek-wsl-pid-{os.getpid()}.txt"
+    wsl_token = win_to_wsl_path(str(token_file))
+    use_gpu = _gpu_mode_from_args(args)
+    source_cuda_env = (
+        '. "$HOME/.vibechek/cuda-env.sh" 2>/dev/null || true'
+        if use_gpu != "off"
+        else 'true  # --gpu off; skip cuda-env.sh sourcing'
+    )
+    # *Critical*: resolve vibechek's FULL path. Plain `exec vibechek` fails
+    # silently here because we run bash non-interactively (via `setsid bash
+    # <script>`, no `-l`), so .bashrc / .profile don't run and `~/.local/bin`
+    # is NOT on PATH. Earlier betas used `bash -lc` which is a login shell
+    # and handled this — switching to setsid+staged-tempfile (beta.8 fix for
+    # cancel + apt stdin pollution) accidentally broke it.
+    #
+    # We search for vibechek in this order:
+    #   1. The managed venv (canonical install path from install_vibechek_in_wsl)
+    #   2. ~/.local/bin/vibechek (the symlink the installer creates)
+    #   3. `command -v vibechek` (PATH fallback for users who installed
+    #      another way)
+    # The launcher exits with a clear error if none resolve, so the user sees
+    # "vibechek binary not found" instead of "exit 0 + no output written".
+    launcher_script = (
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        "# vibechek launcher (auto-generated, see vibechek/wsl.py)\n"
+        f'echo $$ > {_shell_quote(wsl_token)}\n'
+        'trap "kill -TERM 0 2>/dev/null; exit 130" SIGTERM SIGINT\n'
+        f"{source_cuda_env}\n"
+        '# Resolve vibechek binary explicitly — non-interactive bash has no PATH for it.\n'
+        'VIBECHEK_BIN=""\n'
+        'if [ -x "$HOME/.vibechek/venv/bin/vibechek" ]; then\n'
+        '  VIBECHEK_BIN="$HOME/.vibechek/venv/bin/vibechek"\n'
+        'elif [ -x "$HOME/.local/bin/vibechek" ]; then\n'
+        '  VIBECHEK_BIN="$HOME/.local/bin/vibechek"\n'
+        'elif command -v vibechek >/dev/null 2>&1; then\n'
+        '  VIBECHEK_BIN="$(command -v vibechek)"\n'
+        'else\n'
+        '  echo "ERROR: vibechek binary not found in WSL. Re-run Settings -> Set up now." >&2\n'
+        '  exit 127\n'
+        'fi\n'
+        f"exec \"$VIBECHEK_BIN\" {' '.join(_shell_quote(a) for a in args)}\n"
+    )
+    launcher_path = _stage_script_for_wsl(launcher_script)
+    wsl_launcher = win_to_wsl_path(str(launcher_path))
+    # `setsid -w` makes our bash the leader of a brand-new process group
+    # (`kill -TERM 0` in the trap reliably hits every descendant) AND waits
+    # for the child to complete instead of fork-and-exit. Without `-w`,
+    # setsid forks bash into the background and immediately returns exit 0,
+    # so wsl.exe sees "success + no output" while vibechek is still running
+    # (or dying silently) in WSL. Cost us a day of debugging in beta.11.
+    proc_cmd = [wsl, "-d", distro, "--", "setsid", "-w", "bash", wsl_launcher]
 
     log.info("WSL exec: %s", proc_cmd)
     proc = subprocess.Popen(
@@ -1452,19 +2021,67 @@ def run_vibechek_in_wsl(
         bufsize=1,
     )
 
-    # Watchdog: poll the cancellation flag every 500ms; terminate (then kill)
-    # the child if a cancel comes through.
+    # Watchdog: poll the cancellation flag every 500ms; tear down the entire
+    # WSL process tree if a cancel comes through. Just terminating `wsl.exe`
+    # on Windows does NOT kill bash + python inside WSL — those leak until
+    # the VM eventually reaps them. We do the proper takedown here.
     cancel_event = _threading.Event()
+
+    def _kill_wsl_tree() -> None:
+        """Best-effort takedown of the bash + python tree inside the distro.
+
+        Uses ONLY the bash PID we wrote to the token file — never `pkill -f
+        vibechek`, which would also kill unrelated user processes (vim editing
+        a vibechek file, a separate dev checkout running tests, etc).
+
+        Because our launcher runs under `setsid`, the bash is a process group
+        leader; `kill -TERM -<pgid>` reaches every descendant.
+        """
+        if not token_file.exists():
+            return
+        try:
+            bash_pid = token_file.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            log.debug("Could not read token file: %s", e)
+            return
+        if not bash_pid.isdigit():
+            return
+
+        # Step 1: SIGTERM the process group. setsid made bash the pgid leader.
+        try:
+            subprocess.run(
+                [wsl, "-d", distro, "--", "kill", "-TERM", f"-{bash_pid}"],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.debug("SIGTERM to pgid %s failed: %s", bash_pid, e)
+
+        # Step 2: brief grace, then SIGKILL the same group.
+        import time as _time
+        _time.sleep(1.0)
+        try:
+            subprocess.run(
+                [wsl, "-d", distro, "--", "kill", "-KILL", f"-{bash_pid}"],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.debug("SIGKILL to pgid %s failed: %s", bash_pid, e)
 
     def _watch_cancel() -> None:
         while not cancel_event.is_set() and proc.poll() is None:
             if cancellation.is_cancelled():
-                log.info("WSL subprocess cancellation requested — terminating PID %s", proc.pid)
+                log.info(
+                    "WSL subprocess cancellation requested — terminating PID %s "
+                    "and WSL process tree", proc.pid,
+                )
+                # Kill INSIDE WSL first (so workers die before we lose the
+                # process group reference)
+                _kill_wsl_tree()
+                # Then terminate the Windows-side wsl.exe wrapper
                 try:
                     proc.terminate()
                 except OSError:
                     pass
-                # Give it a grace period, then SIGKILL equivalent
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
@@ -1494,6 +2111,8 @@ def run_vibechek_in_wsl(
 
     rc = proc.wait(timeout=timeout)
     cancel_event.set()  # tell the watchdog we're done
+    token_file.unlink(missing_ok=True)  # PID handoff file
+    launcher_path.unlink(missing_ok=True)  # staged bash launcher
 
     if cancellation.is_cancelled():
         raise cancellation.CancelledError("WSL analyze cancelled by user")
@@ -1504,6 +2123,22 @@ def run_vibechek_in_wsl(
         stdout="".join(stdout_chunks),
         stderr="",  # already streamed via on_stderr_line
     )
+
+
+def _gpu_mode_from_args(args: list[str]) -> str:
+    """Find the --gpu value in a CLI arg list. Returns 'auto' if not present.
+
+    Used by run_vibechek_in_wsl to decide whether to source cuda-env.sh:
+    `--gpu off` means the user wants CPU-only, so we skip the LD_LIBRARY_PATH
+    injection that would otherwise prime TF's CUDA detection. Audit #2 in
+    docs/AUDIT_LANDMINES.md.
+    """
+    for i, a in enumerate(args):
+        if a == "--gpu" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--gpu="):
+            return a.split("=", 1)[1]
+    return "auto"
 
 
 def _shell_quote(s: str) -> str:

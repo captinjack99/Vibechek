@@ -21,9 +21,21 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class GpuDevice:
+    """A single GPU as the host sees it.
+
+    `vendor` and the "acceleration" fields were added when we extended GPU
+    detection to AMD/Intel/Apple (see `vibechek.gpu_detect`). The legacy
+    `backend` field is kept for backward compat with serialized configs and
+    older UI code paths — new code should consume `vendor` directly.
+    """
     name: str
     backend: str  # "cuda" | "rocm" | "metal" | "unknown"
     memory_mb: int | None = None
+    # Newer cross-vendor fields:
+    vendor: str = "nvidia"  # nvidia | amd | intel | apple | unknown
+    device_kind: str = "discrete"  # discrete | integrated | external
+    accelerated_by_vibechek: bool = True  # default True preserves old NVIDIA semantics
+    unsupported_reason: str | None = None
 
 
 @dataclass
@@ -35,6 +47,10 @@ class SystemResources:
     gpu_available: bool
     gpu_devices: list[GpuDevice] = field(default_factory=list)
     cuda_runtime: str | None = None  # e.g. "12.3" if `nvidia-smi` reports one
+    # Cross-vendor counts: useful for the UI to decide whether to show the
+    # "your GPU isn't supported" callout without scanning the device list itself.
+    accelerated_gpu_count: int = 0
+    unsupported_gpu_count: int = 0
 
     @property
     def recommended_workers(self) -> int:
@@ -48,16 +64,27 @@ class SystemResources:
 
 
 def detect() -> SystemResources:
-    """Return a snapshot of available compute resources."""
-    devices = _gpu_devices()
+    """Return a snapshot of available compute resources.
+
+    `gpu_devices` now spans every vendor (NVIDIA + AMD + Intel + Apple), via
+    `vibechek.gpu_detect.detect_all_gpus`. The legacy `gpu_available` flag
+    means "an *accelerated* GPU is available" — i.e. there's at least one
+    NVIDIA card the engine can actually use. This preserves the meaning the
+    rest of the code (UI Stat, analyzer worker scaling) already relies on.
+    """
+    cross_devices = _all_gpu_devices()
+    accelerated = sum(1 for d in cross_devices if d.accelerated_by_vibechek)
+    unsupported = len(cross_devices) - accelerated
     return SystemResources(
         platform=platform.platform(),
         cpu_count=_cpu_count(),
         memory_total_mb=_memory_total_mb(),
         memory_available_mb=_memory_available_mb(),
-        gpu_devices=devices,
-        gpu_available=len(devices) > 0,
+        gpu_devices=cross_devices,
+        gpu_available=accelerated > 0,
         cuda_runtime=_cuda_runtime(),
+        accelerated_gpu_count=accelerated,
+        unsupported_gpu_count=unsupported,
     )
 
 
@@ -119,7 +146,8 @@ def _memory_total_fallback_mb() -> int | None:
 
 
 def _gpu_devices() -> list[GpuDevice]:
-    """Enumerate GPUs visible to us via `nvidia-smi`.
+    """NVIDIA-only enumeration, kept for any callers that still want the
+    legacy CUDA-only view. Newer code should use `_all_gpu_devices()`.
 
     *Deliberately does NOT import TensorFlow.* Importing TF has the side-effect
     of initializing CUDA with the *current* value of `CUDA_VISIBLE_DEVICES`,
@@ -130,6 +158,39 @@ def _gpu_devices() -> list[GpuDevice]:
     place to do an actual TF query, and runs in a *separate subprocess*.
     """
     return _gpu_devices_from_nvidia_smi()
+
+
+def _all_gpu_devices() -> list[GpuDevice]:
+    """Cross-vendor enumeration via `vibechek.gpu_detect`.
+
+    Imported lazily so a stale/broken `gpu_detect` (e.g. mid-merge) can't
+    take down resource detection — falls back to the NVIDIA-only path.
+    """
+    try:
+        from vibechek.gpu_detect import detect_all_gpus  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        log.warning("gpu_detect import failed, falling back to nvidia-smi only: %s", e)
+        return _gpu_devices_from_nvidia_smi()
+    out: list[GpuDevice] = []
+    for d in detect_all_gpus():
+        # Map vendor → backend for the legacy field. "cuda" for NVIDIA;
+        # "rocm"/"metal" follow the existing convention; "unknown" else.
+        backend = {
+            "nvidia": "cuda",
+            "amd": "rocm",
+            "apple": "metal",
+            "intel": "unknown",
+        }.get(d.vendor, "unknown")
+        out.append(GpuDevice(
+            name=d.name,
+            backend=backend,
+            memory_mb=d.vram_mb,
+            vendor=d.vendor,
+            device_kind=d.device_kind,
+            accelerated_by_vibechek=d.accelerated_by_vibechek,
+            unsupported_reason=d.unsupported_reason,
+        ))
+    return out
 
 
 def _gpu_devices_from_nvidia_smi() -> list[GpuDevice]:
@@ -157,7 +218,15 @@ def _gpu_devices_from_nvidia_smi() -> list[GpuDevice]:
                 mem = int(parts[1])
             except ValueError:
                 mem = None
-            devices.append(GpuDevice(name=parts[0], backend="cuda", memory_mb=mem))
+            devices.append(GpuDevice(
+                name=parts[0],
+                backend="cuda",
+                memory_mb=mem,
+                vendor="nvidia",
+                device_kind="discrete",
+                accelerated_by_vibechek=True,
+                unsupported_reason=None,
+            ))
     return devices
 
 

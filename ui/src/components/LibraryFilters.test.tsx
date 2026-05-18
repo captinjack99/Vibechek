@@ -88,6 +88,31 @@ describe("applyFilters", () => {
     });
     expect(result.map((t) => t.filename)).toEqual(["c.mp3"]);
   });
+
+  it("filters by direction (Up / Steady / Down)", () => {
+    const dirTracks = [
+      track("up.mp3", { ml_direction: "Up" }),
+      track("steady.mp3", { ml_direction: "Steady" }),
+      track("down.mp3", { ml_direction: "Down" }),
+    ];
+    const result = applyFilters(dirTracks, {
+      ...emptyFilters(),
+      directions: new Set(["Up"]),
+    });
+    expect(result.map((t) => t.filename)).toEqual(["up.mp3"]);
+  });
+
+  it("excludes tracks without a direction value when direction filter is active", () => {
+    const dirTracks = [
+      track("up.mp3", { ml_direction: "Up" }),
+      track("missing.mp3", { ml_direction: null }),
+    ];
+    const result = applyFilters(dirTracks, {
+      ...emptyFilters(),
+      directions: new Set(["Up"]),
+    });
+    expect(result.map((t) => t.filename)).toEqual(["up.mp3"]);
+  });
 });
 
 describe("<FilterChips />", () => {

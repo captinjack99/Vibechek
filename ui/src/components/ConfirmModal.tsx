@@ -22,6 +22,13 @@ export interface ConfirmModalProps {
   icon?: LucideIcon;
   /** Optional side-effect (e.g. "back up tags first") rendered above the buttons. */
   extra?: React.ReactNode;
+  /**
+   * When true, treat this as a destructive action: backdrop clicks become
+   * no-ops so the user can't accidentally bump the modal closed while reading
+   * the preview. They must explicitly press Cancel or Confirm. The close (X)
+   * button still works.
+   */
+  destructive?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -35,12 +42,16 @@ export function ConfirmModal({
   variant = "default",
   icon: Icon = AlertTriangle,
   extra,
+  destructive = false,
   onConfirm,
   onCancel,
 }: ConfirmModalProps) {
   if (!open) return null;
 
   const isDanger = variant === "danger";
+  // Backdrop click dismisses by default. For destructive confirms we ignore
+  // it — the user has to actively choose Cancel or Confirm.
+  const handleBackdropClick = destructive ? undefined : onCancel;
 
   return (
     <motion.div
@@ -48,7 +59,7 @@ export function ConfirmModal({
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center px-4"
-      onClick={onCancel}
+      onClick={handleBackdropClick}
     >
       <motion.div
         initial={{ scale: 0.96, y: 10 }}

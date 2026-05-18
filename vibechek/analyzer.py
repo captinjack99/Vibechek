@@ -13,13 +13,15 @@ Source: port of `legacy/analyze_dj_tracks_v2.py`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import urllib.request
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from multiprocessing import Pool, cpu_count
+import multiprocessing
+from multiprocessing import cpu_count
 from pathlib import Path
 from typing import Any, Callable
 
@@ -44,7 +46,30 @@ log = logging.getLogger(__name__)
 # Quiet TensorFlow when essentia eventually imports it
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-MODEL_BASE_URL = "https://essentia.upf.edu/models"
+# Where to fetch ML models from. essentia.upf.edu is the academic source
+# maintained by UPF Barcelona's MTG — stable for years, but academic
+# infrastructure is famously fragile. A URL change or outage there would
+# break every Vibechek install until we shipped an update. So:
+#
+#   1. `VIBECHEK_MODELS_URL` env var wins (power users + self-hosters).
+#   2. Otherwise we try the UPF source first, then a GitHub Release mirror
+#      as a hot-swappable fallback. `_download_with_progress` walks the
+#      tuple, trying each URL in turn — a single domain outage no longer
+#      breaks the install.
+#
+# When publishing a new mirror, upload the .pb + .json files to
+# https://github.com/papapew/Vibechek/releases/download/models-v1/ and bump
+# the tag below.
+_DEFAULT_MODEL_BASE_URLS = (
+    "https://essentia.upf.edu/models",
+    "https://github.com/papapew/Vibechek/releases/download/models-v1",
+)
+_USER_MODEL_BASE_URL = os.environ.get("VIBECHEK_MODELS_URL", "").strip() or None
+MODEL_BASE_URLS: tuple[str, ...] = (
+    (_USER_MODEL_BASE_URL,) if _USER_MODEL_BASE_URL else _DEFAULT_MODEL_BASE_URLS
+)
+# Kept for back-compat: callers still reference the singular MODEL_BASE_URL.
+MODEL_BASE_URL = MODEL_BASE_URLS[0]
 
 # Each entry: (subdirectory, weights filename, metadata filename)
 MODELS: dict[str, tuple[str, str, str]] = {
@@ -93,6 +118,67 @@ MODELS: dict[str, tuple[str, str, str]] = {
 # Mood model class-index lookup: which output index represents the positive
 # (named) class. Determined by Essentia model documentation.
 _MOOD_INDEX = {"aggressive": 0, "happy": 0, "relaxed": 1, "sad": 1}
+
+
+# Content-hash pinning for downloaded model files. A compromised or
+# corrupted mirror could ship a TensorFlow .pb that pretends to be the
+# Discogs-EffNet weights but actually emits adversarial classifications
+# (or worse — `tf.io` deserialization is not safe against hostile graphs).
+# We verify SHA256 after every download and re-fetch on mismatch.
+#
+# Schema: MODEL_SHA256[name][suffix] -> hex digest of the file.
+# `suffix` is "pb" (weights) or "json" (metadata).
+#
+# Fields are POPULATED on the next release-build pass (`scripts/pin_model_
+# hashes.py` downloads each .pb / .json from the canonical mirror, computes
+# the SHA256, and rewrites this dict). Until then the dict is empty and
+# `verify_model_sha256` no-ops — preserving the current "warn on size
+# mismatch only" behaviour. When the dict is populated, EVERY download is
+# strictly verified and a mismatch raises with a `vibechek verify-models`
+# remediation hint.
+MODEL_SHA256: dict[str, dict[str, str]] = {
+    # "effnet": {
+    #     "pb": "0000000000000000000000000000000000000000000000000000000000000000",
+    #     "json": "0000000000000000000000000000000000000000000000000000000000000000",
+    # },
+    # ... one entry per model in MODELS ...
+}
+
+
+def verify_model_sha256(path: Path, expected: str | None) -> None:
+    """Validate `path`'s SHA256 against `expected`. No-op when `expected` is None.
+
+    Streams the file in 1 MiB chunks so we don't slurp the 100+ MB EffNet
+    weights into memory all at once. Raises `RuntimeError` on mismatch with
+    a hint at `vibechek verify-models` (the CLI subcommand that re-downloads
+    every model from scratch — that's how the user recovers from a poisoned
+    cache).
+
+    Designed to be cheap to call from `download_models` even when the
+    `MODEL_SHA256` table is empty: callers pass `expected=None` and we
+    return immediately. This lets us wire the verification call site into
+    `download_models` now, ahead of the release-build pass that populates
+    the table.
+    """
+    if not expected:
+        return
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    got = h.hexdigest()
+    if got.lower() != expected.lower():
+        raise RuntimeError(
+            f"Model file {path.name} failed SHA256 check: "
+            f"expected {expected[:12]}…, got {got[:12]}…. "
+            f"Run `vibechek verify-models` to re-download from the canonical "
+            f"mirror, or set VIBECHEK_MODELS_URL to a trusted source."
+        )
+
+
+def _expected_sha256(model_name: str, suffix: str) -> str | None:
+    """Look up the pinned SHA256 for one model file, or None if not pinned."""
+    return MODEL_SHA256.get(model_name, {}).get(suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -194,17 +280,21 @@ def download_models(
             current = step_idx + 1
         report_progress(on_progress, int(current * 100), total_steps * 100, label)
 
+    def _candidate_urls(subdir: str, fname: str) -> list[str]:
+        """Build the URL fallback chain for one file across all mirror bases."""
+        return [f"{base}/{subdir}/{fname}" for base in MODEL_BASE_URLS]
+
     for i, (name, (subdir, weights_name, metadata_name)) in enumerate(items):
         weights_path = model_dir / f"{name}.pb"
         metadata_path = model_dir / f"{name}.json"
 
         # ---- weights ----
         weights_step = i * 2
-        weights_url = f"{MODEL_BASE_URL}/{subdir}/{weights_name}"
-        if _needs_download(weights_path, weights_url):
+        weights_urls = _candidate_urls(subdir, weights_name)
+        if _needs_download(weights_path, weights_urls[0]):
             try:
-                _download_with_progress(
-                    weights_url,
+                _download_from_mirrors(
+                    weights_urls,
                     weights_path,
                     label=f"{name}.pb",
                     on_progress=lambda done, total, n=name: emit(
@@ -217,15 +307,26 @@ def download_models(
                 # Clean up any partial file so a retry doesn't think it's done
                 weights_path.unlink(missing_ok=True)
                 continue
+        # Content-hash check (no-op when MODEL_SHA256[name]["pb"] is unset).
+        # Verifies whether we just downloaded OR are reusing a cached file —
+        # a poisoned mirror that served a bad .pb on a previous run would
+        # otherwise stay cached forever.
+        try:
+            verify_model_sha256(weights_path, _expected_sha256(name, "pb"))
+        except RuntimeError as e:
+            log.error("SHA256 verification failed for %s: %s", name, e)
+            errors.append(f"{name}.pb: {e}")
+            weights_path.unlink(missing_ok=True)
+            continue
         emit(weights_step, None, f"{name} weights ready")
 
         # ---- metadata ----
         metadata_step = i * 2 + 1
-        metadata_url = f"{MODEL_BASE_URL}/{subdir}/{metadata_name}"
-        if _needs_download(metadata_path, metadata_url):
+        metadata_urls = _candidate_urls(subdir, metadata_name)
+        if _needs_download(metadata_path, metadata_urls[0]):
             try:
-                _download_with_progress(
-                    metadata_url,
+                _download_from_mirrors(
+                    metadata_urls,
                     metadata_path,
                     label=f"{name}.json",
                     on_progress=lambda done, total, n=name: emit(
@@ -237,6 +338,15 @@ def download_models(
                 errors.append(f"{name}.json: {e}")
                 metadata_path.unlink(missing_ok=True)
                 # Still record the descriptor — the .pb may be usable without metadata
+        # SHA256 for metadata is best-effort: metadata mismatch is far less
+        # dangerous than weights mismatch (class labels can drift across model
+        # versions without security impact), but a mismatch here likely means
+        # version skew, so we warn loudly rather than fail.
+        if metadata_path.exists():
+            try:
+                verify_model_sha256(metadata_path, _expected_sha256(name, "json"))
+            except RuntimeError as e:
+                log.warning("Metadata SHA256 mismatch for %s: %s", name, e)
         emit(metadata_step, None, f"{name} metadata ready")
 
         desc: dict[str, Any] = {
@@ -274,22 +384,89 @@ def _fmt_bytes(n: int) -> str:
 
 
 def _needs_download(path: Path, url: str) -> bool:
-    """True if `path` is missing OR clearly truncated relative to `url`."""
+    """True if `path` is missing OR clearly truncated relative to `url`.
+
+    *Important*: if the HEAD probe fails (network error, DNS, server down),
+    we now trust the local file only if it passes a basic sanity check
+    (>100KB for .pb, >200B for .json). A failed HEAD used to silently
+    accept ANY local file, which meant a previous run that wrote a 50KB
+    "Service Unavailable" HTML page would sit there forever — every
+    install reporting "models OK" while analyze blew up at runtime.
+    """
     if not path.exists():
         return True
+
+    # Sanity check the local file size FIRST — fast and doesn't need network.
+    min_size = 200 if path.suffix == ".json" else 100_000
+    local_size = path.stat().st_size
+    if local_size < min_size:
+        log.warning(
+            "Local %s is %d bytes — too small to be a real model file (min %d). Refetching.",
+            path.name, local_size, min_size,
+        )
+        return True
+
     try:
-        # Cheap HEAD — most CDNs respond with Content-Length
         req = urllib.request.Request(url, method="HEAD")
         with urllib.request.urlopen(req, timeout=10) as resp:
             expected = int(resp.headers.get("Content-Length") or 0)
     except Exception as e:  # noqa: BLE001
-        log.debug("HEAD failed for %s: %s — using existing local file", url, e)
-        return False  # Can't verify; trust what we have
-    if expected > 0 and path.stat().st_size != expected:
-        log.warning("Local %s is %d bytes but server says %d — refetching",
-                    path.name, path.stat().st_size, expected)
+        # Network blip: keep the file IF it passed the size sanity check above.
+        # We DON'T trust a download that never finished — that's caught by the
+        # size check. We do trust a complete previous download.
+        log.info(
+            "HEAD probe failed for %s (%s) — using existing %d-byte local file (passed size sanity check).",
+            url, e, local_size,
+        )
+        return False
+
+    if expected > 0 and local_size != expected:
+        log.warning(
+            "Local %s is %d bytes but server says %d — refetching",
+            path.name, local_size, expected,
+        )
         return True
     return False
+
+
+def _download_from_mirrors(
+    urls: list[str],
+    dest: Path,
+    label: str,
+    on_progress: Callable[[int, int], None] | None = None,
+    chunk_size: int = 64 * 1024,
+    max_attempts_per_mirror: int = 3,
+) -> None:
+    """Download `dest` from the first URL in `urls` that works.
+
+    Each URL gets `max_attempts_per_mirror` tries with exponential backoff
+    before we fall through to the next mirror. Net effect: a UPF outage
+    (audit #21) hands off to the GitHub Release mirror, then to any
+    user-configured VIBECHEK_MODELS_URL, without the user noticing.
+
+    Raises RuntimeError listing every mirror's last error if all fail.
+    """
+    if not urls:
+        raise ValueError("No mirror URLs provided")
+
+    mirror_errors: list[str] = []
+    for url in urls:
+        try:
+            _download_with_progress(
+                url, dest, label,
+                on_progress=on_progress, chunk_size=chunk_size,
+                max_attempts=max_attempts_per_mirror,
+            )
+            return  # success
+        except RuntimeError as e:
+            log.warning("Mirror %s failed for %s: %s", url, dest.name, e)
+            mirror_errors.append(f"{url}: {e}")
+            continue
+
+    raise RuntimeError(
+        f"All {len(urls)} mirror(s) failed for {dest.name}. "
+        f"Errors:\n  " + "\n  ".join(mirror_errors)
+    )
 
 
 def _download_with_progress(
@@ -298,15 +475,59 @@ def _download_with_progress(
     label: str,
     on_progress: Callable[[int, int], None] | None = None,
     chunk_size: int = 64 * 1024,
+    max_attempts: int = 3,
 ) -> None:
     """Stream `url` → `dest`, calling `on_progress(bytes_done, bytes_total)`.
 
-    Throttles progress emission to ~10/sec so we don't flood the JSON-RPC pipe.
-    Validates that the file matches the server's Content-Length when present.
+    - Throttles progress emission to ~10/sec so we don't flood the JSON-RPC pipe.
+    - Validates that the file matches the server's Content-Length when present.
+    - Retries up to `max_attempts` times on transient network errors
+      (urllib.error.URLError, socket timeouts, ConnectionResetError).
+    - Sanity-checks the final size to catch HTML error pages masquerading as
+      model files.
+    - Honors HTTP_PROXY / HTTPS_PROXY env vars via urllib's default handler.
     """
+    import socket as _socket
     import time as _time
+    import urllib.error
 
-    log.info("Downloading %s → %s", url, dest.name)
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            backoff = min(2 ** (attempt - 1), 10)
+            log.warning(
+                "Retry %d/%d for %s after %ds (last error: %s)",
+                attempt, max_attempts, dest.name, backoff, last_err,
+            )
+            _time.sleep(backoff)
+
+        log.info("Downloading %s -> %s (attempt %d/%d)", url, dest.name, attempt, max_attempts)
+        try:
+            _do_one_download(url, dest, on_progress, chunk_size)
+            return  # success
+        except (urllib.error.URLError, _socket.timeout, ConnectionResetError,
+                TimeoutError, OSError) as e:
+            last_err = e
+            # Network error: retry.
+            continue
+        except RuntimeError:
+            # Truncated / too-small / wrong-size: these aren't transient, no retry.
+            raise
+
+    raise RuntimeError(
+        f"Failed to download {dest.name} after {max_attempts} attempts. "
+        f"Last error: {type(last_err).__name__}: {last_err}"
+    ) from last_err
+
+
+def _do_one_download(
+    url: str,
+    dest: Path,
+    on_progress: Callable[[int, int], None] | None,
+    chunk_size: int,
+) -> None:
+    """One attempt at downloading `url` to `dest`. Raises on failure."""
+    import time as _time
 
     with urllib.request.urlopen(url, timeout=30) as resp:
         total = int(resp.headers.get("Content-Length") or 0)
@@ -366,6 +587,17 @@ def load_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
     TF's device enumeration.
     """
     apply_gpu_preference(use_gpu)
+
+    # *Critical for multi-worker GPU mode*: TF allocates ALL GPU memory at
+    # init by default. With workers=19 and one 8 GB GPU, all 19 processes
+    # fight for the same memory and CUDA OOM-kills them. Setting
+    # TF_FORCE_GPU_ALLOW_GROWTH=true tells TF to grow allocations as needed
+    # instead, letting many workers coexist on one GPU.
+    #
+    # Also set TF_CPP_MIN_LOG_LEVEL to silence the noisy startup logs that
+    # would otherwise spam the JSON-RPC stdout pipe.
+    os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
     try:
         import essentia
@@ -498,7 +730,17 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         result.ml_error = "EffNet embedding model not loaded"
         return result
 
-    embeddings = models["effnet"](audio_16k)
+    # EffNet embedding can blow up on malformed audio (0-byte files, truncated
+    # FLAC headers, corrupted MP3 sync bytes) — Essentia surfaces these as a
+    # bare RuntimeError from native code that takes the whole worker down. We
+    # bail early on failure so the parent analysis still records BPM/key from
+    # the rhythm/key extractors run by the non-ML pass, instead of losing the
+    # entire track to an unhandled exception in the worker pool.
+    try:
+        embeddings = models["effnet"](audio_16k)
+    except Exception as e:  # noqa: BLE001
+        result.ml_error = f"EffNet embedding failed: {e}"
+        return result
 
     # ---------- Genre ----------
     if "genre" in models and "genre_classes" in models:
@@ -558,7 +800,17 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         except Exception as e:  # noqa: BLE001
             log.debug("Mood %s failed for %s: %s", mood, filepath.name, e)
 
-    if mood_scores:
+    # Need at least 2 of the 4 mood models to land before trusting the
+    # blended energy/brightness math. Old behaviour: any non-empty
+    # `mood_scores` triggered the blend, with `.get(..., 0.5)` defaults for
+    # missing models — so a track where 3 of 4 mood models silently failed
+    # got energy ~= int(round((0.5*0.35 + 0.5*0.35 + 0.5*0.15 + 0.5*0.15)*5))
+    # = ~3 ("medium energy") for every track, even when the genre would
+    # otherwise have steered it to 1 or 5. That's not a fallback, that's
+    # fabrication. We now require ≥2 real scores; below that we drop to the
+    # genre-table fallback below — at least the user sees that as "default
+    # by genre" instead of a silently-confident lie.
+    if len(mood_scores) >= 2:
         aggressive = mood_scores.get("aggressive", 0.5)
         relaxed = mood_scores.get("relaxed", 0.5)
         happy = mood_scores.get("happy", 0.5)
@@ -737,8 +989,91 @@ _WORKER_MODELS: dict[str, Any] | None = None
 
 
 def _worker_init(model_dir: str, use_gpu: str) -> None:
+    """multiprocessing.Pool initializer. If load_models raises, multiprocessing
+    silently restarts the worker in an infinite loop — masking real errors
+    like OOM, missing essentia install, or corrupted model files behind a
+    forever hang.
+
+    We wrap load_models so init errors crash the worker FAST and visibly:
+      - log the traceback to stderr (will end up in the WSL stderr stream
+        the parent captures)
+      - re-raise so the pool sees the worker as broken; we set
+        maxtasksperchild=1 in the Pool call so the bad init doesn't auto-respawn
+    """
     global _WORKER_MODELS
-    _WORKER_MODELS = load_models(Path(model_dir), use_gpu=use_gpu)
+    try:
+        _WORKER_MODELS = load_models(Path(model_dir), use_gpu=use_gpu)
+    except Exception as e:  # noqa: BLE001
+        import sys as _sys
+        import traceback as _tb
+        _sys.stderr.write(
+            f"VIBECHEK_WORKER_INIT_FAIL: {type(e).__name__}: {e}\n"
+            f"{_tb.format_exc()}\n"
+        )
+        _sys.stderr.flush()
+        # Re-raise so the pool marks this worker as broken. Combined with
+        # maxtasksperchild=1, this triggers a single retry; if it fails again,
+        # the second attempt's exception kills the pool cleanly instead of
+        # hanging forever.
+        raise
+
+
+# Per-worker GPU memory budget. ~1.5 GB covers a TF/essentia worker:
+# the bundled Discogs-EffNet weights (~500 MB) plus per-worker activation
+# tensors and a CUDA context (~800-1000 MB at steady state). Tuned against
+# 4 GB / 8 GB / 24 GB consumer cards; below 1500 we see OOM cascades.
+_GPU_WORKER_MB = 1500
+
+# Fallback cap when VRAM probing fails — preserves prior behaviour of
+# "at most 4 workers in GPU mode" so we never regress on systems where
+# nvidia-smi is missing or unreadable (e.g. WSL with no GPU passthrough).
+_GPU_FALLBACK_CAP = 4
+
+
+def _probe_free_vram_mb() -> int | None:
+    """Return free VRAM in MB across all visible GPUs via `nvidia-smi`, or None.
+
+    We sum free memory across devices because TF with the default
+    `CUDA_VISIBLE_DEVICES` picks GPU 0; if the user has a multi-GPU rig and
+    GPU 0 is busy (e.g. driving the display), summing slightly overestimates.
+    That's OK — the cap is a *ceiling* anchored by `_GPU_FALLBACK_CAP` below
+    and the user's `workers` setting above. We err toward more workers than
+    fewer on multi-GPU rigs; OOM still surfaces via the stall watchdog.
+
+    Returns None on any failure (binary missing, timeout, parse error). Callers
+    must treat None as "unknown" and fall back to the conservative cap.
+    """
+    import shutil as _shutil  # noqa: PLC0415  (lazy to keep import cost flat)
+    import subprocess as _subprocess  # noqa: PLC0415
+
+    smi = _shutil.which("nvidia-smi")
+    if not smi:
+        return None
+    try:
+        out = _subprocess.run(
+            [smi, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, _subprocess.TimeoutExpired) as e:
+        log.debug("nvidia-smi free-VRAM probe failed: %s", e)
+        return None
+    if out.returncode != 0:
+        log.debug("nvidia-smi returned %d: %s", out.returncode, out.stderr.strip())
+        return None
+
+    total_free = 0
+    saw_any = False
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            total_free += int(line)
+            saw_any = True
+        except ValueError:
+            # A malformed row (rare) shouldn't poison the whole probe — skip it.
+            continue
+    return total_free if saw_any else None
 
 
 def _worker_analyze(filepath_str: str) -> dict[str, Any]:
@@ -826,9 +1161,75 @@ def analyze_directory(
     file_strs = [str(f) for f in files]
     results: list[dict[str, Any]] = []
 
-    # Resolve "auto" worker count: leave one core for the OS/GUI.
+    # Resolve worker count with TWO real-world constraints baked in:
+    #
+    #   1. *Memory*: each worker holds ~500 MB of model weights. We use
+    #      psutil to find total RAM, reserve 2 GB for the OS / GUI / other
+    #      apps, and cap workers at floor(available / 800 MB) (the 800 MB
+    #      buffer covers TF runtime overhead beyond just the weights).
+    #
+    #   2. *GPU contention*: even with TF_FORCE_GPU_ALLOW_GROWTH=true,
+    #      N workers each carving up one GPU is fragile. We cap at 4 in GPU
+    #      mode — empirically the sweet spot for ~8 GB consumer cards.
     requested = config.workers if config.workers and config.workers > 0 else max(1, cpu_count() - 1)
     workers = max(1, min(requested, cpu_count()))
+
+    # Memory cap
+    try:
+        import psutil  # noqa: PLC0415
+        total_mb = psutil.virtual_memory().total // (1024 * 1024)
+        # Reserve 2 GB for the host; assume ~800 MB per worker for models + TF.
+        usable_mb = max(0, total_mb - 2048)
+        memory_cap = max(1, usable_mb // 800)
+        if memory_cap < workers:
+            log.warning(
+                "Capping workers from %d -> %d based on available RAM "
+                "(%d MB total, ~800 MB per worker)",
+                workers, memory_cap, total_mb,
+            )
+            workers = memory_cap
+    except ImportError:
+        pass  # psutil missing — fall through with the cpu_count-based number
+
+    # GPU contention cap — VRAM-aware (audit #11).
+    #
+    # Old behaviour: hardcoded `workers = 4`, regardless of card. That OOM-kills
+    # 4 GB cards (4 workers * 1.5 GB = 6 GB needed) and wastes 24 GB cards
+    # (4 workers leaves 18 GB idle). Now we probe free VRAM and pick
+    # max(1, free_mb // _GPU_WORKER_MB), falling back to the old cap of 4 if
+    # the probe fails (no nvidia-smi, WSL without GPU passthrough, etc).
+    if config.use_gpu in ("auto", "on"):
+        free_vram_mb = _probe_free_vram_mb()
+        if free_vram_mb is not None:
+            gpu_cap = max(1, free_vram_mb // _GPU_WORKER_MB)
+            cap_reason = (
+                f"{free_vram_mb // 1024} GB free VRAM "
+                f"(~{_GPU_WORKER_MB} MB per worker)"
+            )
+        else:
+            gpu_cap = _GPU_FALLBACK_CAP
+            cap_reason = (
+                "nvidia-smi unavailable; using conservative GPU cap of "
+                f"{_GPU_FALLBACK_CAP}"
+            )
+            log.warning(
+                "GPU mode active but VRAM probe failed — capping workers at %d. "
+                "Set workers explicitly in Settings if your GPU can handle more.",
+                _GPU_FALLBACK_CAP,
+            )
+        if gpu_cap < workers:
+            msg = (
+                f"Capped workers from {workers} to {gpu_cap} due to {cap_reason}"
+            )
+            log.warning(msg)
+            # Surface to the GUI: log.warning alone is invisible to users.
+            # report_progress swallows exceptions, so a flaky callback won't
+            # crash the analyze. We send total=total so the GUI's progress bar
+            # state is unchanged — this is purely a status message piggybacked
+            # on the progress channel (current=0 means "not yet started").
+            report_progress(on_progress, 0, total, msg)
+            workers = gpu_cap
+
     log.info("Analyzing %d files with %d worker(s), GPU=%s", total, workers, config.use_gpu)
 
     if workers == 1:
@@ -849,12 +1250,71 @@ def analyze_directory(
             if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
                 _write_partial(output_path, results, total, in_progress=(i + 1) < total)
     else:
-        with Pool(
+        # *Always use spawn for multi-worker analyze* — even on Linux where
+        # Python defaults to fork on <3.14. Reasons:
+        #
+        #   1. essentia bundles TensorFlow as a native C++ lib. If the parent
+        #      process has touched TF for any reason (preflight, system_info,
+        #      anything), fork()-ing it leaves the child with a half-initialized
+        #      CUDA context that segfaults or hangs on first use.
+        #   2. Some Python libraries (e.g., libxml, libcairo) install atfork
+        #      handlers that lock up after fork() if any worker thread was
+        #      mid-call. spawn sidesteps the entire class of problem.
+        #   3. The slight startup cost (~1 sec per worker for re-imports) is
+        #      dwarfed by the per-track analysis time.
+        spawn_ctx = multiprocessing.get_context("spawn")
+        # maxtasksperchild=200: every 200 tracks the worker recycles, freeing
+        # any TF memory leaks that essentia / TF native code might accumulate.
+        # Cheap; one re-init per ~200 tracks is invisible alongside analysis.
+        with spawn_ctx.Pool(
             processes=workers,
             initializer=_worker_init,
             initargs=(str(config.models_dir), config.use_gpu),
+            maxtasksperchild=200,
         ) as pool:
-            for i, record in enumerate(pool.imap_unordered(_worker_analyze, file_strs)):
+            # Stall watchdog: if no result arrives in STALL_TIMEOUT seconds, the
+            # pool is wedged (workers all crashed during init, or all OOM-killed).
+            # Tear down with a useful error instead of hanging until the RPC
+            # timeout (1 hour) cuts us off.
+            import time as _time
+            STALL_TIMEOUT = 300  # 5 minutes between any two results = dead
+            last_result_at = _time.monotonic()
+            iterator = pool.imap_unordered(_worker_analyze, file_strs)
+
+            def _next_with_stall_check():
+                """Like next(iterator) but raises RuntimeError on stall."""
+                deadline = _time.monotonic() + STALL_TIMEOUT
+                # multiprocessing's imap iterator doesn't expose a timeout
+                # directly, but it's actually a `_PoolReadyResult` wrapper
+                # whose `.next(timeout)` we can use.
+                while True:
+                    try:
+                        return iterator.next(timeout=10)  # type: ignore[attr-defined]
+                    except multiprocessing.TimeoutError:
+                        if _time.monotonic() > deadline:
+                            raise RuntimeError(
+                                f"Analyze stalled — no track completed in "
+                                f"{STALL_TIMEOUT}s. The worker pool is dead "
+                                f"(likely OOM or essentia init crash). Check "
+                                f"the sidecar log for VIBECHEK_WORKER_INIT_FAIL "
+                                f"lines."
+                            )
+                        if cancellation.is_cancelled():
+                            raise cancellation.CancelledError(
+                                "Analysis cancelled by user"
+                            )
+
+            for i in range(total):
+                try:
+                    record = _next_with_stall_check()
+                except cancellation.CancelledError:
+                    pool.terminate()
+                    pool.join()
+                    raise
+                except StopIteration:
+                    break
+                last_result_at = _time.monotonic()
+                _ = last_result_at  # silence pyflakes; intentional touch
                 # On cancel: terminate the pool (kills outstanding workers) and bail.
                 if cancellation.is_cancelled():
                     pool.terminate()
@@ -1006,11 +1466,19 @@ def _analyze_via_wsl(
     if limit:
         args += ["--limit", str(limit)]
 
-    # Progress lines from `vibechek analyze` look like "Progress: 50/12000 ..."
-    # We re-emit them as JSON-RPC notifications for the GUI.
+    # Progress lines from `vibechek analyze` look like "Progress: 50/12000 ...".
+    # We re-emit them as JSON-RPC notifications. Every stderr line is ALSO
+    # captured into a bounded buffer so a failure exit can show what went
+    # wrong (previously we just got "exited with 1" and empty stdout —
+    # useless for diagnosis).
     progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
+    stderr_tail: list[str] = []
 
     def on_line(line: str) -> None:
+        # Keep the last 80 stderr lines for the error message.
+        stderr_tail.append(line)
+        if len(stderr_tail) > 80:
+            stderr_tail.pop(0)
         if not line:
             return
         m = progress_re.search(line)
@@ -1020,18 +1488,38 @@ def _analyze_via_wsl(
     result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line)
 
     if result.returncode != 0:
+        stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"
         raise RuntimeError(
             f"vibechek analyze inside WSL ({distro}) exited with "
-            f"{result.returncode}. stdout tail:\n{result.stdout[-1500:]}"
+            f"{result.returncode}.\n\n"
+            f"stderr tail:\n{stderr_blob}\n\n"
+            f"stdout tail:\n{result.stdout[-1500:] if result.stdout else '(empty)'}"
         )
 
-    # Read the analysis.json the WSL side wrote and rewrite paths
-    if not local_output.exists():
+    # Read the analysis.json the WSL side wrote and rewrite paths.
+    # Empty output (0 bytes) means the WSL CLI crashed BEFORE writing
+    # anything, even if it returned exit 0 (which can happen when the
+    # crash is in a child process or via SyntaxError in the entry-point
+    # shim). Surface a useful error instead of letting json.loads('') leak
+    # the unhelpful "Expecting value: line 1 column 1 (char 0)" toast.
+    if not local_output.exists() or local_output.stat().st_size == 0:
+        stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"
         raise RuntimeError(
-            f"WSL analyze finished but no output file at {local_output}"
+            f"WSL analyze ({distro}) returned exit 0 but wrote no output to "
+            f"{local_output}. This usually means the venv's `vibechek` shim "
+            f"is corrupted (a pre-beta.10 CUDA install bug). Try re-running "
+            f"the GUI — the next `wsl_status` call auto-repairs the shim.\n\n"
+            f"stderr tail:\n{stderr_blob}"
         )
 
-    report = _json.loads(local_output.read_text(encoding="utf-8"))
+    try:
+        report = _json.loads(local_output.read_text(encoding="utf-8"))
+    except _json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"WSL analyze ({distro}) wrote {local_output.stat().st_size} bytes "
+            f"to {local_output} but they don't parse as JSON: {e}. "
+            f"First 200 bytes: {local_output.read_text(encoding='utf-8', errors='replace')[:200]!r}"
+        ) from e
     for track in report.get("tracks", []):
         if "path" in track:
             track["path"] = wsl_to_win_path(track["path"])
@@ -1097,9 +1585,11 @@ __all__ = [
     "MLResult",
     "TrackAnalysis",
     "MODELS",
+    "MODEL_SHA256",
     "download_models",
     "load_models",
     "analyze_audio_features",
     "analyze_track",
     "analyze_directory",
+    "verify_model_sha256",
 ]

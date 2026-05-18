@@ -22,11 +22,11 @@ import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
   X, CheckCircle2, AlertCircle, Download, Loader2,
-  Terminal, Cpu, StopCircle,
+  Terminal, Cpu, StopCircle, Wrench,
 } from "lucide-react";
 
-import { rpc, useSidecarProgress } from "../hooks/useSidecar";
-import { useOperationStore } from "../stores";
+import { isCancellation, rpc, useSidecarProgress } from "../hooks/useSidecar";
+import { useNotificationStore, useOperationStore } from "../stores";
 import type { InstallResult, PreflightResult, WSLStatus } from "../types";
 
 interface Props {
@@ -39,12 +39,18 @@ interface Props {
 type Action = "wsl" | "distro" | "vibechek" | "models" | null;
 
 export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Props) {
+  const active = useOperationStore((s) => s.active);
   const begin = useOperationStore((s) => s.begin);
   const finish = useOperationStore((s) => s.finish);
   const fail = useOperationStore((s) => s.fail);
+  const notify = useNotificationStore((s) => s.notify);
 
   const [busyAction, setBusyAction] = useState<Action>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  // Sticky note from install_wsl letting the user know a reboot might be
+  // needed before WSL is fully usable. Rendered above the live log.
+  const [postInstallNote, setPostInstallNote] = useState<string | null>(null);
+  const [repairBusy, setRepairBusy] = useState(false);
   // Live log lines accumulated from sidecar:progress while a step is running.
   const [logLines, setLogLines] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
@@ -93,24 +99,82 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   ): Promise<T | null> => {
     setBusyAction(action);
     setActionMessage(null);
+    setPostInstallNote(null);
     setLogLines([]);
     begin("download-models"); // generic "busy" indicator
     try {
       const result = await rpc<T>(method, params);
       if (!result.ok) {
+        // AUDIT_LIBRARY_TAB #15: previously called `finish()` even when the
+        // op reported failure, which left the global op state inconsistent.
+        // Route through `fail()` (which handles the cancellation case too).
         fail(result.error ?? "install failed");
         setActionMessage(result.error ?? null);
         return null;
       }
       finish();
+      // AUDIT_SETTINGS_TAB #13: install_wsl returns a `note` ("may need a
+      // reboot...") that we used to drop on the floor. Surface it.
+      if (result.note) setPostInstallNote(result.note);
       await reCheck();
       return result;
     } catch (e) {
-      fail(String(e));
-      setActionMessage(String(e));
+      fail(e);
+      // Cancellations are intentional and already handled by `fail` — don't
+      // also flash a red error block in the dialog body.
+      if (!isCancellation(e)) {
+        const msg =
+          typeof e === "object" && e !== null && "message" in e
+            ? String((e as { message: unknown }).message)
+            : String(e);
+        setActionMessage(msg);
+      }
       return null;
     } finally {
       setBusyAction(null);
+    }
+  };
+
+  /**
+   * Audit Settings #4: explicit "Repair WSL shim" affordance.
+   *
+   * The cuda-env.sh patch in pre-beta.10 builds wrote a bash line into the
+   * Python entry-point script, breaking analyze with a SyntaxError. The
+   * sidecar already auto-repairs on probe, but we expose a manual button
+   * for users who hit the broken state after upgrading.
+   */
+  const handleRepairWslShim = async () => {
+    const distro = preflight.wsl?.usable_distro
+      ?? preflight.wsl?.distros[0]?.name
+      ?? null;
+    if (!distro) {
+      notify("No usable WSL distro to repair.", { kind: "info" });
+      return;
+    }
+    setRepairBusy(true);
+    try {
+      const r = await rpc<{
+        ok: boolean;
+        repaired?: boolean;
+        message?: string;
+        error?: string;
+      }>("repair_wsl_shim", { distro });
+      if (r.ok) {
+        notify(r.message ?? "Shim repair completed.", { kind: "success" });
+        await reCheck(false);
+      } else {
+        notify(`Repair failed: ${r.error ?? "unknown"}`, { kind: "info" });
+      }
+    } catch (e) {
+      if (!isCancellation(e)) {
+        const msg =
+          typeof e === "object" && e !== null && "message" in e
+            ? String((e as { message: unknown }).message)
+            : String(e);
+        notify(`Repair failed: ${msg}`, { kind: "info" });
+      }
+    } finally {
+      setRepairBusy(false);
     }
   };
 
@@ -144,7 +208,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
       finish();
       await reCheck();
     } catch (e) {
-      fail(String(e));
+      fail(e);
     } finally {
       setBusyAction(null);
     }
@@ -156,7 +220,11 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center px-4"
-      onClick={onClose}
+      // AUDIT_SETTINGS_TAB #14: don't let a stray backdrop click dismiss the
+      // dialog mid-install. The user would lose the live progress log and
+      // the post-install note; the underlying install keeps running but they
+      // can't see it. Suppress the click while any step is busy.
+      onClick={busyAction ? undefined : onClose}
     >
       <motion.div
         initial={{ scale: 0.96, y: 10 }}
@@ -211,6 +279,14 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             </div>
           )}
 
+          {/* AUDIT_SETTINGS_TAB #13: surface install_wsl's "may need a reboot"
+              note. Persists across re-renders until the next install runs. */}
+          {postInstallNote && (
+            <div className="panel-pad bg-accent-yellow/10 border-accent-yellow/30 text-xs text-accent-yellow/90">
+              {postInstallNote}
+            </div>
+          )}
+
           {busyAction && logLines.length > 0 && (
             <div className="panel">
               <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
@@ -218,14 +294,20 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
                   <Terminal className="w-3.5 h-3.5" />
                   Live progress
                 </div>
-                <button
-                  onClick={handleCancel}
-                  className="text-xs text-accent-red hover:underline flex items-center gap-1"
-                  title="Stop this step"
-                >
-                  <StopCircle className="w-3.5 h-3.5" />
-                  Cancel
-                </button>
+                {/* AUDIT_SETTINGS_TAB #2: only offer Cancel when there is an
+                    actually-cancellable op in flight. Without the active
+                    check we'd send a no-op cancel_operation that confuses
+                    the user when nothing happens. */}
+                {active !== null && (
+                  <button
+                    onClick={handleCancel}
+                    className="text-xs text-accent-red hover:underline flex items-center gap-1"
+                    title="Stop this step"
+                  >
+                    <StopCircle className="w-3.5 h-3.5" />
+                    Cancel
+                  </button>
+                )}
               </div>
               <div
                 ref={logRef}
@@ -235,6 +317,23 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
                   <div key={i} className="truncate">{line}</div>
                 ))}
               </div>
+            </div>
+          )}
+
+          {/* Troubleshooting affordance — small, low-visibility "repair shim"
+              button (AUDIT_SETTINGS_TAB #4). Only shown when WSL is at least
+              present; otherwise there's nothing to repair. */}
+          {(preflight.wsl?.distros.length ?? 0) > 0 && (
+            <div className="text-[11px] text-white/40 flex items-center gap-2 pt-1">
+              <Wrench className="w-3 h-3" />
+              <span>Analyze failing with a SyntaxError in WSL?</span>
+              <button
+                onClick={handleRepairWslShim}
+                disabled={repairBusy || busyAction !== null}
+                className="underline hover:text-white/70 disabled:opacity-50"
+              >
+                {repairBusy ? "Repairing…" : "Repair WSL shim"}
+              </button>
             </div>
           )}
         </div>

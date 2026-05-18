@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# Push-burst on a PR queues 6 redundant matrix jobs without this. Cancel the
+# in-flight run for the same ref before starting a new one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -35,10 +41,22 @@ jobs:
 
       - name: Lint with ruff
         run: ruff check vibechek tests
-        continue-on-error: true  # Don't fail CI on lint until we've cleaned up
+        continue-on-error: true  # advisory until we've cleaned up; flip to enforcing in v0.5
 
-      - name: Run pytest
-        run: pytest -v --tb=short
+      - name: Run pytest with coverage
+        run: pytest -v --tb=short --cov=vibechek --cov-report=xml --cov-report=term
+
+      - name: Upload coverage artifact
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.python }}
+          path: coverage.xml
+          if-no-files-found: warn
+
+      - name: Verify README stats are current
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: python scripts/update_readme_stats.py --check
 
       - name: Smoke-test the CLI
         run: |
@@ -46,7 +64,7 @@ jobs:
           vibechek --help
 
   frontend:
-    name: Frontend tests (Node 20)
+    name: Frontend (Node 20)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +80,16 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      - name: Type-check (tsc --noEmit)
+        working-directory: ui
+        run: ./node_modules/.bin/tsc --noEmit
+        continue-on-error: true  # advisory until pre-existing errors are cleaned up
+
       - name: Run vitest
         working-directory: ui
         run: npm test
+
+      - name: Production build smoke test
+        working-directory: ui
+        run: npm run build
+        continue-on-error: true  # build deps need Tauri toolchain; gate after v0.4.0 ships

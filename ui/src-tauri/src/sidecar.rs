@@ -25,7 +25,76 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
 
-const RPC_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour — analyses on big libraries
+// Per-method RPC timeouts (audit #12). A single one-hour ceiling for every
+// method is wrong in both directions: too long for a hung `system_info`
+// (the GUI sits at a spinner for an hour) and too short for analyzing a
+// 50,000-track library on a slow disk.
+//
+// `timeout_for(method)` returns:
+//   - `Some(60s)`  for quick reads (config, system_info, status probes...)
+//   - `Some(60m)`  for medium ops (scans, dedupe, installs)
+//   - `None`       for `analyze_directory` — duration is unbounded; the
+//                   sidecar-died heartbeat path (oneshot Cancellation) is
+//                   what guards against hangs, NOT a wall-clock timeout.
+//
+// Anything not in the map gets the conservative one-hour default so a new
+// RPC method we forgot to classify still behaves like the legacy ceiling.
+const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60; // 1h fallback for unclassified methods
+const QUICK_TIMEOUT_SECS: u64 = 60;        // 60s — anything that should feel instant
+const MEDIUM_TIMEOUT_SECS: u64 = 60 * 60;  // 1h — installs, dedupe, organize, etc.
+
+/// Return the wall-clock timeout for a JSON-RPC method, or `None` for "no
+/// timeout — rely on the sidecar-died drain to surface failures".
+fn timeout_for(method: &str) -> Option<Duration> {
+    // Quick reads: must return within seconds. These all touch local state
+    // (or short-cached values) and a hang here means the sidecar is wedged.
+    const QUICK: &[&str] = &[
+        "ping",
+        "version",
+        "system_info",
+        "preflight",
+        "wsl_status",
+        "engine_gpu_status",
+        "library_state",
+        "backup_history",
+        "get_config",
+        "sidecar_status",
+        "scan_directory",
+    ];
+    // Medium: bounded ops that can legitimately take many minutes (installs,
+    // scans, plans, organizations, model downloads). One hour is generous;
+    // we don't want to kill an `install_vibechek_in_wsl` on a slow apt mirror.
+    const MEDIUM: &[&str] = &[
+        "scan_only",
+        "find_duplicates",
+        "plan_organization",
+        "organize",
+        "apply_ml_tags",
+        "backup_tags",
+        "restore_tags",
+        "download_models",
+        "install_wsl",
+        "install_vibechek_in_wsl",
+        "install_cuda_libs_in_wsl",
+        "install_essentia_native",
+    ];
+
+    if method == "analyze_directory" {
+        // Unbounded: a 50k-track library on a slow USB drive can take many
+        // hours. Hanging detection comes from the sidecar-EOF drain path
+        // (mark_dead_and_drain) and progress notifications, NOT from a
+        // wall-clock timeout that would interrupt a successful long run.
+        return None;
+    }
+    if QUICK.contains(&method) {
+        return Some(Duration::from_secs(QUICK_TIMEOUT_SECS));
+    }
+    if MEDIUM.contains(&method) {
+        return Some(Duration::from_secs(MEDIUM_TIMEOUT_SECS));
+    }
+    // Conservative fallback for any future RPC method we forget to classify.
+    Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+}
 
 /// Handle the frontend holds (via AppState) to talk to the sidecar.
 #[derive(Clone)]
@@ -40,7 +109,7 @@ struct Inner {
     binary_path: String,
     /// Set once the sidecar's stdout has EOF'd or the wait task observed exit.
     /// All subsequent `call()`s fail fast instead of hanging until the
-    /// RPC_TIMEOUT_SECS deadline.
+    /// per-method timeout deadline (`timeout_for`).
     dead: AtomicBool,
 }
 
@@ -95,23 +164,41 @@ impl SidecarHandle {
             stdin.flush().await.context("flush sidecar stdin")?;
         }
 
-        match tokio::time::timeout(Duration::from_secs(RPC_TIMEOUT_SECS), rx).await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(_canceled)) => {
-                // Receiver dropped — sender was either taken by the EOF
-                // drain (sidecar died) or never got the chance to fire.
-                Err(anyhow!(
+        // Per-method timeout (audit #12). `None` means "wait indefinitely" —
+        // used for `analyze_directory`, where a long-running run is normal
+        // and the only legitimate way to detect death is the sidecar-EOF
+        // drain path that wakes our oneshot via `mark_dead_and_drain`.
+        match timeout_for(method) {
+            None => match rx.await {
+                Ok(value) => Ok(value),
+                Err(_canceled) => Err(anyhow!(
                     "sidecar died mid-request on method '{}' (binary: {})",
                     method,
                     self.inner.binary_path
-                ))
-            }
-            Err(_elapsed) => {
-                // Drop the pending entry so we don't leak it
-                let mut pending = self.inner.pending.lock().await;
-                pending.remove(&id);
-                Err(anyhow!("sidecar call '{}' timed out", method))
-            }
+                )),
+            },
+            Some(deadline) => match tokio::time::timeout(deadline, rx).await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(_canceled)) => {
+                    // Receiver dropped — sender was either taken by the EOF
+                    // drain (sidecar died) or never got the chance to fire.
+                    Err(anyhow!(
+                        "sidecar died mid-request on method '{}' (binary: {})",
+                        method,
+                        self.inner.binary_path
+                    ))
+                }
+                Err(_elapsed) => {
+                    // Drop the pending entry so we don't leak it
+                    let mut pending = self.inner.pending.lock().await;
+                    pending.remove(&id);
+                    Err(anyhow!(
+                        "sidecar call '{}' timed out after {}s",
+                        method,
+                        deadline.as_secs()
+                    ))
+                }
+            },
         }
     }
 }
@@ -133,6 +220,14 @@ pub fn spawn(app: AppHandle) -> Result<SidecarHandle> {
 async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandle> {
     let mut child = Command::new(&binary)
         .arg("rpc")
+        // Force UTF-8 mode in the sidecar Python (audit #8). Without this,
+        // pathlib.Path on Windows uses the legacy code page (cp1252) for
+        // os.fspath() — track files with Cyrillic / CJK / emoji names round-
+        // trip as mojibake through JSON-RPC and break the WSL path translation.
+        .env("PYTHONUTF8", "1")
+        // Belt-and-suspenders: also force stdio encoding for any sub-process
+        // the sidecar spawns (PyInstaller may not honor PYTHONUTF8 itself).
+        .env("PYTHONIOENCODING", "utf-8")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -264,8 +359,33 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
     if line.is_empty() {
         return Ok(());
     }
-    let msg: Value = serde_json::from_str(line)
-        .with_context(|| format!("parse sidecar line: {line}"))?;
+
+    // Audit #15: native CUDA/TF/essentia code occasionally writes raw bytes
+    // directly to fd 1, bypassing Python's `_StdoutWriter` lock. Those
+    // appear as non-JSON lines (e.g. "2026-05-17 14:23:11.123456: I tensorflow/...")
+    // and would otherwise abort dispatch with a parse error, losing whatever
+    // response was supposed to follow. We log noise at debug level and skip
+    // the line — the JSON-RPC stream itself is unaffected because the next
+    // newline-delimited frame is still valid.
+    //
+    // A heuristic to filter the obvious-noise case (lines that don't even
+    // start with `{`) keeps the log quiet during a noisy analyze run.
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            if line.starts_with('{') {
+                // Looks like JSON but didn't parse — worth a louder log so
+                // we notice if the sidecar's JSON writer ever emits malformed
+                // frames.
+                eprintln!("sidecar: skipping malformed JSON line ({e}): {line}");
+            } else {
+                // Clearly stray printf noise — keep the log quiet but record
+                // it so we can grep for it during debugging.
+                log_native_noise(line);
+            }
+            return Ok(());
+        }
+    };
 
     // Response: has `id` and either `result` or `error`
     if let Some(id_val) = msg.get("id") {
@@ -280,7 +400,8 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
         }
     }
 
-    // Notification: emit as Tauri event
+    // Notification: emit as Tauri event. Includes `progress` (long ops),
+    // `ready` (startup), and `notify` (startup warnings — audit #18).
     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
         let event_name = format!("sidecar:{method}");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -289,6 +410,22 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
     }
 
     Ok(())
+}
+
+/// Log a stray non-JSON line from the sidecar's stdout (native printf noise).
+/// We keep these as eprintln at trace-ish level — too useful to drop entirely
+/// (debugging "why didn't my analyze finish") but too noisy to enable by
+/// default once we wire up a real logger. For now: always print to stderr
+/// with a clear prefix so users can grep/filter.
+fn log_native_noise(line: &str) {
+    // Truncate long lines so a giant stack dump or binary blob doesn't fill
+    // the user's terminal. 200 chars is enough to identify the source.
+    let truncated = if line.len() > 200 {
+        format!("{}…", &line[..200])
+    } else {
+        line.to_string()
+    };
+    eprintln!("[sidecar stdout noise, ignored] {truncated}");
 }
 
 fn resolve_sidecar_binary() -> Result<String> {

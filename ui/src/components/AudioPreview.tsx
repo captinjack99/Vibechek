@@ -29,8 +29,17 @@ export function AudioPreview({ path }: { path: string }) {
   const [error, setError] = useState<string | null>(null);
 
   // Create / re-create WaveSurfer when the path changes.
+  //
+  // The `aborted` flag closes over the *current* effect run only — if the
+  // user clicks rapidly through tracks (or switches selection mid-decode),
+  // the previous run's async callbacks should be ignored rather than
+  // race-clobbering the state for the new track. WaveSurfer's destroy()
+  // call also stops any in-flight fetch, but its event handlers can still
+  // fire one tick later; the flag is the second line of defence.
   useEffect(() => {
     if (!containerRef.current) return;
+
+    let aborted = false;
 
     setReady(false);
     setPlaying(false);
@@ -54,18 +63,33 @@ export function AudioPreview({ path }: { path: string }) {
     wsRef.current = ws;
 
     ws.on("ready", () => {
+      if (aborted) return;
       setReady(true);
       setDuration(ws.getDuration());
     });
-    ws.on("timeupdate", (t) => setPosition(t));
-    ws.on("play", () => setPlaying(true));
-    ws.on("pause", () => setPlaying(false));
-    ws.on("finish", () => setPlaying(false));
+    ws.on("timeupdate", (t) => {
+      if (aborted) return;
+      setPosition(t);
+    });
+    ws.on("play", () => {
+      if (aborted) return;
+      setPlaying(true);
+    });
+    ws.on("pause", () => {
+      if (aborted) return;
+      setPlaying(false);
+    });
+    ws.on("finish", () => {
+      if (aborted) return;
+      setPlaying(false);
+    });
     ws.on("error", (e: Error) => {
+      if (aborted) return;
       setError(e.message || "Could not load audio");
     });
 
     return () => {
+      aborted = true;
       ws.destroy();
       wsRef.current = null;
     };

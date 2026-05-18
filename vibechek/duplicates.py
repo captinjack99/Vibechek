@@ -138,7 +138,29 @@ def file_md5(filepath: Path, chunk_size: int = 65536) -> str | None:
 
 
 def audio_fingerprint(filepath: Path, fpcalc_cmd: str, duration: int = 120) -> str | None:
-    """Generate a Chromaprint fingerprint hash, or None if unavailable / failed."""
+    """Generate a Chromaprint fingerprint hash, or None if unavailable / failed.
+
+    Returns an MD5 of the raw fingerprint string — suitable for exact-match
+    bucketing (two byte-perfect re-encodings often produce the same hash).
+    For similarity-based matching (transcodes / different bitrates), use
+    `audio_fingerprint_raw` which returns the underlying integer sequence.
+    """
+    raw = audio_fingerprint_raw(filepath, fpcalc_cmd, duration=duration)
+    if raw is None:
+        return None
+    # Hash so fingerprints are comparable as strings of fixed size
+    return hashlib.md5(",".join(str(x) for x in raw).encode()).hexdigest()
+
+
+def audio_fingerprint_raw(
+    filepath: Path, fpcalc_cmd: str, duration: int = 120,
+) -> list[int] | None:
+    """Return the raw Chromaprint fingerprint as a list of 32-bit sub-fingerprints.
+
+    Each int encodes a frame of ~125ms of audio. Bit-level similarity (Hamming
+    distance) between aligned positions of two such lists yields the standard
+    Chromaprint similarity score. None on read/decode failure.
+    """
     try:
         result = subprocess.run(
             [fpcalc_cmd, "-raw", "-length", str(duration), str(filepath)],
@@ -150,12 +172,38 @@ def audio_fingerprint(filepath: Path, fpcalc_cmd: str, duration: int = 120) -> s
             return None
         for line in result.stdout.strip().splitlines():
             if line.startswith("FINGERPRINT="):
-                fp = line.split("=", 1)[1]
-                # Hash so fingerprints are comparable as strings of fixed size
-                return hashlib.md5(fp.encode()).hexdigest()
+                payload = line.split("=", 1)[1].strip()
+                if not payload:
+                    return None
+                try:
+                    # fpcalc -raw emits comma-separated signed 32-bit ints.
+                    # We coerce to unsigned for clean bit operations later.
+                    return [int(x) & 0xFFFFFFFF for x in payload.split(",") if x]
+                except ValueError:
+                    return None
     except (subprocess.SubprocessError, OSError) as e:
         log.warning("Fingerprint failed for %s: %s", filepath, e)
     return None
+
+
+def fingerprint_similarity(a: list[int], b: list[int]) -> float:
+    """Return Hamming-distance similarity in [0.0, 1.0] for two raw fingerprints.
+
+    Aligns at index 0 and compares the overlapping prefix bit-by-bit. 1.0 means
+    identical, 0.0 means every bit differs. This is the standard cheap
+    chromaprint similarity check — for longer audio with offsets you'd slide
+    one window over the other, but for full-track duplicate detection the
+    aligned form catches re-encodes well.
+    """
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0.0
+    diff_bits = 0
+    for x, y in zip(a[:n], b[:n]):
+        # XOR gives a 1 bit wherever the two sub-fingerprints differ.
+        diff_bits += (x ^ y).bit_count()
+    total_bits = n * 32
+    return 1.0 - (diff_bits / total_bits)
 
 
 def _file_info(filepath: Path, read_metadata: bool = True) -> FileInfo:
@@ -200,6 +248,29 @@ def _file_info(filepath: Path, read_metadata: bool = True) -> FileInfo:
     return info
 
 
+def _cluster_by_similarity(
+    items: list[tuple[FileInfo, list[int]]], threshold: float,
+) -> list[list[tuple[FileInfo, list[int]]]]:
+    """Greedy single-link clustering on chromaprint similarity.
+
+    For each input, attach it to the first existing cluster whose head it's
+    >= threshold similar to; otherwise start a new cluster. Quadratic in the
+    bucket size, but buckets are small in practice (see find_duplicates).
+    """
+    clusters: list[list[tuple[FileInfo, list[int]]]] = []
+    for info, raw in items:
+        placed = False
+        for cluster in clusters:
+            head_raw = cluster[0][1]
+            if fingerprint_similarity(raw, head_raw) >= threshold:
+                cluster.append((info, raw))
+                placed = True
+                break
+        if not placed:
+            clusters.append([(info, raw)])
+    return clusters
+
+
 def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:
     """Pick which file to keep from a group; return (keeper, duplicates)."""
     def score(f: FileInfo) -> tuple[int, int, int]:
@@ -239,8 +310,15 @@ def find_duplicates(
     file_infos: dict[str, FileInfo] = {}
     by_hash: dict[str, list[FileInfo]] = defaultdict(list)
 
+    # Lazy import so this module stays usable as a plain library.
+    from vibechek import cancellation
+
     if config.use_md5:
         for i, fp in enumerate(audio_files):
+            # Cancel must actually stop hashing — without this check, a user
+            # cancelling mid-dedupe sees no stop and the long-op lock stays
+            # held for the entire duration of the would-be cancellation.
+            cancellation.check()
             report_progress(on_progress, i + 1, len(audio_files), f"hash {fp.name}")
             info = _file_info(fp, read_metadata=read_metadata)
             file_infos[str(fp)] = info
@@ -270,32 +348,65 @@ def find_duplicates(
                 d.path for g in report.exact_duplicates for d in g.duplicates
             }
             remaining = [fp for fp in audio_files if str(fp) not in exact_dupe_paths]
-            by_fp: dict[str, list[FileInfo]] = defaultdict(list)
+
+            # Bucket key: the first sub-fingerprint as hex. Truly-similar tracks
+            # almost always share the first ~32 bits (this is the start of the
+            # spectral envelope and is extremely stable across re-encodes).
+            # Bucketing first keeps the pairwise similarity step O(N) in
+            # practice instead of O(N²) over the whole library.
+            buckets: dict[str, list[tuple[FileInfo, list[int]]]] = defaultdict(list)
 
             for i, fp in enumerate(remaining):
+                # Same cancellation check as the MD5 loop; chromaprint is
+                # slower (it shells out to fpcalc per file) so this matters more.
+                cancellation.check()
                 report_progress(on_progress, i + 1, len(remaining), f"fingerprint {fp.name}")
                 info = file_infos.get(str(fp)) or _file_info(fp, read_metadata=read_metadata)
                 file_infos[str(fp)] = info
-                fp_hash = audio_fingerprint(fp, fpcalc)
-                if fp_hash:
-                    info.audio_fingerprint = fp_hash
-                    by_fp[fp_hash].append(info)
+                raw_fp = audio_fingerprint_raw(fp, fpcalc)
+                if raw_fp:
+                    # Keep the exact-match hash too so the report dict still has
+                    # a `audio_fingerprint` field the GUI / API can show.
+                    info.audio_fingerprint = hashlib.md5(
+                        ",".join(str(x) for x in raw_fp).encode()
+                    ).hexdigest()
+                    buckets[f"{raw_fp[0]:08x}"].append((info, raw_fp))
 
-            for fp_hash, files in by_fp.items():
-                if len(files) <= 1:
+            threshold = max(0.0, min(1.0, config.chromaprint_similarity_threshold))
+            # Per-bucket union-find: cluster files whose pairwise similarity
+            # crosses the configured threshold. This is the threshold the user
+            # sets in Settings — at 1.0 only byte-identical fingerprints group,
+            # at 0.85 you get re-encodes / different bitrates of the same master.
+            for bucket in buckets.values():
+                if len(bucket) <= 1:
                     continue
-                # Require differing file hashes — same fingerprint AND same MD5
-                # means it was already caught in phase 1.
-                if len({f.file_hash for f in files if f.file_hash}) <= 1:
-                    continue
-                keeper, dupes = choose_keeper(files)
-                report.audio_duplicates.append(DuplicateGroup(
-                    method="chromaprint",
-                    key=fp_hash,
-                    keep=keeper,
-                    duplicates=dupes,
-                    recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
-                ))
+                clusters = _cluster_by_similarity(bucket, threshold)
+                for cluster in clusters:
+                    if len(cluster) <= 1:
+                        continue
+                    files = [info for info, _ in cluster]
+                    # Avoid double-reporting: if everyone in the cluster shares
+                    # the same MD5 hash, phase 1 already grouped them. Only skip
+                    # when MD5 actually ran (config.use_md5 True AND all hashes
+                    # known) — otherwise we wrongly drop legitimate similarity
+                    # clusters.
+                    hashes = [f.file_hash for f in files if f.file_hash]
+                    if (
+                        config.use_md5
+                        and len(hashes) == len(files)
+                        and len(set(hashes)) <= 1
+                    ):
+                        continue
+                    keeper, dupes = choose_keeper(files)
+                    # Group key: the keeper's fingerprint hash. Stable + unique.
+                    group_key = keeper.audio_fingerprint or ""
+                    report.audio_duplicates.append(DuplicateGroup(
+                        method="chromaprint",
+                        key=group_key,
+                        keep=keeper,
+                        duplicates=dupes,
+                        recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
+                    ))
 
     report.update_summary()
     return report
@@ -310,10 +421,14 @@ def handle_duplicates(
     report: DuplicateReport,
     config: DuplicateConfig,
     on_progress: ProgressCallback | None = None,
-) -> dict[str, int]:
+) -> dict:
     """Act on `report` per `config.action`.
 
-    Returns a `{moved, deleted, errors}` summary.
+    Returns a `{moved, deleted, errors, error_messages}` summary. `errors` is
+    the count; `error_messages` is a list of human-readable strings (one per
+    failed file). The list is what the GUI shows in its "errors — see report"
+    toast — without it the toast pointed at a report that didn't exist
+    (duplicates audit #6).
     """
     action = DuplicateAction(config.action)
     all_dupes = [
@@ -321,7 +436,13 @@ def handle_duplicates(
         for g in (*report.exact_duplicates, *report.audio_duplicates)
         for d in g.duplicates
     ]
-    summary = {"moved": 0, "deleted": 0, "errors": 0}
+    error_messages: list[str] = []
+    summary: dict = {
+        "moved": 0,
+        "deleted": 0,
+        "errors": 0,
+        "error_messages": error_messages,
+    }
 
     if action is DuplicateAction.REPORT:
         return summary
@@ -337,6 +458,7 @@ def handle_duplicates(
             src = Path(dupe.path)
             if not src.exists():
                 summary["errors"] += 1
+                error_messages.append(f"{src}: file not found")
                 continue
             dst = _unique_path(dest_root / src.name)
             try:
@@ -345,6 +467,7 @@ def handle_duplicates(
             except OSError as e:
                 log.warning("Move failed for %s: %s", src, e)
                 summary["errors"] += 1
+                error_messages.append(f"{src}: move failed — {e}")
 
     elif action is DuplicateAction.TRASH:
         # Late import — send2trash is optional, only needed for this action
@@ -361,6 +484,7 @@ def handle_duplicates(
             src = Path(dupe.path)
             if not src.exists():
                 summary["errors"] += 1
+                error_messages.append(f"{src}: file not found")
                 continue
             try:
                 send2trash(str(src))
@@ -368,6 +492,7 @@ def handle_duplicates(
             except OSError as e:
                 log.warning("Trash failed for %s: %s", src, e)
                 summary["errors"] += 1
+                error_messages.append(f"{src}: trash failed — {e}")
 
     return summary
 
@@ -400,6 +525,8 @@ __all__ = [
     "DuplicateReport",
     "file_md5",
     "audio_fingerprint",
+    "audio_fingerprint_raw",
+    "fingerprint_similarity",
     "choose_keeper",
     "find_duplicates",
     "handle_duplicates",

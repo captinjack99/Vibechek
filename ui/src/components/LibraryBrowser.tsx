@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { AnimatePresence } from "framer-motion";
 import {
   FolderOpen, Sparkles, Search, Music, AlertCircle, CheckSquare, Square, Tag,
-  Eye, RefreshCw, Clock, X,
+  Eye, RefreshCw, Clock, Loader2, X, ChevronDown, Compass,
 } from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -23,7 +23,7 @@ import type {
 import { TagBadge, EnergyBar } from "./TagBadges";
 import { PreflightDialog } from "./PreflightDialog";
 import { ConfirmModal } from "./ConfirmModal";
-import { FilterChips, applyFilters, emptyFilters, type LibraryFilters } from "./LibraryFilters";
+import { FilterChips, applyFilters, emptyFilters, useLibraryFiltersStore } from "./LibraryFilters";
 
 /** Compact number formatter — "12k" instead of "12,466". */
 const compactFmt = new Intl.NumberFormat(undefined, {
@@ -55,6 +55,27 @@ function basename(path: string): string {
   return segments[segments.length - 1] ?? path;
 }
 
+/**
+ * Friendly display name for a library: user-set `name` if present, otherwise
+ * the folder basename. Mirrors the Python-side `LibraryRecord.display_name()`
+ * so the switcher and the recent-cards label libraries identically.
+ */
+function displayName(record: LibraryRecord): string {
+  // `name` may be undefined on records returned from older sidecars; treat
+  // any falsy value as "fall back to basename".
+  const explicit = (record as LibraryRecord & { name?: string }).name;
+  if (explicit && explicit.trim()) return explicit;
+  return basename(record.path);
+}
+
+/** Wire shape for the count_new_tracks RPC. */
+interface NewTracksCount {
+  new_count: number;
+  total_count: number;
+  analyzed_count?: number;
+  reason?: string;
+}
+
 export function LibraryBrowser() {
   const tracks = useLibraryStore((s) => s.tracks);
   const libraryPath = useLibraryStore((s) => s.libraryPath);
@@ -84,10 +105,39 @@ export function LibraryBrowser() {
 
   const [scanCount, setScanCount] = useState<number | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
-  const [confirmBulkTag, setConfirmBulkTag] = useState<"selected" | "all" | null>(null);
-  const [filters, setFilters] = useState<LibraryFilters>(emptyFilters());
+  // Snapshot the bulk-tag scope at modal-open time. Was previously just a
+  // "selected" | "all" enum, but that re-reads `selectedIds` on confirm —
+  // if the user opens the modal then de-selects rows behind the dimmed
+  // backdrop, confirm would tag whatever the *current* selection is, not
+  // what they reviewed. Now we capture the exact tracks once.
+  const [confirmBulkTag, setConfirmBulkTag] = useState<{
+    scope: "selected" | "all";
+    targets: TrackAnalysis[];
+  } | null>(null);
+  const [confirmForget, setConfirmForget] = useState<LibraryRecord | null>(null);
+  const filters = useLibraryFiltersStore((s) => s.filters);
+  const setFilters = useLibraryFiltersStore((s) => s.setFilters);
   const [showErrorsOnly, setShowErrorsOnly] = useState(false);
   const [recentLibraries, setRecentLibraries] = useState<LibraryRecord[]>([]);
+  // Tracks whether `handleAnalyze`'s slow preflight probe is in flight. The
+  // probe can take 5-10s and used to block silently; we surface a spinner
+  // on the trigger button so the user knows the click registered.
+  const [preflightInFlight, setPreflightInFlight] = useState(false);
+  // New-tracks banner state. We refetch this every time the library is
+  // reloaded; the user can dismiss it for the current session but the next
+  // load shows it again (intentional — the count may have changed).
+  const [newTracksCount, setNewTracksCount] = useState<NewTracksCount | null>(null);
+  const [bannerDismissed, setBannerDismissed] = useState(false);
+  // Library switcher dropdown open/closed. Closed by default to keep the
+  // header quiet; opens on header chevron click and closes on outside click.
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+
+  // Generation counter for analyze RPCs. Both `runFastScan`/`scan_only` and
+  // `runAnalyze`/`analyze_directory` write to `tracks` on completion; without
+  // a counter, a slow analyze that started before a quick scan could land
+  // second and clobber the user's now-current view. Each request bumps the
+  // counter at launch and only commits its result if the counter hasn't moved.
+  const analyzeGen = useRef(0);
 
   // Pull the recent-libraries list on mount + after a forget. Both empty-state
   // visibility and the cards themselves read from this.
@@ -106,7 +156,15 @@ export function LibraryBrowser() {
 
   // Click handler for a recent-library card: reload the saved analysis and
   // hydrate the store. Falls back to just setting the path if the analysis
-  // file went missing under us.
+  // file went missing under us. Validates the report shape defensively —
+  // an older sidecar version, a corrupted on-disk cache, or any future
+  // schema drift shouldn't be allowed to crash the renderer.
+  //
+  // Side effects on success: clears the previous library's new-tracks banner,
+  // un-dismisses the banner for the next library (so the user sees fresh
+  // counts), and fires a `count_new_tracks` probe to populate the banner if
+  // there's drift on disk. The probe is best-effort — a failure leaves the
+  // banner empty rather than blocking the load.
   const handleOpenRecent = async (record: LibraryRecord) => {
     begin("analyze");
     try {
@@ -119,18 +177,52 @@ export function LibraryBrowser() {
         await refreshRecent();
         return;
       }
+      const tracks = result.report.tracks;
+      if (!Array.isArray(tracks)) {
+        fail("Saved analysis is malformed (tracks is not a list).");
+        await refreshRecent();
+        return;
+      }
       setLibraryPath(record.path);
-      setTracks(result.report.tracks);
+      setTracks(tracks);
+      setNewTracksCount(null);
+      setBannerDismissed(false);
+      setSwitcherOpen(false);
       finish();
+      // Probe for new tracks AFTER finish() so an error here doesn't block
+      // the user from seeing their library. The banner just stays hidden.
+      checkNewTracks(record.path);
     } catch (e) {
-      fail(String(e));
+      fail(e);
     }
   };
 
+  /** Fire-and-forget RPC to populate the new-tracks banner. */
+  const checkNewTracks = useCallback(async (path: string) => {
+    try {
+      const result = await rpc<NewTracksCount>("count_new_tracks", {
+        library_path: path,
+      });
+      setNewTracksCount(result);
+    } catch {
+      // Silent — the banner just won't appear. Don't surface a scary error
+      // for a non-essential UX feature.
+      setNewTracksCount(null);
+    }
+  }, []);
+
+  // Optimistically remove the card before the RPC round-trip — the user
+  // already decided. If the backend disagrees we re-fetch and the card
+  // reappears, which is rare and self-healing.
   const handleForgetRecent = async (record: LibraryRecord) => {
+    setRecentLibraries((prev) => prev.filter((r) => r.path !== record.path));
     try {
       await rpc("forget_library", { path: record.path });
+    } catch (e) {
+      fail(e);
     } finally {
+      // Reconcile against the source of truth in case the optimistic
+      // removal was wrong (or to pick up other concurrent changes).
       await refreshRecent();
     }
   };
@@ -144,11 +236,12 @@ export function LibraryBrowser() {
   // Genre breakdown for the bulk-tag confirm modal: only count tracks whose
   // genre will actually be written (confidence >= threshold). Tracks without
   // a confidence are counted as zero (won't be written either).
+  //
+  // Uses the snapshotted `confirmBulkTag.targets` rather than re-deriving
+  // from `selectedIds` — see the note on the snapshot's declaration.
   const tagPreview = useMemo(() => {
     if (!confirmBulkTag) return null;
-    const targets = confirmBulkTag === "all"
-      ? tracks
-      : tracks.filter((t) => selectedIds.has(t.path));
+    const targets = confirmBulkTag.targets;
     const threshold = taggingCfg.genre_confidence_threshold;
 
     const counts = new Map<string, number>();
@@ -178,13 +271,80 @@ export function LibraryBrowser() {
       willWrite,
       belowThreshold,
     };
-  }, [confirmBulkTag, tracks, selectedIds, taggingCfg.genre_confidence_threshold]);
+  }, [confirmBulkTag, taggingCfg.genre_confidence_threshold]);
 
   // Tracks with either a top-level scan/decode error or an ML failure.
   const errorCount = useMemo(
     () => tracks.filter((t) => t.error || t.ml_analysis?.ml_error).length,
     [tracks],
   );
+
+  // The currently-selected track (right-rail TrackDetails). We surface a
+  // "Find compatible" affordance in the filter bar when it has enough ML
+  // signal to seed a useful filter set (at minimum: BPM + energy).
+  const selectedTrack = useMemo(
+    () => tracks.find((t) => t.path === selectedTrackPath) ?? null,
+    [tracks, selectedTrackPath],
+  );
+  const canFindCompatible = !!selectedTrack?.ml_analysis?.ml_bpm &&
+    selectedTrack.ml_analysis.ml_energy != null;
+
+  /**
+   * "Find compatible" — populates the filter chips so the library narrows to
+   * tracks that would actually mix well with the selected one:
+   *
+   *   - BPM within ±5
+   *   - Energy within ±1 level
+   *   - Same Camelot key (Agent 3's chip group will widen this to harmonic
+   *     neighbours once that filter is fully wired). Same-key is the safe,
+   *     always-correct fallback per the task spec.
+   *   - Direction = "Up" (or whatever the selected track's direction is —
+   *     so picking a cooldown seed finds other cooldowns, not a fake build)
+   *
+   * The button just sets the chip state — the existing `applyFilters` then
+   * does the actual filtering on the next render. BPM isn't a chip dimension
+   * yet, so we narrow via energies (which the chip system supports) and
+   * leave BPM/Key/Direction visible as active filter pills. The DJ can tweak
+   * any chip after, so we're not overwriting their work invisibly.
+   */
+  const handleFindCompatible = useCallback(() => {
+    const ml = selectedTrack?.ml_analysis;
+    if (!ml) return;
+
+    const next = emptyFilters();
+
+    // Energy ±1 (chip filter is discrete int levels, so we just enumerate)
+    if (ml.ml_energy != null) {
+      const e = ml.ml_energy;
+      next.energies = new Set([e - 1, e, e + 1].filter((x) => x >= 1 && x <= 5));
+    }
+
+    // Direction: match the seed track's direction if known, else default Up.
+    // Up is the most common "what's next" question for a working DJ.
+    next.directions = new Set([ml.ml_direction || "Up"]);
+
+    // Key: same Camelot. Agent 3's camelot chip group, if wired, will let
+    // the DJ click "harmonic" / "energy" to widen. We seed with just the
+    // exact key — both the safe fallback and the spec-mandated behaviour.
+    if (ml.ml_key) {
+      // ml_key may be a Camelot string ("8A") or a music key ("A minor") —
+      // the chip universe is whatever shows up in the library, so passing
+      // the raw value through works in either case.
+      next.camelot = new Set([ml.ml_key]);
+    }
+
+    setFilters(next);
+    // BPM ±5 isn't a chip — we don't want to overwrite the search box, so
+    // we surface it as a toast hint instead. Users can use the search box
+    // to narrow further if they really want BPM-tight matches.
+    if (ml.ml_bpm) {
+      const bpm = Math.round(ml.ml_bpm);
+      notify(`Filtering for tracks compatible with ${bpm} BPM`, {
+        kind: "info",
+        detail: `±5 BPM, ±1 energy, ${ml.ml_key ?? "any key"}, ${ml.ml_direction || "Up"}`,
+      });
+    }
+  }, [selectedTrack, setFilters, notify]);
 
   const filtered = useMemo(() => {
     let result = showErrorsOnly
@@ -215,7 +375,7 @@ export function LibraryBrowser() {
       setScanCount(result.count);
       finish();
     } catch (e) {
-      fail(String(e));
+      fail(e);
     }
   };
 
@@ -223,23 +383,31 @@ export function LibraryBrowser() {
   // so the user can browse / dedupe / organize without committing to a long ML run.
   const runFastScan = async () => {
     if (!libraryPath) return;
+    const myGen = ++analyzeGen.current;
     begin("analyze");
     try {
       const report = await rpc<AnalysisReport>("scan_only", { path: libraryPath });
+      // If a later analyze/scan started after this one (e.g. user clicked
+      // Re-analyze while scan_only was still in flight), drop our result —
+      // committing it would clobber the newer pass.
+      if (analyzeGen.current !== myGen) return;
       setTracks(report.tracks);
       finish();
     } catch (e) {
-      fail(String(e));
+      if (analyzeGen.current === myGen) fail(e);
     }
   };
 
   // Run ML analyze. If `incremental` is true, skip every file already in `tracks`
-  // and merge the new results into what's there.
+  // and merge the new results into what's there — pruning any in-memory tracks
+  // that no longer exist in the freshly-scanned filesystem so deleted/renamed
+  // files don't linger as ghosts in the UI.
   const runAnalyze = async (incremental = false) => {
     if (!libraryPath) return;
     const alreadyAnalyzed = incremental
       ? tracks.filter((t) => t.ml_analysis).map((t) => t.path)
       : [];
+    const myGen = ++analyzeGen.current;
     begin("analyze");
     try {
       const report = await rpc<AnalysisReport>("analyze_directory", {
@@ -248,29 +416,49 @@ export function LibraryBrowser() {
         use_gpu: analysisCfg.use_gpu,
         skip_paths: alreadyAnalyzed,
       });
+      if (analyzeGen.current !== myGen) return;
       if (incremental) {
-        // Merge: keep existing analyzed tracks, add the new ones, dedup by path
-        const existing = new Map(tracks.map((t) => [t.path, t]));
-        for (const t of report.tracks) existing.set(t.path, t);
-        setTracks(Array.from(existing.values()));
+        // Merge: keep existing analyzed tracks, overlay new results from this
+        // pass, and drop entries whose paths weren't seen at all in the new
+        // scan (the sidecar returns *every* current file — analyzed or
+        // skipped — so any path missing from `report.tracks` is a file that
+        // no longer exists on disk).
+        const seen = new Set(report.tracks.map((t) => t.path));
+        const merged = new Map<string, TrackAnalysis>();
+        for (const t of tracks) {
+          if (seen.has(t.path)) merged.set(t.path, t);
+        }
+        for (const t of report.tracks) merged.set(t.path, t);
+        setTracks(Array.from(merged.values()));
       } else {
         setTracks(report.tracks);
       }
       finish();
     } catch (e) {
-      fail(String(e));
+      if (analyzeGen.current === myGen) fail(e);
     }
   };
 
-  // Bulk apply ML tags to either selected tracks or all of them. The actual
-  // RPC + loading/error handling is in useApplyTags; we just decide the scope
-  // and surface a toast.
-  const runBulkTag = async (scope: "selected" | "all") => {
-    const targets = scope === "selected"
-      ? tracks.filter((t) => selectedIds.has(t.path))
-      : tracks;
+  // Bulk apply ML tags to a snapshotted scope. The actual RPC + loading/error
+  // handling is in useApplyTags; we decide the scope, filter out tracks the
+  // sidecar would no-op on, and surface a toast.
+  //
+  // The headline message includes the error count when any failed — a quiet
+  // green "Tagged 500 files" toast hides the 200 files that didn't write.
+  const runBulkTag = async (targets: TrackAnalysis[]) => {
     if (targets.length === 0) return;
-    const result = await applyTags(targets);
+    // Drop tracks with no ML analysis — the sidecar would receive them and
+    // report applied=0/skipped=0/other=0, producing a confusing "Tagged 0
+    // files" success toast.
+    const writable = targets.filter((t) => t.ml_analysis);
+    if (writable.length === 0) {
+      notify("No analyzed tracks in selection", {
+        detail: "Run analyze first — there's nothing to write yet.",
+        kind: "info",
+      });
+      return;
+    }
+    const result = await applyTags(writable);
     if (!result) return; // failure already surfaced via useOperationStore.error
     const threshold = Math.round(taggingCfg.genre_confidence_threshold * 100);
     const detail =
@@ -278,47 +466,63 @@ export function LibraryBrowser() {
       `Skipped (low confidence): ${result.skipped}\n` +
       `Other tags (energy / mood / etc): ${result.other}` +
       (result.errors.length > 0 ? `\nErrors: ${result.errors.length}` : "");
-    notify(`Tagged ${result.applied + result.other} files`, {
+    const wrote = result.applied + result.other;
+    const numErrors = result.errors.length;
+    const headline =
+      numErrors > 0
+        ? `Tagged ${wrote} files — ${numErrors} error${numErrors === 1 ? "" : "s"}`
+        : `Tagged ${wrote} files`;
+    notify(headline, {
       detail,
-      kind: result.errors.length > 0 ? "info" : "success",
+      kind: numErrors > 0 ? "info" : "success",
     });
   };
 
-  // Gate analyze behind preflight. If not ready, show the dialog; the user
-  // can fix things and click Re-check, which auto-proceeds when ready.
+  // Gate analyze behind preflight. The previous version did a quick=true
+  // probe first then maybe upgraded — but on Windows that meant the dialog
+  // first appeared with stale per-distro data, falsely claiming "WSL not
+  // installed" while the upgrade was still in flight. Users would see the
+  // wrong error and click Re-check (which actually does the slow probe).
+  //
+  // New flow: ALWAYS do the slow probe before opening the dialog. The user
+  // would otherwise see nothing for the 5-10s the full probe takes — track
+  // `preflightInFlight` so the trigger button shows a spinner and is
+  // disabled, and also short-circuit if any long op is already underway.
   const handleAnalyze = async () => {
     if (!libraryPath) return;
+    if (active !== null) return;       // long op already running — be safe
+    if (preflightInFlight) return;     // already probing, don't double-fire
+    setPreflightInFlight(true);
     try {
-      // Fast preflight first — opens the dialog immediately without waiting
-      // for the (slow) per-distro WSL probe.
+      // Quick probe first — if it says ready, we're done immediately.
       const quick = await rpc<PreflightResult>("preflight", {});
+      // Re-check the long-op lock: it can flip between us starting the
+      // probe and the probe finishing (e.g. user kicked off a different
+      // operation while we were waiting). Don't trample an active op.
+      if (useOperationStore.getState().active !== null) return;
       if (quick.ready) {
         runAnalyze();
         return;
       }
-      setPreflightResult(quick);
-      // Then upgrade with the detailed WSL probe in the background
-      if (quick.wsl?.is_windows) {
-        rpc<PreflightResult["wsl"]>("wsl_status", { quick: false })
-          .then((wsl) => {
-            setPreflightResult((prev) => {
-              if (!prev) return prev;
-              const wslReady = wsl?.can_run_vibechek ?? false;
-              const ready =
-                (prev.essentia.installed || wslReady) &&
-                prev.models.missing.length === 0;
-              const analyze_via: "native" | "wsl" | null = prev.essentia.installed
-                ? "native"
-                : wslReady
-                ? "wsl"
-                : null;
-              return { ...prev, wsl, ready, analyze_via };
-            });
-          })
-          .catch(() => {});
+      // Not ready per quick mode. On Windows the quick mode never probes
+      // distros, so "not ready" is uninformative. Do the full probe before
+      // showing the dialog so the user sees the real state, not a stale one.
+      const full = await rpc<PreflightResult>("preflight", { quick: false });
+      if (useOperationStore.getState().active !== null) return;
+      if (full.ready) {
+        // Full probe revealed we're actually ready (quick mode missed it
+        // because the WSL distro probe wasn't run). Skip the dialog.
+        runAnalyze();
+        return;
       }
+      setPreflightResult(full);
     } catch (e) {
-      fail(String(e));
+      // Mirror the convention used elsewhere in this file — stringify so
+      // the operation store doesn't end up with a raw RpcError object that
+      // surfaces as "[object Object]" when re-rendered.
+      fail(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPreflightInFlight(false);
     }
   };
 
@@ -348,7 +552,7 @@ export function LibraryBrowser() {
 
     return (
       <div className="h-full flex flex-col">
-        <Header onOpen={handleOpenFolder} libraryPath={libraryPath} />
+        <Header onOpen={handleOpenFolder} libraryPath={libraryPath} disabled={active !== null} />
         {preflightOverlay}
         <div className="flex-1 overflow-auto flex items-center justify-center px-8 py-8">
           {showRecents ? (
@@ -372,7 +576,7 @@ export function LibraryBrowser() {
                     record={rec}
                     disabled={active !== null}
                     onOpen={() => handleOpenRecent(rec)}
-                    onForget={() => handleForgetRecent(rec)}
+                    onForget={() => setConfirmForget(rec)}
                   />
                 ))}
               </div>
@@ -423,11 +627,19 @@ export function LibraryBrowser() {
                     <button
                       className="btn-ghost"
                       onClick={handleAnalyze}
-                      disabled={active !== null}
-                      title="Full ML pass — detects genre, mood, energy, etc. Takes longer."
+                      disabled={active !== null || preflightInFlight}
+                      title={
+                        preflightInFlight
+                          ? "Checking preflight…"
+                          : "Full ML pass — detects genre, mood, energy, etc. Takes longer."
+                      }
                     >
-                      <Sparkles className="w-4 h-4" />
-                      Analyze with ML
+                      {preflightInFlight ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Sparkles className="w-4 h-4" />
+                      )}
+                      {preflightInFlight ? "Checking…" : "Analyze with ML"}
                     </button>
                   </div>
                   <div>
@@ -454,6 +666,32 @@ export function LibraryBrowser() {
             </div>
           )}
         </div>
+
+        <ConfirmModal
+          open={confirmForget !== null}
+          title="Forget this library?"
+          message={
+            <div className="space-y-2 text-sm text-white/70">
+              <div className="font-mono text-xs text-white/50 break-all">
+                {confirmForget?.path ?? ""}
+              </div>
+              <div>
+                Vibechek will drop this from the recent-libraries list. The on-disk
+                files and saved analysis cache are untouched — you can re-open the
+                folder any time.
+              </div>
+            </div>
+          }
+          confirmLabel="Forget"
+          cancelLabel="Keep"
+          variant="danger"
+          onConfirm={() => {
+            const record = confirmForget;
+            setConfirmForget(null);
+            if (record) handleForgetRecent(record);
+          }}
+          onCancel={() => setConfirmForget(null)}
+        />
       </div>
     );
   }
@@ -461,8 +699,54 @@ export function LibraryBrowser() {
   // Populated state
   return (
     <div className="h-full flex flex-col">
-      <Header onOpen={handleOpenFolder} libraryPath={libraryPath} />
+      <Header
+        onOpen={handleOpenFolder}
+        libraryPath={libraryPath}
+        recentLibraries={recentLibraries}
+        switcherOpen={switcherOpen}
+        onToggleSwitcher={() => setSwitcherOpen((v) => !v)}
+        onCloseSwitcher={() => setSwitcherOpen(false)}
+        onSwitchLibrary={handleOpenRecent}
+        disabled={active !== null}
+      />
       {preflightOverlay}
+
+      {/* New-tracks banner — appears above the toolbar when count_new_tracks
+          surfaces tracks on disk that the saved analysis hasn't seen yet.
+          Dismissed for the current session only; the next library load
+          un-dismisses it so the count gets re-evaluated. */}
+      {newTracksCount &&
+        newTracksCount.new_count > 0 &&
+        !bannerDismissed &&
+        libraryPath && (
+          <div className="flex items-center gap-3 px-4 py-2 bg-accent/10 border-b border-accent/30 text-sm">
+            <Sparkles className="w-4 h-4 text-accent flex-none" />
+            <div className="flex-1 text-white/90">
+              <span className="font-mono text-accent">
+                {newTracksCount.new_count.toLocaleString()}
+              </span>{" "}
+              new track{newTracksCount.new_count === 1 ? "" : "s"} added since last
+              analysis.
+            </div>
+            <button
+              className="btn-primary btn-sm"
+              onClick={() => runAnalyze(true)}
+              disabled={active !== null}
+              title="Run ML on just the new tracks, then merge with the existing analysis"
+            >
+              <Sparkles className="w-4 h-4" />
+              Analyze + sort
+            </button>
+            <button
+              className="text-white/40 hover:text-white p-1"
+              onClick={() => setBannerDismissed(true)}
+              title="Dismiss (will reappear on next library load)"
+              aria-label="Dismiss new-tracks banner"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
 
       {/* Toolbar */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-white/5">
@@ -500,7 +784,12 @@ export function LibraryBrowser() {
           <>
             <button
               className="btn-primary"
-              onClick={() => setConfirmBulkTag("selected")}
+              onClick={() =>
+                setConfirmBulkTag({
+                  scope: "selected",
+                  targets: tracks.filter((t) => selectedIds.has(t.path)),
+                })
+              }
               disabled={active !== null}
             >
               <Tag className="w-4 h-4" />
@@ -515,7 +804,9 @@ export function LibraryBrowser() {
             {analyzedCount > 0 && (
               <button
                 className="btn-ghost"
-                onClick={() => setConfirmBulkTag("all")}
+                onClick={() =>
+                  setConfirmBulkTag({ scope: "all", targets: tracks })
+                }
                 disabled={active !== null}
                 title="Write ML tags to every analyzed track"
               >
@@ -537,11 +828,19 @@ export function LibraryBrowser() {
             <button
               className="btn-ghost"
               onClick={handleAnalyze}
-              disabled={active !== null || !libraryPath}
-              title="Re-run ML on the whole library"
+              disabled={active !== null || preflightInFlight || !libraryPath}
+              title={
+                preflightInFlight
+                  ? "Checking preflight…"
+                  : "Re-run ML on the whole library"
+              }
             >
-              <RefreshCw className="w-4 h-4" />
-              Re-analyze all
+              {preflightInFlight ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <RefreshCw className="w-4 h-4" />
+              )}
+              {preflightInFlight ? "Checking…" : "Re-analyze all"}
             </button>
           </>
         )}
@@ -552,6 +851,23 @@ export function LibraryBrowser() {
         <div className="px-4 py-2 border-b border-white/5 flex items-center gap-3 flex-wrap">
           {analyzedCount > 0 && !showErrorsOnly && (
             <FilterChips tracks={tracks} filters={filters} setFilters={setFilters} />
+          )}
+          {/* "Find compatible" — programmatic filter chip writer based on
+              the selected track. Disabled if no track selected or if the
+              selection lacks ML signal we can seed from. */}
+          {canFindCompatible && !showErrorsOnly && (
+            <button
+              onClick={handleFindCompatible}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border bg-accent/10 text-accent border-accent/30 hover:bg-accent/20 transition-colors"
+              title={
+                selectedTrack
+                  ? `Filter to tracks compatible with "${selectedTrack.filename_title ?? selectedTrack.filename}"`
+                  : ""
+              }
+            >
+              <Compass className="w-3.5 h-3.5" />
+              Find compatible
+            </button>
           )}
           {errorCount > 0 && (
             <button
@@ -595,7 +911,11 @@ export function LibraryBrowser() {
 
       <ConfirmModal
         open={confirmBulkTag !== null}
-        title={`Apply ML tags to ${confirmBulkTag === "all" ? "all" : selectedIds.size} tracks?`}
+        title={`Apply ML tags to ${
+          confirmBulkTag?.scope === "all"
+            ? "all"
+            : confirmBulkTag?.targets.length ?? 0
+        } tracks?`}
         message={
           <div className="space-y-3">
             {tagPreview && (
@@ -647,9 +967,12 @@ export function LibraryBrowser() {
         cancelLabel="Cancel"
         variant="default"
         onConfirm={() => {
-          const scope = confirmBulkTag!;
+          // Snapshot the targets before closing the modal — that's the list
+          // the user just reviewed, not whatever the selection has drifted
+          // into during the modal's open window.
+          const targets = confirmBulkTag?.targets ?? [];
           setConfirmBulkTag(null);
-          runBulkTag(scope);
+          runBulkTag(targets);
         }}
         onCancel={() => setConfirmBulkTag(null)}
       />
@@ -657,16 +980,148 @@ export function LibraryBrowser() {
   );
 }
 
-function Header({ onOpen, libraryPath }: { onOpen: () => void; libraryPath: string | null }) {
+function Header({
+  onOpen,
+  libraryPath,
+  disabled = false,
+  recentLibraries,
+  switcherOpen,
+  onToggleSwitcher,
+  onCloseSwitcher,
+  onSwitchLibrary,
+}: {
+  onOpen: () => void;
+  libraryPath: string | null;
+  disabled?: boolean;
+  recentLibraries?: LibraryRecord[];
+  switcherOpen?: boolean;
+  onToggleSwitcher?: () => void;
+  onCloseSwitcher?: () => void;
+  onSwitchLibrary?: (record: LibraryRecord) => void;
+}) {
+  // Outside-click closes the switcher dropdown. Same pattern as
+  // LibraryFilters' chip dropdowns — one listener, scoped to the open state.
+  const switcherRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!switcherOpen || !onCloseSwitcher) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (switcherRef.current && !switcherRef.current.contains(target)) {
+        onCloseSwitcher();
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCloseSwitcher();
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [switcherOpen, onCloseSwitcher]);
+
+  // Only show the switcher chevron when there's more than the active library
+  // in the recent list. With ≤1 recent, the dropdown would be empty or
+  // tautological ("switch to the same library you're on").
+  const otherLibraries = (recentLibraries ?? []).filter(
+    (r) => r.path !== libraryPath,
+  );
+  const showSwitcher =
+    recentLibraries !== undefined &&
+    otherLibraries.length > 0 &&
+    onToggleSwitcher !== undefined &&
+    onSwitchLibrary !== undefined;
+  const activeRecord = libraryPath
+    ? (recentLibraries ?? []).find((r) => r.path === libraryPath)
+    : null;
+  const headerLabel = activeRecord ? displayName(activeRecord) : "Library";
+
   return (
     <div className="flex items-center justify-between px-4 py-3 border-b border-white/5">
-      <div>
-        <h1 className="font-display font-semibold text-white">Library</h1>
+      <div ref={switcherRef} className="relative min-w-0 flex-1">
+        {showSwitcher ? (
+          <button
+            type="button"
+            className="flex items-center gap-1.5 group text-left max-w-full"
+            onClick={onToggleSwitcher}
+            aria-haspopup="listbox"
+            aria-expanded={switcherOpen}
+            title="Switch library"
+          >
+            <h1 className="font-display font-semibold text-white truncate">
+              {headerLabel}
+            </h1>
+            <ChevronDown
+              className={cx(
+                "w-4 h-4 text-white/40 group-hover:text-white transition-transform flex-none",
+                switcherOpen && "rotate-180",
+              )}
+            />
+          </button>
+        ) : (
+          <h1 className="font-display font-semibold text-white truncate">
+            {headerLabel}
+          </h1>
+        )}
         <p className="text-xs text-white/40 truncate max-w-md">
           {libraryPath ?? "no folder open"}
         </p>
+
+        {/* Switcher dropdown. Each row is a recent library OTHER than the
+            currently-active one (filtered above). Clicking calls the
+            standard load_recent_analysis flow via onSwitchLibrary, which is
+            wired to the same handleOpenRecent used by the empty-state cards
+            — so the "Analyze with ML" button behaviour is unchanged after
+            a switch. */}
+        {switcherOpen && showSwitcher && (
+          <div
+            role="listbox"
+            className="absolute top-full left-0 mt-1 z-40 min-w-[280px] max-w-[420px] panel max-h-80 overflow-auto p-1"
+          >
+            <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-white/40">
+              Switch library
+            </div>
+            {otherLibraries.map((rec) => (
+              <button
+                key={rec.path}
+                role="option"
+                aria-selected={false}
+                disabled={disabled}
+                onClick={() => {
+                  onSwitchLibrary?.(rec);
+                  onCloseSwitcher?.();
+                }}
+                className={cx(
+                  "w-full text-left px-2 py-2 rounded text-sm flex items-center gap-2",
+                  disabled
+                    ? "opacity-50 cursor-not-allowed"
+                    : "hover:bg-white/5 cursor-pointer",
+                )}
+                title={rec.path}
+              >
+                <Music className="w-3.5 h-3.5 text-accent flex-none" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-white truncate">{displayName(rec)}</div>
+                  <div className="text-[11px] text-white/40 truncate font-mono">
+                    {rec.path}
+                  </div>
+                </div>
+                <span className="text-[10px] text-white/40 font-mono flex-none">
+                  {compactFmt.format(rec.track_count)}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
-      <button className="btn-ghost" onClick={onOpen}>
+      <button
+        className="btn-ghost"
+        onClick={onOpen}
+        disabled={disabled}
+        title={disabled ? "Wait for the current operation to finish" : "Open a different folder"}
+      >
         <FolderOpen className="w-4 h-4" />
         Open folder
       </button>
@@ -725,7 +1180,7 @@ function TrackRow({ track, selected, checked, onCheck, onClick }: TrackRowProps)
       </div>
 
       <div className="w-16 text-right text-xs text-white/40 font-mono">
-        {track.size_mb.toFixed(1)}M
+        {(track.size_mb ?? 0).toFixed(1)}M
       </div>
     </div>
   );
@@ -739,14 +1194,14 @@ interface RecentLibraryCardProps {
 }
 
 function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibraryCardProps) {
-  // Right-click → forget. Single-button context menus are overkill; just run
-  // the action straight from the menu event.
+  // Right-click → forget. `onForget` opens the in-app ConfirmModal (parent
+  // owns the modal state) — the previous `window.confirm` was OS-native,
+  // off-brand, and could render behind the Tauri window on multi-monitor
+  // setups, looking like the click did nothing.
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
     if (disabled) return;
-    if (window.confirm(`Remove "${basename(record.path)}" from recent libraries?`)) {
-      onForget();
-    }
+    onForget();
   };
 
   return (
@@ -774,7 +1229,7 @@ function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibrary
       </div>
       <div className="flex-1 min-w-0">
         <div className="font-display font-medium text-base text-white truncate">
-          {basename(record.path)}
+          {displayName(record)}
         </div>
         <div className="text-xs text-white/40 truncate font-mono" title={record.path}>
           {record.path}
@@ -797,6 +1252,20 @@ function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibrary
             Opened {relativeTime(record.last_opened)}
           </span>
         </div>
+        {/* User-assigned tags ("Brunch", "Wedding", …). Treat the array as
+            optional — older sidecar responses may not include it. */}
+        {((record as LibraryRecord & { tags?: string[] }).tags ?? []).length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {((record as LibraryRecord & { tags?: string[] }).tags ?? []).map((t) => (
+              <span
+                key={t}
+                className="px-1.5 py-0.5 rounded text-[10px] bg-accent/10 text-accent border border-accent/20"
+              >
+                {t}
+              </span>
+            ))}
+          </div>
+        )}
       </div>
       <button
         className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent-red p-1.5 rounded transition-opacity"
@@ -805,7 +1274,7 @@ function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibrary
           if (!disabled) onForget();
         }}
         title="Forget this library"
-        aria-label={`Forget ${basename(record.path)}`}
+        aria-label={`Forget ${displayName(record)}`}
         disabled={disabled}
       >
         <X className="w-4 h-4" />

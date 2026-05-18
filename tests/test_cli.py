@@ -53,31 +53,38 @@ def test_organize_dry_run(synthetic_analysis: dict, tmp_path: Path) -> None:
 
 def test_preflight_quick_mode_skips_distro_probes(monkeypatch) -> None:
     """`vibechek preflight --quick` skips the slow per-distro WSL probe."""
+    from vibechek import preflight as _preflight_module
     from vibechek import wsl
 
-    # Drop a sentinel: detect_wsl(quick=True) returns an empty status fast.
+    # The CLI imports `preflight()` from vibechek.preflight, which in turn
+    # imports `detect_wsl` at module load. Monkeypatch the name in the
+    # preflight module's namespace — that's where the call resolves.
     probe_calls: list[bool] = []
 
     def fake_detect(quick: bool = False) -> wsl.WSLStatus:
         probe_calls.append(quick)
         return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
 
-    monkeypatch.setattr(wsl, "detect_wsl", fake_detect)
-    # The CLI does a `from vibechek.wsl import detect_wsl` inside the command
-    # function, so monkeypatch on the source module is enough — Click invokes
-    # the function fresh each call.
+    monkeypatch.setattr(_preflight_module, "detect_wsl", fake_detect)
 
     runner = CliRunner()
     result = runner.invoke(main, ["preflight", "--quick"])
-    # Exit may be 0 or 1 depending on model state; we care that it ran.
     assert result.exit_code in (0, 1), result.output
     assert "Vibechek preflight" in result.output
     assert any(call is True for call in probe_calls), \
         f"Expected detect_wsl(quick=True) call, got: {probe_calls}"
 
 
-def test_preflight_full_mode_does_distro_probes(monkeypatch) -> None:
-    """`vibechek preflight` (default) does the full probe — quick=False."""
+def test_analyze_directory_uses_full_wsl_probe(monkeypatch, tmp_path) -> None:
+    """Regression: `analyze_directory` must do a non-quick WSL probe.
+
+    Previously, analyze called `preflight()` which used quick=True WSL probe
+    (skips per-distro essentia checks). Result: on Windows with essentia
+    installed inside WSL, analyze would false-fail with "essentia-tensorflow
+    is not installed (native, in WSL, or in the managed venv)" because the
+    quick probe couldn't see the distro contents.
+    """
+    from vibechek import analyzer, preflight as _preflight_module
     from vibechek import wsl
 
     probe_calls: list[bool] = []
@@ -86,7 +93,38 @@ def test_preflight_full_mode_does_distro_probes(monkeypatch) -> None:
         probe_calls.append(quick)
         return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
 
-    monkeypatch.setattr(wsl, "detect_wsl", fake_detect)
+    monkeypatch.setattr(_preflight_module, "detect_wsl", fake_detect)
+
+    # Need a non-empty library; analyzer short-circuits on total==0 before
+    # the preflight check.
+    library = tmp_path / "lib"
+    library.mkdir()
+    (library / "fake.mp3").write_text("not real audio")
+    try:
+        analyzer.analyze_directory(library)
+    except RuntimeError:
+        pass  # expected — preflight will fail because no engine + no models
+    except Exception:
+        pass  # any other failure also fine; we only check the probe call
+
+    assert any(call is False for call in probe_calls), (
+        f"analyze_directory must call detect_wsl(quick=False) so it sees "
+        f"essentia inside WSL distros. Got: {probe_calls}"
+    )
+
+
+def test_preflight_full_mode_does_distro_probes(monkeypatch) -> None:
+    """`vibechek preflight` (default) does the full probe — quick=False."""
+    from vibechek import preflight as _preflight_module
+    from vibechek import wsl
+
+    probe_calls: list[bool] = []
+
+    def fake_detect(quick: bool = False) -> wsl.WSLStatus:
+        probe_calls.append(quick)
+        return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
+
+    monkeypatch.setattr(_preflight_module, "detect_wsl", fake_detect)
 
     runner = CliRunner()
     result = runner.invoke(main, ["preflight"])

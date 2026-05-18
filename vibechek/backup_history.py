@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from vibechek.config import CONFIG_DIR
+from vibechek.io import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +78,9 @@ def load() -> BackupHistory:
 def save(history: BackupHistory) -> None:
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {"records": [asdict(r) for r in history.records]}
-    HISTORY_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Atomic write: a corrupt index hides EVERY past backup from the user
+    # (the backup files themselves are fine, but the UI can't find them).
+    atomic_write_json(HISTORY_FILE, payload, indent=2)
 
 
 # ---------------------------------------------------------------------------

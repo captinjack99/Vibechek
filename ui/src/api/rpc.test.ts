@@ -1,0 +1,130 @@
+/**
+ * Sync-check between the Python METHODS dict and the TS api/rpc wrappers.
+ *
+ * The Python source of truth lives in `vibechek/rpc.py` (METHODS dict, around
+ * line 670). We *could* parse that file via `fs.readFileSync` here, but the UI
+ * tsconfig does not pull `@types/node` and the project's no-new-dependencies
+ * constraint rules out adding it just for one test. So the canonical list is
+ * mirrored here as `PYTHON_METHODS` and any new RPC method needs three edits:
+ *
+ *   1. vibechek/rpc.py             — register the handler in METHODS.
+ *   2. ui/src/api/methods.ts        — append to RPC_METHODS + add a param type.
+ *   3. ui/src/api/rpc.ts            — add the typed wrapper.
+ *   4. THIS FILE                   — add the name to PYTHON_METHODS below.
+ *
+ * If any of those four are out of sync, this test fails and tells you which
+ * direction the drift is in.
+ */
+
+import { describe, expect, it } from "vitest";
+
+import api from "./rpc";
+import * as rpcModule from "./rpc";
+import { RPC_METHODS, isKnownRpcMethod } from "./methods";
+
+/**
+ * Mirror of `vibechek/rpc.py:METHODS` keys. KEEP IN SYNC — see file header.
+ */
+const PYTHON_METHODS = [
+  "ping",
+  "version",
+  "system_info",
+  "engine_gpu_status",
+  "preflight",
+  "wsl_status",
+  "install_wsl",
+  "install_vibechek_in_wsl",
+  "install_cuda_libs_in_wsl",
+  "install_essentia_native",
+  "native_venv_status",
+  "repair_wsl_shim",
+  "scan_directory",
+  "scan_only",
+  "analyze_directory",
+  "find_duplicates",
+  "handle_duplicates",
+  "plan_organization",
+  "organize",
+  "apply_ml_tags",
+  "backup_tags",
+  "restore_tags",
+  "restore_tags_with_remap",
+  "download_models",
+  "get_config",
+  "save_config",
+  "restore_default_config",
+  "cancel_operation",
+  "library_state",
+  "forget_library",
+  "load_recent_analysis",
+  "get_log_tail",
+  "backup_history",
+  "forget_backup",
+] as const;
+
+// snake_case (Python METHODS key) -> camelCase (TS wrapper name).
+// Handles the WSL/CUDA edge cases where we keep the acronyms uppercase
+// after the underscore boundary (installWSL, not installWsl).
+function toCamel(s: string): string {
+  const special: Record<string, string> = {
+    install_wsl: "installWSL",
+    install_vibechek_in_wsl: "installVibechekInWSL",
+    install_cuda_libs_in_wsl: "installCudaLibsInWSL",
+    repair_wsl_shim: "repairWSLShim",
+    wsl_status: "wslStatus",
+  };
+  if (s in special) return special[s];
+  return s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+}
+
+describe("api/rpc.ts foundation", () => {
+  it("imports cleanly and exposes a default namespace", () => {
+    expect(api).toBeTruthy();
+    expect(typeof api).toBe("object");
+    // Spot-check that a few key wrappers are functions.
+    expect(typeof api.analyzeDirectory).toBe("function");
+    expect(typeof api.findDuplicates).toBe("function");
+    expect(typeof api.preflight).toBe("function");
+    expect(typeof api.installWSL).toBe("function");
+  });
+
+  it("RPC_METHODS is the canonical, deduplicated list", () => {
+    expect(RPC_METHODS.length).toBeGreaterThan(0);
+    expect(new Set(RPC_METHODS).size).toBe(RPC_METHODS.length);
+  });
+
+  it("isKnownRpcMethod recognizes registered names and rejects typos", () => {
+    expect(isKnownRpcMethod("analyze_directory")).toBe(true);
+    expect(isKnownRpcMethod("ping")).toBe(true);
+    expect(isKnownRpcMethod("nope_not_a_method")).toBe(false);
+  });
+});
+
+describe("api/rpc <-> vibechek/rpc.py sync", () => {
+  it("every Python METHODS key appears in RPC_METHODS", () => {
+    const tsSet = new Set<string>(RPC_METHODS);
+    const missing = PYTHON_METHODS.filter((n) => !tsSet.has(n));
+    expect(missing, `Python methods missing from RPC_METHODS: ${missing.join(", ")}`).toEqual([]);
+  });
+
+  it("RPC_METHODS contains no entries that don't exist in Python METHODS", () => {
+    const pySet = new Set<string>(PYTHON_METHODS);
+    const stale = RPC_METHODS.filter((n) => !pySet.has(n));
+    expect(stale, `RPC_METHODS contains names not in vibechek/rpc.py: ${stale.join(", ")}`).toEqual([]);
+  });
+
+  it("every Python METHODS key has a corresponding wrapper function", () => {
+    const apiAny = api as unknown as Record<string, unknown>;
+    const moduleAny = rpcModule as unknown as Record<string, unknown>;
+    const missing: string[] = [];
+    for (const name of PYTHON_METHODS) {
+      const camel = toCamel(name);
+      const fromDefault = typeof apiAny[camel] === "function";
+      const fromNamed = typeof moduleAny[camel] === "function";
+      if (!fromDefault || !fromNamed) {
+        missing.push(`${name} -> ${camel}`);
+      }
+    }
+    expect(missing, `Methods missing wrappers in api/rpc.ts: ${missing.join(", ")}`).toEqual([]);
+  });
+});

@@ -6,7 +6,7 @@
 
 ---
 
-## The pitch
+## Why Vibechek?
 
 Every paid library tool makes one of three trade-offs:
 
@@ -14,7 +14,7 @@ Every paid library tool makes one of three trade-offs:
 - **Lexicon DJ** is the deepest library manager, but the good features sit behind a $20/month subscription and require an online account.
 - **Rekordbox** is "free" if you accept Pioneer's account ecosystem, has had a "MOOD: HIGH/MID/LOW" column for years, and *still* won't auto-detect genre — the #1 request on their own forum.
 
-Vibechek does all of that, plus the things they don't bother with — ML genre classification across 400 Discogs subgenres, timeslot tagging (Opener / Warm-Up / Peak / Afterhours), Chromaprint-based acoustic dedup that catches re-encodes and remixes — and runs entirely on your machine with zero accounts, zero telemetry, and zero recurring cost.
+Vibechek does all of that, plus the things they don't bother with — ML genre classification across 400 Discogs subgenres, timeslot tagging (Opener / Warm-Up / Peak / Afterhours), Chromaprint-based acoustic de-duplication that catches re-encodes and remixes, and runs entirely on your machine with no accounts, no telemetry, and zero recurring cost.
 
 ```
 $0 forever  •  no account  •  no upload  •  AGPL-3.0  •  CPU or GPU
@@ -24,29 +24,30 @@ $0 forever  •  no account  •  no upload  •  AGPL-3.0  •  CPU or GPU
 
 ## What Vibechek does that the paid tools don't
 
-| Capability | Vibechek | Mixed In Key | Lexicon | Rekordbox | beaTunes | Tunebat |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| ML genre + subgenre (Discogs-400 taxonomy) | ✅ | — | — | — | — | — |
-| Timeslot tag (Opener / Warm-Up / Peak / Afterhours) | ✅ | — | — | — | — | — |
-| Energy 0-5 + Dark/Neutral/Bright mood | ✅ | Energy only | — | HIGH/MID/LOW | Loudness | "Happiness" |
-| **Acoustic** duplicate detection (Chromaprint) | ✅ | — | filename only | — | filename | — |
-| Bulk auto-organize into Genre/Subgenre folders | ✅ | — | partial | — | — | — |
-| Full tag backup / restore (incl. binary frames) | ✅ | — | $/mo tier | $/mo tier | — | — |
-| Preserves Rekordbox GEOB/PRIV cue frames | ✅ | n/a | sync only | native | unknown | — |
-| Works offline, no account | ✅ | ✅ | account req. | account req. | ✅ | upload req. |
-| Open source | **AGPL-3.0** | — | — | — | — | — |
-| GPU acceleration | ✅ | — | — | — | — | — |
-| Price | **$0** | $58 once | $10-20/mo | $0-30/mo | ~$35 | freemium |
-
 Stacking the two most popular paid tools together (Mixed In Key + Lexicon DJ) still costs ~$58 up front + $10-20/month — and *still* doesn't ML-classify genre, *still* doesn't tag timeslot, *still* doesn't do acoustic dedup. Vibechek does all three, runs locally, and ships it open source.
+| Capability                                          | Vibechek     | Mixed In Key | Lexicon       | Rekordbox    | beaTunes | Tunebat     |
+| --------------------------------------------------- |:------------:|:------------:|:-------------:|:------------:|:--------:|:-----------:|
+| ML genre + subgenre (Discogs-400 taxonomy)          | ✅            | —            | —             | —            | —        | —           |
+| Timeslot tag (Opener / Warm-Up / Peak / Afterhours) | ✅            | —            | —             | —            | —        | —           |
+| Energy 0-5 + Dark/Neutral/Bright mood               | ✅            | Energy only  | —             | HIGH/MID/LOW | Loudness | "Happiness" |
+| **Acoustic** duplicate detection (Chromaprint)      | ✅            | —            | filename only | —            | filename | —           |
+| Bulk auto-organize into Genre/Subgenre folders      | ✅            | —            | partial       | —            | —        | —           |
+| Full tag backup / restore (incl. binary frames)     | ✅            | —            | $/mo tier     | $/mo tier    | —        | —           |
+| Preserves Rekordbox GEOB/PRIV cue frames            | ✅            | n/a          | sync only     | native       | unknown  | —           |
+| Works offline, no account                           | ✅            | ✅            | account req.  | account req. | ✅        | upload req. |
+| Open source                                         | **AGPL-3.0** | —            | —             | —            | —        | —           |
+| GPU acceleration                                    | ✅            | —            | —             | —            | —        | —           |
+| Price                                               | **$0**       | $58 once     | $10-20/mo     | $0-30/mo     | ~$35     | freemium    |
+
+Stacking the two most popular paid tools together (Mixed In Key + Lexicon DJ) still costs ~$58 up front + $10-20/month and *still* doesn't ML-classify genre, *still* doesn't tag timeslot, *still* doesn't do acoustic de-dup. Vibechek does all three, runs locally, and ships it open source.
 
 ---
 
 ## The headline features
 
-### 🧠 ML that knows what your tracks actually are
+### Machine Learning that actually knows your tracks
 
-Vibechek uses the [Discogs-EffNet model](https://essentia.upf.edu/models.html) — trained on the largest electronic-music taxonomy in existence — to classify every track on:
+Vibechek uses the [Discogs-EffNet model](https://essentia.upf.edu/models.html), trained on the largest electronic-music taxonomy in existence, to classify every track on:
 
 - **Genre + subgenre** across ~400 categories
 - **BPM and key** (Camelot wheel notation)
@@ -59,9 +60,9 @@ Vibechek uses the [Discogs-EffNet model](https://essentia.upf.edu/models.html) �
 
 You get a tunable confidence threshold per attribute. Tracks below the bar don't get rewritten.
 
-### 🔍 Dedup that doesn't lie
+### 🔍 De-duplication that doesn't lie
 
-MD5 catches the same MP3 saved twice. **Chromaprint** catches the same song saved as FLAC *and* MP3 *and* `(Original Mix)` *and* `(Extended Mix)` — by listening to the audio itself. Auto-keeper rules pick the best version by codec → bitrate → file size → newest → shortest path, and you can override any choice before anything moves.
+MD5 catches the same MP3 saved twice. **Chromaprint** catches the same song saved as FLAC *and* MP3 *and* `(Original Mix)` *and* `(Extended Mix)` — by listening to the audio itself. Auto-keeper rules pick the best version by codec → bitrate → file size → newest → shortest path (or whatever order you configure), and you can override any choice before anything moves.
 
 ### 🗂️ One-click organize
 
@@ -71,17 +72,17 @@ Plan and execute a clean `Music/Genre/Subgenre/` tree from your analysis. Rare g
 
 One click snapshots every ID3, Vorbis, and MP4 tag — **including the binary GEOB and PRIV frames Rekordbox stores cue points and beat grids in.** Most tag editors silently strip these when they rewrite a file. Vibechek preserves them by default and offers full restore. Your performance data is never at risk.
 
-### 🤖 GPU acceleration that doesn't lie about itself
+### 🤖 Cross-Platrform GPU acceleration
 
-Got an NVIDIA GPU? Vibechek probes the *actual analysis engine* (not just the host) to see if TensorFlow can really use it. If your GPU is hardware-visible but missing CUDA runtime libs (the common WSL case), the UI says so plainly and offers a one-click "Enable GPU" install. No false promises, no silent CPU fallback you don't know about.
+Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to see if TensorFlow can really use it... AND, if your GPU is hardware-visible but missing CUDA runtime libraries, the UI says so plainly and offers a one-click "Enable GPU" install. No false promises, no silent CPU fallback you don't know about. This helps speed up the analysis engine tremendously.
 
 ### 🪟 🍎 🐧 Zero-CLI setup on every platform
 
-Every paid tool we benchmarked makes you set up Python or pip or some random runtime by hand. Vibechek is the only one where the GUI does it for you on **every OS**:
+Every other tool we benchmarked makes you set up Python or pip or some random runtime by hand on some systems. Vibechek is the only one where the GUI does it for you on **every OS**:
 
 - **Windows.** Essentia has no Windows wheel. Vibechek detects that, auto-installs WSL Ubuntu via UAC, creates a venv inside WSL, installs Essentia, and routes analysis through it — paths get translated `C:\Music` ↔ `/mnt/c/Music` under the hood. You click *Install Essentia*; the right thing happens.
 - **macOS & Linux.** Vibechek creates a hermetic Python venv at `~/.vibechek/venv/`, installs `essentia-tensorflow + vibechek` into it, and routes analysis through that venv. Doesn't touch your system Python. Click *Install Essentia* in the Preflight dialog; ~3-5 minutes later it's running.
-- **GPU on any of the above.** If your NVIDIA card is visible but TF can't load the CUDA runtime libs (the typical fresh-WSL case), the Settings panel shows exactly what's missing and offers *Enable GPU (install CUDA libs)* — adds NVIDIA's apt repo and installs the right packages.
+- **GPU on any of the above.** Full GPU support across all OS platforms.
 
 No terminal required. On any platform.
 
@@ -163,13 +164,13 @@ Full deep dive: [ui/README.md](ui/README.md).
 
 ## What's on the roadmap
 
-| Phase | Goal | Status |
-|---|---|---|
-| 1 | Package the proven Python pipeline into `vibechek` | ✅ Done |
-| 2 | Cross-platform installer + signed CI release pipeline | ✅ Done |
-| 3 | Desktop UI, full WSL automation, GPU truth detection | ✅ Done |
-| 4 | Polish, docs, community launch | 🚧 In progress (you're here) |
-| 5+ | Smart playlist rules engine • Mashup recommender • Cue-point auto-generation • MusicBrainz lookup • Mobile companion | 💭 Ideas |
+| Phase | Goal                                                                                                                 | Status                       |
+| ----- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| 1     | Package the proven Python pipeline into `vibechek`                                                                   | ✅ Done                       |
+| 2     | Cross-platform installer + signed CI release pipeline                                                                | ✅ Done                       |
+| 3     | Desktop UI, full WSL automation, GPU truth detection                                                                 | ✅ Done                       |
+| 4     | Polish, docs, community launch                                                                                       | 🚧 In progress (you're here) |
+| 5+    | Smart playlist rules engine • Mashup recommender • Cue-point auto-generation • MusicBrainz lookup • Mobile companion | 💭 Ideas                     |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features competitors have that Vibechek deliberately doesn't (cross-DAW cue sync, cloud library backup, real-time streaming analysis).
 
@@ -177,10 +178,12 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 
 ## Stats
 
-- **192** Python tests pass + 1 skipped (audio fixture)
-- **24** frontend tests across keeperRules, LibraryFilters, ConfirmModal, Sidebar
-- **20** Python modules, ~4,500 LOC of core logic
-- **29** JSON-RPC methods, 5 main views, threadpool dispatch with cancellation singleton
+<!-- STATS_LINE_START -->
+**433 Python tests** · **41 JSON-RPC methods** · **26 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+<!-- STATS_LINE_END -->
+
+- 24 frontend tests across keeperRules, LibraryFilters, ConfirmModal, Sidebar
+- ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 
 ---

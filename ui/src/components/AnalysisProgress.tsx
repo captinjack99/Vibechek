@@ -4,6 +4,15 @@ import { Loader2, StopCircle } from "lucide-react";
 import { useOperationStore } from "../stores";
 import { rpc } from "../hooks/useSidecar";
 
+// Cancelling is best-effort. The sidecar may already have moved past the
+// cancellation point, the RPC pipe may be momentarily dropped, etc. None of
+// those should crash the UI or surface as a scary error toast — the user
+// just wanted to stop, not be told something went wrong.
+function logCancelFailure(e: unknown): void {
+  // eslint-disable-next-line no-console
+  console.warn("cancel_operation RPC failed:", e);
+}
+
 const KIND_LABELS: Record<string, string> = {
   analyze: "Analyzing library",
   dedupe: "Finding duplicates",
@@ -52,7 +61,9 @@ export function AnalysisProgress() {
             </div>
           )}
           <button
-            onClick={() => { void rpc("cancel_operation"); }}
+            onClick={() => {
+              rpc("cancel_operation").catch(logCancelFailure);
+            }}
             className="text-white/40 hover:text-accent-red flex items-center gap-1 text-xs"
             title="Cancel this operation"
           >

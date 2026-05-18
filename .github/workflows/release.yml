@@ -37,6 +37,14 @@ jobs:
             artifact_glob: dist/vibechek-macos-*.tar.gz
             sidecar_name: vibechek-sidecar-aarch64-apple-darwin
             sidecar_source: dist/vibechek/vibechek
+          # Intel Mac is still ~25% of the Mac market. macos-13 is GitHub's
+          # last x86_64 image; without it, Intel Mac users get nothing.
+          - os: macos-13
+            asset_name: vibechek-macos-x64.tar.gz
+            build_cmd: ./packaging/build-macos.sh
+            artifact_glob: dist/vibechek-macos-*.tar.gz
+            sidecar_name: vibechek-sidecar-x86_64-apple-darwin
+            sidecar_source: dist/vibechek/vibechek
           - os: windows-latest
             asset_name: vibechek-windows-x64.zip
             build_cmd: packaging\build-windows.bat
@@ -137,6 +145,30 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: ui
+        # Codesigning + notarization (audit #5). Unsigned macOS .dmg files get
+        # killed by Gatekeeper on first launch with a "can't verify" dialog
+        # that most users misread as malware; unsigned Windows .exe / .msi
+        # triggers Defender SmartScreen. Both are silent failures from the
+        # user's POV ("sidecar died").
+        #
+        # The env vars below are picked up by tauri-action when present. They
+        # need to be configured as GitHub repo secrets first — see
+        # docs/RELEASING.md for the one-time setup walk-through. When secrets
+        # are absent (as in fork CI), the env vars are empty strings and
+        # tauri-action does an UNSIGNED build with a loud warning in the log.
+        env:
+          # macOS — requires APPLE_CERTIFICATE (.p12 base64), password, the
+          # team/signing identity, plus an app-specific password for notarytool.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows — Authenticode cert via SignTool. Tauri also accepts a
+          # WINDOWS_CERTIFICATE base64 + WINDOWS_CERTIFICATE_PASSWORD pair.
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
 
       - name: Collect Tauri bundles
         shell: bash

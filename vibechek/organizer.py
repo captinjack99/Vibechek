@@ -11,6 +11,7 @@ Source: ports of `legacy/organize_by_genre.py` and `legacy/copy_to_genre_folders
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -40,6 +41,13 @@ class PlannedMove:
     genre: str
     subgenre: str
     reason: str  # e.g. "rare genre → Other/", "match by ML genre"
+    # Destination expressed relative to `OrganizePlan.base_dir`. The UI uses
+    # this for folder grouping in the plan preview + result panel so it never
+    # has to do path arithmetic (which was wrong for Windows casing / sep
+    # mismatch / paths outside base_dir — see audit #9). Falls back to the
+    # absolute destination if `os.path.relpath` raises (e.g. destination on a
+    # different Windows drive than base_dir).
+    relative_destination: str = ""
 
 
 @dataclass
@@ -56,6 +64,132 @@ class OrganizeStats:
     planned: int = 0
     moved: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+# Substrings (case-insensitive) that almost always mean the chosen target is
+# inside a cloud-sync virtual filesystem. shutil.move into one of these has
+# unpredictable behavior (placeholder files, sync conflicts, no atomic rename
+# across fs boundaries), so the UI surfaces a warning before letting Execute
+# fire. Kept in sync with rpc._RISKY_PATH_SUBSTRINGS in spirit, but lives here
+# so organizer.py stays self-contained for tests + library use.
+_RISKY_TARGET_SUBSTRINGS: tuple[str, ...] = (
+    "my drive",     # Google Drive File Stream
+    "googledrive",
+    "onedrive",
+    "icloud",
+    "dropbox",
+)
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight validation (cheap, runs before plan_organization)
+# ---------------------------------------------------------------------------
+
+
+def validate_organize_target(
+    target_root: str | Path | None,
+    *,
+    source_library: str | Path | None = None,
+) -> dict[str, Any]:
+    """Check that `target_root` is safe to write into. Pure read-only inspect
+    plus a single tempfile probe.
+
+    Returns a dict with keys:
+      - `ok` (bool): True if the path is usable. False blocks the UI.
+      - `error` (str | None): user-facing reason `ok` is False.
+      - `warnings` (list[str]): non-blocking concerns (cloud-sync paths etc.).
+      - `resolved` (str | None): the absolute path we actually probed.
+
+    The UI calls this on blur / before Preview. The sidecar can also call it
+    inside `_plan_organization` to fail-fast before any planning work. Cheap
+    enough (one mkdir + touch + unlink) to run synchronously on input change.
+    """
+    result: dict[str, Any] = {
+        "ok": True,
+        "error": None,
+        "warnings": [],
+        "resolved": None,
+    }
+
+    # An empty / None target_root means "default — same parent as analyzed
+    # tracks". That's fine; planning resolves it later.
+    if target_root is None or (isinstance(target_root, str) and not target_root.strip()):
+        return result
+
+    raw = str(target_root).strip()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        result["ok"] = False
+        result["error"] = (
+            f"Target root must be an absolute path. Got: {raw!r}. "
+            "Type the full path (e.g. C:\\Music\\sorted on Windows, "
+            "/Users/you/Music/sorted on macOS) or click the folder picker."
+        )
+        return result
+
+    resolved = candidate.resolve()
+    result["resolved"] = str(resolved)
+
+    if source_library is not None:
+        try:
+            src = Path(source_library).resolve()
+        except OSError:
+            src = None
+        if src is not None and src == resolved:
+            result["ok"] = False
+            result["error"] = (
+                "Target root is the same folder as the source library. "
+                "Pick a different folder (or leave the field blank to use "
+                "the default)."
+            )
+            return result
+
+    # Writability probe: ensure we can mkdir + create a file. Don't actually
+    # require the folder to pre-exist — many users will type a new path.
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+        probe = resolved / ".vibechek_write_probe"
+        probe.touch()
+        probe.unlink()
+    except OSError as e:
+        result["ok"] = False
+        result["error"] = (
+            f"Target root is not writable: {e}. Pick a folder you have "
+            "permission to write to."
+        )
+        return result
+
+    # Warn — don't block — if the path is inside a cloud-sync virtual FS.
+    # Some users intentionally organize into Google Drive; we just want them
+    # to know what they're signing up for (slow moves, possible conflicts).
+    norm_lower = str(resolved).replace("\\", "/").lower()
+    for needle in _RISKY_TARGET_SUBSTRINGS:
+        if needle in norm_lower:
+            result["warnings"].append(
+                f"Target root is inside a cloud-sync folder ('{needle}'). "
+                "Moves may be slow and may conflict with online sync. "
+                "Consider organizing to a local folder first, then syncing."
+            )
+            break
+
+    return result
+
+
+def ml_genre_coverage(analysis_data: dict[str, Any]) -> dict[str, int]:
+    """Count tracks with usable `ml_genre` data.
+
+    Returned dict: {`total`, `with_ml_genre`}. The UI uses this to warn the
+    user before they organize a scan-only library (everything would route to
+    Unknown/).
+    """
+    tracks = analysis_data.get("tracks", [])
+    total = len(tracks)
+    with_ml_genre = 0
+    for track in tracks:
+        ml = track.get("ml_analysis") or {}
+        if ml.get("ml_genre"):
+            with_ml_genre += 1
+    return {"total": total, "with_ml_genre": with_ml_genre}
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +266,21 @@ def plan_organization(
         if dest.exists() and source != dest:
             dest = _unique_destination(dest)
 
+        # Compute the relative destination once, here, so the UI never has to.
+        # On Windows, destinations on a different drive than base_dir raise
+        # ValueError from os.path.relpath — fall back to the absolute path.
+        try:
+            rel_dest = os.path.relpath(str(dest), str(base_dir))
+        except ValueError:
+            rel_dest = str(dest)
+
         plan.moves.append(PlannedMove(
             source=source,
             destination=dest,
             genre=genre,
             subgenre=subgenre,
             reason=reason,
+            relative_destination=rel_dest,
         ))
 
     return plan
@@ -162,7 +305,15 @@ def organize_from_analysis(
     if dry_run:
         return stats
 
+    # Import here so we don't make cancellation a hard dep of organizer when
+    # someone uses it as a library outside the sidecar.
+    from vibechek import cancellation
+
     for i, move in enumerate(plan.moves):
+        # Check before each move — user clicking Cancel mid-organize must
+        # actually stop, not just stop SHOWING progress. Audit found that
+        # without this, ~12k file moves would continue after cancel.
+        cancellation.check()
         report_progress(on_progress, i + 1, len(plan.moves), move.source.name)
         try:
             move.destination.parent.mkdir(parents=True, exist_ok=True)
@@ -269,4 +420,6 @@ __all__ = [
     "plan_organization",
     "organize_from_analysis",
     "route_new_tracks",
+    "validate_organize_target",
+    "ml_genre_coverage",
 ]
