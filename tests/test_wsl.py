@@ -603,6 +603,27 @@ def test_cuda_libs_translation_to_apt_packages() -> None:
     assert any("libcublas" in p for p in packages)
 
 
+def test_cuda_lib_map_prefers_meta_package() -> None:
+    """All CUDA toolkit libs should try `cuda-libraries-11-8` first.
+
+    Per-lib packages like `libcufft-11-8` aren't reachable on some
+    Ubuntu/keyring combinations (a real user hit `E: Unable to locate
+    package libcufft-11-8`). The NVIDIA meta-package pulls in everything
+    in one shot and is always present in the cuda-keyring repo.
+    """
+    from vibechek.wsl import _CUDA_APT_PACKAGES_BY_LIB
+
+    toolkit_libs = [
+        "libcublas.so.11", "libcublasLt.so.11",
+        "libcufft.so.10", "libcurand.so.10",
+        "libcusolver.so.11", "libcusparse.so.11",
+    ]
+    for lib in toolkit_libs:
+        fallbacks = _CUDA_APT_PACKAGES_BY_LIB[lib]
+        assert fallbacks[0] == "cuda-libraries-11-8", \
+            f"{lib} should try cuda-libraries-11-8 first; got {fallbacks}"
+
+
 def test_install_cuda_libs_in_wsl_no_packages_for_unknown_libs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
