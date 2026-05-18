@@ -1,0 +1,504 @@
+"""Native Essentia install for Linux & macOS.
+
+On Linux and macOS, Essentia *does* have a PyPI wheel (`essentia-tensorflow`),
+but the desktop app's sidecar runs as a PyInstaller bundle — there's no pip
+inside that bundle. So we mirror the Windows-via-WSL approach: create a
+managed venv at `~/.vibechek/venv/`, install `essentia-tensorflow + vibechek`
+into it, and route the analyze step through *that* venv's `vibechek` binary.
+
+This module is the Linux/macOS analog of `vibechek.wsl` — same idea, no WSL.
+
+The flow:
+  1. `probe_native_venv()`  — does ~/.vibechek/venv/ exist + have essentia?
+  2. `install_essentia_native(on_progress)` — create venv + pip install.
+     Streams pip output line-by-line as progress notifications.
+  3. `run_vibechek_in_native_venv(args)` — analog to run_vibechek_in_wsl.
+
+Why a separate venv instead of `pip install --user`?
+- User-site installs leak into whatever Python the user happens to have, can
+  conflict with system packages, and break when they upgrade Python.
+- A managed venv at a known path is hermetic and easy to delete cleanly.
+- Mirrors the WSL flow so the analyze routing code stays simple.
+
+Skip on Windows entirely: Windows doesn't have a working essentia wheel,
+which is the whole reason we route through WSL there.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading as _threading
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable
+
+log = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[int, int, str], None]
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+# Skip the whole module on Windows — WSL is the path there.
+IS_SUPPORTED = IS_MAC or IS_LINUX
+
+# Where the managed venv lives. Keeping it under the user's home (not
+# user_data_dir) makes it visible in `ls ~/.vibechek/` and matches the WSL
+# install layout.
+VENV_DIR = Path.home() / ".vibechek" / "venv"
+
+
+@dataclass
+class NativeVenvStatus:
+    """What we know about the managed venv on this machine."""
+
+    supported: bool                    # False on Windows
+    venv_dir: str                      # ~/.vibechek/venv as a string
+    venv_python: str | None = None     # Absolute path to python in the venv
+    venv_vibechek: str | None = None   # Absolute path to vibechek CLI in venv
+    essentia_installed: bool = False
+    essentia_version: str | None = None
+    vibechek_installed: bool = False
+    vibechek_version: str | None = None
+    error: str | None = None
+
+
+def to_dict(s: NativeVenvStatus) -> dict:
+    return asdict(s)
+
+
+# ---------------------------------------------------------------------------
+# Probe — does the venv exist and what's in it?
+# ---------------------------------------------------------------------------
+
+
+def probe_native_venv() -> NativeVenvStatus:
+    """Snapshot the managed venv state.
+
+    Fast: no subprocess calls, just disk inspection. The result is what the
+    Settings UI shows in the "Engine" row on Linux/macOS.
+    """
+    status = NativeVenvStatus(
+        supported=IS_SUPPORTED,
+        venv_dir=str(VENV_DIR),
+    )
+
+    if not IS_SUPPORTED:
+        return status
+
+    # Find the venv python (bin/python on Unix, Scripts/python.exe on Windows
+    # — even though we don't support Windows here, leave the path lookup
+    # symmetric for tests and future-proofing).
+    candidate_pythons = [
+        VENV_DIR / "bin" / "python3",
+        VENV_DIR / "bin" / "python",
+        VENV_DIR / "Scripts" / "python.exe",
+    ]
+    py = next((p for p in candidate_pythons if p.exists()), None)
+    if py is None:
+        return status
+    status.venv_python = str(py)
+
+    # vibechek CLI binary inside the venv
+    candidate_clis = [
+        VENV_DIR / "bin" / "vibechek",
+        VENV_DIR / "Scripts" / "vibechek.exe",
+    ]
+    cli = next((p for p in candidate_clis if p.exists()), None)
+    if cli is not None:
+        status.venv_vibechek = str(cli)
+        status.vibechek_installed = True
+        # Best-effort version probe — small subprocess, ~50ms
+        try:
+            result = subprocess.run(
+                [str(cli), "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                m = re.search(r"version\s+(\S+)", result.stdout)
+                if m:
+                    status.vibechek_version = m.group(1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    # Disk-only check for essentia (avoids the ~10s TF load that
+    # `import essentia` would trigger).
+    site_packages_globs = [
+        VENV_DIR / "lib" / "python3.*" / "site-packages",
+        VENV_DIR / "Lib" / "site-packages",  # Windows venv layout
+    ]
+    for pattern in site_packages_globs:
+        for sp in pattern.parent.glob(pattern.name):
+            # `essentia-tensorflow` installs both `essentia/` and a dist-info
+            for d in sp.glob("essentia*.dist-info"):
+                status.essentia_installed = True
+                # Parse version from dir name: "essentia_tensorflow-2.1b6.dev1110.dist-info"
+                m = re.match(r"essentia[_-][^-]+-([^-]+)\.dist-info$", d.name)
+                if m:
+                    status.essentia_version = m.group(1)
+                break
+            if status.essentia_installed:
+                break
+        if status.essentia_installed:
+            break
+
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+
+
+def _find_host_python() -> str | None:
+    """Locate a Python 3.10+ interpreter on the host to bootstrap the venv with.
+
+    We don't trust `sys.executable` because the desktop app's sidecar is a
+    PyInstaller bundle — `sys.executable` would point at the frozen binary,
+    not a real python. Instead, look for system python in order of preference.
+    """
+    # Common names — pick the highest version we can find
+    candidates = ["python3.13", "python3.12", "python3.11", "python3.10", "python3", "python"]
+    for name in candidates:
+        path = shutil.which(name)
+        if not path:
+            continue
+        # Sanity check: is it 3.10+? Run --version and parse.
+        try:
+            result = subprocess.run(
+                [path, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            m = re.search(r"Python (\d+)\.(\d+)", result.stdout + result.stderr)
+            if m:
+                major, minor = int(m.group(1)), int(m.group(2))
+                if major == 3 and minor >= 10:
+                    return path
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+def install_essentia_native(
+    on_progress: ProgressCallback | None = None,
+    *,
+    vibechek_source: str | None = None,
+) -> dict:
+    """Create the managed venv and install essentia-tensorflow + vibechek.
+
+    Streams pip output line-by-line. Returns a dict the GUI can render.
+
+    `vibechek_source` defaults to the GitHub master branch — same as the WSL
+    install path. Override for local testing (e.g. an editable install
+    against the dev checkout).
+    """
+    if not IS_SUPPORTED:
+        return {"ok": False, "error": f"Native install not supported on {sys.platform}"}
+
+    host_python = _find_host_python()
+    if not host_python:
+        return {
+            "ok": False,
+            "error": (
+                "No Python 3.10+ found on PATH. Install Python 3.10 or newer "
+                "(e.g. `brew install python@3.12` on macOS, "
+                "`sudo apt install python3` on Debian/Ubuntu) and try again."
+            ),
+        }
+
+    if on_progress:
+        on_progress(0, 100, f"Using host Python: {host_python}")
+
+    VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- Step 1: create venv (or skip if it exists) ----
+    if not (VENV_DIR / "bin" / "python3").exists() and not (VENV_DIR / "bin" / "python").exists():
+        if on_progress:
+            on_progress(5, 100, f"Creating venv at {VENV_DIR}...")
+        try:
+            result = subprocess.run(
+                [host_python, "-m", "venv", str(VENV_DIR)],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"ok": False, "error": f"venv creation failed: {e}"}
+        if result.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"venv creation exited with {result.returncode}\n{result.stderr[-1000:]}",
+            }
+    elif on_progress:
+        on_progress(10, 100, f"Venv already exists at {VENV_DIR}, reusing")
+
+    venv_python = next(
+        p for p in [VENV_DIR / "bin" / "python3", VENV_DIR / "bin" / "python"]
+        if p.exists()
+    )
+    venv_pip = [str(venv_python), "-m", "pip"]
+
+    # ---- Step 2: upgrade pip + wheel ----
+    if on_progress:
+        on_progress(15, 100, "Upgrading pip + wheel...")
+    rc, tail = _run_with_progress(
+        [*venv_pip, "install", "--upgrade", "--quiet", "pip", "wheel"],
+        on_progress=lambda line: on_progress and on_progress(15, 100, line[:120]),
+        timeout=120,
+    )
+    if rc != 0:
+        return _fail("pip/wheel upgrade", rc, tail)
+
+    # ---- Step 3: essentia-tensorflow (the slow ~3-5 min step) ----
+    if on_progress:
+        on_progress(25, 100, "Installing essentia-tensorflow (this is the slow step, ~3-5 min)...")
+    rc, tail = _run_with_progress(
+        [*venv_pip, "install", "essentia-tensorflow"],
+        on_progress=lambda line: on_progress and on_progress(
+            _parse_pip_pct(line, base=25, span=55), 100, line[:120],
+        ),
+        timeout=60 * 15,  # 15 min ceiling — usually ~3-5 min on a decent connection
+    )
+    if rc != 0:
+        return _fail("essentia-tensorflow install", rc, tail)
+
+    # ---- Step 4: vibechek itself ----
+    if on_progress:
+        on_progress(85, 100, "Installing vibechek...")
+    source = vibechek_source or "git+https://github.com/papapew/Vibechek.git"
+    rc, tail = _run_with_progress(
+        [*venv_pip, "install", "--upgrade", source],
+        on_progress=lambda line: on_progress and on_progress(90, 100, line[:120]),
+        timeout=60 * 10,
+    )
+    if rc != 0:
+        return _fail("vibechek install", rc, tail)
+
+    # ---- Step 5: verify ----
+    if on_progress:
+        on_progress(95, 100, "Verifying install...")
+    venv_vibechek = VENV_DIR / "bin" / "vibechek"
+    try:
+        version_result = subprocess.run(
+            [str(venv_vibechek), "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        essentia_result = subprocess.run(
+            [str(venv_python), "-c", "import essentia; print(essentia.__version__)"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"ok": False, "error": f"verification failed: {e}"}
+
+    if version_result.returncode != 0 or essentia_result.returncode != 0:
+        return {
+            "ok": False,
+            "error": (
+                f"Install completed but verification failed.\n"
+                f"vibechek --version → rc={version_result.returncode}: {version_result.stderr[:300]}\n"
+                f"import essentia → rc={essentia_result.returncode}: {essentia_result.stderr[:300]}"
+            ),
+        }
+
+    if on_progress:
+        on_progress(100, 100, "Install complete")
+
+    return {
+        "ok": True,
+        "venv_dir": str(VENV_DIR),
+        "venv_python": str(venv_python),
+        "venv_vibechek": str(venv_vibechek),
+        "vibechek_version": version_result.stdout.strip(),
+        "essentia_version": essentia_result.stdout.strip(),
+    }
+
+
+def _fail(stage: str, rc: int, tail: list[str]) -> dict:
+    """Build a structured failure dict with the last-N lines of output."""
+    last = "\n".join(tail[-15:])
+    return {
+        "ok": False,
+        "error": f"{stage} exited with {rc}.\n\nLast output:\n{last}",
+        "tail": "\n".join(tail[-60:]),
+    }
+
+
+_PIP_DOWNLOAD_RE = re.compile(r"^\s*Downloading\s+(\S+)")
+_PIP_INSTALLING_RE = re.compile(r"^Installing collected packages:")
+
+
+def _parse_pip_pct(line: str, base: int, span: int) -> int:
+    """Best-effort progress estimate from pip stdout lines.
+
+    pip doesn't emit percentages; we use markers ("Downloading X", "Installing
+    collected packages") as rough waypoints inside [base, base+span].
+    """
+    if _PIP_DOWNLOAD_RE.match(line):
+        return base + span // 3
+    if _PIP_INSTALLING_RE.match(line):
+        return base + (span * 2) // 3
+    if line.startswith("Successfully installed"):
+        return base + span
+    return base
+
+
+def _run_with_progress(
+    args: list[str],
+    on_progress: Callable[[str], None],
+    timeout: int,
+) -> tuple[int, list[str]]:
+    """Run `args`, stream stdout (+stderr merged) to `on_progress` line-by-line.
+
+    Returns (returncode, last-N-lines). On timeout, kills the process and
+    returns -1 plus whatever we collected.
+    """
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as e:
+        return -1, [f"Could not invoke: {e}"]
+
+    tail: list[str] = []
+    assert proc.stdout
+
+    # Use a thread to drain stdout so .wait(timeout=) actually enforces the limit
+    def _drain() -> None:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            stripped = line.rstrip()
+            tail.append(stripped)
+            if len(tail) > 400:
+                tail.pop(0)
+            try:
+                on_progress(stripped)
+            except Exception:  # noqa: BLE001
+                pass
+
+    drainer = _threading.Thread(target=_drain, daemon=True)
+    drainer.start()
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return -1, tail + [f"Killed after {timeout}s timeout"]
+    drainer.join(timeout=5)
+    return rc, tail
+
+
+# ---------------------------------------------------------------------------
+# Routing — run vibechek inside the managed venv
+# ---------------------------------------------------------------------------
+
+
+def run_vibechek_in_native_venv(
+    args: list[str],
+    on_stderr_line: Callable[[str], None] | None = None,
+    timeout: int | None = None,
+) -> subprocess.CompletedProcess:
+    """Run `~/.vibechek/venv/bin/vibechek <args>` and return the completed process.
+
+    The Linux/macOS analog of `run_vibechek_in_wsl`. Same cooperative
+    cancellation pattern: a watchdog thread polls
+    `vibechek.cancellation.is_cancelled()` and terminates the child if a
+    cancel comes in.
+    """
+    from vibechek import cancellation
+
+    status = probe_native_venv()
+    if not status.vibechek_installed or not status.venv_vibechek:
+        raise FileNotFoundError(
+            f"vibechek is not installed in the managed venv at {VENV_DIR}. "
+            "Run install_essentia_native() first."
+        )
+
+    cmd = [status.venv_vibechek, *args]
+    log.info("Native venv exec: %s", cmd)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    cancel_event = _threading.Event()
+
+    def _watch_cancel() -> None:
+        while not cancel_event.is_set() and proc.poll() is None:
+            if cancellation.is_cancelled():
+                log.info("Native venv cancellation requested — terminating PID %s", proc.pid)
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                return
+            cancel_event.wait(0.5)
+
+    watchdog = _threading.Thread(target=_watch_cancel, daemon=True)
+    watchdog.start()
+
+    stdout_chunks: list[str] = []
+
+    if on_stderr_line and proc.stderr is not None:
+        def _reader() -> None:
+            for line in proc.stderr:  # type: ignore[union-attr]
+                on_stderr_line(line.rstrip())
+
+        t = _threading.Thread(target=_reader, daemon=True)
+        t.start()
+
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            stdout_chunks.append(line)
+
+    rc = proc.wait(timeout=timeout)
+    cancel_event.set()
+
+    if cancellation.is_cancelled():
+        raise cancellation.CancelledError("Native venv analyze cancelled by user")
+
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=rc,
+        stdout="".join(stdout_chunks),
+        stderr="",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Suppress an unused-import warning at module level
+# ---------------------------------------------------------------------------
+
+_ = os  # imported for future use (env tweaks)
+
+__all__ = [
+    "IS_SUPPORTED",
+    "VENV_DIR",
+    "NativeVenvStatus",
+    "to_dict",
+    "probe_native_venv",
+    "install_essentia_native",
+    "run_vibechek_in_native_venv",
+]

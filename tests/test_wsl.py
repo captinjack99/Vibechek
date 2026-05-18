@@ -616,3 +616,114 @@ def test_install_cuda_libs_in_wsl_no_packages_for_unknown_libs(
     result = install_cuda_libs_in_wsl("Ubuntu", ["libimaginary.so.99"])
     assert result["ok"] is False
     assert "libimaginary.so.99" in result["error"]
+
+
+def test_libcudnn_has_fallback_packages() -> None:
+    """libcudnn8 should have fallbacks because it's not in NVIDIA's CUDA repo.
+
+    The user's bug: CUDA install exits 100 because libcudnn8 isn't in the
+    cuda-keyring repo. We now try nvidia-cudnn (Ubuntu multiverse) as a
+    fallback.
+    """
+    from vibechek.wsl import _CUDA_APT_PACKAGES_BY_LIB
+    cudnn_packages = _CUDA_APT_PACKAGES_BY_LIB["libcudnn.so.8"]
+    assert len(cudnn_packages) >= 2, \
+        f"libcudnn.so.8 needs fallback packages (NVIDIA CUDA repo doesn't ship it). Got: {cudnn_packages}"
+    assert "libcudnn8" in cudnn_packages
+    assert "nvidia-cudnn" in cudnn_packages
+
+
+def test_build_try_chain_produces_valid_bash() -> None:
+    """The bash try-chain generator emits something we can sanity-check."""
+    from vibechek.wsl import _build_try_chain
+
+    chain, packages = _build_try_chain(
+        ["libcudnn.so.8", "libcublas.so.11"]
+    )
+    # Each lib should produce an apt-get install line per fallback
+    assert "apt-get install" in chain
+    assert "libcudnn8" in chain
+    assert "nvidia-cudnn" in chain  # fallback
+    assert "libcublas-11-8" in chain
+    # The bash variables we use for tracking installed vs failed
+    assert "INSTALLED_THIS" in chain
+    assert "FAILED_LIBS" in chain
+    # All packages we'd attempt
+    assert "libcudnn8" in packages
+    assert "libcublas-11-8" in packages
+
+
+def test_build_try_chain_handles_unknown_libs_gracefully() -> None:
+    """Unknown libs get a WARN line, not an exception."""
+    from vibechek.wsl import _build_try_chain
+
+    chain, packages = _build_try_chain(["libnotreal.so.999", "libcublas.so.11"])
+    assert "WARN" in chain
+    assert "libnotreal.so.999" in chain
+    # Known libs still produce install commands
+    assert "libcublas-11-8" in chain
+    # Unknown lib's "package" isn't in the set
+    assert not any("libnotreal" in p for p in packages)
+
+
+# ---------------------------------------------------------------------------
+# Native (Linux/macOS) install module
+# ---------------------------------------------------------------------------
+
+
+def test_native_venv_probe_reports_supported_on_unix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """probe_native_venv reports supported=True on Linux/macOS, False on Windows."""
+    from vibechek import native_install
+
+    # Force the supported flag for the test
+    monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
+    status = native_install.probe_native_venv()
+    assert status.supported is True
+    assert status.venv_dir.endswith(".vibechek/venv") or status.venv_dir.endswith(".vibechek\\venv")
+    # On a clean test sandbox, neither vibechek nor essentia is installed
+    assert status.vibechek_installed is False
+    assert status.essentia_installed is False
+
+
+def test_native_venv_probe_returns_supported_false_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibechek import native_install
+
+    monkeypatch.setattr(native_install, "IS_SUPPORTED", False)
+    status = native_install.probe_native_venv()
+    assert status.supported is False
+    assert status.essentia_installed is False
+    assert status.vibechek_installed is False
+
+
+def test_install_essentia_native_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """install_essentia_native returns a clean error on unsupported platforms."""
+    from vibechek import native_install
+
+    monkeypatch.setattr(native_install, "IS_SUPPORTED", False)
+    result = native_install.install_essentia_native()
+    assert result["ok"] is False
+    assert "not supported" in result["error"].lower()
+
+
+def test_native_venv_status_to_dict_is_jsonable() -> None:
+    """The wire form round-trips through json so the GUI can read it."""
+    import json
+    from vibechek.native_install import NativeVenvStatus, to_dict
+
+    status = NativeVenvStatus(
+        supported=True,
+        venv_dir="/home/user/.vibechek/venv",
+        venv_python="/home/user/.vibechek/venv/bin/python",
+        venv_vibechek="/home/user/.vibechek/venv/bin/vibechek",
+        essentia_installed=True,
+        essentia_version="2.1b6.dev1110",
+        vibechek_installed=True,
+        vibechek_version="0.3.0-beta.1",
+    )
+    d = to_dict(status)
+    s = json.dumps(d)
+    rt = json.loads(s)
+    assert rt["essentia_installed"] is True
+    assert rt["vibechek_version"] == "0.3.0-beta.1"

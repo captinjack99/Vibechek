@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vibechek"
-version = "0.1.0-dev"
+version = "0.3.0b2"
 description = "ML-powered DJ library organizer — analyze, tag, and organize music collections"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -52,8 +52,9 @@ dev = [
 vibechek = "vibechek.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/vibechek"
-Issues = "https://github.com/yourusername/vibechek/issues"
+Homepage = "https://github.com/papapew/Vibechek"
+Issues = "https://github.com/papapew/Vibechek/issues"
+Documentation = "https://github.com/papapew/Vibechek/tree/main/docs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vibechek"]

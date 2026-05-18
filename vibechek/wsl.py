@@ -541,9 +541,89 @@ def probe_engine_gpu(distro: str | None, *, force: bool = False) -> EngineGpuInf
 
 
 def _probe_native_engine_gpu() -> EngineGpuInfo:
-    """Native probe: use the same engine vibechek.resources uses."""
-    # Reuse resources.detect() since it already does the TF-aware enumeration
-    # when essentia is installed locally.
+    """Native probe: ask `~/.vibechek/venv` if it has essentia + GPU.
+
+    On Linux/macOS the analyze engine is the managed venv (not the sidecar's
+    own Python, which is the PyInstaller bundle without essentia). So we
+    run the same layered TF probe we use for WSL — just without the wsl.exe
+    wrapper. If the managed venv isn't installed yet, we fall back to the
+    host-only view from `resources.detect()`.
+
+    Skipped on Windows entirely: Windows uses the WSL probe path.
+    """
+    if IS_WINDOWS:
+        # On Windows, the "native" engine is essentia in the sidecar's Python,
+        # which never has it. Just use host hardware view.
+        return _probe_host_only_native_gpu()
+
+    from vibechek.native_install import probe_native_venv  # noqa: PLC0415
+    nv = probe_native_venv()
+    if not nv.supported or not nv.essentia_installed or not nv.venv_python:
+        # Managed venv not set up → fall back to host hardware probe.
+        return _probe_host_only_native_gpu()
+
+    info = EngineGpuInfo(engine="native")
+
+    # Same layered probe as WSL, but run directly via the venv python — no
+    # bash -s wrapper, no wsl.exe.
+    script = _ENGINE_GPU_PROBE_PY
+    try:
+        result = subprocess.run(
+            [nv.venv_python, "-c", script],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        info.error = "engine GPU probe timed out after 60s"
+        return info
+    except OSError as e:
+        info.error = f"engine GPU probe failed: {e}"
+        return info
+
+    # Parse the JSON line. The probe script prints one JSON object on stdout.
+    stdout = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else result.stdout
+    try:
+        tf_out = json.loads(stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as e:
+        info.error = f"could not parse engine GPU probe output: {e}; stdout={stdout[:200]}"
+        return info
+
+    info.ok = bool(tf_out.get("ok"))
+    info.tf_version = tf_out.get("tf_version")
+    info.tf_built_with_cuda = tf_out.get("tf_built_with_cuda")
+    info.gpu_hardware_visible = bool(tf_out.get("gpu_hardware_visible"))
+    info.missing_cuda_libs = list(tf_out.get("missing_cuda_libs") or [])
+    for d in tf_out.get("devices", []):
+        info.devices.append(EngineGpuDevice(
+            name=d.get("device_name") or d.get("name", "?"),
+            backend="cuda",
+            compute_capability=d.get("compute_capability"),
+        ))
+    info.gpu_count = int(tf_out.get("gpu_count") or len(info.devices))
+    info.gpu_available = info.gpu_count > 0
+
+    # nvidia-smi truth (separate from TF probe — works on Linux/macOS too)
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        try:
+            r = subprocess.run(
+                [smi, "--query-gpu=driver_version", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                info.nvidia_driver = r.stdout.strip().splitlines()[0].strip()
+                info.nvidia_smi_available = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    if not info.ok and not info.error:
+        info.error = tf_out.get("error", "engine GPU probe returned ok=false")
+    return info
+
+
+def _probe_host_only_native_gpu() -> EngineGpuInfo:
+    """Host-only fallback when the managed venv isn't usable yet."""
     try:
         from vibechek.resources import detect  # noqa: PLC0415
         res = detect()
@@ -551,11 +631,7 @@ def _probe_native_engine_gpu() -> EngineGpuInfo:
         return EngineGpuInfo(engine="native", ok=False, error=f"{type(e).__name__}: {e}")
 
     devices = [
-        EngineGpuDevice(
-            name=g.name,
-            backend=g.backend,
-            memory_mb=g.memory_mb,
-        )
+        EngineGpuDevice(name=g.name, backend=g.backend, memory_mb=g.memory_mb)
         for g in res.gpu_devices
     ]
     return EngineGpuInfo(
@@ -564,6 +640,7 @@ def _probe_native_engine_gpu() -> EngineGpuInfo:
         gpu_available=res.gpu_available,
         gpu_count=len(devices),
         devices=devices,
+        gpu_hardware_visible=res.gpu_available,
         nvidia_driver=res.cuda_runtime,
         nvidia_smi_available=res.cuda_runtime is not None,
     )
@@ -958,23 +1035,34 @@ def install_vibechek_in_wsl(
 # ---------------------------------------------------------------------------
 
 
-# Maps essentia's bundled TF 2.5 dlopen targets → Ubuntu 22.04/24.04 apt
-# package names. We install the runtime-only variants (not the dev headers)
-# to keep download size down (~600 MB instead of ~2 GB for the full toolkit).
+# Maps essentia's bundled TF 2.5 dlopen targets → Ubuntu apt package names.
+# Each value is a list of *fallback* package names — we try them in order until
+# one installs. This handles the fact that the same lib lives in different
+# packages on different Ubuntu/CUDA-repo versions.
+#
+# Notes:
+# - libcublas / libcufft / libcusparse: in NVIDIA's cuda-keyring repo as
+#   `<lib>-11-8` (CUDA 11.8 runtime). Reliably available on Ubuntu 22.04/24.04.
+# - libcudnn8 is NOT in the cuda-keyring repo — cuDNN has a separate
+#   distribution. We try `libcudnn8` (works if cuDNN repo is configured),
+#   `nvidia-cudnn` (Ubuntu multiverse), then fall back to a clear error
+#   pointing the user at the manual install.
 _CUDA_APT_PACKAGES_BY_LIB = {
     "libcublas.so.11":   ["libcublas-11-8"],
-    "libcublasLt.so.11": ["libcublas-11-8"],  # ships with libcublas
+    "libcublasLt.so.11": ["libcublas-11-8"],   # ships with libcublas
     "libcufft.so.10":    ["libcufft-11-8"],
     "libcurand.so.10":   ["libcurand-11-8"],
     "libcusolver.so.11": ["libcusolver-11-8"],
     "libcusparse.so.11": ["libcusparse-11-8"],
-    "libcudnn.so.8":     ["libcudnn8"],
+    "libcudnn.so.8":     ["libcudnn8", "nvidia-cudnn"],
 }
 
 # The CUDA repo isn't enabled by default on most WSL Ubuntu installs. We add
-# NVIDIA's keyring + repo before apt-get, then install the requested libs.
+# NVIDIA's keyring + repo, then try each requested package in turn. A failure
+# on one doesn't abort the rest — we collect what worked vs. what didn't so
+# the UI can show progress even on partial success.
 _CUDA_LIBS_BOOTSTRAP = r"""
-set -e
+set +e  # don't bail on individual package failures
 export DEBIAN_FRONTEND=noninteractive
 
 # Find Ubuntu version for the right NVIDIA repo URL.
@@ -988,24 +1076,89 @@ case "$UBUNTU_VER" in
         ;;
 esac
 
-echo "[1/3] Adding NVIDIA CUDA repository for Ubuntu $VERSION_ID..."
+echo "[1/4] Adding NVIDIA CUDA repository for Ubuntu $VERSION_ID..."
 KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${UBUNTU_VER}/x86_64/cuda-keyring_1.1-1_all.deb"
 TMPDEB="$(mktemp --suffix=.deb)"
-if ! curl -fsSL "$KEYRING_URL" -o "$TMPDEB"; then
-    echo "Failed to download CUDA keyring from $KEYRING_URL"
+if ! curl -fsSL "$KEYRING_URL" -o "$TMPDEB" 2>&1; then
+    echo "ERROR: Failed to download CUDA keyring from $KEYRING_URL"
+    echo "ERROR: Your WSL distro may not have internet access right now."
     exit 3
 fi
-dpkg -i "$TMPDEB"
+if ! dpkg -i "$TMPDEB" 2>&1; then
+    echo "ERROR: Failed to install CUDA keyring deb."
+    exit 4
+fi
 rm -f "$TMPDEB"
 
-echo "[2/3] Updating apt..."
-apt-get update -y -q
+echo "[2/4] Enabling Ubuntu multiverse (for nvidia-cudnn fallback)..."
+# add-apt-repository may not be installed — install it lazily if needed.
+if ! command -v add-apt-repository >/dev/null 2>&1; then
+    apt-get install -y -q --no-install-recommends software-properties-common 2>&1 | tail -3
+fi
+add-apt-repository -y multiverse 2>&1 | tail -3 || true
 
-echo "[3/3] Installing requested CUDA libraries: __PACKAGES__"
-apt-get install -y -q --no-install-recommends __PACKAGES__
+echo "[3/4] Updating apt..."
+if ! apt-get update -y 2>&1 | tail -20; then
+    echo "ERROR: apt-get update failed"
+    exit 5
+fi
 
+# Each "TRY:" line is a fallback chain: try the first; if it fails, try the
+# next. Lines come from the Python side via __TRY_CHAIN__ substitution.
+INSTALLED_PKGS=""
+FAILED_LIBS=""
+
+echo "[4/4] Installing CUDA runtime libraries..."
+__TRY_CHAIN__
+
+if [ -n "$FAILED_LIBS" ]; then
+    echo "PARTIAL: installed=[${INSTALLED_PKGS# }] failed=[${FAILED_LIBS# }]"
+    # Soft-fail with exit 0 — we want the Python side to read the markers and
+    # decide. A hard failure here would lose all progress info.
+    exit 0
+fi
+
+echo "INSTALLED: ${INSTALLED_PKGS# }"
 echo "DONE"
 """
+
+
+def _build_try_chain(missing_libs: list[str]) -> tuple[str, list[str]]:
+    """Build the shell try-chain block for a list of missing libs.
+
+    Returns (bash_block, all_packages_attempted).
+    """
+    lines: list[str] = []
+    all_pkgs: set[str] = set()
+    for lib in missing_libs:
+        fallbacks = _CUDA_APT_PACKAGES_BY_LIB.get(lib, [])
+        if not fallbacks:
+            lines.append(f'echo "WARN: no apt mapping for {lib}; skipping"')
+            lines.append(f'FAILED_LIBS="$FAILED_LIBS {lib}"')
+            continue
+        all_pkgs.update(fallbacks)
+        lines.append(f'# --- {lib} ---')
+        lines.append(f'INSTALLED_THIS=""')
+        for pkg in fallbacks:
+            # `apt-get install` returns 100 on missing package; we let that
+            # fall through to the next fallback.
+            lines.append(
+                f'if [ -z "$INSTALLED_THIS" ]; then\n'
+                f'  echo "[install] {lib} -> {pkg}"\n'
+                f'  if apt-get install -y -q --no-install-recommends {pkg} 2>&1 | tail -5 ; then\n'
+                f'    if dpkg -l {pkg} >/dev/null 2>&1; then\n'
+                f'      INSTALLED_THIS="{pkg}"\n'
+                f'      INSTALLED_PKGS="$INSTALLED_PKGS {pkg}"\n'
+                f'    fi\n'
+                f'  fi\n'
+                f'fi'
+            )
+        lines.append(
+            f'if [ -z "$INSTALLED_THIS" ]; then\n'
+            f'  FAILED_LIBS="$FAILED_LIBS {lib}"\n'
+            f'fi'
+        )
+    return "\n".join(lines), sorted(all_pkgs)
 
 
 def install_cuda_libs_in_wsl(
@@ -1028,31 +1181,31 @@ def install_cuda_libs_in_wsl(
     if not wsl:
         return {"ok": False, "error": "wsl.exe not found"}
 
-    # Translate libs → unique apt packages
-    packages: set[str] = set()
-    unknown: list[str] = []
-    for lib in missing_libs:
-        if lib in _CUDA_APT_PACKAGES_BY_LIB:
-            packages.update(_CUDA_APT_PACKAGES_BY_LIB[lib])
-        else:
-            unknown.append(lib)
+    # Build the per-library try-chain. Each lib has 1-N fallback packages;
+    # the bash script tries them in order and tracks what worked.
+    try_chain, all_packages = _build_try_chain(missing_libs)
+    unknown = [lib for lib in missing_libs if lib not in _CUDA_APT_PACKAGES_BY_LIB]
 
-    if not packages:
+    if not all_packages:
         return {
             "ok": False,
             "error": (
-                f"No installable packages found for: {', '.join(missing_libs)}. "
+                f"No installable packages mapped for: {', '.join(missing_libs)}. "
                 f"You may need to install them manually."
             ),
         }
 
-    script = _CUDA_LIBS_BOOTSTRAP.replace("__PACKAGES__", " ".join(sorted(packages)))
+    script = _CUDA_LIBS_BOOTSTRAP.replace("__TRY_CHAIN__", try_chain)
 
     if on_progress:
-        on_progress(0, 100, f"Installing CUDA libs ({len(packages)} packages) in {distro}...")
+        on_progress(0, 100, f"Installing CUDA libs in {distro}...")
 
-    step_pct = {"[1/3]": 10, "[2/3]": 30, "[3/3]": 50, "DONE": 95}
+    # Step markers in the new bootstrap: [1/4] keyring, [2/4] multiverse,
+    # [3/4] apt update, [4/4] install.
+    step_pct = {"[1/4]": 5, "[2/4]": 15, "[3/4]": 25, "[4/4]": 40, "DONE": 95, "PARTIAL": 95}
     tail: list[str] = []
+    installed_packages: list[str] = []
+    failed_libs: list[str] = []
 
     try:
         proc = subprocess.Popen(
@@ -1071,32 +1224,74 @@ def install_cuda_libs_in_wsl(
     for raw_line in proc.stdout:
         line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
         tail.append(line)
-        if len(tail) > 200:
+        if len(tail) > 400:
             tail.pop(0)
         for marker, pct in step_pct.items():
             if line.startswith(marker):
                 if on_progress:
-                    on_progress(pct, 100, line)
+                    on_progress(pct, 100, line[:120])
                 break
+        # Parse the script's structured markers
+        if line.startswith("INSTALLED: "):
+            installed_packages = line[len("INSTALLED: "):].split()
+        elif line.startswith("PARTIAL: "):
+            # Format: PARTIAL: installed=[a b c] failed=[x y]
+            import re as _re
+            inst = _re.search(r"installed=\[([^\]]*)\]", line)
+            fail = _re.search(r"failed=\[([^\]]*)\]", line)
+            if inst:
+                installed_packages = inst.group(1).split()
+            if fail:
+                failed_libs = fail.group(1).split()
 
     try:
-        rc = proc.wait(timeout=60 * 30)  # apt can be slow on first install
+        rc = proc.wait(timeout=60 * 30)
     except subprocess.TimeoutExpired:
         proc.kill()
         return {"ok": False, "error": "CUDA lib install timed out after 30 min"}
 
+    # Hard failure (couldn't even get to the install step — keyring, apt update,
+    # or distro issue). Surface the tail so the user can see the actual error.
     if rc != 0:
+        last_lines = "\n".join(tail[-20:])
         return {
             "ok": False,
-            "error": f"CUDA lib install exited with {rc}",
-            "tail": "\n".join(tail[-30:]),
+            "error": (
+                f"CUDA lib install exited with {rc} before the install step.\n"
+                f"Last output:\n{last_lines}"
+            ),
+            "tail": "\n".join(tail[-60:]),
             "unknown_libs": unknown,
-            "packages_attempted": sorted(packages),
+            "packages_attempted": all_packages,
         }
 
     # Invalidate the engine GPU cache so the next probe reflects the new state
     with _ENGINE_GPU_CACHE_LOCK:
         _ENGINE_GPU_CACHE.clear()
+
+    # Partial success: some libs failed to install. Still useful (any installed
+    # libs help TF) but we tell the user which ones to fix manually.
+    if failed_libs:
+        last_lines = "\n".join(tail[-20:])
+        return {
+            "ok": False,  # partial = not ok from the UI's perspective
+            "partial": True,
+            "error": (
+                f"Installed {len(installed_packages)} package(s) but "
+                f"{len(failed_libs)} library/libraries couldn't be installed: "
+                f"{', '.join(failed_libs)}.\n\n"
+                f"libcudnn8 is the most common one to fail — it's not in NVIDIA's "
+                f"CUDA repo. You can install it manually with:\n"
+                f"  wsl -d {distro} -u root -- apt install -y nvidia-cudnn\n"
+                f"(after enabling the multiverse repo). Or download from "
+                f"https://developer.nvidia.com/cudnn .\n\n"
+                f"Last output:\n{last_lines}"
+            ),
+            "tail": "\n".join(tail[-60:]),
+            "packages_installed": installed_packages,
+            "failed_libs": failed_libs,
+            "unknown_libs": unknown,
+        }
 
     if on_progress:
         on_progress(100, 100, "CUDA libs installed; re-probe GPU to verify")
@@ -1104,9 +1299,9 @@ def install_cuda_libs_in_wsl(
     return {
         "ok": True,
         "distro": distro,
-        "packages_installed": sorted(packages),
+        "packages_installed": installed_packages or all_packages,
         "unknown_libs": unknown,
-        "tail": "\n".join(tail[-30:]),
+        "tail": "\n".join(tail[-60:]),
     }
 
 

@@ -233,8 +233,37 @@ The **X** on a history row removes the entry from Vibechek's index but does **no
 Top of the page:
 
 - **Ready to analyze?** banner — green if Essentia + models are ready, otherwise tells you what's missing.
-- **System** — CPU cores, RAM, GPU. Updates live on every load.
+- **System** — CPU cores, RAM, GPU. The GPU row shows what the actual analyze
+  engine sees, not just what your host has — see the next section.
 - **Analysis** — workers slider (snaps to recommended = cores − 1), GPU auto/on/off, models directory + download button.
+
+### System — what the GPU row really means
+
+Vibechek goes out of its way to never lie to you about GPU acceleration. The
+GPU row in **Settings → System** asks the *actual analyze engine* (Essentia's
+bundled TensorFlow, running inside WSL on Windows) what it can see. It is
+NOT a host-side `nvidia-smi` check. This means the value reflects what
+analysis will really use.
+
+Three possible states:
+
+- **GPU available** (green) — TF registered the GPU. Analyze will use it.
+  Shows your card name, e.g. *"NVIDIA GeForce RTX 4070 Laptop GPU"*, plus
+  the driver version and TF version.
+
+- **GPU detected but TensorFlow can&apos;t use it** (yellow) — your card is
+  visible to WSL, but Essentia's TF couldn&apos;t load the CUDA runtime
+  libraries it needs (typically `libcublas`, `libcufft`, `libcudnn`,
+  `libcusparse`). Analysis would silently fall back to CPU. Click
+  **Enable GPU (install CUDA libs)** to install them via NVIDIA&apos;s
+  apt repo (~600 MB, ~5 min).
+
+- **No GPU** (grey) — either you have no NVIDIA card or the WSL kernel
+  isn&apos;t passing it through. Analysis runs on CPU. On a modern multi-core
+  CPU this is still fast — ~25-40 tracks/min with workers ≈ cores − 1.
+
+The probe is slow the first time (~10 sec to spin up TF inside WSL) and then
+cached for 5 minutes. Click **Re-probe** to force a fresh check.
 
 Click **Advanced settings** to expand:
 

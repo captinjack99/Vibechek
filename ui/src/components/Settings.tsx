@@ -561,15 +561,18 @@ function PreflightSection({
   const isWindows = preflight.wsl?.is_windows ?? false;
   const wslReady = preflight.wsl?.can_run_vibechek ?? false;
   const usableDistro = preflight.wsl?.usable_distro ?? null;
+  const nativeVenv = preflight.native_venv;
+  const nativeVenvReady =
+    (nativeVenv?.essentia_installed && nativeVenv?.vibechek_installed) ?? false;
 
-  // On Windows, "Essentia missing natively" is the expected state. What
-  // matters is whether it's available via WSL.
+  // The Essentia row tells the user where analyze gets its ML engine from.
+  // Three possible "ready" sources, three possible "not yet" messages.
   const essentiaRow = (() => {
     if (preflight.essentia.installed) {
       return {
         ok: true,
         label: "Essentia",
-        detail: `installed${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`,
+        detail: `installed in the sidecar${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`,
       };
     }
     if (isWindows && wslReady && usableDistro) {
@@ -577,6 +580,13 @@ function PreflightSection({
         ok: true,
         label: "Essentia",
         detail: `available via WSL (${usableDistro})`,
+      };
+    }
+    if (nativeVenvReady) {
+      return {
+        ok: true,
+        label: "Essentia",
+        detail: `available via managed venv${nativeVenv?.essentia_version ? ` (${nativeVenv.essentia_version})` : ""}`,
       };
     }
     if (isWindows) {
@@ -589,9 +599,17 @@ function PreflightSection({
     return {
       ok: false,
       label: "Essentia",
-      detail: preflight.essentia.error ?? "not installed (pip install essentia-tensorflow)",
+      detail: "not installed yet — click Set up below",
     };
   })();
+
+  const subtitle = ready
+    ? (preflight.analyze_via === "wsl"
+        ? "analyze will route through WSL"
+        : preflight.analyze_via === "native_venv"
+        ? "analyze will route through the managed venv"
+        : "all prerequisites satisfied")
+    : "see below";
 
   return (
     <Section
@@ -603,9 +621,7 @@ function PreflightSection({
         )
       }
       title={ready ? "Ready to analyze" : "Not ready to analyze"}
-      subtitle={ready
-        ? (preflight.analyze_via === "wsl" ? "analyze will route through WSL" : "all prerequisites satisfied")
-        : "see below"}
+      subtitle={subtitle}
     >
       <Row ok={essentiaRow.ok} label={essentiaRow.label} detail={essentiaRow.detail} />
       <Row

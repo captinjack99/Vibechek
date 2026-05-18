@@ -21,7 +21,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  X, CheckCircle2, AlertCircle, Download, Copy, ExternalLink, Loader2,
+  X, CheckCircle2, AlertCircle, Download, Loader2,
   Terminal, Cpu, StopCircle,
 } from "lucide-react";
 
@@ -76,7 +76,31 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   const isWindows = preflight.wsl?.is_windows ?? false;
 
   const reCheck = async (autoCloseIfReady = true) => {
+    // Two-phase: preflight uses quick=true WSL probe (returns in <1 sec) so
+    // the dialog stays snappy. But after an install we MUST do the slow
+    // probe — that's the only way to detect that essentia just landed inside
+    // a distro. Otherwise the dialog would still show "Essentia not installed"
+    // even after a successful install_vibechek_in_wsl call.
     const next = await rpc<PreflightResult>("preflight", {});
+    if (next.wsl?.is_windows) {
+      try {
+        const fullWsl = await rpc<PreflightResult["wsl"]>("wsl_status", { quick: false });
+        const wslReady = fullWsl?.can_run_vibechek ?? false;
+        const ready =
+          (next.essentia.installed || wslReady) &&
+          next.models.missing.length === 0;
+        const analyze_via: string | null = next.essentia.installed
+          ? "native"
+          : wslReady
+          ? "wsl"
+          : null;
+        next.wsl = fullWsl;
+        next.ready = ready;
+        next.analyze_via = analyze_via;
+      } catch {
+        /* keep quick-mode result if the slow probe fails */
+      }
+    }
     onRefresh(next);
     if (autoCloseIfReady && next.ready) onReady();
     return next;
@@ -128,6 +152,10 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     });
   };
 
+  const handleInstallEssentiaNative = async () => {
+    await runWithProgress<InstallResult>("vibechek", "install_essentia_native", {});
+  };
+
   const handleDownloadModels = async () => {
     setBusyAction("models");
     begin("download-models");
@@ -164,9 +192,8 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
               Setup needed before analyze
             </h2>
             <p className="text-sm text-white/60 mt-0.5">
-              {isWindows
-                ? "Vibechek can set everything up for you automatically. Each step below is a one-click install."
-                : "Fix the items below, then click Re-check."}
+              Vibechek can set everything up for you automatically. Each step
+              below is a one-click install.
             </p>
           </div>
           <button onClick={onClose} className="text-white/40 hover:text-white -m-1 p-1">
@@ -185,7 +212,11 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
               onInstallVibechekInWsl={handleInstallVibecheckInWsl}
             />
           ) : (
-            <UnixEssentiaRow check={preflight.essentia} />
+            <UnixEssentiaFlow
+              preflight={preflight}
+              busyAction={busyAction}
+              onInstallEssentiaNative={handleInstallEssentiaNative}
+            />
           )}
 
           <ModelsRow
@@ -361,19 +392,74 @@ function WindowsFlow({
 }
 
 // ===========================================================================
-// Non-Windows essentia row (Linux / macOS just need pip)
+// Non-Windows essentia flow (Linux / macOS — one-click managed-venv install)
 // ===========================================================================
 
-function UnixEssentiaRow({ check }: { check: PreflightResult["essentia"] }) {
+interface UnixFlowProps {
+  preflight: PreflightResult;
+  busyAction: Action;
+  onInstallEssentiaNative: () => void;
+}
+
+function UnixEssentiaFlow({
+  preflight,
+  busyAction,
+  onInstallEssentiaNative,
+}: UnixFlowProps) {
+  const sidecarHasIt = preflight.essentia.installed;
+  const nv = preflight.native_venv;
+
+  // Case 1: essentia is already in the sidecar's own Python (rare — only
+  // when running from a dev checkout where the user pip-installed
+  // essentia-tensorflow into the same venv).
+  if (sidecarHasIt) {
+    return (
+      <Step
+        ok={true}
+        title="Essentia (Python ML library)"
+        sub={`Installed in the sidecar process${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`}
+      />
+    );
+  }
+
+  // Case 2: essentia is in the managed venv — analyze will route there.
+  if (nv?.essentia_installed && nv?.vibechek_installed) {
+    return (
+      <Step
+        ok={true}
+        title="Essentia (managed venv)"
+        sub={`Installed at ${nv.venv_dir}${nv.essentia_version ? ` (${nv.essentia_version})` : ""}`}
+      />
+    );
+  }
+
+  // Case 3: not installed — show the one-click install button.
   return (
     <Step
-      ok={check.installed}
+      ok={false}
       title="Essentia (Python ML library)"
-      sub={check.installed
-        ? `Installed${check.version ? ` (${check.version})` : ""}`
-        : (check.error ?? "Not installed")}
-      info={!check.installed && "Install with:"}
-      extra={!check.installed && <CodeBlock>pip install essentia-tensorflow</CodeBlock>}
+      sub={
+        nv?.supported === false
+          ? "Native install not supported on this OS"
+          : "Not installed yet"
+      }
+      info={
+        <>
+          Vibechek will create a managed Python virtual environment at{" "}
+          <code>{nv?.venv_dir ?? "~/.vibechek/venv"}</code> and install{" "}
+          <code>essentia-tensorflow</code> + <code>vibechek</code> into it.
+          Takes ~3-5 minutes. No admin prompt; doesn't touch your system
+          Python.
+        </>
+      }
+      action={
+        <ActionButton
+          icon={<Terminal className="w-4 h-4" />}
+          label="Install Essentia"
+          busy={busyAction === "vibechek"}
+          onClick={onInstallEssentiaNative}
+        />
+      }
     />
   );
 }
@@ -480,31 +566,8 @@ function ActionButton({
   );
 }
 
-function CodeBlock({ children }: { children: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <div className="relative">
-      <pre className="bg-surface-300 border border-white/10 rounded-md p-3 text-xs font-mono text-white/80 overflow-x-auto whitespace-pre">
-        {children}
-      </pre>
-      <button
-        onClick={() => {
-          void navigator.clipboard.writeText(children);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        }}
-        className="absolute top-2 right-2 p-1 rounded text-white/40 hover:text-white hover:bg-white/10"
-        title="Copy"
-      >
-        {copied ? (
-          <CheckCircle2 className="w-3.5 h-3.5 text-accent-green" />
-        ) : (
-          <Copy className="w-3.5 h-3.5" />
-        )}
-      </button>
-    </div>
-  );
-}
+// CodeBlock helper removed: the Unix essentia flow no longer asks the user
+// to copy a pip command — Vibechek installs Essentia for them now via
+// `install_essentia_native`. If a future flow needs an inline copyable
+// snippet, restore from git history.
 
-// Unused helpers retained for the help text on unsupported platforms
-export const _UNUSED = { ExternalLink };

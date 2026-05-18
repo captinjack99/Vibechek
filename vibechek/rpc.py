@@ -284,6 +284,22 @@ def _install_vibechek_in_wsl(params: dict) -> dict:
     return install_vibechek_in_wsl(distro, on_progress=_emit_progress)
 
 
+def _install_essentia_native(_params: dict) -> dict:
+    """Install essentia-tensorflow + vibechek into ~/.vibechek/venv/.
+
+    The Linux/macOS counterpart to install_vibechek_in_wsl. On Windows this
+    short-circuits — Windows always uses the WSL path.
+    """
+    from vibechek.native_install import install_essentia_native
+    return install_essentia_native(on_progress=_emit_progress)
+
+
+def _native_venv_status(_params: dict) -> dict:
+    """Report what's installed in the managed ~/.vibechek/venv/."""
+    from vibechek.native_install import probe_native_venv, to_dict
+    return to_dict(probe_native_venv())
+
+
 def _install_cuda_libs_in_wsl(params: dict) -> dict:
     """Install missing CUDA runtime libs (libcublas/libcufft/libcudnn/...) in WSL.
 
@@ -596,6 +612,8 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "install_wsl": _install_wsl,
     "install_vibechek_in_wsl": _install_vibechek_in_wsl,
     "install_cuda_libs_in_wsl": _install_cuda_libs_in_wsl,
+    "install_essentia_native": _install_essentia_native,
+    "native_venv_status": _native_venv_status,
     "scan_directory": _scan_directory,
     "scan_only": _scan_only,
     "analyze_directory": _analyze_directory,
@@ -632,6 +650,7 @@ _CANCELLABLE_METHODS = {
     "install_wsl": "install-wsl",
     "install_vibechek_in_wsl": "install-essentia",
     "install_cuda_libs_in_wsl": "install-cuda",
+    "install_essentia_native": "install-essentia",
 }
 
 # JSON-RPC error codes
