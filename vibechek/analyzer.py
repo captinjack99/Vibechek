@@ -793,9 +793,15 @@ def analyze_directory(
     # Pre-flight: catch missing essentia / models BEFORE we spawn a worker pool.
     # An ImportError inside a multiprocessing.Pool initializer hangs the pool
     # silently instead of surfacing the error — we never want to land there.
+    #
+    # *quick_wsl=False*: the default preflight uses the quick WSL probe for
+    # sub-second GUI responsiveness, but quick mode can't tell us whether a
+    # WSL distro actually has essentia. We're about to start a multi-hour
+    # operation; an extra ~5 seconds of probe time is fine, and without it
+    # we'd false-fail every analyze-via-WSL run.
     from vibechek.preflight import preflight  # noqa: PLC0415
 
-    pf = preflight(config.models_dir)
+    pf = preflight(config.models_dir, quick_wsl=False)
     if not pf.ready:
         raise RuntimeError(
             "Cannot analyze: " + "; ".join(pf.reasons_not_ready) +

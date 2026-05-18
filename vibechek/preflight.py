@@ -139,7 +139,11 @@ def check_models(models_dir: Path | None = None) -> ModelsCheck:
     return result
 
 
-def preflight(models_dir: Path | None = None) -> PreflightResult:
+def preflight(
+    models_dir: Path | None = None,
+    *,
+    quick_wsl: bool = True,
+) -> PreflightResult:
     """Full check; ready=True iff analyze can actually run.
 
     "Ready" means ONE of:
@@ -149,13 +153,17 @@ def preflight(models_dir: Path | None = None) -> PreflightResult:
       - Linux/macOS: managed venv at ~/.vibechek/venv/ has essentia AND
         models present
 
-    The native_venv check is fast (disk-only, no subprocess) so we include it
-    in this quick preflight. WSL stays quick=True; full distro probe is done
-    by the separate `wsl_status` RPC.
+    `quick_wsl=True` (default) skips per-distro vibechek/essentia probes so the
+    call returns in under a second — appropriate for the GUI's first-render
+    Settings poll. The native_venv check is always fast (disk-only).
+
+    Callers about to run a long ML operation (e.g. `analyze_directory`)
+    should pass `quick_wsl=False` so they don't false-fail when WSL has
+    essentia but quick mode couldn't see it.
     """
     essentia = check_essentia()
     models = check_models(models_dir)
-    wsl_status = detect_wsl(quick=True)
+    wsl_status = detect_wsl(quick=quick_wsl)
     native_venv = probe_native_venv()
 
     have_native = essentia.installed

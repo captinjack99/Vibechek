@@ -76,31 +76,11 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   const isWindows = preflight.wsl?.is_windows ?? false;
 
   const reCheck = async (autoCloseIfReady = true) => {
-    // Two-phase: preflight uses quick=true WSL probe (returns in <1 sec) so
-    // the dialog stays snappy. But after an install we MUST do the slow
-    // probe — that's the only way to detect that essentia just landed inside
-    // a distro. Otherwise the dialog would still show "Essentia not installed"
-    // even after a successful install_vibechek_in_wsl call.
-    const next = await rpc<PreflightResult>("preflight", {});
-    if (next.wsl?.is_windows) {
-      try {
-        const fullWsl = await rpc<PreflightResult["wsl"]>("wsl_status", { quick: false });
-        const wslReady = fullWsl?.can_run_vibechek ?? false;
-        const ready =
-          (next.essentia.installed || wslReady) &&
-          next.models.missing.length === 0;
-        const analyze_via: string | null = next.essentia.installed
-          ? "native"
-          : wslReady
-          ? "wsl"
-          : null;
-        next.wsl = fullWsl;
-        next.ready = ready;
-        next.analyze_via = analyze_via;
-      } catch {
-        /* keep quick-mode result if the slow probe fails */
-      }
-    }
+    // After an install we MUST do the slow WSL probe — that's the only way to
+    // detect that essentia just landed inside a distro. Ask the sidecar for a
+    // full (non-quick) preflight in a single round-trip. The dialog is
+    // already user-blocking; the extra 5-10s for the slow probe is fine here.
+    const next = await rpc<PreflightResult>("preflight", { quick: false });
     onRefresh(next);
     if (autoCloseIfReady && next.ready) onReady();
     return next;
