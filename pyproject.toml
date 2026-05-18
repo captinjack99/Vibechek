@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vibechek"
-version = "0.4.0b1"
+version = "0.4.0b2"
 description = "ML-powered DJ library organizer — analyze, tag, and organize music collections"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,6 +32,10 @@ dependencies = [
     "psutil>=5.9",
     # TOML write support — tomllib is stdlib for reads only
     "tomli-w>=1.0",
+    # `tomllib` (stdlib TOML reader) only exists on Python 3.11+. On 3.10 we
+    # need `tomli` (the third-party backport that became stdlib `tomllib`).
+    # Used only on the legacy-config-migration path; no perf or surface impact.
+    'tomli>=2.0; python_version < "3.11"',
 ]
 
 [project.optional-dependencies]

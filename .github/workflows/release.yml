@@ -21,6 +21,10 @@ jobs:
   build-cli:
     name: Build CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Matrix entries marked `experimental: true` can fail without aborting
+    # the downstream `release` job. Used for the Intel Mac entry while we
+    # validate it across actual release runs.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -39,12 +43,15 @@ jobs:
             sidecar_source: dist/vibechek/vibechek
           # Intel Mac is still ~25% of the Mac market. macos-13 is GitHub's
           # last x86_64 image; without it, Intel Mac users get nothing.
+          # `experimental: true` makes a failure here non-blocking — the rest
+          # of the release pipeline (arm64 Mac, Windows, Linux) still ships.
           - os: macos-13
             asset_name: vibechek-macos-x64.tar.gz
             build_cmd: ./packaging/build-macos.sh
             artifact_glob: dist/vibechek-macos-*.tar.gz
             sidecar_name: vibechek-sidecar-x86_64-apple-darwin
             sidecar_source: dist/vibechek/vibechek
+            experimental: true
           - os: windows-latest
             asset_name: vibechek-windows-x64.zip
             build_cmd: packaging\build-windows.bat
@@ -89,6 +96,7 @@ jobs:
     name: Build desktop (${{ matrix.os }})
     needs: build-cli
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +110,12 @@ jobs:
           - os: windows-latest
             sidecar_name: vibechek-sidecar-x86_64-pc-windows-msvc.exe
             sidecar_dest: ui/src-tauri/binaries/vibechek-sidecar-x86_64-pc-windows-msvc.exe
+          # Intel Mac — paired with the `macos-13` build-cli entry above so the
+          # arm64 + x86_64 .dmg sit side-by-side in the release.
+          - os: macos-13
+            sidecar_name: vibechek-sidecar-x86_64-apple-darwin
+            sidecar_dest: ui/src-tauri/binaries/vibechek-sidecar-x86_64-apple-darwin
+            experimental: true
     steps:
       - uses: actions/checkout@v4
 
@@ -195,7 +209,11 @@ jobs:
     name: Publish GitHub Release
     needs: [build-cli, build-tauri]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # `always()` lets the release run even when an experimental matrix entry
+    # (Intel Mac today) failed — we still ship whatever artifacts succeeded.
+    # The `cancelled()` guard prevents a release when the workflow is cancelled.
+    # `startsWith` keeps manual `workflow_dispatch` runs from publishing.
+    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
 

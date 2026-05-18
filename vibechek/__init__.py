@@ -1,4 +1,4 @@
 """Vibechek — ML-powered DJ library organizer."""
 
-__version__ = "0.4.0-beta.1"
+__version__ = "0.4.0-beta.2"
 __all__ = ["__version__"]

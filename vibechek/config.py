@@ -166,11 +166,23 @@ class VibechekConfig:
     def _load_toml(cls, target: Path) -> "VibechekConfig":
         # Import lazily — tomllib is only needed for the rare migration path,
         # and we want module import to stay cheap.
+        #
+        # `tomllib` is stdlib from Python 3.11+. On 3.10 we fall back to `tomli`
+        # (the third-party backport that became stdlib `tomllib`). Both expose
+        # the same `loads()` + `TOMLDecodeError`. We depend on `tomli` via
+        # pyproject.toml's `tomli; python_version < "3.11"` marker so 3.10
+        # users always have it available.
         try:
-            import tomllib
-        except ImportError:  # pragma: no cover — Python <3.11; we require 3.10+
-            log.warning("tomllib unavailable; cannot read legacy %s", target)
-            return cls()
+            import tomllib  # Python 3.11+
+        except ImportError:
+            try:
+                import tomli as tomllib  # Python 3.10 backport
+            except ImportError:  # pragma: no cover
+                log.warning(
+                    "Neither tomllib nor tomli is available; cannot read legacy %s. "
+                    "Install tomli: pip install tomli", target,
+                )
+                return cls()
         try:
             raw = tomllib.loads(target.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError) as e:
