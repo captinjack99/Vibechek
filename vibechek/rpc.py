@@ -253,10 +253,16 @@ def _engine_gpu_status(params: dict) -> dict:
 
 
 def _preflight(params: dict) -> dict:
-    """Verify essentia + models are ready for `analyze_directory`."""
+    """Verify essentia + models are ready for `analyze_directory`.
+
+    `quick` (default True) skips per-distro WSL probes for sub-second response.
+    Pass `quick=False` after running an install to get the accurate post-install
+    state in one call — the GUI uses this in PreflightDialog's reCheck().
+    """
     from vibechek.preflight import preflight, to_dict
     models_dir = Path(params["models_dir"]) if params.get("models_dir") else None
-    return to_dict(preflight(models_dir))
+    quick = bool(params.get("quick", True))
+    return to_dict(preflight(models_dir, quick_wsl=quick))
 
 
 def _wsl_status(params: dict) -> dict:

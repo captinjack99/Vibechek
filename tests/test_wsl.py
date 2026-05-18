@@ -603,6 +603,60 @@ def test_cuda_libs_translation_to_apt_packages() -> None:
     assert any("libcublas" in p for p in packages)
 
 
+def test_cuda_bootstrap_does_not_mention_placeholders_in_comments() -> None:
+    """Regression: a comment that mentioned `__TRY_CHAIN__` got its tail
+    spliced into bash by str.replace(), producing `fi substitution.` as a
+    literal token in the generated script (bash: line 158: syntax error
+    near unexpected token `substitution.'). Comments must never mention
+    the placeholder string by name.
+    """
+    from vibechek.wsl import _CUDA_LIBS_BOOTSTRAP
+
+    # Find every occurrence of the placeholder and ensure each one is on a
+    # line that's NOT a comment (i.e. the real substitution site).
+    for i, line in enumerate(_CUDA_LIBS_BOOTSTRAP.splitlines(), 1):
+        if "__TRY_CHAIN__" in line:
+            stripped = line.lstrip()
+            assert not stripped.startswith("#"), (
+                f"Line {i} mentions __TRY_CHAIN__ in a comment: {line!r}. "
+                f"str.replace() would splice the chain into the comment and "
+                f"corrupt the script. Rename or remove the placeholder reference."
+            )
+
+
+def test_generated_cuda_script_parses_as_bash() -> None:
+    """End-to-end: the script we generate is syntactically valid bash.
+
+    Catches *any* future bash-generation bug (mis-balanced if/fi, unclosed
+    quotes, accidental command-substitution). Skipped if we can't find a
+    `bash` interpreter on the host — Windows CI runners often don't have one.
+    """
+    import shutil as _shutil
+    import subprocess as _subprocess
+    from vibechek.wsl import _CUDA_LIBS_BOOTSTRAP, _build_try_chain
+
+    bash = _shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this host; skipping syntax check")
+
+    chain, _ = _build_try_chain([
+        "libcublas.so.11", "libcublasLt.so.11", "libcufft.so.10",
+        "libcusparse.so.11", "libcudnn.so.8",
+    ])
+    script = _CUDA_LIBS_BOOTSTRAP.replace("__TRY_CHAIN__", chain, 1)
+
+    # `bash -n` parses but doesn't execute. Non-zero rc = syntax error.
+    result = _subprocess.run(
+        [bash, "-n"],
+        input=script.encode("utf-8"),
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 0, (
+        f"Generated CUDA install script has a bash syntax error.\n"
+        f"stderr: {result.stderr.decode('utf-8', errors='replace')}"
+    )
+
+
 def test_cuda_lib_map_prefers_meta_package() -> None:
     """All CUDA toolkit libs should try `cuda-libraries-11-8` first.
 
