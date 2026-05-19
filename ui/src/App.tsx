@@ -77,7 +77,15 @@ export default function App() {
           {viewMode === "tags" && <TagsView />}
           {viewMode === "settings" && <Settings />}
         </main>
-        <TrackDetails />
+        {/* TrackDetails is library-tab only. Mounting it everywhere meant
+            the embedded AudioPreview's WaveSurfer instance kept playing
+            after the user navigated to Duplicates / Organize / etc — there
+            was no UI to control or even see the player. Unmounting on tab
+            change destroys WaveSurfer (its useEffect cleanup), which
+            stops playback. The previously-selected track stays in the
+            store, so flipping back to Library shows the same panel again
+            (just without auto-resuming playback). */}
+        {viewMode === "library" && <TrackDetails />}
       </div>
 
       <AnimatePresence>

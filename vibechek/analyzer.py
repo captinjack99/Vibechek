@@ -1038,11 +1038,32 @@ def _normalize_version(v: str) -> str:
     return _re.sub(r"[^a-z0-9]", "", s)
 
 
-# Per-worker GPU memory budget. ~1.5 GB covers a TF/essentia worker:
-# the bundled Discogs-EffNet weights (~500 MB) plus per-worker activation
-# tensors and a CUDA context (~800-1000 MB at steady state). Tuned against
-# 4 GB / 8 GB / 24 GB consumer cards; below 1500 we see OOM cascades.
-_GPU_WORKER_MB = 1500
+# Per-worker GPU memory budget. ~2.5 GB covers a steady-state essentia + TF
+# worker process under multi-worker contention:
+#
+#   - Persistent CUDA context: ~800 MB
+#   - EffNet + Discogs-400 + 6 mood heads, materialized as TF graphs: ~600 MB
+#   - Activation buffers + intermediate tensors: ~400 MB
+#   - Growth-allocator fragmentation: ~700 MB (this is the biggest hidden cost)
+#
+# The fragmentation overhead is the killer — TF_FORCE_GPU_ALLOW_GROWTH=true
+# tells TF to grow allocations as needed, but it never shrinks. After dozens
+# of inferences with varying batch shapes, each worker's footprint is
+# significantly larger than the sum of its tensors. With N workers sharing
+# one card, the effective steady-state per-worker can be 50-100% higher
+# than naive accounting suggests.
+#
+# Tuned against an RTX 4070 Laptop (8 GB shared with the desktop):
+#
+#   _GPU_WORKER_MB = 1500 (original) → cap = 5 → stalled after ~12 tracks
+#   _GPU_WORKER_MB = 1800              → cap = 4 → stalled at startup (init OOM)
+#   _GPU_WORKER_MB = 2500 (current)    → cap = 3 → ran 12 tracks cleanly
+#
+# 2500 might leave parallelism on the table for dedicated cards (a 24-GB
+# card gets 9 workers instead of 13), but the previous cap was producing
+# 5-min stall-watchdog errors with no useful diagnostic — the worst possible
+# failure mode. We prefer "always finishes" over "sometimes faster".
+_GPU_WORKER_MB = 2500
 
 # Fallback cap when VRAM probing fails — preserves prior behaviour of
 # "at most 4 workers in GPU mode" so we never regress on systems where
@@ -1338,16 +1359,38 @@ def analyze_directory(
                 _GPU_FALLBACK_CAP,
             )
         if gpu_cap < workers:
+            # Build a single actionable message. The user just configured N
+            # workers in Settings and sees the analyze run with way fewer —
+            # tell them WHY (free VRAM math) and HOW to opt out (toggle GPU
+            # off in Settings, the CPU memory cap is much higher on most
+            # machines). Without the hint, the cap looks broken.
+            requested_workers = (
+                config.workers if config.workers and config.workers > 0
+                else cpu_count() - 1
+            )
+            # `memory_cap` is only bound if psutil was importable above; fall
+            # back to the cpu_count ceiling so the message stays accurate
+            # when psutil is missing.
+            cpu_ceiling = locals().get("memory_cap", cpu_count())
             msg = (
-                f"Capped workers from {workers} to {gpu_cap} due to {cap_reason}"
+                f"Capped workers from {requested_workers} to {gpu_cap} "
+                f"({cap_reason}). Set 'GPU mode' to 'off' in Settings to use "
+                f"your full {cpu_ceiling}-worker CPU budget instead."
             )
             log.warning(msg)
-            # Surface to the GUI: log.warning alone is invisible to users.
-            # report_progress swallows exceptions, so a flaky callback won't
-            # crash the analyze. We send total=total so the GUI's progress bar
-            # state is unchanged — this is purely a status message piggybacked
-            # on the progress channel (current=0 means "not yet started").
+            # Surface to the GUI on BOTH channels: log.warning alone is
+            # invisible to interactive users, the progress callback drives
+            # the AnalysisProgress overlay's status text, and the structured
+            # event channel is what the typed event stream uses for
+            # explanatory stages. report_progress swallows exceptions, so a
+            # flaky callback won't crash the analyze. We send total=total so
+            # the GUI's progress bar state is unchanged — this is purely a
+            # status message piggybacked on the progress channel (current=0
+            # means "not yet started").
             report_progress(on_progress, 0, total, msg)
+            _emit_event("stage", name="worker_cap", message=msg,
+                        requested=requested_workers, applied=gpu_cap,
+                        reason=cap_reason)
             workers = gpu_cap
 
     log.info("Analyzing %d files with %d worker(s), GPU=%s", total, workers, config.use_gpu)
@@ -1724,9 +1767,28 @@ def _analyze_via_wsl(
     # process emits one VIBECHEK_EVENT line per stage transition and one
     # per finished track, which the GUI uses to drive a live "starting
     # WSL → spawning workers → analyzed: filename" feedback chain.
+    #
+    # *Path translation*: WSL-emitted track records carry POSIX paths
+    # (/mnt/c/...). We translate them back to Windows form here BEFORE
+    # forwarding to on_track — otherwise the GUI receives "/mnt/c/Users/..."
+    # paths and Tauri's `convertFileSrc` produces broken asset:// URLs that
+    # silently fail to load. The final report's tracks also get translated
+    # below, but the streaming events need their own translation step or the
+    # AudioPreview component breaks during live analyze.
+    if on_track is not None:
+        _wrapped_on_track = on_track
+
+        def _on_track_translated(record: dict[str, Any], current: int, total: int) -> None:
+            if "path" in record and isinstance(record["path"], str):
+                record = {**record, "path": wsl_to_win_path(record["path"])}
+            _wrapped_on_track(record, current, total)
+        translated_on_track: TrackCallback | None = _on_track_translated
+    else:
+        translated_on_track = None
+
     on_line = _make_event_aware_line_handler(
         on_progress=on_progress,
-        on_track=on_track,
+        on_track=translated_on_track,
         stderr_tail=stderr_tail,
         noise_re=_STDERR_NOISE,
     )
