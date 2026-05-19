@@ -34,6 +34,7 @@ const PYTHON_METHODS = [
   "wsl_status",
   "install_wsl",
   "install_vibechek_in_wsl",
+  "upgrade_vibechek_in_wsl",
   "install_cuda_libs_in_wsl",
   "install_essentia_native",
   "native_venv_status",
@@ -69,6 +70,7 @@ function toCamel(s: string): string {
   const special: Record<string, string> = {
     install_wsl: "installWSL",
     install_vibechek_in_wsl: "installVibechekInWSL",
+    upgrade_vibechek_in_wsl: "upgradeVibechekInWSL",
     install_cuda_libs_in_wsl: "installCudaLibsInWSL",
     repair_wsl_shim: "repairWSLShim",
     wsl_status: "wslStatus",

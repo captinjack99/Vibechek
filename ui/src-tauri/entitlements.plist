@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    macOS hardened-runtime entitlements for Vibechek.
+
+    Notarized apps MUST run under hardened runtime (Apple started rejecting
+    non-hardened builds in early 2020). Hardened runtime locks down a bunch
+    of behaviors that the Vibechek sidecar needs — specifically, PyInstaller's
+    `--onefile` bootloader extracts the bundled Python framework to a tmpdir
+    at startup, and the default library-validation rule blocks the main
+    binary from dlopen()-ing those extracted .dylibs.
+
+    The four entitlements below are the standard PyInstaller-on-macOS set:
+
+      - `disable-library-validation`: required so the sidecar can load the
+        extracted Python framework from its private tmpdir. Without it,
+        every analyze through the sidecar dies at the first essentia /
+        mutagen import.
+      - `allow-jit` + `allow-unsigned-executable-memory`: keep TensorFlow's
+        XLA compiler happy. Not used by the sidecar today (it stays in pure
+        Python) but cheap insurance for future ML hooks.
+      - `allow-dyld-environment-variables`: required by PyInstaller's
+        bootloader to set DYLD_LIBRARY_PATH for the extracted framework.
+
+    `tauri-action`'s macOS signing step picks this up via the entitlements
+    field in tauri.conf.json -> bundle.macOS.entitlements. The same file is
+    applied to both the main Tauri binary and the sidecar (codesign reuses
+    the entitlements for every Mach-O it touches via --options runtime).
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+</dict>
+</plist>

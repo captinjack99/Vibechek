@@ -54,6 +54,7 @@ import type {
   InstallResultPayload,
   InstallVibechekInWSLRequest,
   InstallWSLRequest,
+  UpgradeVibechekInWSLRequest,
   LibraryState,
   LoadRecentAnalysisRequest,
   LoadRecentAnalysisResult,
@@ -152,6 +153,17 @@ export function installVibechekInWSL(
   params: InstallVibechekInWSLRequest,
 ): Promise<InstallResultPayload> {
   return rpc<InstallResultPayload>("install_vibechek_in_wsl", params);
+}
+
+/**
+ * Fast-path upgrade for the WSL vibechek package only (skips apt + essentia).
+ * Use this to repair version drift surfaced by the analyzer's drift guard —
+ * full re-install via installVibechekInWSL is the cold-install path.
+ */
+export function upgradeVibechekInWSL(
+  params: UpgradeVibechekInWSLRequest,
+): Promise<InstallResultPayload> {
+  return rpc<InstallResultPayload>("upgrade_vibechek_in_wsl", params);
 }
 
 /** Install the CUDA runtime libs essentia's bundled TF needs. Cancellable. */
@@ -388,6 +400,7 @@ const api = {
   // install
   installWSL,
   installVibechekInWSL,
+  upgradeVibechekInWSL,
   installCudaLibsInWSL,
   installEssentiaNative,
   repairWSLShim,

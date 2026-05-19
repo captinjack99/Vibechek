@@ -61,6 +61,7 @@ export const RPC_METHODS = [
   // install
   "install_wsl",
   "install_vibechek_in_wsl",
+  "upgrade_vibechek_in_wsl",
   "install_cuda_libs_in_wsl",
   "install_essentia_native",
   "repair_wsl_shim",
@@ -139,6 +140,10 @@ export interface InstallWSLRequest {
 }
 
 export interface InstallVibechekInWSLRequest {
+  distro: string;
+}
+
+export interface UpgradeVibechekInWSLRequest {
   distro: string;
 }
 
