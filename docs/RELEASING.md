@@ -191,6 +191,14 @@ Then add these as GitHub repo secrets (Settings → Secrets and variables → Ac
 
 After the next release, the `.dmg` will be signed and notarized. Users get no scary dialog.
 
+> **PyInstaller-specific note (macOS).** The sidecar is built with `pyinstaller --onefile` (see `packaging/vibechek.spec` for the rationale). At launch, the bootloader extracts the embedded Python framework to a temp dir and dlopen()s it. macOS hardened runtime's library-validation rule would normally block that. We work around it via `ui/src-tauri/entitlements.plist`, which sets four entitlements:
+>
+> - `com.apple.security.cs.disable-library-validation` — lets the bootloader load the extracted Python framework
+> - `com.apple.security.cs.allow-dyld-environment-variables` — PyInstaller's bootloader sets `DYLD_LIBRARY_PATH` for the temp dir
+> - `com.apple.security.cs.allow-jit` + `allow-unsigned-executable-memory` — keeps TF's XLA compiler (and any future ML hook) working
+>
+> Tauri 2 applies the same entitlements to the main app binary AND every signed Mach-O inside the bundle, including the sidecar — so `tauri-action`'s automatic codesign covers everything. **You should not need to do anything extra**, as long as `bundle.macOS.entitlements` is wired up in `tauri.conf.json` (it is).
+
 ### Windows
 
 You need an **Authenticode code-signing certificate** (~$70-$400/year from DigiCert, Sectigo, or SSL.com). EV certs cost more but skip the SmartScreen reputation-building period.
@@ -208,6 +216,8 @@ You need an **Authenticode code-signing certificate** (~$70-$400/year from DigiC
 | `WINDOWS_CERTIFICATE_PASSWORD` | The .pfx password |
 
 After the next release, `.exe` and `.msi` installers will be Authenticode-signed.
+
+> **PyInstaller-specific note (Windows).** The sidecar is a single `.exe` (no `_internal/` sibling). `tauri-action` signs the externalBin (the sidecar EXE) alongside the main app — both pick up Authenticode signatures from the same cert. The bootloader self-extracts the bundled Python interpreter to `%TEMP%` at runtime; those extracted files are not signed individually and Windows doesn't require them to be. SmartScreen looks at the parent `.exe` only.
 
 ### If you don't have certs yet
 

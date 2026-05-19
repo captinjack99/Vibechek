@@ -126,6 +126,25 @@ def _emit_progress(current: int, total: int, message: str = "") -> None:
     })
 
 
+def _emit_track_analyzed(record: dict, current: int, total: int) -> None:
+    """Stream a single track's ML record to the GUI as it completes.
+
+    The frontend's LibraryBrowser subscribes to `sidecar:track_analyzed`
+    events and merges incoming records into `useLibraryStore.tracks` in
+    real time, so the user sees their library populate live instead of
+    waiting for the whole analyze batch to finish. We deliberately do NOT
+    rate-limit this — the per-track stream is naturally bounded (workers *
+    track-rate ≈ a few events / sec on typical hardware), and each event
+    is a unique record we'd lose to a "drop one per N" throttle. Progress
+    bars stay throttled via _emit_progress; this channel is purely additive.
+    """
+    _write_message({
+        "jsonrpc": "2.0",
+        "method": "track_analyzed",
+        "params": {"current": current, "total": total, "track": record},
+    })
+
+
 def _ok(req_id: Any, result: Any) -> None:
     _write_message({"jsonrpc": "2.0", "id": req_id, "result": result})
 
@@ -237,6 +256,7 @@ def _analyze_directory(params: dict) -> dict:
         library_path,
         config=config,
         on_progress=_emit_progress,
+        on_track=_emit_track_analyzed,
         output_path=Path(params["output_path"]) if params.get("output_path") else None,
         skip=int(params.get("skip", 0)),
         limit=int(params.get("limit") or 0) or None,
@@ -319,6 +339,20 @@ def _install_vibechek_in_wsl(params: dict) -> dict:
     from vibechek.wsl import install_vibechek_in_wsl
     distro = str(params["distro"])
     return install_vibechek_in_wsl(distro, on_progress=_emit_progress)
+
+
+def _upgrade_vibechek_in_wsl(params: dict) -> dict:
+    """Fast-path repair when the WSL install has drifted behind the sidecar.
+
+    Skips the apt + essentia steps (slow, unchanged between betas) and only
+    re-installs the vibechek package itself. The analyzer's version-drift
+    guard raises a RuntimeError pointing here, so the GUI can surface a
+    one-click repair instead of forcing users into the 5-10 minute full
+    `install_vibechek_in_wsl` path.
+    """
+    from vibechek.wsl import upgrade_vibechek_in_wsl
+    distro = str(params["distro"])
+    return upgrade_vibechek_in_wsl(distro, on_progress=_emit_progress)
 
 
 def _install_essentia_native(_params: dict) -> dict:
@@ -855,6 +889,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "wsl_status": _wsl_status,
     "install_wsl": _install_wsl,
     "install_vibechek_in_wsl": _install_vibechek_in_wsl,
+    "upgrade_vibechek_in_wsl": _upgrade_vibechek_in_wsl,
     "install_cuda_libs_in_wsl": _install_cuda_libs_in_wsl,
     "install_essentia_native": _install_essentia_native,
     "native_venv_status": _native_venv_status,
@@ -903,6 +938,7 @@ _CANCELLABLE_METHODS = {
     "download_models": "download-models",
     "install_wsl": "install-wsl",
     "install_vibechek_in_wsl": "install-essentia",
+    "upgrade_vibechek_in_wsl": "install-essentia",
     "install_cuda_libs_in_wsl": "install-cuda",
     "install_essentia_native": "install-essentia",
 }

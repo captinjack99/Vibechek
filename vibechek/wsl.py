@@ -60,6 +60,11 @@ class DistroInfo:
     vibechek_installed: bool = False
     essentia_installed: bool = False
     vibechek_path: str | None = None
+    # The vibechek __version__ string read from the WSL install's
+    # site-packages metadata. None when not yet probed; "0.1.0-dev" or any
+    # older value means the user installed before the cap/stall-watchdog work
+    # landed and analyze WILL crash silently on multi-worker runs.
+    vibechek_version: str | None = None
 
 
 @dataclass
@@ -231,6 +236,17 @@ for p in "$SHIM" "$HOME_DIR/.local/bin/vibechek"; do
     break
   fi
 done
+# Probe the installed vibechek __version__ from site-packages metadata. We
+# prefer reading PKG-INFO over invoking `vibechek --version` because the
+# latter imports the package (slow + can fail if the install is half-broken),
+# and we need this probe to be fast + tolerant.
+for d in "$HOME_DIR/.vibechek/venv/lib/python3."*/site-packages/vibechek-*.dist-info; do
+  if [ -d "$d" ]; then
+    VER="$(basename "$d" | sed -E 's/^vibechek-([^-]+)\.dist-info$/\1/')"
+    printf 'vibechek_version=%s\n' "$VER"
+    break
+  fi
+done
 for d in "$HOME_DIR/.vibechek/venv/lib/python3."*/site-packages/essentia*.dist-info; do
   if [ -d "$d" ]; then
     printf 'essentia=%s\n' "$(basename "$d" | sed -E 's/^essentia[_-][^-]+-([^-]+)\.dist-info$/\1/')"
@@ -270,7 +286,9 @@ done
 
     for line in stdout.splitlines():
         line = line.strip()
-        if line.startswith("vibechek=") and len(line) > len("vibechek="):
+        if line.startswith("vibechek_version=") and len(line) > len("vibechek_version="):
+            distro.vibechek_version = line[len("vibechek_version="):]
+        elif line.startswith("vibechek=") and len(line) > len("vibechek="):
             distro.vibechek_installed = True
             distro.vibechek_path = line[len("vibechek="):]
         elif line.startswith("essentia=") and len(line) > len("essentia="):
@@ -1156,7 +1174,12 @@ fi
 echo "[4/4] Installing Python packages (this is the slow part)..."
 "$HOME/.vibechek/venv/bin/pip" install --upgrade --quiet pip wheel
 "$HOME/.vibechek/venv/bin/pip" install --quiet essentia-tensorflow
-"$HOME/.vibechek/venv/bin/pip" install --quiet git+https://github.com/papapew/Vibechek.git
+# `--upgrade` makes re-running Set up WSL an idempotent way for users to
+# fix version drift: every code-side bump that lands on GitHub becomes
+# available here without forcing them to delete ~/.vibechek/venv. Combined
+# with the analyzer's version-drift guard, this is how an out-of-date WSL
+# install gets self-repaired by the user clicking one button.
+"$HOME/.vibechek/venv/bin/pip" install --upgrade --quiet git+https://github.com/papapew/Vibechek.git
 
 # Symlink the CLI into ~/.local/bin so it's on PATH (login shells get this dir
 # automatically on most distros; we also tack it onto .bashrc just in case).
@@ -1334,6 +1357,128 @@ def install_vibechek_in_wsl(
         on_progress(100, 100, "Install complete")
 
     return {"ok": True, "distro": distro, "tail": "\n".join(full_tail)}
+
+
+# Fast path that only re-installs vibechek itself (no apt, no essentia
+# rebuild). Designed for the version-drift case: the WSL install is healthy
+# but stuck on an older code revision, so we just bump the package and skip
+# the 5-10 minute essentia re-download. The full bootstrap remains the
+# correct entry for cold installs.
+_VIBECHEK_UPGRADE = r"""
+set -e
+
+if [ ! -x "$HOME/.vibechek/venv/bin/pip" ]; then
+    echo "ERROR: $HOME/.vibechek/venv is missing — run the full WSL setup first" >&2
+    exit 2
+fi
+
+echo "[1/1] Upgrading vibechek package (essentia + apt unchanged)..."
+# --force-reinstall guarantees we get the latest GitHub head even when pip's
+# resolver sees the existing version as satisfying ">=" requirements. --no-deps
+# keeps us from touching essentia/numpy/tensorflow, which is the whole point
+# of the fast path.
+"$HOME/.vibechek/venv/bin/pip" install --upgrade --force-reinstall --no-deps --quiet \
+    git+https://github.com/papapew/Vibechek.git
+
+echo "DONE"
+"$HOME/.vibechek/venv/bin/vibechek" --version
+"""
+
+
+def upgrade_vibechek_in_wsl(
+    distro: str,
+    on_progress: ProgressCallback | None = None,
+) -> dict:
+    """Re-install vibechek inside `distro` from GitHub, skipping apt + essentia.
+
+    This is the fast repair path for version drift: when the sidecar is on
+    v0.4.0-beta.3 but the WSL install is stuck on v0.4.0-beta.1, the user can
+    click "Update WSL install" without paying for a full apt + essentia
+    re-install (~5-10 min). Apt and essentia don't change between betas, only
+    the Python code does.
+
+    Returns the same shape as `install_vibechek_in_wsl` so the GUI can route
+    both through the same progress / error UI.
+    """
+    if not IS_WINDOWS:
+        return {"ok": False, "error": "Not running on Windows"}
+    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    if not wsl:
+        return {"ok": False, "error": "wsl.exe not found"}
+
+    from vibechek import cancellation  # noqa: PLC0415
+
+    if on_progress:
+        on_progress(0, 100, f"Upgrading vibechek inside {distro}...")
+
+    tail_lines: list[str] = []
+
+    # We reuse the same setsid+token-file launcher pattern as
+    # install_vibechek_in_wsl so cancellation works identically. Inlining the
+    # subset of `_run_phase` we need keeps this function self-contained.
+    import tempfile as _tempfile  # noqa: PLC0415
+    token_file = Path(_tempfile.gettempdir()) / (
+        f"vibechek-wsl-upgrade-pid-{os.getpid()}.txt"
+    )
+    wsl_token = win_to_wsl_path(str(token_file))
+    inner_script = _stage_script_for_wsl(_VIBECHEK_UPGRADE)
+    inner_wsl = win_to_wsl_path(str(inner_script))
+    launcher = (
+        "#!/usr/bin/env bash\n"
+        "set -e\n"
+        f'echo $$ > {_shell_quote(wsl_token)}\n'
+        'trap "kill -TERM 0 2>/dev/null; exit 130" SIGTERM SIGINT\n'
+        f"exec bash {_shell_quote(inner_wsl)}\n"
+    )
+    launcher_path = _stage_script_for_wsl(launcher)
+    wsl_launcher = win_to_wsl_path(str(launcher_path))
+
+    try:
+        proc = subprocess.Popen(
+            [wsl, "-d", distro, "--", "setsid", "-w", "bash", wsl_launcher],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as e:
+        return {"ok": False, "error": f"Could not invoke wsl: {e}"}
+    assert proc.stdout
+
+    cancel_done, cancel_state = _start_cancellation_watchdog(
+        proc, on_cancel=lambda: _kill_wsl_pgid(wsl, distro, token_file),
+    )
+
+    try:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            tail_lines.append(line)
+            if line.startswith("[1/1]") and on_progress:
+                on_progress(40, 100, line)
+            if line == "DONE" and on_progress:
+                on_progress(95, 100, line)
+        try:
+            rc = proc.wait(timeout=60 * 10)  # 10 min cap — pure pip install
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            cancel_done.set()
+            return {"ok": False, "error": "Upgrade killed after 10 min timeout",
+                    "tail": "\n".join(tail_lines)}
+        cancel_done.set()
+    finally:
+        launcher_path.unlink(missing_ok=True)
+        inner_script.unlink(missing_ok=True)
+        token_file.unlink(missing_ok=True)
+
+    if cancel_state["v"] or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True,
+                "tail": "\n".join(tail_lines)}
+    if rc != 0:
+        return {"ok": False, "error": f"vibechek upgrade exited with {rc}",
+                "tail": "\n".join(tail_lines)}
+
+    if on_progress:
+        on_progress(100, 100, "Upgrade complete")
+    return {"ok": True, "distro": distro, "tail": "\n".join(tail_lines)}
 
 
 # ---------------------------------------------------------------------------
@@ -1985,6 +2130,12 @@ def run_vibechek_in_wsl(
         f'echo $$ > {_shell_quote(wsl_token)}\n'
         'trap "kill -TERM 0 2>/dev/null; exit 130" SIGTERM SIGINT\n'
         f"{source_cuda_env}\n"
+        # Activate the structured-progress event channel inside the WSL
+        # `vibechek analyze` process so the parent sidecar can show per-stage
+        # progress (scanning → preflight → spawning workers → first track)
+        # AND per-track records as they complete. See
+        # vibechek/analyzer.py:_emit_event for the line schema.
+        'export VIBECHEK_STREAM_PROGRESS=1\n'
         '# Resolve vibechek binary explicitly — non-interactive bash has no PATH for it.\n'
         'VIBECHEK_BIN=""\n'
         'if [ -x "$HOME/.vibechek/venv/bin/vibechek" ]; then\n'

@@ -19,6 +19,16 @@ interface LibraryState {
   setLibraryPath: (path: string | null) => void;
   setTracks: (tracks: TrackAnalysis[]) => void;
   /**
+   * Merge one analyzed-track record into the library, by path. Used by the
+   * `sidecar:track_analyzed` event handler so the user sees tracks populate
+   * live during an analyze pass instead of waiting for the whole batch.
+   *
+   * Semantics: replace the existing entry that matches `record.path`. If no
+   * such entry exists (e.g. analyzing a folder that wasn't pre-scanned), the
+   * record is appended. selectedIds is untouched.
+   */
+  mergeAnalyzedTrack: (record: TrackAnalysis) => void;
+  /**
    * Rewrite track paths in-place after a filesystem move (e.g. organize).
    * Each entry of `pathMap` maps an old source path to its new destination.
    * Tracks not in the map are left untouched. Also rewrites the matching
@@ -40,6 +50,24 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
 
   setLibraryPath: (path) => set({ libraryPath: path }),
   setTracks: (tracks) => set({ tracks, selectedIds: new Set() }),
+
+  mergeAnalyzedTrack: (record) => {
+    const { tracks } = get();
+    // Path-based identity. The sidecar always sends a path (Windows-side
+    // path post-translation via wsl_to_win_path). We do a linear scan
+    // because tracks lists are typically <50k entries and analyze events
+    // stream at ~5/sec — well below the threshold where Map-based lookup
+    // would matter. Bumping the list to a Map keyed by path would also
+    // force every selector that re-derives from `tracks` to recompute.
+    const idx = tracks.findIndex((t) => t.path === record.path);
+    if (idx === -1) {
+      set({ tracks: [...tracks, record] });
+      return;
+    }
+    const next = tracks.slice();
+    next[idx] = record;
+    set({ tracks: next });
+  },
 
   updateTrackPaths: (pathMap) => {
     // Normalize Record → Map for a single lookup path. A Map is cheaper to

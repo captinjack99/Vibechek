@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the Vibechek CLI on Linux.
+# Build the Vibechek CLI / sidecar binary on Linux.
 #
 # Prereqs:
 #   - Python 3.10+
@@ -10,7 +10,7 @@
 #   ./packaging/build-linux.sh
 #
 # Output:
-#   dist/vibechek/                — one-folder bundle
+#   dist/vibechek                  — single-file executable (PyInstaller --onefile)
 #   dist/vibechek-linux-x64.tar.gz
 
 set -euo pipefail
@@ -32,13 +32,15 @@ echo "Running PyInstaller..."
 pyinstaller packaging/vibechek.spec --noconfirm --clean
 
 echo "Smoke-test the built binary..."
-dist/vibechek/vibechek --version
-dist/vibechek/vibechek --help > /dev/null
+dist/vibechek --version
+dist/vibechek --help > /dev/null
 
 ARCHIVE="dist/vibechek-linux-x64.tar.gz"
 echo "Packaging ${ARCHIVE}..."
+# Onefile output is a bare executable, not a directory. We still tar it for a
+# consistent release artifact so the execute bit survives the download cycle.
 tar -czf "${ARCHIVE}" -C dist vibechek
 
 echo
-echo "Build complete: dist/vibechek/vibechek"
+echo "Build complete: dist/vibechek"
 echo "Archive:        ${ARCHIVE}"

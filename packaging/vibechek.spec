@@ -1,22 +1,48 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for the Vibechek CLI.
+"""PyInstaller spec for the Vibechek CLI / sidecar binary.
 
-Builds a standalone executable that bundles the pure-Python core plus its
+Builds a SINGLE-FILE executable that bundles the pure-Python core plus its
 runtime deps (Click, Rich, Mutagen, platformdirs). Essentia / TensorFlow are
-deliberately NOT bundled — they're too heavy (~500MB) and don't have Windows
-wheels. The CLI works without them; the `analyze` and `download-models`
-subcommands instruct the user to install Essentia separately.
+deliberately NOT bundled — they're heavy (~500MB) and Windows lacks wheels.
+The CLI works without them; analyze/download-models flows instruct the user
+to install Essentia separately (via the managed venv or WSL).
 
 Build:
     pyinstaller packaging/vibechek.spec --noconfirm --clean
 Result:
-    dist/vibechek/                 (one-folder bundle)
-    dist/vibechek/vibechek(.exe)   (entry point)
+    dist/vibechek(.exe)            (single self-contained binary)
 
-One-folder mode (not --onefile) is used because:
-- ~10x faster startup (no temp extraction on every launch).
-- Easier to inspect / debug what's bundled.
-- Plays better with antivirus on Windows (--onefile triggers heuristic flags).
+# Why --onefile, not --onedir?
+
+Earlier revisions used `--onedir` because that mode starts ~3x faster (no
+self-extraction step) and AV vendors flag --onefile less often after they
+learn to whitelist a signed publisher. *But* shipping --onedir through a
+Tauri 2 sidecar broke in two important ways:
+
+  1. Tauri's `externalBin` config is single-file by contract. It copies one
+     file from `binaries/` into `target/<profile>/` at build time. PyInstaller
+     `--onedir` produces an EXE that LOADS its sibling `_internal/` directory
+     at startup (Python DLL, native pyds). Without explicit secondary staging,
+     `_internal/` never reached the dev binary's directory and the sidecar
+     died at launch with "Failed to load Python DLL python314.dll".
+
+  2. macOS code-signing + notarization. `tauri-action`'s codesign step
+     correctly signs the `externalBin` (the sidecar EXE), but not its sibling
+     `.dylib` / `.so` files under `_internal/`. Apple's notarytool refuses
+     bundles containing any unsigned Mach-O. We'd need a custom recursive
+     signing pass over `_internal/` per release, and Apple has been
+     deprecating `codesign --deep` in favor of explicit per-binary signing
+     (which scales poorly when PyInstaller drops 30+ shared libraries).
+
+Switching to `--onefile` collapses both problems to one signed binary per
+platform. The 500ms cold-start cost is paid ONCE when the Tauri app spawns
+its sidecar at session start, not per RPC call — entirely acceptable for a
+long-lived RPC server.
+
+AV note: we keep `upx=False` to avoid the Windows AV heuristic that flags
+UPX-packed onefile binaries. Combined with Authenticode signing (configured
+in `.github/workflows/release.yml`), SmartScreen warnings go away after the
+publisher reputation builds.
 """
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
@@ -63,11 +89,17 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# --onefile equivalent: pass the binaries / zipfiles / datas directly to EXE
+# (instead of routing them through a separate COLLECT step). PyInstaller
+# embeds everything inside the EXE and the bootloader self-extracts to a
+# temp dir at runtime.
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="vibechek",
     debug=False,
     bootloader_ignore_signals=False,
@@ -78,15 +110,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="vibechek",
 )

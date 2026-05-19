@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the Vibechek CLI on macOS.
+# Build the Vibechek CLI / sidecar binary on macOS.
 #
 # Prereqs:
 #   - Python 3.10+ (system python3 or installed via brew)
@@ -9,7 +9,7 @@
 #   ./packaging/build-macos.sh
 #
 # Output:
-#   dist/vibechek/                  — one-folder bundle
+#   dist/vibechek                   — single-file executable (PyInstaller --onefile)
 #   dist/vibechek-macos-<arch>.tar.gz
 
 set -euo pipefail
@@ -31,14 +31,17 @@ echo "Running PyInstaller..."
 pyinstaller packaging/vibechek.spec --noconfirm --clean
 
 echo "Smoke-test the built binary..."
-dist/vibechek/vibechek --version
-dist/vibechek/vibechek --help > /dev/null
+dist/vibechek --version
+dist/vibechek --help > /dev/null
 
 ARCH=$(uname -m)
 ARCHIVE="dist/vibechek-macos-${ARCH}.tar.gz"
 echo "Packaging ${ARCHIVE}..."
+# Onefile output is a bare executable, not a directory. We tar it so the
+# +x bit survives the upload → download cycle, and so the artifact name
+# matches the convention used by the other platforms.
 tar -czf "${ARCHIVE}" -C dist vibechek
 
 echo
-echo "Build complete: dist/vibechek/vibechek"
+echo "Build complete: dist/vibechek"
 echo "Archive:        ${ARCHIVE}"

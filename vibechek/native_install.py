@@ -560,6 +560,15 @@ def run_vibechek_in_native_venv(
     cmd = [status.venv_vibechek, *args]
     log.info("Native venv exec: %s", cmd)
 
+    # Activate the structured-progress event channel inside the managed-venv
+    # `vibechek analyze` process. The parent (this sidecar) parses
+    # VIBECHEK_EVENT lines out of stderr via `_make_event_aware_line_handler`
+    # so the GUI gets per-stage and per-track feedback instead of sitting at
+    # "starting…" through preflight + worker spawn. See
+    # vibechek/analyzer.py:_emit_event for the line schema.
+    venv_env = os.environ.copy()
+    venv_env["VIBECHEK_STREAM_PROGRESS"] = "1"
+
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -569,6 +578,7 @@ def run_vibechek_in_native_venv(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=venv_env,
     )
 
     cancel_event = _threading.Event()

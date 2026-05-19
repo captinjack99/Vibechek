@@ -13,17 +13,38 @@ import { ErrorToast } from "./components/ErrorToast";
 import { Toast } from "./components/Toast";
 import { Onboarding } from "./components/Onboarding";
 
-import { useUIStore, useOperationStore, useConfigStore } from "./stores";
-import { useSidecarProgress } from "./hooks/useSidecar";
+import { useUIStore, useOperationStore, useConfigStore, useLibraryStore } from "./stores";
+import { useSidecarProgress, useSidecarEvent } from "./hooks/useSidecar";
 import { useConfigPersistence } from "./hooks/useConfigPersistence";
+import type { TrackAnalysis } from "./types";
+
+interface TrackAnalyzedPayload {
+  current: number;
+  total: number;
+  track: TrackAnalysis;
+}
 
 export default function App() {
   const viewMode = useUIStore((s) => s.viewMode);
   const setProgress = useOperationStore((s) => s.setProgress);
+  const mergeAnalyzedTrack = useLibraryStore((s) => s.mergeAnalyzedTrack);
 
   // Pipe every sidecar progress notification into the operation store. Any
   // component can read it; the progress overlay does so.
   useSidecarProgress((evt) => setProgress(evt));
+
+  // Live-merge per-track results as the sidecar streams them during analyze.
+  // The user sees tracks appear in the library table in real-time instead of
+  // waiting for the whole batch to finish. The sidecar emits one
+  // `track_analyzed` notification per track once the structured event
+  // channel in vibechek/analyzer.py is active (which happens automatically
+  // for WSL- and managed-venv-routed analyzes — both set
+  // VIBECHEK_STREAM_PROGRESS=1 in the subprocess env).
+  useSidecarEvent<TrackAnalyzedPayload>("track_analyzed", (payload) => {
+    if (payload?.track?.path) {
+      mergeAnalyzedTrack(payload.track);
+    }
+  });
 
   // Load config from disk on startup, then auto-save (debounced) on change.
   useConfigPersistence();

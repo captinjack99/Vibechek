@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import urllib.request
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -1018,6 +1019,25 @@ def _worker_init(model_dir: str, use_gpu: str) -> None:
         raise
 
 
+def _normalize_version(v: str) -> str:
+    """Reduce a vibechek version string to a comparable shape.
+
+    pip writes PEP 440 forms ("0.4.0b2") in dist-info metadata, while
+    `__version__` carries the human form ("0.4.0-beta.2"). Both need to
+    compare equal for the WSL-drift check, so we strip non-alphanumerics,
+    lowercase, and collapse "beta" → "b" (pip's canonical) so both forms
+    converge to the same string. "0.4.0-beta.2" → "040b2"; "0.4.0b2" →
+    "040b2".  Older sentinel "0.1.0-dev" stays as "010dev".
+    """
+    import re as _re
+    s = v.strip().lower()
+    # Canonicalize pre-release tag spellings before stripping separators —
+    # otherwise "beta" stays as "beta" and won't match the "b" pip canonical.
+    s = s.replace("beta", "b").replace("alpha", "a")
+    # Drop everything that isn't [a-z0-9] — periods, dashes, underscores.
+    return _re.sub(r"[^a-z0-9]", "", s)
+
+
 # Per-worker GPU memory budget. ~1.5 GB covers a TF/essentia worker:
 # the bundled Discogs-EffNet weights (~500 MB) plus per-worker activation
 # tensors and a CUDA context (~800-1000 MB at steady state). Tuned against
@@ -1076,6 +1096,63 @@ def _probe_free_vram_mb() -> int | None:
     return total_free if saw_any else None
 
 
+# ---------------------------------------------------------------------------
+# Structured event stream — for surfacing analyze progress to a parent sidecar
+# ---------------------------------------------------------------------------
+#
+# When run as a sidecar subprocess (Windows sidecar → WSL `vibechek analyze`,
+# or the managed-venv variant), Rich's progress bar uses `\r` to overwrite a
+# single line, which Python's line-buffered subprocess.PIPE collapses into ONE
+# giant blob that only flushes after the process exits. The parent sidecar
+# therefore sees NO progress between "starting" and "done" — the user stares
+# at "starting…" for 30-60 s before the first byte of feedback arrives.
+#
+# To fix that, we emit our own structured-line stream IN PARALLEL with Rich:
+#
+#     VIBECHEK_EVENT\t<type>\t<json-payload>
+#
+# Each event is its own line (terminated by `\n`), so subprocess pipe
+# buffering can't merge them. The parent's stderr reader grep-matches the
+# sentinel prefix, parses the JSON, and re-emits as a JSON-RPC notification.
+# The Rich progress bar still renders for interactive CLI users.
+#
+# Activation is via the `VIBECHEK_STREAM_PROGRESS=1` environment variable so
+# interactive CLI invocations don't pay the extra IO cost — the Windows
+# sidecar sets it in the WSL launcher (`vibechek/wsl.py:run_vibechek_in_wsl`)
+# and the managed-venv launcher (`vibechek/native_install.py:run_vibechek_in_native_venv`).
+import os as _os_for_events
+import sys as _sys_for_events
+import threading as _threading_for_events
+
+EVENT_PREFIX = "VIBECHEK_EVENT\t"
+_EVENT_LOCK = _threading_for_events.Lock()
+_EVENT_STREAM_ON = _os_for_events.environ.get("VIBECHEK_STREAM_PROGRESS") == "1"
+
+
+def _emit_event(event_type: str, **payload: Any) -> None:
+    """Emit a structured event line if VIBECHEK_STREAM_PROGRESS=1.
+
+    No-op for interactive CLI usage. The parent sidecar parses these lines
+    out of the WSL/venv subprocess's stderr and turns them into JSON-RPC
+    notifications the GUI subscribes to. Never raises — if JSON encoding
+    fails (non-serializable payload), the event is silently dropped so a
+    flaky event call can't crash analyze.
+    """
+    if not _EVENT_STREAM_ON:
+        return
+    try:
+        encoded = json.dumps(payload, default=str, ensure_ascii=False)
+    except Exception:
+        return
+    line = EVENT_PREFIX + event_type + "\t" + encoded + "\n"
+    with _EVENT_LOCK:
+        try:
+            _sys_for_events.stderr.write(line)
+            _sys_for_events.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _worker_analyze(filepath_str: str) -> dict[str, Any]:
     filepath = Path(filepath_str)
     try:
@@ -1090,6 +1167,9 @@ def _worker_analyze(filepath_str: str) -> dict[str, Any]:
         }
 
 
+TrackCallback = Callable[[dict[str, Any], int, int], None]
+
+
 def analyze_directory(
     library_path: Path,
     config: AnalysisConfig | None = None,
@@ -1098,6 +1178,7 @@ def analyze_directory(
     skip: int = 0,
     limit: int | None = None,
     skip_paths: set[str] | None = None,
+    on_track: TrackCallback | None = None,
 ) -> dict[str, Any]:
     """Analyze every audio file under `library_path`.
 
@@ -1108,9 +1189,23 @@ def analyze_directory(
     When `skip_paths` is provided, files whose absolute string path is in the
     set are skipped — used by the GUI's incremental "analyze new tracks only"
     flow so re-runs don't re-process the whole library.
+
+    `on_track(record, current_idx, total)` is called as each track's ML record
+    becomes available — the RPC layer uses this to stream `track_analyzed`
+    notifications to the GUI so analyzed tracks appear live instead of after
+    the whole batch finishes. Pass None to opt out (CLI does this).
     """
     if config is None:
         config = AnalysisConfig()
+
+    # Surface "scanning files" as soon as the call starts. Without this, the
+    # GUI's progress overlay sits at "starting…" through find_audio_files +
+    # the slow preflight for 5-30 s, which is the worst UX the audit hit. The
+    # event channel ignores it when VIBECHEK_STREAM_PROGRESS isn't set, so
+    # interactive CLI users don't see anything new.
+    _emit_event("stage", name="scanning",
+                message="Scanning library for audio files...")
+    report_progress(on_progress, 0, 0, "Scanning library...")
 
     files = find_audio_files(library_path)
     if skip_paths:
@@ -1124,6 +1219,10 @@ def analyze_directory(
     if total == 0:
         return {"status": "complete", "summary": {"total_files": 0, "analyzed": 0, "errors": 0},
                 "tracks": [], "statistics": {}}
+
+    _emit_event("stage", name="preflight",
+                message=f"Checking environment ({total} files queued)...")
+    report_progress(on_progress, 0, total, f"Checking environment ({total} files)...")
 
     # Pre-flight: catch missing essentia / models BEFORE we spawn a worker pool.
     # An ImportError inside a multiprocessing.Pool initializer hangs the pool
@@ -1146,16 +1245,37 @@ def analyze_directory(
 
     # If native essentia is missing but WSL has it, route through WSL transparently.
     if pf.analyze_via == "wsl":
+        # Look up the installed WSL vibechek version from the preflight's
+        # already-probed WSLStatus so `_analyze_via_wsl` doesn't pay for a
+        # second `detect_wsl(quick=False)` (5-30 s) just to read one field.
+        wsl_distro = pf.wsl.usable_distro  # type: ignore[union-attr]
+        wsl_version = None
+        if pf.wsl is not None:
+            wsl_version = next(
+                (d.vibechek_version for d in pf.wsl.distros
+                 if d.name == wsl_distro and d.vibechek_version),
+                None,
+            )
+        _emit_event("stage", name="wsl_dispatch",
+                    message=f"Starting WSL analyzer ({wsl_distro})...")
+        report_progress(on_progress, 0, total,
+                        f"Starting WSL analyzer ({wsl_distro})...")
         return _analyze_via_wsl(
             library_path, config, on_progress, output_path, skip, limit,
-            distro=pf.wsl.usable_distro,  # type: ignore[union-attr]
+            distro=wsl_distro,
+            wsl_vibechek_version=wsl_version,
+            on_track=on_track,
         )
 
     # If native essentia is missing but the managed Linux/macOS venv has it,
     # route through that venv. Mirrors the WSL path; no path translation needed.
     if pf.analyze_via == "native_venv":
+        _emit_event("stage", name="venv_dispatch",
+                    message="Starting managed-venv analyzer...")
+        report_progress(on_progress, 0, total, "Starting managed-venv analyzer...")
         return _analyze_via_native_venv(
             library_path, config, on_progress, output_path, skip, limit,
+            on_track=on_track,
         )
 
     file_strs = [str(f) for f in files]
@@ -1231,22 +1351,38 @@ def analyze_directory(
             workers = gpu_cap
 
     log.info("Analyzing %d files with %d worker(s), GPU=%s", total, workers, config.use_gpu)
+    _emit_event("stage", name="analyzing",
+                message=f"Analyzing {total} files with {workers} worker(s)")
+    report_progress(on_progress, 0, total,
+                    f"Analyzing {total} files with {workers} worker(s)")
 
     if workers == 1:
+        _emit_event("stage", name="loading_models",
+                    message="Loading ML models...")
+        report_progress(on_progress, 0, total, "Loading ML models...")
         models = load_models(config.models_dir, use_gpu=config.use_gpu)
         for i, filepath in enumerate(files):
             cancellation.check()  # Raises CancelledError if user clicked Cancel
             report_progress(on_progress, i + 1, total, filepath.name)
             try:
-                results.append(asdict(analyze_track(filepath, models)))
+                record = asdict(analyze_track(filepath, models))
             except Exception as e:  # noqa: BLE001
-                results.append({
+                record = {
                     "path": str(filepath),
                     "filename": filepath.name,
                     "extension": filepath.suffix.lower(),
                     "size_mb": 0.0,
                     "error": str(e),
-                })
+                }
+            results.append(record)
+            # Per-track stream — sidecar relays this to the GUI so analyzed
+            # tracks appear live instead of after the whole batch.
+            _emit_event("track", index=i + 1, total=total, record=record)
+            if on_track is not None:
+                try:
+                    on_track(record, i + 1, total)
+                except Exception:  # noqa: BLE001
+                    log.exception("on_track callback raised; ignoring")
             if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
                 _write_partial(output_path, results, total, in_progress=(i + 1) < total)
     else:
@@ -1262,6 +1398,11 @@ def analyze_directory(
         #      mid-call. spawn sidesteps the entire class of problem.
         #   3. The slight startup cost (~1 sec per worker for re-imports) is
         #      dwarfed by the per-track analysis time.
+        _emit_event("stage", name="spawning_workers",
+                    message=f"Spawning {workers} worker process(es) "
+                            f"(loading models, may take 10-30 s)...")
+        report_progress(on_progress, 0, total,
+                        f"Spawning {workers} workers (loading models)...")
         spawn_ctx = multiprocessing.get_context("spawn")
         # maxtasksperchild=200: every 200 tracks the worker recycles, freeing
         # any TF memory leaks that essentia / TF native code might accumulate.
@@ -1322,6 +1463,12 @@ def analyze_directory(
                     raise cancellation.CancelledError("Analysis cancelled by user")
                 results.append(record)
                 report_progress(on_progress, i + 1, total, Path(record.get("path", "")).name)
+                _emit_event("track", index=i + 1, total=total, record=record)
+                if on_track is not None:
+                    try:
+                        on_track(record, i + 1, total)
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_track callback raised; ignoring")
                 if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
                     _write_partial(output_path, results, total, in_progress=(i + 1) < total)
 
@@ -1334,6 +1481,91 @@ def analyze_directory(
     return report
 
 
+def _make_event_aware_line_handler(
+    on_progress: ProgressCallback | None,
+    on_track: TrackCallback | None,
+    stderr_tail: list[str] | None = None,
+    *,
+    progress_re: re.Pattern[str] | None = None,
+    noise_re: re.Pattern[str] | None = None,
+) -> Callable[[str], None]:
+    """Build an `on_stderr_line` handler that parses VIBECHEK_EVENT lines.
+
+    The WSL / managed-venv `vibechek analyze` subprocess emits two channels:
+
+      1. Structured `VIBECHEK_EVENT\\t<type>\\t<json>` lines when
+         `VIBECHEK_STREAM_PROGRESS=1` is set in the env. These carry the
+         "starting WSL...", "spawning workers...", per-track records that the
+         GUI needs for live feedback.
+      2. Plain Rich progress bar output, parsed by the legacy regex
+         `(\\d+)\\s*/\\s*(\\d+)`. This is kept as a fallback for the
+         interactive CLI path and any older WSL install that pre-dates the
+         event channel.
+
+    `stderr_tail` (if provided) gets every non-noise line appended for the
+    bounded error-context buffer the WSL launcher uses on failure exit.
+    `noise_re` filters out essentia / TF chatter before the tail accumulates.
+
+    Returns a closure ready to pass to `run_vibechek_in_wsl(..., on_stderr_line=...)`
+    or `run_vibechek_in_native_venv(..., on_stderr_line=...)`.
+    """
+    if progress_re is None:
+        progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+    def _on_line(line: str) -> None:
+        # 1) Structured event channel — the primary signal during analyze.
+        if line.startswith(EVENT_PREFIX):
+            try:
+                _, event_type, payload_json = line.split("\t", 2)
+                payload = json.loads(payload_json)
+            except (ValueError, json.JSONDecodeError) as e:
+                log.debug("Failed to parse VIBECHEK_EVENT line: %s", e)
+                return
+            if event_type == "stage":
+                if on_progress is not None:
+                    msg = str(payload.get("message", payload.get("name", "")))
+                    try:
+                        on_progress(0, 0, msg)
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_progress raised on stage event")
+            elif event_type == "track":
+                idx = int(payload.get("index", 0))
+                total = int(payload.get("total", 0))
+                record = payload.get("record") or {}
+                if on_progress is not None:
+                    try:
+                        on_progress(idx, total,
+                                    Path(record.get("path", "")).name)
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_progress raised on track event")
+                if on_track is not None:
+                    try:
+                        on_track(record, idx, total)
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_track raised; ignoring")
+            return  # don't fall through to tail/regex for event lines
+
+        # 2) Bounded stderr tail for error-context (used by the WSL caller).
+        if stderr_tail is not None:
+            if noise_re is None or not noise_re.search(line):
+                stderr_tail.append(line)
+                if len(stderr_tail) > 80:
+                    stderr_tail.pop(0)
+
+        # 3) Legacy "N/M" regex — covers the rare case of a pre-event WSL
+        # install where Rich's final progress line is the only signal.
+        if not line:
+            return
+        m = progress_re.search(line)
+        if m and on_progress is not None:
+            try:
+                on_progress(int(m.group(1)), int(m.group(2)), line[:80])
+            except Exception:  # noqa: BLE001
+                log.exception("on_progress raised on legacy progress line")
+
+    return _on_line
+
+
 def _analyze_via_native_venv(
     library_path: Path,
     config: AnalysisConfig,
@@ -1341,6 +1573,7 @@ def _analyze_via_native_venv(
     output_path: Path | None,
     skip: int,
     limit: int | None,
+    on_track: TrackCallback | None = None,
 ) -> dict[str, Any]:
     """Route analyze to the managed `~/.vibechek/venv/bin/vibechek` on Linux/macOS.
 
@@ -1378,14 +1611,13 @@ def _analyze_via_native_venv(
     if limit:
         args += ["--limit", str(limit)]
 
-    progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
-
-    def on_line(line: str) -> None:
-        if not line:
-            return
-        m = progress_re.search(line)
-        if m and on_progress:
-            on_progress(int(m.group(1)), int(m.group(2)), line[:80])
+    # Shared handler — parses both the structured VIBECHEK_EVENT channel
+    # (stage transitions, per-track records) AND the legacy Rich-progress
+    # regex. See _make_event_aware_line_handler's docstring for the schema.
+    on_line = _make_event_aware_line_handler(
+        on_progress=on_progress,
+        on_track=on_track,
+    )
 
     result = run_vibechek_in_native_venv(args, on_stderr_line=on_line)
 
@@ -1419,6 +1651,8 @@ def _analyze_via_wsl(
     skip: int,
     limit: int | None,
     distro: str,
+    wsl_vibechek_version: str | None = None,
+    on_track: TrackCallback | None = None,
 ) -> dict[str, Any]:
     """Route the analyze to vibechek-inside-WSL.
 
@@ -1466,24 +1700,57 @@ def _analyze_via_wsl(
     if limit:
         args += ["--limit", str(limit)]
 
-    # Progress lines from `vibechek analyze` look like "Progress: 50/12000 ...".
-    # We re-emit them as JSON-RPC notifications. Every stderr line is ALSO
-    # captured into a bounded buffer so a failure exit can show what went
-    # wrong (previously we just got "exited with 1" and empty stdout —
-    # useless for diagnosis).
-    progress_re = re.compile(r"(\d+)\s*/\s*(\d+)")
+    # Drop high-volume essentia / TF noise lines from the bounded tail
+    # buffer so an 80-line window survives the per-worker spam and actually
+    # contains the real error (traceback, OOM kill, etc.). Without this
+    # filter, "MusicExtractorSVM: no classifier models were configured by
+    # default" (one line per worker init, repeated by every recycle) and TF's
+    # GPU-init chatter saturate the window and we end up reporting "stderr
+    # tail: 40 copies of MusicExtractorSVM" instead of the actual python
+    # traceback that fired one line earlier.
     stderr_tail: list[str] = []
+    _STDERR_NOISE = re.compile(
+        r"MusicExtractorSVM:|"
+        r"^\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+: [IWE] tensorflow|"
+        r"^Skipping registering GPU devices\.\.\.$|"
+        r"^Your kernel may have been built without NUMA support\.$|"
+        r"^pciBusID:|^coreClock:"
+    )
+    # Shared handler — parses structured VIBECHEK_EVENT lines (stage
+    # transitions, per-track records) AND keeps the legacy Rich-progress
+    # regex as a fallback. The structured channel is activated by setting
+    # VIBECHEK_STREAM_PROGRESS=1 in the WSL launcher (see
+    # vibechek/wsl.py:run_vibechek_in_wsl); the WSL `vibechek analyze`
+    # process emits one VIBECHEK_EVENT line per stage transition and one
+    # per finished track, which the GUI uses to drive a live "starting
+    # WSL → spawning workers → analyzed: filename" feedback chain.
+    on_line = _make_event_aware_line_handler(
+        on_progress=on_progress,
+        on_track=on_track,
+        stderr_tail=stderr_tail,
+        noise_re=_STDERR_NOISE,
+    )
 
-    def on_line(line: str) -> None:
-        # Keep the last 80 stderr lines for the error message.
-        stderr_tail.append(line)
-        if len(stderr_tail) > 80:
-            stderr_tail.pop(0)
-        if not line:
-            return
-        m = progress_re.search(line)
-        if m and on_progress:
-            on_progress(int(m.group(1)), int(m.group(2)), line[:80])
+    # Version-drift guard: catch the worst class of "silent exit 1" — the WSL
+    # vibechek install is older than the sidecar, so it's missing whatever
+    # safety patch landed since (worker cap, stall watchdog, atomic writes,
+    # ...). The user's symptom is "exits 1 in seconds, stderr is just essentia
+    # noise" because the old code paths haven't been written defensively.
+    # Refuse to dispatch and surface a clear repair message instead. The
+    # caller passes the version it already probed via preflight; if probing
+    # failed (None), we skip the guard rather than block an otherwise-healthy
+    # analyze on a flaky detection.
+    if wsl_vibechek_version is not None:
+        from vibechek import __version__ as _sidecar_version  # noqa: PLC0415
+        if _normalize_version(wsl_vibechek_version) != _normalize_version(_sidecar_version):
+            raise RuntimeError(
+                f"WSL vibechek is out of date: {distro} has "
+                f"{wsl_vibechek_version}, sidecar is {_sidecar_version}. "
+                f"Run Settings → Set up WSL again (or call the "
+                f"`repair_wsl_install` RPC) so the WSL install picks up the "
+                f"worker-cap and stall-watchdog patches. Older WSL installs "
+                f"crash silently on multi-worker analyze."
+            )
 
     result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line)
 
