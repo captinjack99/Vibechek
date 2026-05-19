@@ -119,10 +119,12 @@ def test_probe_skips_malformed_rows_but_keeps_good_ones() -> None:
 @pytest.mark.parametrize(
     "free_mb, expected_cap",
     [
-        (1500, 1),       # exactly 1 worker fits
-        (4500, 3),       # 4500 / 1500 = 3
-        (9000, 6),       # 8 GB-ish card -> 6 workers
-        (24000, 16),     # 24 GB monster -> 16 workers
+        (2500, 1),       # exactly 1 worker fits at the 2500-MB-per-worker budget
+        (7500, 3),       # 7500 / 2500 = 3
+        (7948, 3),       # the user's RTX 4070 Laptop empirical case — 3 workers
+                         #   stable, 4 stalls under contention
+        (10000, 4),      # 10 GB card -> 4 workers
+        (24000, 9),      # 24 GB monster -> 9 workers
         (500, 1),        # below per-worker budget -> still 1 (max(1, ...))
         (0, 1),          # zero free -> still 1 worker requested
     ],
@@ -135,11 +137,13 @@ def test_gpu_cap_formula(free_mb: int, expected_cap: int) -> None:
 def test_gpu_worker_mb_is_sane() -> None:
     """Guard against accidental tuning regressions.
 
-    The per-worker budget should stay in the 1-2 GB range. Below 1 GB risks
-    OOM (the model weights alone are ~500 MB and TF's CUDA context is ~700 MB);
-    above 2 GB starves big-VRAM cards of parallelism.
+    The per-worker budget should stay in the 1.5-3 GB range. Below 1.5 GB
+    risks OOM cascades (model weights ~500 MB + CUDA context ~800 MB +
+    activation buffers ~400 MB + growth-allocator fragmentation ~700 MB =
+    ~2.4 GB at steady state under contention); above 3 GB starves big-VRAM
+    cards of useful parallelism for diminishing reliability gains.
     """
-    assert 1000 <= analyzer._GPU_WORKER_MB <= 2000
+    assert 1500 <= analyzer._GPU_WORKER_MB <= 3000
 
 
 def test_gpu_fallback_cap_matches_prior_behaviour() -> None:

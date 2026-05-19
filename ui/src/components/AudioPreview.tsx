@@ -146,9 +146,18 @@ export function AudioPreview({ path }: { path: string }) {
         )}
 
         {error && (
-          <div className="px-3 py-6 flex items-center justify-center gap-2 text-xs text-accent-red">
-            <AlertCircle className="w-4 h-4 flex-none" />
-            <span className="truncate" title={error}>{error}</span>
+          // WaveSurfer / asset-protocol errors are often long (full file
+          // paths, decode-failure detail). The previous `truncate` class
+          // hid everything past the first ~30 chars — useless when the user
+          // is trying to figure out which codec is unsupported. We allow
+          // wrap, preserve internal whitespace (some error strings have
+          // newlines), and cap with a scrollable max-height so a runaway
+          // multi-line stack trace doesn't blow the side panel out.
+          <div className="px-3 py-3 flex items-start gap-2 text-xs text-accent-red max-h-40 overflow-y-auto">
+            <AlertCircle className="w-4 h-4 flex-none mt-0.5" />
+            <span className="break-words whitespace-pre-wrap font-mono leading-snug">
+              {error}
+            </span>
           </div>
         )}
       </div>
