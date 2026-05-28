@@ -154,6 +154,92 @@ def test_apply_ml_tags_legacy_report_no_parent_fallback(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Rekordbox preservation — the product's #1 defensible feature. These use a
+# synthetic-but-valid silent MP3 (no external fixture needed) so they run in
+# CI unconditionally and guard against a tag write ever stripping GEOB/PRIV
+# (Serato/Rekordbox cue points, beat grids, color waveforms).
+# ---------------------------------------------------------------------------
+
+
+def _make_silent_mp3(path: Path) -> None:
+    """Write a minimal valid MPEG-1 Layer III file mutagen can parse.
+
+    One frame = header (FF FB 90 C0: 128kbps, 44.1kHz, mono) + 413 zero bytes
+    = 417 bytes. ~40 frames ≈ 1s of silence — enough for MP3() to parse and
+    for us to attach ID3 frames.
+    """
+    frame = bytes([0xFF, 0xFB, 0x90, 0xC0]) + bytes(413)
+    path.write_bytes(frame * 40)
+
+
+def test_apply_ml_tags_preserves_rekordbox_geob_priv(tmp_path: Path) -> None:
+    """A genre tag write must NOT strip GEOB/PRIV frames — losing those would
+    silently destroy a DJ's Serato/Rekordbox cue points and beat grids."""
+    from mutagen.mp3 import MP3
+    from mutagen.id3 import GEOB, PRIV
+
+    track = tmp_path / "cued.mp3"
+    _make_silent_mp3(track)
+
+    # Seed the file with Rekordbox/Serato-style binary frames.
+    audio = MP3(track)
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags.add(GEOB(encoding=0, mime="application/octet-stream",
+                        filename="", desc="Serato Markers_", data=b"\x01\x02cues"))
+    audio.tags.add(PRIV(owner="Serato Markers2", data=b"\x03\x04grid"))
+    audio.save()
+
+    analysis = {
+        "tracks": [{
+            "path": str(track),
+            "ml_analysis": {
+                "ml_genre": "House",
+                "ml_subgenre": "Deep House",
+                "ml_genre_confidence": 0.95,
+                "ml_genre_raw_confidence": 0.95,
+            },
+        }],
+    }
+    stats = apply_ml_tags(analysis, TaggingConfig(preserve_rekordbox_frames=True))
+    assert stats.genre_applied == 1
+
+    # The binary frames must survive the write.
+    after = MP3(track)
+    keys = list(after.tags.keys())
+    assert any(k.startswith("GEOB") for k in keys), f"GEOB stripped! keys={keys}"
+    assert any(k.startswith("PRIV") for k in keys), f"PRIV stripped! keys={keys}"
+    # And the genre actually got written.
+    assert str(after.tags.get("TCON")) == "Deep House"
+
+
+def test_apply_ml_tags_preserves_geob_across_reapply(tmp_path: Path) -> None:
+    """Re-applying tags twice must not drop or duplicate the GEOB frame."""
+    from mutagen.mp3 import MP3
+    from mutagen.id3 import GEOB
+
+    track = tmp_path / "x.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags.add(GEOB(encoding=0, mime="x", filename="", desc="Serato Markers_", data=b"cues"))
+    audio.save()
+
+    analysis = {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "Techno", "ml_subgenre": "Techno",
+        "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+    }}]}
+    apply_ml_tags(analysis, TaggingConfig(), dry_run=False)
+    apply_ml_tags(analysis, TaggingConfig(), dry_run=False)
+
+    after = MP3(track)
+    geob_keys = [k for k in after.tags.keys() if k.startswith("GEOB")]
+    # mutagen keys GEOB by description, so a re-add replaces rather than dupes.
+    assert len(geob_keys) == 1, f"GEOB duplicated/dropped: {geob_keys}"
+
+
+# ---------------------------------------------------------------------------
 # Integration: real audio file required
 # ---------------------------------------------------------------------------
 

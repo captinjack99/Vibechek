@@ -1253,20 +1253,23 @@ def install_vibechek_in_wsl(
             f"vibechek-wsl-install-pid-{os.getpid()}-{id(script)}.txt"
         )
         wsl_token = win_to_wsl_path(str(token_file))
+        # Stage the inner script FIRST and keep its path in a variable. The old
+        # code inlined `_stage_script_for_wsl(script)` inside the f-string and
+        # then reverse-engineered the path by splitting the launcher's last
+        # line on whitespace — which broke when `_shell_quote` wrapped a path
+        # containing a space (e.g. `%TEMP%` under `C:\Users\name with spaces\`),
+        # leaking the tempfile and potentially unlinking the wrong path.
+        inner_script_path = _stage_script_for_wsl(script)
+        inner_script_wsl = win_to_wsl_path(str(inner_script_path))
         launcher = (
             "#!/usr/bin/env bash\n"
             "set -e\n"
             f'echo $$ > {_shell_quote(wsl_token)}\n'
             'trap "kill -TERM 0 2>/dev/null; exit 130" SIGTERM SIGINT\n'
-            f"exec bash {_shell_quote(win_to_wsl_path(str(_stage_script_for_wsl(script))))}\n"
+            f"exec bash {_shell_quote(inner_script_wsl)}\n"
         )
-        # We staged the script above; recover its path so we can clean up.
-        # Re-parse from the launcher line.
         launcher_path = _stage_script_for_wsl(launcher)
         wsl_launcher = win_to_wsl_path(str(launcher_path))
-        # Extract the script path so we delete it too. Cheap: it's the last
-        # arg of the exec line.
-        inner_script_wsl = launcher.rstrip().splitlines()[-1].split()[-1].strip("'")
         try:
             try:
                 # `setsid -w`: WAIT for the child instead of fork-and-exit.
@@ -1314,14 +1317,9 @@ def install_vibechek_in_wsl(
             return rc, tail, cancel_state["v"]
         finally:
             launcher_path.unlink(missing_ok=True)
-            # The inner script was staged with its own NamedTemporaryFile path
-            # via _stage_script_for_wsl; convert back from the WSL form so we
-            # can unlink the Windows-side copy.
-            try:
-                inner_win = wsl_to_win_path(inner_script_wsl)
-                Path(inner_win).unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Clean up the inner script via the Path we captured up front (no
+            # more fragile reparse of the launcher text).
+            inner_script_path.unlink(missing_ok=True)
             token_file.unlink(missing_ok=True)
 
     # ---- Phase 1: apt as root ----
@@ -1547,8 +1545,13 @@ def _resolve_cuda_packages(missing_libs: list[str]) -> tuple[list[str], list[str
       - Mixed: pick cu12 (forward-compatible — cu12 runtime supports cu11
         apps via CUDA's binary compat guarantee)
     """
+    # A CUDA-12 install dlopens .so.12 (cudart/cublas/...) or .so.9 (cudnn).
+    # Detect by soname suffix only — the membership test the old code ANDed in
+    # was dead (every .so.12 name is in the cu12 table anyway) and the missing
+    # parentheses meant `and` bound tighter than `or`, making the logic
+    # accidental rather than intended.
     has_cu12 = any(
-        lib in _CUDA12_PIP_PACKAGES_BY_LIB and ".so.12" in lib or ".so.9" in lib
+        (".so.12" in lib) or (".so.9" in lib)
         for lib in missing_libs
     )
     table = _CUDA12_PIP_PACKAGES_BY_LIB if has_cu12 else _CUDA_PIP_PACKAGES_BY_LIB
@@ -1867,7 +1870,16 @@ fi
     finally:
         script_path.unlink(missing_ok=True)
 
-    stdout = result.stdout.decode("utf-8", errors="replace").strip()
+    # Decode like the other probes — WSL on some setups emits UTF-16 LE, and a
+    # plain utf-8 decode there interleaves NULs so none of the marker checks
+    # below match (the repair succeeds but we'd report "Unexpected output").
+    stdout = ""
+    for enc in ("utf-8", "utf-16-le", "cp1252"):
+        try:
+            stdout = result.stdout.decode(enc).replace("\x00", "").strip()
+            break
+        except UnicodeDecodeError:
+            continue
     if "REPAIRED" in stdout:
         return {"ok": True, "repaired": True,
                 "message": "Shim repaired. Analyze should work now."}

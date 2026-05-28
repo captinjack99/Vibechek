@@ -206,33 +206,29 @@ def get_best_genre(
     else:
         related = {top_subgenre}
 
+    # `top` is sorted by confidence descending and `top[0]` is the leader, so
+    # the chosen subgenre is always the top prediction's subgenre. (An earlier
+    # version tried to "promote a more specific sibling" inside this loop, but
+    # the guard `pred.confidence > leader.confidence` could never be true for a
+    # later, lower-confidence prediction — it was dead code that always fell
+    # through to `top_subgenre`.) We keep the loop solely to sum the family's
+    # aggregate confidence across related subgenres.
     family_confidence = 0.0
     best_subgenre = top_subgenre
-    best_subgenre_conf = pri.confidence
 
     for pred in top:
         sub = pred.subgenre or ""
-        is_related = False
-        if sub == top_subgenre:
-            is_related = True
-        elif sub in related:
-            is_related = True
-        elif pred.parent_category == top_parent_category and sub in SUBGENRE_TO_PARENT:
-            if SUBGENRE_TO_PARENT[sub] == top_dj_parent:
-                is_related = True
-
+        is_related = (
+            sub == top_subgenre
+            or sub in related
+            or (
+                pred.parent_category == top_parent_category
+                and sub in SUBGENRE_TO_PARENT
+                and SUBGENRE_TO_PARENT[sub] == top_dj_parent
+            )
+        )
         if is_related:
             family_confidence += pred.confidence
-            if sub != top_dj_parent and sub in related:
-                # Track the most specific subgenre that's at least half as
-                # confident as the leader.
-                if pred.confidence > best_subgenre_conf * 0.5 and pred.confidence > best_subgenre_conf:
-                    best_subgenre = sub
-                    best_subgenre_conf = pred.confidence
-
-    # If the top prediction is already a recognized subgenre, keep it
-    if top_subgenre in SUBGENRE_TO_PARENT:
-        best_subgenre = top_subgenre
 
     dj_genre = DJ_GENRE_MAP.get(top_dj_parent, top_dj_parent)
     dj_subgenre = DJ_GENRE_MAP.get(best_subgenre, best_subgenre)

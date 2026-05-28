@@ -399,7 +399,10 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
             if let Some(tx) = pending.remove(&id) {
                 let _ = tx.send(msg);
             } else {
-                eprintln!("response for unknown id {id}");
+                // Expected when a slow op finished just after its wall-clock
+                // timeout dropped the pending entry (the result is discarded —
+                // the caller already got a timeout error). Not an error.
+                eprintln!("[sidecar] late/duplicate response for id {id} (likely post-timeout) — ignoring");
             }
             return Ok(());
         }

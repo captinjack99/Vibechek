@@ -65,13 +65,16 @@ export const useOperationStore = create<OperationState>((set) => ({
   //      where the RpcError carries one. The full raw JSON stays on `error`
   //      for the LogsViewer / clipboard copy path.
   fail: (error) => {
-    // Cancellation detection (works for both RpcError and plain string forms)
+    // Cancellation detection. `RpcError.cancelled` is the reliable signal
+    // (set from the server's structured `data.cancelled`). We also accept a
+    // raw JSON string carrying `"cancelled":true` for the rare path where a
+    // caller passed an unparsed error string. We deliberately do NOT do a
+    // loose `includes("cancelled by user")` substring match anymore — a
+    // genuine sidecar-death error whose message happened to contain that
+    // phrase (e.g. an install path) would be wrongly suppressed.
     const cancelled =
       (typeof error === "object" && error !== null && (error as any).cancelled === true) ||
-      (typeof error === "string" && (
-        error.includes('"cancelled":true') ||
-        error.toLowerCase().includes("cancelled by user")
-      ));
+      (typeof error === "string" && error.includes('"cancelled":true'));
     if (cancelled) {
       set({ active: null, progress: null, startedAt: null, error: null });
       return;

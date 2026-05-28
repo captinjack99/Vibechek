@@ -14,6 +14,29 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
 
 ---
 
+## [0.4.0-beta.5] — 2026-05-18
+
+Undo journal + the remaining audit LOW/informational fixes.
+
+### Added
+- **Operation undo journal** (`vibechek/journal.py`). `organize` and `dedupe` (move-to-review) now write an append-only JSONL journal — each completed move is recorded + flushed BEFORE the next, so a partial run (disk full, crash, power loss) is recoverable AND a finished operation can be reverted. New `revert_journal` moves files back to their origins (newest-first, never clobbering an occupied origin); `list_journals` powers an undo list. Trash entries are journaled for transparency but flagged non-revertible (send2trash → OS recycle bin has no reliable restore). New RPCs `list_journals` + `revert_journal` (+ typed TS wrappers), CLI `vibechek journals` / `vibechek revert <file>`, and `OrganizeStats.journal_path` / dedupe summary `journal_path` so the GUI can offer one-click undo. 9 new journal tests.
+
+### Fixed (audit LOW + informational)
+- **Double `aggressive` model inference per track** — the Direction calc re-ran the most expensive ML head on the full embedding; now reuses the array already computed in the mood loop (measurable speedup on large libraries).
+- **`find_audio_files` aborted the whole scan** on one unreadable entry (broken symlink, MAX_PATH, permission denied) → now skips the bad entry and continues.
+- **`sanitize`/install fragility**: `_run_phase` reverse-parsed the staged inner-script path out of the launcher text (broke on paths with spaces, leaked tempfiles) → now captures the `Path` up front. `_resolve_cuda_packages` had an operator-precedence smell in cu12 detection → parenthesized. `repair_wsl_shim` decoded stdout as utf-8 only → now multi-encoding like the other WSL probes.
+- **JSON-RPC**: failed *notifications* (no `id`) wrongly emitted an error response → now silent per spec. Sidecar shutdown sets the cancellation flag before pool teardown so an in-flight analyze/install can unwind instead of orphaning subprocesses.
+- **CLI `export`** crashed on a malformed `analysis.json` with non-dict track entries → skips them.
+- **M4A BPM restore** raised `ValueError` on a non-numeric backup value (`"128 BPM"`) and failed the whole file → coerces defensively.
+- **keys.py**: an explicit-but-unknown mode (`"C dim"`) no longer silently resolves to major; `is_compatible_with` is now genuinely symmetric for the directional `energy-boost` mode (checks both directions).
+- **genres.py**: removed dead "promote more specific subgenre" branch (the guard could never fire given descending sort).
+- **config int coercion** accepts string/float forms uniformly (`int(round(float(v)))`) instead of truncating/raising inconsistently.
+- **resources.py** `nvidia-smi` device probe now checks the exit code before parsing (NVML driver-mismatch errors).
+- **Frontend**: Settings engine-GPU error unwraps `RpcError.message` instead of `String(e)` → no more `[object Object]`; `operation.fail` dropped the fragile `includes("cancelled by user")` substring heuristic (relies on the reliable `RpcError.cancelled`); Rust shell logs post-timeout late responses as expected-noise, not errors.
+- Added a real (CI-runnable, synthetic-MP3-backed) **Rekordbox GEOB/PRIV preservation regression test** — guards the product's #1 feature against a tag write ever stripping cue points / beat grids, including across a double re-apply.
+
+---
+
 ## [0.4.0-beta.4] — 2026-05-18
 
 End-to-end codebase audit (7 parallel review agents). Fixed all HIGH + MED findings.

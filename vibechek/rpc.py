@@ -835,6 +835,37 @@ def _load_recent_analysis(params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Undo journals (organize / dedupe-move / dedupe-trash)
+# ---------------------------------------------------------------------------
+
+
+def _list_journals(params: dict) -> dict:
+    """List recent operation journals so the GUI can offer 'Undo'.
+
+    Returns {"journals": [{path, kind, started_at, root, move_count,
+    trash_count}, ...]}, most recent first.
+    """
+    from vibechek import journal
+    limit = int(params.get("limit", 50))
+    return {"journals": journal.list_journals(limit=limit)}
+
+
+def _revert_journal(params: dict) -> dict:
+    """Reverse the moves recorded in a journal. Cancellable.
+
+    Params: {journal_path: str}. Moves files back to their original locations
+    (skips entries whose destination is gone or whose origin is now occupied).
+    Trash entries can't be auto-restored and are reported in
+    `trashed_not_reverted`. Returns the revert summary.
+    """
+    from vibechek import journal
+    return journal.revert_journal(
+        Path(params["journal_path"]),
+        on_progress=_emit_progress,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -923,6 +954,8 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "verify_models": _verify_models,
     "list_profiles": _list_profiles,
     "load_profile": _load_profile,
+    "list_journals": _list_journals,
+    "revert_journal": _revert_journal,
 }
 
 # Methods that run long ops and should be cancellable.
@@ -941,6 +974,7 @@ _CANCELLABLE_METHODS = {
     "upgrade_vibechek_in_wsl": "install-essentia",
     "install_cuda_libs_in_wsl": "install-cuda",
     "install_essentia_native": "install-essentia",
+    "revert_journal": "revert",
 }
 
 # JSON-RPC error codes
@@ -995,13 +1029,19 @@ def _dispatch(request: dict[str, Any]) -> None:
     try:
         result = handler(params)
     except cancellation.CancelledError as e:
-        _err(req_id, APP_ERROR, str(e), data={"cancelled": True})
+        # Per JSON-RPC 2.0 the server must not reply to a notification (no id),
+        # even on failure. The success path already guards this; mirror it on
+        # every error branch so a failed notification stays silent.
+        if req_id is not None:
+            _err(req_id, APP_ERROR, str(e), data={"cancelled": True})
     except (TypeError, KeyError, ValueError) as e:
         log.exception("Invalid params to method %s", method)
-        _err(req_id, INVALID_PARAMS, f"Invalid params: {e}")
+        if req_id is not None:
+            _err(req_id, INVALID_PARAMS, f"Invalid params: {e}")
     except Exception as e:  # noqa: BLE001
         log.exception("Handler raised for method %s", method)
-        _err(req_id, APP_ERROR, str(e), data={"traceback": traceback.format_exc()})
+        if req_id is not None:
+            _err(req_id, APP_ERROR, str(e), data={"traceback": traceback.format_exc()})
     else:
         if req_id is not None:
             _ok(req_id, result)
@@ -1217,6 +1257,17 @@ def serve(stdin=None, stdout=None) -> None:
             pool.submit(_dispatch, request)
     finally:
         log.info("Sidecar shutting down (stdin closed)")
+        # Signal the cooperative cancellation flag BEFORE tearing down the
+        # pool. `cancel_futures=True` only drops QUEUED futures, not the one
+        # already executing — an in-flight analyze / WSL install would
+        # otherwise keep running (and its spawned subprocesses orphaned) after
+        # the sidecar's stdin closed. Setting the cancel flag gives the running
+        # long-op loop (which checks cancellation.is_cancelled()) a chance to
+        # unwind and kill its children.
+        try:
+            cancellation.cancel()
+        except Exception:  # noqa: BLE001
+            pass
         pool.shutdown(wait=False, cancel_futures=True)
 
 

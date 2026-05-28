@@ -80,7 +80,18 @@ def key_to_camelot(key_str: str | None) -> str | None:
         note = m.group(1).capitalize()
         # Normalize C#/Db style by leaving as-typed; lookup will handle both
         mode = m.group(2)
-        full = f"{note} minor" if mode and mode.lower() in ("min", "minor", "m") else f"{note} major"
+        if mode is None:
+            # Bare note (e.g. "C") → major, the conventional default.
+            full = f"{note} major"
+        elif mode.lower() in ("min", "minor", "m"):
+            full = f"{note} minor"
+        elif mode.lower() in ("maj", "major"):
+            full = f"{note} major"
+        else:
+            # An explicit but unrecognized mode ("dim", "aug", ...) — don't
+            # silently guess major; return None so callers treat it as unknown
+            # rather than a confidently-wrong Camelot.
+            return None
         return KEY_TO_CAMELOT.get(full)
 
     return None
@@ -176,7 +187,15 @@ def is_compatible_with(a: str | None, b: str | None, mode: str = "energy") -> bo
     b_camelot = _wrap_camelot(*b_parsed)
     if a_camelot == b_camelot:
         return True
-    return b_camelot in compatible_camelot(a_camelot, mode=mode)
+    # Check BOTH directions so the function is genuinely symmetric as
+    # documented. "energy-boost" is directional (it adds a +7 modulation but
+    # not its inverse), so `b in compatible(a)` alone would make
+    # is_compatible_with(8A, 3A) != is_compatible_with(3A, 8A). OR-ing both
+    # directions restores symmetry without changing the looser/creative intent.
+    return (
+        b_camelot in compatible_camelot(a_camelot, mode=mode)
+        or a_camelot in compatible_camelot(b_camelot, mode=mode)
+    )
 
 
 __all__ = [

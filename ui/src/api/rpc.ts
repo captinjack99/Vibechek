@@ -66,6 +66,10 @@ import type {
   ListProfilesResult,
   LoadProfileRequest,
   LoadProfileResult,
+  ListJournalsRequest,
+  ListJournalsResult,
+  RevertJournalRequest,
+  RevertJournalResult,
   DoctorResult,
   VerifyModelsResult,
   NativeVenvStatus,
@@ -429,6 +433,24 @@ export function forgetBackup(
 }
 
 // ---------------------------------------------------------------------------
+// Undo journals
+// ---------------------------------------------------------------------------
+
+/** List recent operation journals (organize / dedupe) for the Undo UI. */
+export function listJournals(
+  params: ListJournalsRequest = {},
+): Promise<ListJournalsResult> {
+  return rpc<ListJournalsResult>("list_journals", params);
+}
+
+/** Reverse the moves recorded in a journal. Cancellable. */
+export function revertJournal(
+  params: RevertJournalRequest,
+): Promise<RevertJournalResult> {
+  return rpc<RevertJournalResult>("revert_journal", params);
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -503,6 +525,9 @@ const api = {
   getLogTail,
   backupHistory,
   forgetBackup,
+  // undo journals
+  listJournals,
+  revertJournal,
   // diagnostics
   doctor,
 };

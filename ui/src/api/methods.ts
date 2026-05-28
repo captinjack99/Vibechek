@@ -103,6 +103,9 @@ export const RPC_METHODS = [
   "get_log_tail",
   "backup_history",
   "forget_backup",
+  // undo journals
+  "list_journals",
+  "revert_journal",
   // diagnostics
   "doctor",
 ] as const;
@@ -444,6 +447,41 @@ export interface LoadProfileResult {
   applied?: unknown;
   config?: VibechekConfig;
   [k: string]: unknown;
+}
+
+// --- undo journals ---
+
+export interface JournalSummary {
+  path: string;
+  /** "organize" | "dedupe_move" | "dedupe_trash". */
+  kind: string;
+  started_at: number | null;
+  root: string | null;
+  move_count: number;
+  trash_count: number;
+}
+
+export interface ListJournalsRequest {
+  /** Max journals to return (default 50). */
+  limit?: number;
+}
+
+export interface ListJournalsResult {
+  journals: JournalSummary[];
+}
+
+export interface RevertJournalRequest {
+  journal_path: string;
+}
+
+export interface RevertJournalResult {
+  reverted: number;
+  skipped: number;
+  errors: number;
+  /** Trash entries can't be auto-restored — count of files the user must
+   * restore manually from the OS recycle bin. */
+  trashed_not_reverted: number;
+  error_messages: string[];
 }
 
 // --- diagnostics / models ---

@@ -466,30 +466,43 @@ def handle_duplicates(
     if action is DuplicateAction.REPORT:
         return summary
 
+    from vibechek import journal as _journal
+    summary["journal_path"] = None
+
     if action is DuplicateAction.MOVE:
         if not config.review_folder:
             raise ValueError("DuplicateConfig.action='move' requires a review_folder")
         dest_root = Path(config.review_folder)
         dest_root.mkdir(parents=True, exist_ok=True)
 
-        for i, dupe in enumerate(all_dupes):
-            # Honor Cancel mid-batch — a user stopping a 12k-file move must
-            # actually stop, not just stop seeing progress.
-            cancellation.check()
-            report_progress(on_progress, i + 1, len(all_dupes), dupe.filename)
-            src = Path(dupe.path)
-            if not src.exists():
-                summary["errors"] += 1
-                error_messages.append(f"{src}: file not found")
-                continue
-            dst = _unique_path(dest_root / src.name)
-            try:
-                shutil.move(str(src), str(dst))
-                summary["moved"] += 1
-            except OSError as e:
-                log.warning("Move failed for %s: %s", src, e)
-                summary["errors"] += 1
-                error_messages.append(f"{src}: move failed — {e}")
+        # Move-to-review is fully revertible (move the file back), so we
+        # journal each move. Trash is recorded too (below) but only for
+        # transparency — send2trash has no reliable restore.
+        jrnl = _journal.start_journal(_journal.KIND_DEDUPE_MOVE, root=dest_root)
+        try:
+            for i, dupe in enumerate(all_dupes):
+                # Honor Cancel mid-batch — a user stopping a 12k-file move must
+                # actually stop, not just stop seeing progress.
+                cancellation.check()
+                report_progress(on_progress, i + 1, len(all_dupes), dupe.filename)
+                src = Path(dupe.path)
+                if not src.exists():
+                    summary["errors"] += 1
+                    error_messages.append(f"{src}: file not found")
+                    continue
+                dst = _unique_path(dest_root / src.name)
+                try:
+                    shutil.move(str(src), str(dst))
+                    jrnl.record_move(src, dst)
+                    summary["moved"] += 1
+                except OSError as e:
+                    log.warning("Move failed for %s: %s", src, e)
+                    summary["errors"] += 1
+                    error_messages.append(f"{src}: move failed — {e}")
+        finally:
+            jrnl.close()
+        if jrnl.entries > 0:
+            summary["journal_path"] = str(jrnl.path)
 
     elif action is DuplicateAction.TRASH:
         # Late import — send2trash is optional, only needed for this action
@@ -501,21 +514,31 @@ def handle_duplicates(
                 "Install with: pip install send2trash"
             ) from e
 
-        for i, dupe in enumerate(all_dupes):
-            cancellation.check()
-            report_progress(on_progress, i + 1, len(all_dupes), dupe.filename)
-            src = Path(dupe.path)
-            if not src.exists():
-                summary["errors"] += 1
-                error_messages.append(f"{src}: file not found")
-                continue
-            try:
-                send2trash(str(src))
-                summary["deleted"] += 1
-            except OSError as e:
-                log.warning("Trash failed for %s: %s", src, e)
-                summary["errors"] += 1
-                error_messages.append(f"{src}: trash failed — {e}")
+        # Trash journal is transparency-only: it records what was trashed so
+        # the user has a manifest, but revert_journal can't auto-restore from
+        # the OS recycle bin — it reports them for manual restore.
+        jrnl = _journal.start_journal(_journal.KIND_DEDUPE_TRASH, root=None)
+        try:
+            for i, dupe in enumerate(all_dupes):
+                cancellation.check()
+                report_progress(on_progress, i + 1, len(all_dupes), dupe.filename)
+                src = Path(dupe.path)
+                if not src.exists():
+                    summary["errors"] += 1
+                    error_messages.append(f"{src}: file not found")
+                    continue
+                try:
+                    send2trash(str(src))
+                    jrnl.record_trash(src)
+                    summary["deleted"] += 1
+                except OSError as e:
+                    log.warning("Trash failed for %s: %s", src, e)
+                    summary["errors"] += 1
+                    error_messages.append(f"{src}: trash failed — {e}")
+        finally:
+            jrnl.close()
+        if jrnl.entries > 0:
+            summary["journal_path"] = str(jrnl.path)
 
     return summary
 

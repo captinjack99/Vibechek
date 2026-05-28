@@ -101,3 +101,4 @@ _to_review/
 **/.DS_Store
 **/Thumbs.db
 .claude/worktrees/vigilant-pare-92eb80/
+/.claude

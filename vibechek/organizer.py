@@ -64,6 +64,9 @@ class OrganizeStats:
     planned: int = 0
     moved: int = 0
     errors: list[str] = field(default_factory=list)
+    # Path to the undo journal written for this run (None if nothing moved or
+    # the journal couldn't be opened). The GUI uses it to offer "Undo".
+    journal_path: str | None = None
 
 
 # Substrings (case-insensitive) that almost always mean the chosen target is
@@ -317,31 +320,45 @@ def organize_from_analysis(
     # Import here so we don't make cancellation a hard dep of organizer when
     # someone uses it as a library outside the sidecar.
     from vibechek import cancellation
+    from vibechek import journal as _journal
 
-    for i, move in enumerate(plan.moves):
-        # Check before each move — user clicking Cancel mid-organize must
-        # actually stop, not just stop SHOWING progress. Audit found that
-        # without this, ~12k file moves would continue after cancel.
-        cancellation.check()
-        report_progress(on_progress, i + 1, len(plan.moves), move.source.name)
-        try:
-            if not move.source.exists():
-                # Vanished between plan and execute (user deleted it, an
-                # earlier move with a colliding source name already took it).
-                stats.errors.append(f"{move.source.name}: source no longer exists")
-                continue
-            dest = move.destination
-            # Re-check at execute time: the plan uniquified against a disk
-            # snapshot, but time has passed (and earlier moves in this batch
-            # created folders). shutil.move OVERWRITES an existing destination
-            # file — a silent data-loss bug. Re-uniquify so we never clobber.
-            if dest.exists():
-                dest = _unique_destination(dest)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(move.source), str(dest))
-            stats.moved += 1
-        except OSError as e:
-            stats.errors.append(f"{move.source.name}: {e}")
+    # Append-only undo journal: records each completed move BEFORE the next so
+    # a partial run (disk full, crash) is recoverable and a finished organize
+    # can be reverted. A failure to open the journal degrades to a no-op
+    # writer — the organize still runs, just without undo.
+    jrnl = _journal.start_journal(_journal.KIND_ORGANIZE, root=plan.base_dir)
+    try:
+        for i, move in enumerate(plan.moves):
+            # Check before each move — user clicking Cancel mid-organize must
+            # actually stop, not just stop SHOWING progress. Audit found that
+            # without this, ~12k file moves would continue after cancel.
+            cancellation.check()
+            report_progress(on_progress, i + 1, len(plan.moves), move.source.name)
+            try:
+                if not move.source.exists():
+                    # Vanished between plan and execute (user deleted it, an
+                    # earlier move with a colliding source name already took it).
+                    stats.errors.append(f"{move.source.name}: source no longer exists")
+                    continue
+                dest = move.destination
+                # Re-check at execute time: the plan uniquified against a disk
+                # snapshot, but time has passed (and earlier moves in this batch
+                # created folders). shutil.move OVERWRITES an existing destination
+                # file — a silent data-loss bug. Re-uniquify so we never clobber.
+                if dest.exists():
+                    dest = _unique_destination(dest)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(move.source), str(dest))
+                # Record AFTER the move succeeds, BEFORE the next iteration.
+                jrnl.record_move(move.source, dest)
+                stats.moved += 1
+            except OSError as e:
+                stats.errors.append(f"{move.source.name}: {e}")
+    finally:
+        jrnl.close()
+
+    # Expose the journal path so the GUI can offer "Undo this organize".
+    stats.journal_path = str(jrnl.path) if jrnl.entries > 0 else None
 
     return stats
 

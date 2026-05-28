@@ -72,6 +72,8 @@ const PYTHON_METHODS = [
   "get_log_tail",
   "backup_history",
   "forget_backup",
+  "list_journals",
+  "revert_journal",
   "doctor",
   "verify_models",
   "list_profiles",
