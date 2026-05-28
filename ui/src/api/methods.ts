@@ -82,20 +82,29 @@ export const RPC_METHODS = [
   "restore_tags_with_remap",
   // models
   "download_models",
+  "verify_models",
   // config
   "get_config",
   "save_config",
   "restore_default_config",
+  // profiles
+  "list_profiles",
+  "load_profile",
   // ops
   "cancel_operation",
   // library state
   "library_state",
   "forget_library",
   "load_recent_analysis",
+  "rename_library",
+  "tag_library",
+  "count_new_tracks",
   // logging / history
   "get_log_tail",
   "backup_history",
   "forget_backup",
+  // diagnostics
+  "doctor",
 ] as const;
 
 export type RpcMethodName = (typeof RPC_METHODS)[number];
@@ -382,6 +391,77 @@ export interface ForgetBackupRequest {
 
 export interface ForgetBackupResult {
   removed: boolean;
+}
+
+// --- multi-library management ---
+
+export interface RenameLibraryRequest {
+  path: string;
+  name: string;
+}
+
+export interface TagLibraryRequest {
+  path: string;
+  tags: string[];
+}
+
+/** Both rename_library and tag_library return this shape. */
+export interface LibraryMutationResult {
+  /** renamed/tagged true iff the path was found in the recent list. */
+  renamed?: boolean;
+  tagged?: boolean;
+  record?: unknown;
+}
+
+export interface CountNewTracksRequest {
+  library_path: string;
+}
+
+export interface CountNewTracksResult {
+  new_count: number;
+  total_count: number;
+  analyzed_count: number;
+}
+
+// --- profiles ---
+
+export interface LoadProfileRequest {
+  name: string;
+}
+
+export interface ListProfilesResult {
+  profiles: Array<{
+    name: string;
+    label?: string;
+    description?: string;
+    [k: string]: unknown;
+  }>;
+}
+
+export interface LoadProfileResult {
+  loaded?: boolean;
+  saved_to?: string;
+  applied?: unknown;
+  config?: VibechekConfig;
+  [k: string]: unknown;
+}
+
+// --- diagnostics / models ---
+
+export interface DoctorResult {
+  markdown: string;
+}
+
+export interface VerifyModelsResult {
+  results: Array<{
+    name: string;
+    suffix: string;
+    /** true=match, false=mismatch/missing, null=no pin yet. */
+    ok: boolean | null;
+    expected?: string;
+    computed?: string;
+    reason?: string;
+  }>;
 }
 
 // --- install result shape (shared by all install_* handlers) ---

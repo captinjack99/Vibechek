@@ -239,6 +239,12 @@ def plan_organization(
         genre_counts=dict(genre_counts),
     )
 
+    # Destinations already assigned in THIS plan. Prevents two source files
+    # with the same basename + genre from both planning onto the same dest
+    # (neither exists on disk yet at plan time, so the on-disk check alone
+    # can't catch it).
+    claimed: set[Path] = set()
+
     for track in tracks:
         source = Path(track["path"])
         if not source.exists():
@@ -263,8 +269,11 @@ def plan_organization(
         if source == dest:
             continue  # Already in the right place
 
-        if dest.exists() and source != dest:
-            dest = _unique_destination(dest)
+        # Uniquify against BOTH on-disk state and destinations already claimed
+        # by earlier moves in this batch (intra-batch basename collisions).
+        if dest in claimed or (dest.exists() and source != dest):
+            dest = _unique_destination(dest, claimed)
+        claimed.add(dest)
 
         # Compute the relative destination once, here, so the UI never has to.
         # On Windows, destinations on a different drive than base_dir raise
@@ -316,8 +325,20 @@ def organize_from_analysis(
         cancellation.check()
         report_progress(on_progress, i + 1, len(plan.moves), move.source.name)
         try:
-            move.destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(move.source), str(move.destination))
+            if not move.source.exists():
+                # Vanished between plan and execute (user deleted it, an
+                # earlier move with a colliding source name already took it).
+                stats.errors.append(f"{move.source.name}: source no longer exists")
+                continue
+            dest = move.destination
+            # Re-check at execute time: the plan uniquified against a disk
+            # snapshot, but time has passed (and earlier moves in this batch
+            # created folders). shutil.move OVERWRITES an existing destination
+            # file — a silent data-loss bug. Re-uniquify so we never clobber.
+            if dest.exists():
+                dest = _unique_destination(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(move.source), str(dest))
             stats.moved += 1
         except OSError as e:
             stats.errors.append(f"{move.source.name}: {e}")
@@ -342,7 +363,11 @@ def route_new_tracks(
     files = find_audio_files(staging_dir)
     summary = {"copied": 0, "skipped_no_genre": 0, "skipped_exists": 0, "errors": 0}
 
+    from vibechek import cancellation
+
     for i, fp in enumerate(files):
+        # Honor Cancel mid-copy (the trash/move loops in duplicates do too).
+        cancellation.check()
         report_progress(on_progress, i + 1, len(files), fp.name)
 
         genre = _read_genre_tag(fp)
@@ -402,13 +427,24 @@ def _read_genre_tag(filepath: Path) -> str | None:
     return None
 
 
-def _unique_destination(path: Path) -> Path:
-    """Append _1, _2, ... until `path` doesn't exist."""
+def _unique_destination(path: Path, claimed: set[Path] | None = None) -> Path:
+    """Append _1, _2, ... until `path` is free.
+
+    "Free" means it neither exists on disk NOR has already been claimed by an
+    earlier planned move in this same batch. The `claimed` set closes the
+    intra-batch collision hole: two source files with the same basename
+    routing to the same genre folder are BOTH absent from disk at plan time
+    (they're still at their source locations), so without `claimed` they'd
+    both plan to the identical destination and the second `shutil.move` would
+    silently overwrite the first — data loss.
+    """
+    if path not in (claimed or ()) and not path.exists():
+        return path
     stem, suffix = path.stem, path.suffix
     counter = 1
     while True:
         candidate = path.with_name(f"{stem}_{counter}{suffix}")
-        if not candidate.exists():
+        if candidate not in (claimed or ()) and not candidate.exists():
             return candidate
         counter += 1
 

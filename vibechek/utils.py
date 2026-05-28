@@ -44,12 +44,32 @@ def find_audio_files(
 
 
 def sanitize_folder_name(name: str | None) -> str:
-    """Strip characters that are invalid on Windows/macOS/Linux folder names."""
+    """Sanitize a string for use as a single folder name.
+
+    Strips characters invalid on Windows/macOS/Linux AND defends against
+    path traversal. The genre used to build a destination folder can come
+    straight from a file's existing tag (see organizer.route_new_tracks),
+    which is fully attacker-controlled on a downloaded track. Without the
+    traversal guard, a genre tag of ".." or "../../Windows" would escape the
+    library root — `library_root / ".."` writes into the PARENT directory.
+
+    Guarantees the result is a single, safe path segment: no separators, no
+    leading/trailing dots, never "." or "..".
+    """
     if not name:
         return "Unknown"
     for ch in INVALID_FOLDER_CHARS:
         name = name.replace(ch, "_")
-    return name.strip() or "Unknown"
+    # Collapse any stray separators the loop above already turned into "_"
+    # is handled, but a literal forward slash on POSIX is in INVALID_FOLDER_CHARS
+    # so it's covered. Now strip leading/trailing dots + whitespace so "..",
+    # ".", " ..", "..hidden" etc. can't traverse or create dotfiles.
+    name = name.strip().strip(".").strip()
+    # After stripping, a name that was purely dots/separators is empty, OR a
+    # residual "." / ".." would still be dangerous — reject them outright.
+    if not name or name in (".", ".."):
+        return "Unknown"
+    return name
 
 
 def find_fpcalc() -> str | None:

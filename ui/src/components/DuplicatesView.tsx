@@ -464,29 +464,22 @@ function ReportView({
   );
 
   const spaceToFree = useMemo(() => {
-    // Start from the precomputed `recoverable_mb` (which assumes g.keep is
-    // the keeper). For groups with a user override, recompute the freed
-    // size using the actual chosen keeper.
+    // Sum the sizes of every NON-keeper file, using the *effective* keeper
+    // (`currentKeeper`) which accounts for both manual overrides AND the
+    // active auto-pick rules. The previous version fell back to the backend's
+    // precomputed `recoverable_mb` whenever there was no manual override — so
+    // reordering/toggling rules (which changes the auto-picked keeper, often
+    // to a file of a different size) left this figure stale. `rulesSig` is in
+    // the deps so a rule change recomputes.
     let total = 0;
     for (const g of activeGroups) {
-      const override = keeperOverrides[g.key];
-      if (override === undefined || override === g.keep.path) {
-        total += g.recoverable_mb;
-        continue;
-      }
-      const validPaths = [g.keep.path, ...g.duplicates.map((d) => d.path)];
-      if (!validPaths.includes(override)) {
-        // Stale override: treat as auto-pick (g.keep, same as backend assumption).
-        total += g.recoverable_mb;
-        continue;
-      }
-      const allFiles = [g.keep, ...g.duplicates];
-      for (const f of allFiles) {
-        if (f.path !== override) total += f.size_mb;
+      const keeperPath = currentKeeper(g);
+      for (const f of [g.keep, ...g.duplicates]) {
+        if (f.path !== keeperPath) total += f.size_mb;
       }
     }
     return total;
-  }, [activeGroups, keeperOverrides]);
+  }, [activeGroups, currentKeeper, rulesSig]);
 
   return (
     <div className="flex-1 flex flex-col min-h-0 px-4 py-4 space-y-4 overflow-hidden">

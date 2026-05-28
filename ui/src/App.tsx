@@ -24,6 +24,22 @@ interface TrackAnalyzedPayload {
   track: TrackAnalysis;
 }
 
+/**
+ * True if `trackPath` lives under `libraryPath`. Used to drop stale
+ * `track_analyzed` events from a previous/cancelled analyze run that arrive
+ * after the user has switched to a different library — without this, those
+ * events get merged (appended) into the new library as phantom tracks.
+ * Normalizes separators + case so Windows `C:\Foo\bar.flac` matches a
+ * library path of `C:/Foo` regardless of slash direction or casing.
+ */
+function isUnderLibrary(trackPath: string, libraryPath: string | null): boolean {
+  if (!libraryPath) return false;
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const t = norm(trackPath);
+  const lib = norm(libraryPath);
+  return t === lib || t.startsWith(lib + "/");
+}
+
 export default function App() {
   const viewMode = useUIStore((s) => s.viewMode);
   const setProgress = useOperationStore((s) => s.setProgress);
@@ -40,10 +56,21 @@ export default function App() {
   // channel in vibechek/analyzer.py is active (which happens automatically
   // for WSL- and managed-venv-routed analyzes — both set
   // VIBECHEK_STREAM_PROGRESS=1 in the subprocess env).
+  //
+  // Stale-event guard: a cancelled/superseded analyze keeps streaming events
+  // that are already queued in the sidecar's thread pool + Tauri's event
+  // channel. If the user switched libraries in the meantime, those events
+  // carry paths from the OLD folder and would be appended into the NEW
+  // library as phantom tracks (mergeAnalyzedTrack appends on path-not-found).
+  // We read libraryPath fresh from the store on each event (not via a
+  // subscription, so this closure never goes stale) and drop any event whose
+  // track isn't under the currently-open library.
   useSidecarEvent<TrackAnalyzedPayload>("track_analyzed", (payload) => {
-    if (payload?.track?.path) {
-      mergeAnalyzedTrack(payload.track);
-    }
+    const path = payload?.track?.path;
+    if (!path) return;
+    const libraryPath = useLibraryStore.getState().libraryPath;
+    if (!isUnderLibrary(path, libraryPath)) return;
+    mergeAnalyzedTrack(payload.track);
   });
 
   // Load config from disk on startup, then auto-save (debounced) on change.

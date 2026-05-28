@@ -59,12 +59,17 @@ fn timeout_for(method: &str) -> Option<Duration> {
         "backup_history",
         "get_config",
         "sidecar_status",
-        "scan_directory",
     ];
     // Medium: bounded ops that can legitimately take many minutes (installs,
     // scans, plans, organizations, model downloads). One hour is generous;
     // we don't want to kill an `install_vibechek_in_wsl` on a slow apt mirror.
     const MEDIUM: &[&str] = &[
+        // scan_directory enumerates + stat()s every audio file under a root.
+        // On a 50k-track library on a slow USB/SMB mount that easily exceeds
+        // the 60s QUICK budget — a timeout there drops the pending entry and
+        // discards the result even when the scan eventually finishes. It's a
+        // bounded op, so it belongs here, not in QUICK.
+        "scan_directory",
         "scan_only",
         "find_duplicates",
         "plan_organization",

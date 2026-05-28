@@ -58,6 +58,16 @@ import type {
   LibraryState,
   LoadRecentAnalysisRequest,
   LoadRecentAnalysisResult,
+  RenameLibraryRequest,
+  TagLibraryRequest,
+  LibraryMutationResult,
+  CountNewTracksRequest,
+  CountNewTracksResult,
+  ListProfilesResult,
+  LoadProfileRequest,
+  LoadProfileResult,
+  DoctorResult,
+  VerifyModelsResult,
   NativeVenvStatus,
   OrganizeRequest,
   OrganizeStats,
@@ -300,6 +310,11 @@ export function downloadModels(
   return rpc<DownloadModelsResult>("download_models", params);
 }
 
+/** SHA256-verify every downloaded model against the pinned table. */
+export function verifyModels(): Promise<VerifyModelsResult> {
+  return rpc<VerifyModelsResult>("verify_models");
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -319,6 +334,22 @@ export function saveConfig(
 /** Reset config to defaults and persist. */
 export function restoreDefaultConfig(): Promise<RestoreDefaultConfigResult> {
   return rpc<RestoreDefaultConfigResult>("restore_default_config");
+}
+
+// ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+/** List the built-in DJ profiles (house-dj, edm-festival, ...). */
+export function listProfiles(): Promise<ListProfilesResult> {
+  return rpc<ListProfilesResult>("list_profiles");
+}
+
+/** Apply a built-in profile to the config + persist. */
+export function loadProfile(
+  params: LoadProfileRequest,
+): Promise<LoadProfileResult> {
+  return rpc<LoadProfileResult>("load_profile", params);
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +384,27 @@ export function loadRecentAnalysis(
   return rpc<LoadRecentAnalysisResult>("load_recent_analysis", params);
 }
 
+/** Set a friendly display name on a recent library. */
+export function renameLibrary(
+  params: RenameLibraryRequest,
+): Promise<LibraryMutationResult> {
+  return rpc<LibraryMutationResult>("rename_library", params);
+}
+
+/** Replace the user-assigned tag list on a recent library. */
+export function tagLibrary(
+  params: TagLibraryRequest,
+): Promise<LibraryMutationResult> {
+  return rpc<LibraryMutationResult>("tag_library", params);
+}
+
+/** Count audio files on disk not yet in the saved analysis (cheap; no ML). */
+export function countNewTracks(
+  params: CountNewTracksRequest,
+): Promise<CountNewTracksResult> {
+  return rpc<CountNewTracksResult>("count_new_tracks", params);
+}
+
 // ---------------------------------------------------------------------------
 // Logging / history
 // ---------------------------------------------------------------------------
@@ -374,6 +426,15 @@ export function forgetBackup(
   params: ForgetBackupRequest,
 ): Promise<ForgetBackupResult> {
   return rpc<ForgetBackupResult>("forget_backup", params);
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/** Render the `vibechek doctor` diagnostic report as paste-friendly markdown. */
+export function doctor(): Promise<DoctorResult> {
+  return rpc<DoctorResult>("doctor");
 }
 
 // ---------------------------------------------------------------------------
@@ -421,20 +482,29 @@ const api = {
   restoreTagsWithRemap,
   // models
   downloadModels,
+  verifyModels,
   // config
   getConfig,
   saveConfig,
   restoreDefaultConfig,
+  // profiles
+  listProfiles,
+  loadProfile,
   // ops
   cancelOperation,
   // library state
   libraryState,
   forgetLibrary,
   loadRecentAnalysis,
+  renameLibrary,
+  tagLibrary,
+  countNewTracks,
   // logging / history
   getLogTail,
   backupHistory,
   forgetBackup,
+  // diagnostics
+  doctor,
 };
 
 export default api;

@@ -97,6 +97,29 @@ export function OrganizeView() {
   const setViewMode = useUIStore((s) => s.setViewMode);
 
   // Fingerprint of the params that flow into plan_organization. Updates to
+  // Cheap content fingerprint of the fields that actually drive the organize
+  // plan: each track's path + ML genre + subgenre. Counting `tracks.length`
+  // alone was insufficient — a track whose genre changed (e.g. a re-analyze
+  // updated ML fields without changing the file count) would leave the
+  // previewed plan looking valid while the executed moves silently diverge.
+  // Since organize is a destructive, no-undo file move, the confirmed preview
+  // MUST match what executes. Recomputed only when `tracks` identity changes
+  // (setTracks / mergeAnalyzedTrack), so it's O(n) once per change, not per
+  // render.
+  const tracksFingerprint = useMemo(() => {
+    if (source?.kind !== "in-memory") return "";
+    let h = 0;
+    for (const t of tracks) {
+      const s = `${t.path}|${t.ml_analysis?.ml_genre ?? ""}|${t.ml_analysis?.ml_subgenre ?? ""}`;
+      // djb2-ish rolling hash — cheap, order-sensitive, collision-resistant
+      // enough to detect content drift between preview and execute.
+      for (let i = 0; i < s.length; i++) {
+        h = (h * 33 + s.charCodeAt(i)) | 0;
+      }
+    }
+    return `${tracks.length}:${h}`;
+  }, [tracks, source?.kind]);
+
   // any of these invalidate a previously-generated plan.
   const currentParamsKey = useMemo(() => {
     return JSON.stringify({
@@ -107,10 +130,10 @@ export function OrganizeView() {
         source?.kind === "file"
           ? { kind: "file", path: source.path }
           : source?.kind === "in-memory"
-            ? { kind: "in-memory", count: tracks.length }
+            ? { kind: "in-memory", fingerprint: tracksFingerprint }
             : null,
     });
-  }, [orgCfg.use_subgenres, orgCfg.min_genre_size, orgCfg.target_root, source, tracks.length]);
+  }, [orgCfg.use_subgenres, orgCfg.min_genre_size, orgCfg.target_root, source, tracksFingerprint]);
 
   // Drop a stale plan as soon as the user changes any input that feeds into
   // it. Cleaner than showing a "this plan is stale" banner — the user

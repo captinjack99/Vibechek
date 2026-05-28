@@ -349,22 +349,15 @@ def backup_tags(
     return stats
 
 
-def restore_tags(
-    backup_path: Path,
-    on_progress: ProgressCallback | None = None,
-    config: TaggingConfig | None = None,
-) -> RestoreStats:
-    """Restore tags from a backup created by `backup_tags`.
+def _load_backup_files(backup_path: Path) -> dict[str, Any]:
+    """Load + validate a backup JSON, returning its `files` mapping.
 
-    `config` is forwarded to `write_all_tags` so MP3 restores honor the user's
-    chosen ID3 text-frame encoding. Defaults to a fresh `TaggingConfig()`.
-
-    Raises `ValueError` (with a user-friendly message) on corrupt / wrong-shape
-    backup files, rather than letting `json.loads` or `data["files"]` leak a
-    raw KeyError to the GUI (audit Tags#2).
+    Raises FileNotFoundError / ValueError with user-friendly messages on a
+    missing / empty / non-JSON / wrong-shape backup, instead of letting a raw
+    JSONDecodeError or KeyError leak to the GUI. Shared by both restore paths
+    (`restore_tags` and `restore_tags_with_remap`) so neither can regress the
+    audit Tags#2 hardening independently.
     """
-    from vibechek import cancellation
-
     path = Path(backup_path)
     if not path.exists():
         raise FileNotFoundError(f"Backup file not found: {path}")
@@ -386,6 +379,31 @@ def restore_tags(
             f"{list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
         )
     files = data["files"]
+    if not isinstance(files, dict):
+        raise ValueError(
+            f"Backup file at {path} has a 'files' entry that isn't an object "
+            f"(got {type(files).__name__})."
+        )
+    return files
+
+
+def restore_tags(
+    backup_path: Path,
+    on_progress: ProgressCallback | None = None,
+    config: TaggingConfig | None = None,
+) -> RestoreStats:
+    """Restore tags from a backup created by `backup_tags`.
+
+    `config` is forwarded to `write_all_tags` so MP3 restores honor the user's
+    chosen ID3 text-frame encoding. Defaults to a fresh `TaggingConfig()`.
+
+    Raises `ValueError` (with a user-friendly message) on corrupt / wrong-shape
+    backup files, rather than letting `json.loads` or `data["files"]` leak a
+    raw KeyError to the GUI (audit Tags#2).
+    """
+    from vibechek import cancellation
+
+    files = _load_backup_files(backup_path)
     stats = RestoreStats(total=len(files))
 
     for i, (filepath_str, tags) in enumerate(files.items()):
@@ -471,7 +489,8 @@ def apply_ml_tags(
         # behaviour exactly.
         family_conf = ml.get("ml_genre_confidence") or 0.0
         subgenre_conf = ml.get("ml_genre_raw_confidence")
-        if subgenre_conf is None:
+        is_legacy_report = subgenre_conf is None
+        if is_legacy_report:
             # Backward-compat for analysis reports written before raw_confidence
             # was plumbed. Use family confidence as the stage-1 input so we
             # don't accidentally over-tag.
@@ -484,8 +503,18 @@ def apply_ml_tags(
             subgenre_conf >= config.genre_confidence_threshold
             and bool(subgenre)
         )
+        # Stage 2 (parent-only) must NOT fire on legacy reports. Without
+        # `ml_genre_raw_confidence` we can't tell a genuine high-confidence
+        # parent from a subgenre prediction, so `family_conf` here is really
+        # the old single-stage confidence. Applying the 0.50 parent gate to it
+        # would tag ~30% more tracks than the user saw when that report was
+        # the live behaviour ("tagless below 0.85"), silently writing genres
+        # to files on a simple re-apply. Re-analyze to get the two-stage
+        # behaviour on these tracks. (Matches the docstring's "yields the
+        # legacy behaviour exactly".)
         apply_parent_only = (
             not apply_subgenre
+            and not is_legacy_report
             and family_conf >= config.parent_genre_confidence_threshold
             and bool(parent_genre)
         )
@@ -663,8 +692,7 @@ def restore_tags_with_remap(
     `library_root` is marked `ambiguous` (skipped) — restoring to the wrong
     file would silently corrupt tags.
     """
-    data = json.loads(Path(backup_path).read_text(encoding="utf-8"))
-    files: dict[str, dict[str, Any]] = data["files"]
+    files = _load_backup_files(backup_path)
     stats = RemapRestoreStats(total=len(files))
 
     # Build an index of the destination library so we can resolve moved files.

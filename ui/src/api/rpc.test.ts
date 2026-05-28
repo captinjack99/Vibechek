@@ -1,19 +1,26 @@
 /**
  * Sync-check between the Python METHODS dict and the TS api/rpc wrappers.
  *
- * The Python source of truth lives in `vibechek/rpc.py` (METHODS dict, around
- * line 670). We *could* parse that file via `fs.readFileSync` here, but the UI
- * tsconfig does not pull `@types/node` and the project's no-new-dependencies
- * constraint rules out adding it just for one test. So the canonical list is
- * mirrored here as `PYTHON_METHODS` and any new RPC method needs three edits:
+ * The authoritative cross-language check lives in PYTHON, not here:
+ * `tests/test_rpc_method_sync.py` reads BOTH `vibechek/rpc.py:METHODS` and
+ * this directory's `methods.ts:RPC_METHODS` and asserts they're identical.
+ * That's the guardrail that catches "Python added a method, the TS side
+ * forgot it" — it can't go self-referential because it reads both real files.
+ * (The previous version of THIS file mirrored the list by hand and compared
+ * it to itself, so 7 real methods drifted out of sync while the test stayed
+ * green.)
  *
- *   1. vibechek/rpc.py             — register the handler in METHODS.
- *   2. ui/src/api/methods.ts        — append to RPC_METHODS + add a param type.
- *   3. ui/src/api/rpc.ts            — add the typed wrapper.
- *   4. THIS FILE                   — add the name to PYTHON_METHODS below.
+ * The checks below stay as a TS-side smoke test: RPC_METHODS is well-formed,
+ * every name has a wrapper, and the hand mirror (`PYTHON_METHODS`) lines up
+ * with RPC_METHODS. The Python test is what guarantees the mirror itself is
+ * honest.
  *
- * If any of those four are out of sync, this test fails and tells you which
- * direction the drift is in.
+ * Adding a new RPC method requires:
+ *   1. vibechek/rpc.py        — register the handler in METHODS.
+ *   2. ui/src/api/methods.ts   — append to RPC_METHODS + add a param type.
+ *   3. ui/src/api/rpc.ts       — add the typed wrapper.
+ *   4. THIS FILE              — add the name to PYTHON_METHODS.
+ *   (tests/test_rpc_method_sync.py fails loudly if you miss step 1 or 2.)
  */
 
 import { describe, expect, it } from "vitest";
@@ -23,7 +30,8 @@ import * as rpcModule from "./rpc";
 import { RPC_METHODS, isKnownRpcMethod } from "./methods";
 
 /**
- * Mirror of `vibechek/rpc.py:METHODS` keys. KEEP IN SYNC — see file header.
+ * Mirror of `vibechek/rpc.py:METHODS` keys. KEEP IN SYNC — the Python test
+ * `tests/test_rpc_method_sync.py` enforces this against the real source.
  */
 const PYTHON_METHODS = [
   "ping",
@@ -58,10 +66,21 @@ const PYTHON_METHODS = [
   "library_state",
   "forget_library",
   "load_recent_analysis",
+  "rename_library",
+  "tag_library",
+  "count_new_tracks",
   "get_log_tail",
   "backup_history",
   "forget_backup",
+  "doctor",
+  "verify_models",
+  "list_profiles",
+  "load_profile",
 ] as const;
+
+/** The list the sync tests assert against (the hand mirror; the Python test
+ * `tests/test_rpc_method_sync.py` keeps this honest against the real source). */
+const AUTHORITATIVE_METHODS: readonly string[] = PYTHON_METHODS;
 
 // snake_case (Python METHODS key) -> camelCase (TS wrapper name).
 // Handles the WSL/CUDA edge cases where we keep the acronyms uppercase
@@ -105,12 +124,12 @@ describe("api/rpc.ts foundation", () => {
 describe("api/rpc <-> vibechek/rpc.py sync", () => {
   it("every Python METHODS key appears in RPC_METHODS", () => {
     const tsSet = new Set<string>(RPC_METHODS);
-    const missing = PYTHON_METHODS.filter((n) => !tsSet.has(n));
+    const missing = AUTHORITATIVE_METHODS.filter((n) => !tsSet.has(n));
     expect(missing, `Python methods missing from RPC_METHODS: ${missing.join(", ")}`).toEqual([]);
   });
 
   it("RPC_METHODS contains no entries that don't exist in Python METHODS", () => {
-    const pySet = new Set<string>(PYTHON_METHODS);
+    const pySet = new Set<string>(AUTHORITATIVE_METHODS);
     const stale = RPC_METHODS.filter((n) => !pySet.has(n));
     expect(stale, `RPC_METHODS contains names not in vibechek/rpc.py: ${stale.join(", ")}`).toEqual([]);
   });
@@ -119,7 +138,7 @@ describe("api/rpc <-> vibechek/rpc.py sync", () => {
     const apiAny = api as unknown as Record<string, unknown>;
     const moduleAny = rpcModule as unknown as Record<string, unknown>;
     const missing: string[] = [];
-    for (const name of PYTHON_METHODS) {
+    for (const name of AUTHORITATIVE_METHODS) {
       const camel = toCamel(name);
       const fromDefault = typeof apiAny[camel] === "function";
       const fromNamed = typeof moduleAny[camel] === "function";

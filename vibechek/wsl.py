@@ -1269,8 +1269,15 @@ def install_vibechek_in_wsl(
         inner_script_wsl = launcher.rstrip().splitlines()[-1].split()[-1].strip("'")
         try:
             try:
+                # `setsid -w`: WAIT for the child instead of fork-and-exit.
+                # Without -w, setsid backgrounds bash and exits 0 immediately —
+                # wsl.exe sees instant success + EOF, the stdout loop ends, and
+                # `proc.wait()` returns 0 while apt/pip run orphaned inside WSL.
+                # The GUI then reports "Install complete" before anything is
+                # actually installed. This is the exact landmine documented in
+                # run_vibechek_in_wsl; both install paths must match it.
                 proc = subprocess.Popen(
-                    distro_args + ["setsid", "bash", wsl_launcher],
+                    distro_args + ["setsid", "-w", "bash", wsl_launcher],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -1954,8 +1961,13 @@ def install_cuda_libs_in_wsl(
 
     try:
         try:
+            # `setsid -w`: WAIT for the child (see install_vibechek_in_wsl /
+            # run_vibechek_in_wsl). Without -w the CUDA wheel install forks to
+            # the background, the parent sees instant exit 0 + EOF, and reports
+            # success with an empty lib_dirs list while the multi-hundred-MB
+            # pip pulls run orphaned inside WSL.
             proc = subprocess.Popen(
-                [wsl, "-d", distro, "--", "setsid", "bash", wsl_launcher],
+                [wsl, "-d", distro, "--", "setsid", "-w", "bash", wsl_launcher],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -2248,10 +2260,16 @@ def run_vibechek_in_wsl(
 
     stdout_chunks: list[str] = []
 
-    if on_stderr_line and proc.stderr is not None:
+    # ALWAYS drain stderr on a background thread, even when the caller didn't
+    # supply on_stderr_line. stderr is a PIPE; if we leave it unread while the
+    # main thread blocks reading stdout, a verbose child filling the ~64KB
+    # stderr pipe buffer deadlocks both sides (child blocks on write, parent
+    # blocks on stdout read). The callback is optional; the drain is not.
+    if proc.stderr is not None:
         def _reader() -> None:
             for line in proc.stderr:  # type: ignore[union-attr]
-                on_stderr_line(line.rstrip())
+                if on_stderr_line:
+                    on_stderr_line(line.rstrip())
 
         t = _threading.Thread(target=_reader, daemon=True)
         t.start()
