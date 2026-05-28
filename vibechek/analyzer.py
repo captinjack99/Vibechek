@@ -34,6 +34,7 @@ from vibechek import cancellation
 from vibechek.config import AnalysisConfig
 from vibechek.filename import extract_from_filename
 from vibechek.genres import GenreResult, get_best_genre
+from vibechek.io import atomic_write_json
 from vibechek.keys import key_to_camelot
 from vibechek.resources import apply_gpu_preference
 from vibechek.utils import (
@@ -1427,7 +1428,14 @@ def analyze_directory(
                 except Exception:  # noqa: BLE001
                     log.exception("on_track callback raised; ignoring")
             if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
-                _write_partial(output_path, results, total, in_progress=(i + 1) < total)
+                # A transient checkpoint-write failure (disk full, permission
+                # blip) must NOT abort the run — that would discard the
+                # in-memory results AND defeat the point of checkpointing. The
+                # final write at the end is the backstop.
+                try:
+                    _write_partial(output_path, results, total, in_progress=(i + 1) < total)
+                except OSError as e:
+                    log.warning("Partial checkpoint write failed (continuing): %s", e)
     else:
         # *Always use spawn for multi-worker analyze* — even on Linux where
         # Python defaults to fork on <3.14. Reasons:
@@ -1462,7 +1470,6 @@ def analyze_directory(
             # timeout (1 hour) cuts us off.
             import time as _time
             STALL_TIMEOUT = 300  # 5 minutes between any two results = dead
-            last_result_at = _time.monotonic()
             iterator = pool.imap_unordered(_worker_analyze, file_strs)
 
             def _next_with_stall_check():
@@ -1497,8 +1504,6 @@ def analyze_directory(
                     raise
                 except StopIteration:
                     break
-                last_result_at = _time.monotonic()
-                _ = last_result_at  # silence pyflakes; intentional touch
                 # On cancel: terminate the pool (kills outstanding workers) and bail.
                 if cancellation.is_cancelled():
                     pool.terminate()
@@ -1513,14 +1518,18 @@ def analyze_directory(
                     except Exception:  # noqa: BLE001
                         log.exception("on_track callback raised; ignoring")
                 if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
-                    _write_partial(output_path, results, total, in_progress=(i + 1) < total)
+                    # See single-worker path: a transient checkpoint-write
+                    # failure must not abort the whole analyze.
+                    try:
+                        _write_partial(output_path, results, total, in_progress=(i + 1) < total)
+                    except OSError as e:
+                        log.warning("Partial checkpoint write failed (continuing): %s", e)
 
     report = _build_report(results, total, in_progress=False)
     if output_path:
-        Path(output_path).write_text(
-            json.dumps(report, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # Atomic write — a kill/power-loss/disk-full mid-write must not
+        # truncate the report (which can represent 30+ min of GPU time).
+        atomic_write_json(Path(output_path), report, indent=2)
     return report
 
 
@@ -1670,12 +1679,23 @@ def _analyze_via_native_venv(
             f"{result.returncode}. stdout tail:\n{result.stdout[-1500:]}"
         )
 
-    if not local_output.exists():
+    if not local_output.exists() or local_output.stat().st_size == 0:
         raise RuntimeError(
-            f"managed-venv analyze finished but no output file at {local_output}"
+            f"managed-venv analyze finished but wrote no output to {local_output}"
         )
 
-    report = _json.loads(local_output.read_text(encoding="utf-8"))
+    # Read bytes once + decode defensively (a truncated multibyte sequence
+    # would raise UnicodeDecodeError, not JSONDecodeError).
+    raw_bytes = local_output.read_bytes()
+    raw_text = raw_bytes.decode("utf-8", errors="replace")
+    try:
+        report = _json.loads(raw_text)
+    except _json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"managed-venv analyze wrote {len(raw_bytes)} bytes to "
+            f"{local_output} but they don't parse as JSON: {e}. "
+            f"First 200 bytes: {raw_text[:200]!r}"
+        ) from e
 
     if output_path is None:
         try:
@@ -1841,24 +1861,30 @@ def _analyze_via_wsl(
             f"stderr tail:\n{stderr_blob}"
         )
 
+    # Read the bytes ONCE. A truncated multibyte sequence raises
+    # UnicodeDecodeError (not JSONDecodeError), which must be caught too or it
+    # escapes as an opaque crash instead of the friendly "doesn't parse"
+    # message. Decode with errors="replace" so we always get a string for the
+    # error preview, and let json.loads surface the structural problem.
+    raw_bytes = local_output.read_bytes()
+    raw_text = raw_bytes.decode("utf-8", errors="replace")
     try:
-        report = _json.loads(local_output.read_text(encoding="utf-8"))
+        report = _json.loads(raw_text)
     except _json.JSONDecodeError as e:
         raise RuntimeError(
-            f"WSL analyze ({distro}) wrote {local_output.stat().st_size} bytes "
+            f"WSL analyze ({distro}) wrote {len(raw_bytes)} bytes "
             f"to {local_output} but they don't parse as JSON: {e}. "
-            f"First 200 bytes: {local_output.read_text(encoding='utf-8', errors='replace')[:200]!r}"
+            f"First 200 bytes: {raw_text[:200]!r}"
         ) from e
     for track in report.get("tracks", []):
         if "path" in track:
             track["path"] = wsl_to_win_path(track["path"])
 
     if output_path is not None:
-        # Rewrite the file with translated paths so external consumers see Windows paths
-        local_output.write_text(
-            _json.dumps(report, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # Rewrite the file with translated paths so external consumers see
+        # Windows paths. Atomic so a crash mid-rewrite doesn't truncate the
+        # report the user just waited 30+ min for.
+        atomic_write_json(local_output, report, indent=2)
     else:
         # Clean up our temp file
         try:
@@ -1870,9 +1896,14 @@ def _analyze_via_wsl(
 
 
 def _write_partial(output_path: Path, results: list[dict[str, Any]], total: int, in_progress: bool) -> None:
-    Path(output_path).write_text(
-        json.dumps(_build_report(results, total, in_progress), indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    # Atomic write so a crash mid-checkpoint doesn't truncate the report —
+    # the whole point of writing partials every 50 tracks is crash recovery,
+    # which a non-atomic write_text would defeat (a kill during the write
+    # leaves a zero-byte/corrupt file).
+    atomic_write_json(
+        Path(output_path),
+        _build_report(results, total, in_progress),
+        indent=2,
     )
 
 

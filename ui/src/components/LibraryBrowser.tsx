@@ -85,7 +85,7 @@ export function LibraryBrowser() {
   const setSearchFilter = useLibraryStore((s) => s.setSearchFilter);
   const selectedIds = useLibraryStore((s) => s.selectedIds);
   const toggleSelect = useLibraryStore((s) => s.toggleSelect);
-  const selectAll = useLibraryStore((s) => s.selectAll);
+  const selectPaths = useLibraryStore((s) => s.selectPaths);
   const clearSelection = useLibraryStore((s) => s.clearSelection);
 
   const active = useOperationStore((s) => s.active);
@@ -517,10 +517,11 @@ export function LibraryBrowser() {
       }
       setPreflightResult(full);
     } catch (e) {
-      // Mirror the convention used elsewhere in this file — stringify so
-      // the operation store doesn't end up with a raw RpcError object that
-      // surfaces as "[object Object]" when re-rendered.
-      fail(e instanceof Error ? e.message : String(e));
+      // Pass the raw error object to fail() — it unwraps RpcError.message AND
+      // detects data.cancelled so a user-cancelled preflight exits silently
+      // instead of surfacing a scary error toast. Stringifying here (the old
+      // behaviour) discarded the cancelled flag and the structured data.
+      fail(e);
     } finally {
       setPreflightInFlight(false);
     }
@@ -753,7 +754,13 @@ export function LibraryBrowser() {
         <button
           className="text-white/40 hover:text-white"
           onClick={() =>
-            selectedIds.size === filtered.length ? clearSelection() : selectAll()
+            // Select/clear the FILTERED set, not the whole library — otherwise
+            // "select all" under an active filter silently selects (and
+            // bulk-tags) tracks the user can't see, and the checkbox state
+            // never reconciles with `filtered.length`.
+            selectedIds.size === filtered.length && filtered.length > 0
+              ? clearSelection()
+              : selectPaths(filtered.map((t) => t.path))
           }
           title={selectedIds.size === filtered.length ? "Clear selection" : "Select all"}
         >

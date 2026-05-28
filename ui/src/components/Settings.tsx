@@ -455,13 +455,13 @@ export function Settings() {
         </Field>
 
         <Toggle
-          label="Skip BPM &amp; key"
+          label="Skip BPM & key"
           checked={cfg.tagging.skip_bpm_and_key}
           onChange={(v) => updateTagging({ skip_bpm_and_key: v })}
           hint="Rekordbox's BPM/key detection is more reliable than the ML's."
         />
         <Toggle
-          label="Preserve Rekordbox cue points &amp; beat grids"
+          label="Preserve Rekordbox cue points & beat grids"
           checked={cfg.tagging.preserve_rekordbox_frames}
           onChange={(v) => updateTagging({ preserve_rekordbox_frames: v })}
           hint="Keeps GEOB and PRIV binary frames intact. Turning this off can destroy performance data."
@@ -571,13 +571,22 @@ export function Settings() {
           <input
             type="number"
             min={1}
+            max={500}
             className="input w-24"
             value={cfg.organization.min_genre_size}
-            onChange={(e) =>
-              updateOrganization({ min_genre_size: Number(e.target.value) || 1 })
-            }
+            onChange={(e) => {
+              // Clamp to [1, 500] on the way into config — OrganizeView clamps
+              // the input control, but a value persisted here (or hand-edited
+              // in config.json) flows straight into plan_organization, so the
+              // store must hold a sane value too. NaN → 1.
+              const raw = Number(e.target.value);
+              const clamped = Number.isFinite(raw)
+                ? Math.min(500, Math.max(1, Math.round(raw)))
+                : 1;
+              updateOrganization({ min_genre_size: clamped });
+            }}
           />
-          <Hint>Genres with fewer tracks get bucketed into Other/.</Hint>
+          <Hint>Genres with fewer tracks get bucketed into Other/. (1–500)</Hint>
         </Field>
         <Field label="Target root (override)">
           <div className="flex gap-2">
@@ -1545,10 +1554,13 @@ function Toggle({
           className="mt-0.5 accent-accent"
         />
         <div className="flex-1">
-          <div
-            className={danger ? "text-sm text-accent-red" : "text-sm text-white/90"}
-            dangerouslySetInnerHTML={{ __html: label }}
-          />
+          {/* Plain text — JSX escapes correctly, so labels pass "BPM & key"
+              literally. Previously used dangerouslySetInnerHTML to render
+              &amp; entities, an XSS footgun if a caller ever passed dynamic
+              (track/genre) text. */}
+          <div className={danger ? "text-sm text-accent-red" : "text-sm text-white/90"}>
+            {label}
+          </div>
           {hint && (
             <div className={danger ? "text-xs text-accent-red/70 mt-0.5" : "text-xs text-white/40 mt-0.5"}>
               {hint}

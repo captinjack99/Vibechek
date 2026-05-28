@@ -87,10 +87,11 @@ def test_apply_ml_tags_parent_fallback_lifts_coverage(synthetic_analysis: dict) 
     """Two-stage: subgenre <85% but family >=50% → tagged with parent genre.
 
     The synthetic_analysis fixture has tracks at confidence 0.92, 0.88, 0.75,
-    0.50, 0.91, 0.42, 0.65. None set `ml_genre_raw_confidence`, so the
-    backward-compat path treats family conf as the stage-1 input. Stage-1
-    (strict 0.85) tags 0.92, 0.88, 0.91. Stage-2 (parent 0.50) picks up
-    0.75, 0.50, 0.65 as parent-only. 0.42 falls below both.
+    0.50, 0.91, 0.42, 0.65, with `ml_genre_raw_confidence` mirrored to the
+    same value (a modern report). Stage-1 (strict 0.85) tags 0.92, 0.88, 0.91.
+    Stage-2 (parent 0.50) picks up 0.75, 0.50, 0.65 as parent-only. 0.42 falls
+    below both. (Legacy reports lacking raw_confidence get strict-only — see
+    test_apply_ml_tags_legacy_report_no_parent_fallback.)
     """
     config = TaggingConfig()  # defaults: 0.85 strict, 0.50 parent fallback
     stats = apply_ml_tags(synthetic_analysis, config, dry_run=True)
@@ -121,6 +122,35 @@ def test_apply_ml_tags_respects_raw_confidence_when_present(tmp_path) -> None:
     # family=0.92 >= 0.50, passes — parent-only tag.
     assert stats.genre_applied == 0
     assert stats.genre_applied_parent_only == 1
+
+
+def test_apply_ml_tags_legacy_report_no_parent_fallback(tmp_path) -> None:
+    """A legacy report (no ml_genre_raw_confidence) must NOT get the parent
+    fallback — it reproduces the old strict-only behaviour exactly.
+
+    Re-applying an old analysis must not silently tag ~30% more files than
+    the user saw when that report was the live behaviour. A track at family
+    confidence 0.60 (above the 0.50 parent gate, below the 0.85 strict gate)
+    would be parent-tagged on a MODERN report, but stays untagged on a legacy
+    one because we can't trust that 0.60 is a true family score.
+    """
+    track_path = tmp_path / "legacy.mp3"
+    track_path.write_bytes(b"")
+    analysis = {
+        "tracks": [{
+            "path": str(track_path),
+            "ml_analysis": {
+                "ml_genre": "House",
+                "ml_subgenre": "Deep House",
+                "ml_genre_confidence": 0.60,
+                # NO ml_genre_raw_confidence — this is a legacy report.
+            },
+        }],
+    }
+    stats = apply_ml_tags(analysis, TaggingConfig(), dry_run=True)
+    assert stats.genre_applied == 0
+    assert stats.genre_applied_parent_only == 0
+    assert stats.genre_skipped_low_confidence == 1
 
 
 # ---------------------------------------------------------------------------

@@ -272,13 +272,28 @@ def _cluster_by_similarity(
 
 
 def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:
-    """Pick which file to keep from a group; return (keeper, duplicates)."""
-    def score(f: FileInfo) -> tuple[int, int, int]:
+    """Pick which file to keep from a group; return (keeper, duplicates).
+
+    Selection is fully deterministic so repeated runs (and the GUI's preview
+    vs. execute) agree. Ordering, in priority:
+
+      1. Zero-byte files are deprioritized HARD. A corrupt 0-byte `.flac`
+         would otherwise win on format priority over a healthy 8 MB `.mp3`
+         and we'd keep the empty file while deleting the real audio.
+      2. Format priority (lossless before lossy).
+      3. Larger size (better bitrate / less truncation).
+      4. Shorter path (prefer the canonical location over a `/dupes/` copy).
+      5. Path string — a final tiebreaker so two otherwise-identical files
+         always order the same way regardless of scan order.
+    """
+    def score(f: FileInfo) -> tuple[int, int, int, int, str]:
         ext = Path(f.path).suffix.lower()
         return (
+            0 if f.size_bytes > 0 else 1,          # real files before 0-byte
             _KEEPER_FORMAT_PRIORITY.get(ext, 99),  # lossless first
             -f.size_bytes,                         # larger is better
             len(f.path),                           # shorter path is better
+            f.path,                                # deterministic tiebreak
         )
 
     ordered = sorted(files, key=score)
@@ -430,6 +445,10 @@ def handle_duplicates(
     toast — without it the toast pointed at a report that didn't exist
     (duplicates audit #6).
     """
+    # Local import — keeps cancellation a soft dep when duplicates is used as
+    # a library outside the sidecar (mirrors the scan path).
+    from vibechek import cancellation
+
     action = DuplicateAction(config.action)
     all_dupes = [
         d
@@ -454,6 +473,9 @@ def handle_duplicates(
         dest_root.mkdir(parents=True, exist_ok=True)
 
         for i, dupe in enumerate(all_dupes):
+            # Honor Cancel mid-batch — a user stopping a 12k-file move must
+            # actually stop, not just stop seeing progress.
+            cancellation.check()
             report_progress(on_progress, i + 1, len(all_dupes), dupe.filename)
             src = Path(dupe.path)
             if not src.exists():
@@ -480,6 +502,7 @@ def handle_duplicates(
             ) from e
 
         for i, dupe in enumerate(all_dupes):
+            cancellation.check()
             report_progress(on_progress, i + 1, len(all_dupes), dupe.filename)
             src = Path(dupe.path)
             if not src.exists():
@@ -511,11 +534,14 @@ def _unique_path(path: Path) -> Path:
 
 
 def save_report(report: DuplicateReport, output_path: Path) -> None:
-    """Write a duplicate report to JSON in the same shape as the legacy tool."""
-    Path(output_path).write_text(
-        json.dumps(report.to_dict(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    """Write a duplicate report to JSON in the same shape as the legacy tool.
+
+    Atomic: this report drives the GUI's destructive delete/move decisions, so
+    a kill mid-write that leaves a truncated file (then read back) could
+    under-report dupes. atomic_write_json writes-then-renames.
+    """
+    from vibechek.io import atomic_write_json
+    atomic_write_json(Path(output_path), report.to_dict(), indent=2)
 
 
 __all__ = [

@@ -14,6 +14,39 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
 
 ---
 
+## [0.4.0-beta.4] — 2026-05-18
+
+End-to-end codebase audit (7 parallel review agents). Fixed all HIGH + MED findings.
+
+### Fixed — data safety (HIGH)
+- **Non-atomic JSON writes in the analyzer.** The final report write, the every-50-tracks checkpoint (`_write_partial`), and the WSL path-rewrite all used `Path.write_text(json.dumps(...))` — a kill/power-loss/disk-full mid-write truncated the report (up to 32 MB / 30+ min of GPU time). All now use `vibechek.io.atomic_write_json`. Checkpoint writes are also wrapped so a transient write error logs-and-continues instead of aborting the whole run.
+- **Path traversal via genre tags** (`utils.sanitize_folder_name`). A track's existing genre tag (attacker-controlled on a downloaded file) flows into `organizer.route_new_tracks` as a destination folder; a genre of `..` or `../../Windows` escaped the library root. `sanitize_folder_name` now strips leading/trailing dots + separators and rejects `.`/`..` outright.
+- **organize move could overwrite an existing file** (data loss). `shutil.move` overwrites silently. Two source files with the same basename routing to one genre folder both planned the same destination (neither existed on disk at plan time), and the second move clobbered the first. Fixed with an intra-batch `claimed` destination set in `plan_organization` plus an execute-time `_unique_destination` re-check that never overwrites.
+- **`duplicates.save_report` non-atomic** → switched to `atomic_write_json` (the report drives destructive delete/move decisions).
+
+### Fixed — correctness (HIGH/MED)
+- **WSL installs used `setsid` without `-w`** (the documented fork-and-exit landmine) in `install_vibechek_in_wsl` and `install_cuda_libs_in_wsl` — the parent saw instant exit 0 while apt/pip ran orphaned, reporting "Install complete" before anything installed. Both now use `setsid -w` like the analyze path.
+- **stderr pipe deadlock**: `run_vibechek_in_wsl` / `run_vibechek_in_native_venv` only drained stderr when an `on_stderr_line` callback was supplied; a verbose child filling the ~64KB stderr pipe buffer while the parent blocked on stdout would deadlock. stderr is now always drained on a background thread.
+- **Two-stage tagger over-tagged legacy reports.** Re-applying a pre-`ml_genre_raw_confidence` analysis tagged ~30% more files with parent genres than the user saw when that report was the live behaviour. Stage 2 (parent fallback) is now disabled when `ml_genre_raw_confidence` is absent, matching the documented "legacy behaviour exactly."
+- **Duplicate keeper selection** could keep a 0-byte corrupt file over real audio (format priority alone won) and was non-deterministic on ties. Now deprioritizes empty files and adds a path tiebreaker.
+- **Cancellation ignored** in the duplicate trash/move loops and `organizer.route_new_tracks` — a Cancel mid-batch kept moving/copying files. All now check `cancellation.check()`.
+- **`restore_tags_with_remap`** leaked raw `JSONDecodeError`/`KeyError` on a corrupt backup (the non-remap path was already hardened). Both now share `_load_backup_files` validation.
+- **Truncated WSL/venv output** raised an opaque `UnicodeDecodeError` instead of the friendly "doesn't parse as JSON" message. Both analyze paths now read bytes once + decode with `errors="replace"`.
+- **`nvidia-smi` device probe** parsed stdout without checking the exit code (NVML mismatch errors). Now bails on non-zero return.
+- **CLI `analyze`** accepted negative `--workers`/`--skip`/`--limit` (e.g. `--skip -5` analyzed only the last 5 tracks). Now `click.IntRange(min=0)`.
+
+### Fixed — frontend (HIGH/MED)
+- **RPC sync guardrail was self-referential** — 7 Python methods (`rename_library`, `tag_library`, `count_new_tracks`, `doctor`, `verify_models`, `list_profiles`, `load_profile`) were missing from `RPC_METHODS` AND its hand-maintained test mirror, so the drift test stayed green while the TS wrappers didn't exist. Added all 7 (typed wrappers + param types), and added an authoritative cross-language check (`tests/test_rpc_method_sync.py`) that reads both `vibechek/rpc.py` and `ui/src/api/methods.ts` directly.
+- **`track_analyzed` stale-event corruption**: a cancelled/superseded analyze kept streaming events that got merged as phantom tracks into a freshly-opened library. App.tsx now drops events whose path isn't under the current `libraryPath`.
+- **`fail(String(e))` reintroduced** in LibraryBrowser's preflight catch — discarded the RpcError `cancelled` flag (user-cancel surfaced as an error toast). Reverted to `fail(e)`.
+- **OrganizeView executed from live state, not the confirmed plan**: `currentParamsKey` only fingerprinted track *count*, so a content change (same count) left a stale plan looking valid before a destructive, no-undo move. Now includes a path+genre content fingerprint.
+- **"Select all" ignored active filters** → selected (and could bulk-tag) hidden tracks. Now selects the filtered set via a new `selectPaths` store action.
+- **DuplicatesView "space to free"** went stale after a rule reorder (used the backend's precomputed `recoverable_mb` instead of the rule-picked keeper). Now computes from `currentKeeper` with `rulesSig` in deps.
+- **`scan_directory` mis-classed as a 60s QUICK op** in the Rust shell — timed out on large network shares. Moved to MEDIUM.
+- Removed a `dangerouslySetInnerHTML` footgun in the Settings `Toggle` (rendered static labels as raw HTML).
+
+---
+
 ## [0.4.0-beta.3] — 2026-05-18
 
 ### Fixed

@@ -108,6 +108,13 @@ def synthetic_analysis(tmp_path: Path) -> dict:
                 "ml_genre": genre,
                 "ml_subgenre": subgenre,
                 "ml_genre_confidence": confidence,
+                # Modern reports carry raw (top-class) confidence too. The
+                # two-stage tagger only applies the parent-genre fallback when
+                # this field is present (a legacy report without it reproduces
+                # the old strict-only behaviour). We mirror `confidence` here so
+                # stage-1 (raw) and stage-2 (family) gate on the same value,
+                # matching what these tests assert.
+                "ml_genre_raw_confidence": confidence,
                 "ml_energy": 3,
                 "ml_mood": "Neutral",
                 "ml_timeslot": "Warm-Up",

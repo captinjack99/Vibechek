@@ -207,6 +207,14 @@ def _gpu_devices_from_nvidia_smi() -> list[GpuDevice]:
         log.debug("nvidia-smi probe failed: %s", e)
         return []
 
+    # A non-zero exit means the driver/NVML is in a bad state ("Failed to
+    # initialize NVML: Driver/library version mismatch" is a common one).
+    # stdout is usually empty in that case, but a future driver could print a
+    # partial banner to stdout — bail rather than risk fabricating a device.
+    if out.returncode != 0:
+        log.debug("nvidia-smi returned %d: %s", out.returncode, out.stderr.strip())
+        return []
+
     devices: list[GpuDevice] = []
     for line in out.stdout.splitlines():
         line = line.strip()

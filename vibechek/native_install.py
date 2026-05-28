@@ -606,10 +606,15 @@ def run_vibechek_in_native_venv(
 
     stdout_chunks: list[str] = []
 
-    if on_stderr_line and proc.stderr is not None:
+    # ALWAYS drain stderr (see run_vibechek_in_wsl): stderr is a PIPE, and
+    # leaving it unread while we block on stdout deadlocks a verbose child
+    # once the stderr pipe buffer fills. The callback is optional; draining
+    # is mandatory.
+    if proc.stderr is not None:
         def _reader() -> None:
             for line in proc.stderr:  # type: ignore[union-attr]
-                on_stderr_line(line.rstrip())
+                if on_stderr_line:
+                    on_stderr_line(line.rstrip())
 
         t = _threading.Thread(target=_reader, daemon=True)
         t.start()
@@ -632,11 +637,6 @@ def run_vibechek_in_native_venv(
     )
 
 
-# ---------------------------------------------------------------------------
-# Suppress an unused-import warning at module level
-# ---------------------------------------------------------------------------
-
-_ = os  # imported for future use (env tweaks)
 
 __all__ = [
     "IS_SUPPORTED",

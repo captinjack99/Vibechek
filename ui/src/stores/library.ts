@@ -38,6 +38,12 @@ interface LibraryState {
   updateTrackPaths: (pathMap: Map<string, string> | Record<string, string>) => void;
   toggleSelect: (path: string) => void;
   selectAll: () => void;
+  /**
+   * Select exactly the given paths (used to "select all" within an active
+   * filter — selecting the *filtered* set rather than the whole library, so
+   * the toolbar count and any bulk action operate on what the user can see).
+   */
+  selectPaths: (paths: string[]) => void;
   clearSelection: () => void;
   setSearchFilter: (s: string) => void;
 }
@@ -120,6 +126,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const all = new Set(get().tracks.map((t) => t.path));
     set({ selectedIds: all });
   },
+  selectPaths: (paths) => set({ selectedIds: new Set(paths) }),
   clearSelection: () => set({ selectedIds: new Set() }),
   setSearchFilter: (s) => set({ searchFilter: s }),
 }));

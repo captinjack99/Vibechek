@@ -71,12 +71,14 @@ def main() -> None:
 
 @main.command()
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--workers", default=0, show_default=False,
+@click.option("--workers", type=click.IntRange(min=0), default=0, show_default=False,
               help="Parallel analysis processes (default: auto = cpu_count - 1).")
 @click.option("--gpu", type=click.Choice(["auto", "on", "off"]), default="auto", show_default=True,
               help="GPU usage: auto = use if available, on = force, off = CPU-only.")
-@click.option("--skip", default=0, show_default=True, help="Skip the first N tracks.")
-@click.option("--limit", default=0, show_default=True, help="Limit to N tracks (0 = all).")
+@click.option("--skip", type=click.IntRange(min=0), default=0, show_default=True,
+              help="Skip the first N tracks.")
+@click.option("--limit", type=click.IntRange(min=0), default=0, show_default=True,
+              help="Limit to N tracks (0 = all).")
 @click.option("--output", "-o", type=click.Path(path_type=Path),
               default=Path("analysis.json"), show_default=True)
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
