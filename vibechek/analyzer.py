@@ -792,11 +792,20 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 
     # ---------- Mood / energy ----------
     mood_scores: dict[str, float] = {}
+    # Cache the raw (pre-mean) aggressive prediction so the Direction block
+    # below can slice it into thirds WITHOUT re-running the model. The
+    # aggressive head is the most expensive inference per track; calling it
+    # twice (once here, once for direction) doubled that cost across the whole
+    # library for no benefit.
+    aggressive_raw = None
     for mood in ("aggressive", "happy", "relaxed", "sad"):
         if mood not in models:
             continue
         try:
-            pred = np.mean(models[mood](embeddings), axis=0)
+            raw = models[mood](embeddings)
+            if mood == "aggressive":
+                aggressive_raw = raw
+            pred = np.mean(raw, axis=0)
             idx = _MOOD_INDEX[mood]
             mood_scores[mood] = float(pred[idx]) if len(pred) > 1 else float(pred)
         except Exception as e:  # noqa: BLE001
@@ -845,13 +854,14 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
     result.ml_timeslot = _pick_timeslot(result.ml_genre, result.ml_energy or 3, result.ml_bpm)
 
     # ---------- Direction (energy curve over the track) ----------
+    # Reuse the aggressive prediction computed in the mood loop above instead
+    # of re-running the model (the array is per-frame; we slice it into thirds).
     try:
-        if "aggressive" in models:
-            third = len(embeddings) // 3
+        if aggressive_raw is not None:
+            third = len(aggressive_raw) // 3
             if third > 0:
-                pred_full = models["aggressive"](embeddings)
-                start_e = float(np.mean(pred_full[:third]))
-                end_e = float(np.mean(pred_full[-third:]))
+                start_e = float(np.mean(aggressive_raw[:third]))
+                end_e = float(np.mean(aggressive_raw[-third:]))
                 diff = end_e - start_e
                 if diff > 0.08:
                     result.ml_direction = "Up"
@@ -1367,7 +1377,7 @@ def analyze_directory(
             # machines). Without the hint, the cap looks broken.
             requested_workers = (
                 config.workers if config.workers and config.workers > 0
-                else cpu_count() - 1
+                else max(1, cpu_count() - 1)
             )
             # `memory_cap` is only bound if psutil was importable above; fall
             # back to the cpu_count ceiling so the message stays accurate

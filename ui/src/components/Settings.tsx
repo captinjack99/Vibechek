@@ -114,7 +114,12 @@ export function Settings() {
           tf_built_with_cuda: null,
           nvidia_driver: null,
           nvidia_smi_available: false,
-          error: String(e),
+          // Unwrap RpcError.message (which String(e) would render as
+          // "[object Object]"); fall back to String for non-Error rejections.
+          error:
+            typeof e === "object" && e !== null && "message" in e
+              ? String((e as { message: unknown }).message)
+              : String(e),
           probed_at: Date.now() / 1000,
         });
       })

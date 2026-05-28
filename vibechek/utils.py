@@ -36,9 +36,22 @@ def find_audio_files(
     found: set[Path] = set()
 
     iterator = root.rglob("*") if recursive else root.glob("*")
-    for p in iterator:
-        if p.is_file() and p.suffix.lower() in exts:
-            found.add(p)
+    # One unreadable entry (broken symlink, a name exceeding Windows MAX_PATH,
+    # a permission-denied dir) must not abort the whole scan of a 12k-track
+    # library. `is_file()` can raise OSError mid-iteration; skip the bad entry.
+    while True:
+        try:
+            p = next(iterator)
+        except StopIteration:
+            break
+        except OSError as e:
+            log.debug("Skipping unreadable entry during scan: %s", e)
+            continue
+        try:
+            if p.is_file() and p.suffix.lower() in exts:
+                found.add(p)
+        except OSError as e:
+            log.debug("Skipping unreadable file %s: %s", p, e)
 
     return sorted(found, key=str)
 

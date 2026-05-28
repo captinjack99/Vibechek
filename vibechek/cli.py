@@ -214,6 +214,67 @@ def restore_tags_cmd(backup_file: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# undo journals (revert organize / dedupe-move)
+# ---------------------------------------------------------------------------
+
+
+@main.command("journals")
+def journals_cmd() -> None:
+    """List recent organize/dedupe operation journals (for `revert`)."""
+    from vibechek.journal import list_journals
+    import datetime as _dt
+
+    items = list_journals()
+    if not items:
+        console.print("No operation journals found.")
+        return
+    for j in items:
+        when = (
+            _dt.datetime.fromtimestamp(j["started_at"]).strftime("%Y-%m-%d %H:%M")
+            if j.get("started_at") else "?"
+        )
+        trash_note = (
+            f" • {j['trash_count']} trashed (not revertible)"
+            if j["trash_count"] else ""
+        )
+        console.print(
+            f"[cyan]{j['path']}[/]\n"
+            f"  {j['kind']} • {when} • {j['move_count']} moves{trash_note}"
+        )
+
+
+@main.command()
+@click.argument("journal_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def revert(journal_file: Path) -> None:
+    """Undo an organize/dedupe-move by moving files back to their origins.
+
+    Trash entries can't be auto-restored — restore those from the OS recycle
+    bin manually. Run `vibechek journals` to list available journals.
+    """
+    from vibechek.journal import revert_journal
+
+    with _progress_bar("Reverting") as progress:
+        task = progress.add_task("starting", total=None)
+
+        def on_progress(current: int, total: int, message: str) -> None:
+            progress.update(task, completed=current, total=total, description=message[:40])
+
+        summary = revert_journal(journal_file, on_progress=on_progress)
+
+    console.print(
+        f"\n[green]Done.[/] Reverted {summary['reverted']} • "
+        f"skipped: {summary['skipped']} • errors: {summary['errors']}"
+    )
+    if summary["trashed_not_reverted"]:
+        console.print(
+            f"  [yellow]⚠[/] {summary['trashed_not_reverted']} trashed files "
+            f"can't be auto-restored — recover them from your OS recycle bin."
+        )
+    for err in summary["error_messages"][:5]:
+        console.print(f"  [red]✗[/] {err}")
+
+
+# ---------------------------------------------------------------------------
 # dedupe
 # ---------------------------------------------------------------------------
 
@@ -629,6 +690,12 @@ def export_cmd(analysis_json: Path, fmt: str, output: Path | None) -> None:
             writer = csv.DictWriter(fh, fieldnames=_EXPORT_CSV_COLUMNS)
             writer.writeheader()
             for track in tracks:
+                # A malformed analysis.json (hand-edited, wrong shape) can have
+                # non-dict entries; iterating a dict yields its string keys.
+                # Skip anything that isn't a track object rather than crashing
+                # with a Click traceback dump.
+                if not isinstance(track, dict):
+                    continue
                 writer.writerow(_track_to_csv_row(track))
     elif fmt == "json":
         output.write_text(json.dumps(data, indent=2), encoding="utf-8")

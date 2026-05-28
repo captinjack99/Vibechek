@@ -300,7 +300,13 @@ def _write_m4a_tags(filepath: Path, tags: dict[str, Any]) -> None:
     if "genre" in tags:
         audio["\xa9gen"] = [tags["genre"]]
     if "bpm" in tags:
-        audio["tmpo"] = [int(float(tags["bpm"]))]
+        # `tmpo` is an int atom. A backup value like "128 BPM" or "" would
+        # raise ValueError and fail the whole file restore — skip a
+        # non-numeric BPM rather than abort.
+        try:
+            audio["tmpo"] = [int(float(str(tags["bpm"]).split()[0]))]
+        except (ValueError, IndexError):
+            log.debug("Skipping non-numeric M4A bpm %r", tags.get("bpm"))
     audio.save()
 
 

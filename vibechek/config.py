@@ -296,7 +296,13 @@ def _coerce(ftype: Any, value: Any) -> Any:
             # `True`/`False` shouldn't sneak into an int field as 1/0; treat
             # as a config mistake.
             raise TypeError("bool given for int field")
-        return int(value)
+        # Accept both `10` and a string/float `"10"` / `10.0` uniformly:
+        # `int("10.0")` raises, but `int(float("10.0"))` works. Round so a
+        # hand-edited `10.9` lands on 11 rather than silently truncating to 10
+        # without the user noticing (and stays consistent with the float path).
+        if isinstance(value, str):
+            return int(round(float(value)))
+        return int(round(value)) if isinstance(value, float) else int(value)
 
     if "float" in type_str:
         if isinstance(value, bool):
