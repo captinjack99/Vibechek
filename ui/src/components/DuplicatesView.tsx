@@ -159,17 +159,25 @@ export function DuplicatesView() {
 
     begin("dedupe");
     try {
-      const summary = await rpc<Record<string, number>>("handle_duplicates", {
-        report: filtered,
-        action,
-        review_folder: reviewFolder,
-      });
+      const summary = await rpc<Record<string, number> & { journal_path?: string | null }>(
+        "handle_duplicates",
+        { report: filtered, action, review_folder: reviewFolder },
+      );
       finish();
       const word = action === "trash" ? "Trashed" : "Moved";
       const count = summary.deleted ?? summary.moved ?? 0;
       const errors = summary.errors ?? 0;
+      // Move-to-review is revertible via Recent operations; trash isn't
+      // (it's in the OS recycle bin). Surface the right hint either way.
+      const detailParts: string[] = [];
+      if (errors > 0) detailParts.push(`${errors} error${errors === 1 ? "" : "s"} — see report.`);
+      if (action === "move" && summary.journal_path) {
+        detailParts.push('Undo available in "Recent operations" (sidebar).');
+      } else if (action === "trash" && count > 0) {
+        detailParts.push("Restore from your OS recycle bin if needed.");
+      }
       notify(`${word} ${count} duplicate${count === 1 ? "" : "s"}`, {
-        detail: errors > 0 ? `${errors} error${errors === 1 ? "" : "s"} — see report.` : undefined,
+        detail: detailParts.length > 0 ? detailParts.join(" ") : undefined,
         kind: errors > 0 ? "info" : "success",
       });
       // Clear the stale report immediately so the user can't act on

@@ -1,7 +1,9 @@
-import { Music, Copy, FolderTree, Archive, Settings as SettingsIcon, Disc3 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Music, Copy, FolderTree, Archive, Settings as SettingsIcon, Disc3, History } from "lucide-react";
 import { clsx } from "clsx";
 
 import { useUIStore, useLibraryStore, useOperationStore } from "../stores";
+import { version as fetchVersion } from "../api/rpc";
 import type { ViewMode } from "../types";
 
 /** "12,466" → "12k" via Intl. Tooltip-friendly precise form is just toLocaleString. */
@@ -34,9 +36,28 @@ function fmtBadge(count: number, unit: string): Badge {
 export function Sidebar() {
   const viewMode = useUIStore((s) => s.viewMode);
   const setViewMode = useUIStore((s) => s.setViewMode);
+  const setHistoryOpen = useUIStore((s) => s.setHistoryOpen);
   const trackCount = useLibraryStore((s) => s.tracks.length);
   const dupReport = useOperationStore((s) => s.duplicateReport);
   const organizePlan = useOperationStore((s) => s.organizePlan);
+
+  // Show the real sidecar version instead of a hardcoded string (which had
+  // drifted to a stale "v0.3.0-dev"). Falls back to a neutral label if the
+  // probe fails.
+  const [version, setVersion] = useState<string>("");
+  useEffect(() => {
+    let cancelled = false;
+    fetchVersion()
+      .then((v) => {
+        if (!cancelled) setVersion(v.version);
+      })
+      .catch(() => {
+        /* leave blank — better than a wrong hardcoded number */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const items: NavItem[] = [
     {
@@ -88,7 +109,7 @@ export function Sidebar() {
         <div>
           <div className="font-display font-semibold text-white">Vibechek</div>
           <div className="text-[10px] uppercase tracking-wider text-white/40">
-            v0.3.0-dev
+            {version ? `v${version}` : " "}
           </div>
         </div>
       </div>
@@ -128,6 +149,18 @@ export function Sidebar() {
           );
         })}
       </nav>
+
+      {/* Recent operations (undo) */}
+      <div className="px-2 pb-1">
+        <button
+          onClick={() => setHistoryOpen(true)}
+          className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-white/70 hover:text-white hover:bg-white/5 transition-colors"
+          title="Undo a recent organize or de-duplicate"
+        >
+          <History className="w-5 h-5" />
+          <span className="flex-1 text-left font-medium">Recent operations</span>
+        </button>
+      </div>
 
       {/* Footer */}
       <div className="px-4 py-3 text-[10px] text-white/30">

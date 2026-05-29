@@ -3,12 +3,17 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield,
   Zap, AlertTriangle, CheckCircle2, RotateCcw, ChevronDown, ChevronRight,
-  FileText, Wrench, StopCircle, HelpCircle,
+  FileText, Wrench, StopCircle, HelpCircle, Disc3, Loader2,
 } from "lucide-react";
 import { AnimatePresence } from "framer-motion";
 
 import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
 import { isCancellation, rpc, sidecarStatus, useSidecarProgress } from "../hooks/useSidecar";
+import {
+  listProfiles, loadProfile, doctor as runDoctor, verifyModels,
+  upgradeVibechekInWSL,
+} from "../api/rpc";
+import type { ListProfilesResult } from "../api/methods";
 import type { EngineGpuInfo, GpuDevice, PreflightResult, SystemResources, VibechekConfig } from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 import { LogsViewer } from "./LogsViewer";
@@ -85,6 +90,120 @@ export function Settings() {
   // engineProbing=true means "asking, ~10s wait".
   const [engineGpu, setEngineGpu] = useState<EngineGpuInfo | null>(null);
   const [engineProbing, setEngineProbing] = useState(false);
+
+  const notify = useNotificationStore((s) => s.notify);
+
+  // ---- DJ profiles (list_profiles / load_profile) ----
+  const [profiles, setProfiles] = useState<ListProfilesResult["profiles"]>([]);
+  const [profileBusy, setProfileBusy] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    listProfiles()
+      .then((r) => { if (!cancelled) setProfiles(r.profiles); })
+      .catch(() => { /* non-fatal — the picker just stays empty */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleLoadProfile = async (name: string) => {
+    setProfileBusy(name);
+    try {
+      const res = await loadProfile({ name });
+      // load_profile applies + persists server-side and returns the new config.
+      if (res.config) setConfig(res.config as VibechekConfig, true);
+      notify(`Applied "${name}" profile`, { kind: "success" });
+    } catch (e) {
+      notify(
+        typeof e === "object" && e !== null && "message" in e
+          ? `Couldn't load profile: ${String((e as { message: unknown }).message)}`
+          : `Couldn't load profile: ${String(e)}`,
+        { kind: "info" },
+      );
+    } finally {
+      if (isMounted.current) setProfileBusy(null);
+    }
+  };
+
+  // ---- Diagnostics & maintenance (doctor / verify_models / upgrade WSL) ----
+  const [diagBusy, setDiagBusy] = useState<null | "doctor" | "verify" | "upgrade">(null);
+
+  const handleCopyDiagnostic = async () => {
+    setDiagBusy("doctor");
+    try {
+      const res = await runDoctor();
+      await navigator.clipboard.writeText(res.markdown);
+      notify("Diagnostic copied to clipboard", {
+        kind: "success",
+        detail: "Paste it into a GitHub issue or support thread.",
+      });
+    } catch (e) {
+      notify(
+        typeof e === "object" && e !== null && "message" in e
+          ? `Diagnostic failed: ${String((e as { message: unknown }).message)}`
+          : `Diagnostic failed: ${String(e)}`,
+        { kind: "info" },
+      );
+    } finally {
+      if (isMounted.current) setDiagBusy(null);
+    }
+  };
+
+  const handleVerifyModels = async () => {
+    setDiagBusy("verify");
+    try {
+      const res = await verifyModels();
+      const bad = res.results.filter((r) => r.ok === false);
+      const unpinned = res.results.filter((r) => r.ok === null);
+      const okCount = res.results.filter((r) => r.ok === true).length;
+      if (bad.length > 0) {
+        notify(`${bad.length} model file(s) failed verification`, {
+          kind: "info",
+          detail: bad.map((b) => `${b.name}.${b.suffix}: ${b.reason ?? "mismatch"}`).join("\n"),
+        });
+      } else {
+        notify("Models verified", {
+          kind: "success",
+          detail: `${okCount} matched the pinned hashes`
+            + (unpinned.length ? `, ${unpinned.length} not yet pinned (OK).` : "."),
+        });
+      }
+    } catch (e) {
+      notify(
+        typeof e === "object" && e !== null && "message" in e
+          ? `Verify failed: ${String((e as { message: unknown }).message)}`
+          : `Verify failed: ${String(e)}`,
+        { kind: "info" },
+      );
+    } finally {
+      if (isMounted.current) setDiagBusy(null);
+    }
+  };
+
+  const handleUpgradeWsl = async () => {
+    const distro = preflightResult?.wsl?.usable_distro;
+    if (!distro) {
+      notify("No usable WSL distro detected.", { kind: "info" });
+      return;
+    }
+    setDiagBusy("upgrade");
+    begin("install-essentia");
+    try {
+      const res = await upgradeVibechekInWSL({ distro });
+      finish();
+      if (res.ok) {
+        notify("WSL Vibechek updated", {
+          kind: "success",
+          detail: "The WSL analyzer now matches the app version.",
+        });
+        refreshPreflight();
+      } else {
+        notify(`Update failed: ${res.error ?? "unknown error"}`, { kind: "info" });
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      if (isMounted.current) setDiagBusy(null);
+    }
+  };
 
   /**
    * Ask the actual analyze engine what GPUs it sees.
@@ -643,6 +762,98 @@ export function Settings() {
         onConfirm={handleRestoreAll}
         onCancel={() => setShowRestoreConfirm(false)}
       />
+
+      {profiles.length > 0 && (
+        <Section
+          icon={<Disc3 className="w-5 h-5" />}
+          title="DJ profiles"
+          subtitle="one-click presets"
+        >
+          <p className="text-xs text-white/50">
+            Apply a preset tuned for a style of set — adjusts confidence
+            thresholds, min genre size, GPU preference, and timeslot BPM bands.
+            Overwrites the matching settings; your other tweaks stay.
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            {profiles.map((p) => {
+              const name = String(p.name);
+              const busy = profileBusy === name;
+              return (
+                <button
+                  key={name}
+                  onClick={() => handleLoadProfile(name)}
+                  disabled={profileBusy !== null}
+                  className="panel-pad text-left hover:bg-white/[0.04] transition-colors disabled:opacity-50"
+                  title={String(p.description ?? "")}
+                >
+                  <div className="flex items-center gap-2">
+                    {busy
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />
+                      : <Disc3 className="w-3.5 h-3.5 text-accent" />}
+                    <span className="text-sm font-medium text-white">
+                      {String(p.label ?? name)}
+                    </span>
+                  </div>
+                  {p.description != null && (
+                    <div className="text-[11px] text-white/40 mt-1 line-clamp-2">
+                      {String(p.description)}
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </Section>
+      )}
+
+      <Section
+        icon={<Wrench className="w-5 h-5" />}
+        title="Diagnostics & maintenance"
+        subtitle=""
+      >
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="btn-ghost"
+            onClick={handleCopyDiagnostic}
+            disabled={diagBusy !== null}
+            title="Copy a full environment report (version, OS, WSL/venv, GPU, log tail) for bug reports"
+          >
+            {diagBusy === "doctor"
+              ? <Loader2 className="w-4 h-4 animate-spin" />
+              : <HelpCircle className="w-4 h-4" />}
+            Copy diagnostic
+          </button>
+          <button
+            className="btn-ghost"
+            onClick={handleVerifyModels}
+            disabled={diagBusy !== null}
+            title="SHA256-verify every downloaded ML model against the pinned hashes"
+          >
+            {diagBusy === "verify"
+              ? <Loader2 className="w-4 h-4 animate-spin" />
+              : <Shield className="w-4 h-4" />}
+            Verify model integrity
+          </button>
+          {preflightResult?.wsl?.usable_distro && (
+            <button
+              className="btn-ghost"
+              onClick={handleUpgradeWsl}
+              disabled={diagBusy !== null || active !== null}
+              title="Re-install the Vibechek package inside WSL so the analyzer matches this app version (fast — skips apt + essentia)"
+            >
+              {diagBusy === "upgrade"
+                ? <Loader2 className="w-4 h-4 animate-spin" />
+                : <Download className="w-4 h-4" />}
+              Update WSL install
+            </button>
+          )}
+        </div>
+        <Hint>
+          Use “Update WSL install” if analyze fails with an “out of date”
+          message — it brings the WSL analyzer up to this app’s version without
+          a full re-install.
+        </Hint>
+      </Section>
 
       <Section title="About" subtitle="">
         <div className="text-xs text-white/40 font-mono break-all">

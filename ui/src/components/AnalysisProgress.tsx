@@ -20,6 +20,10 @@ const KIND_LABELS: Record<string, string> = {
   tag: "Writing tags",
   backup: "Backing up tags",
   "download-models": "Downloading ML models",
+  "install-wsl": "Installing WSL",
+  "install-essentia": "Setting up the analyzer",
+  "install-cuda": "Installing GPU libraries",
+  revert: "Undoing operation",
 };
 
 export function AnalysisProgress() {

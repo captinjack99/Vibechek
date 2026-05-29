@@ -17,6 +17,10 @@ export type OperationKind =
   | "tag"
   | "backup"
   | "download-models"
+  | "install-wsl"
+  | "install-essentia"
+  | "install-cuda"
+  | "revert"
   | null;
 
 interface OperationState {

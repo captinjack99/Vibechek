@@ -12,6 +12,7 @@ import { TrackDetails } from "./components/TrackDetails";
 import { ErrorToast } from "./components/ErrorToast";
 import { Toast } from "./components/Toast";
 import { Onboarding } from "./components/Onboarding";
+import { OperationsHistory } from "./components/OperationsHistory";
 
 import { useUIStore, useOperationStore, useConfigStore, useLibraryStore } from "./stores";
 import { useSidecarProgress, useSidecarEvent } from "./hooks/useSidecar";
@@ -120,6 +121,10 @@ export default function App() {
         <ErrorToast />
       </AnimatePresence>
       <Toast />
+
+      <AnimatePresence>
+        <OperationsHistory />
+      </AnimatePresence>
 
       <AnimatePresence>
         {showOnboarding && <Onboarding />}
