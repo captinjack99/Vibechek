@@ -12,14 +12,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   FolderTree, FolderOpen, Play, Eye, AlertCircle, ArrowRight, FileJson,
-  CheckCircle2, RotateCcw,
+  CheckCircle2, RotateCcw, Undo2, Loader2,
 } from "lucide-react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import {
   useConfigStore, useLibraryStore, useNotificationStore, useOperationStore, useUIStore,
 } from "../stores";
-import { rpc } from "../hooks/useSidecar";
+import { rpc, isCancellation } from "../hooks/useSidecar";
+import { revertJournal } from "../api/rpc";
 import type { OrganizePlan, PlannedMove as GeneratedPlannedMove } from "../types";
 import { TagBadge } from "./TagBadges";
 import { ConfirmModal } from "./ConfirmModal";
@@ -54,6 +55,8 @@ interface OrganizeResult {
   backupPath: string | null;
   /** destination-folder → number of files moved into it */
   folderCounts: [string, number][];
+  /** undo-journal path for this run (null if nothing moved / journal failed) */
+  journalPath: string | null;
 }
 
 export function OrganizeView() {
@@ -301,7 +304,9 @@ export function OrganizeView() {
 
     begin("organize");
     try {
-      const stats = await rpc<{ planned: number; moved: number; errors: string[] }>(
+      const stats = await rpc<{
+        planned: number; moved: number; errors: string[]; journal_path: string | null;
+      }>(
         "organize",
         { ...buildParams(), dry_run: false },
       );
@@ -335,6 +340,7 @@ export function OrganizeView() {
         errors: stats.errors,
         backupPath,
         folderCounts: [...folderCounts.entries()].sort((a, b) => b[1] - a[1]),
+        journalPath: stats.journal_path ?? null,
       });
       setPlan(null);
       setPlanParams(null);
@@ -846,6 +852,37 @@ function OrganizeResultPanel({
   const topFolders = result.folderCounts.slice(0, 10);
   const moreFolders = result.folderCounts.length - topFolders.length;
 
+  const notify = useNotificationStore((s) => s.notify);
+  const [undoing, setUndoing] = useState(false);
+  const [undone, setUndone] = useState(false);
+
+  const handleUndo = async () => {
+    if (!result.journalPath) return;
+    setUndoing(true);
+    try {
+      const summary = await revertJournal({ journal_path: result.journalPath });
+      setUndone(true);
+      const parts = [`Restored ${summary.reverted}`];
+      if (summary.skipped) parts.push(`skipped ${summary.skipped}`);
+      if (summary.errors) parts.push(`${summary.errors} error(s)`);
+      notify(`Undo complete — ${parts.join(", ")}`, {
+        kind: summary.errors > 0 ? "info" : "success",
+        detail: "Re-open or re-scan the library to refresh paths.",
+      });
+    } catch (e) {
+      if (!isCancellation(e)) {
+        notify(
+          typeof e === "object" && e !== null && "message" in e
+            ? `Undo failed: ${String((e as { message: unknown }).message)}`
+            : `Undo failed: ${String(e)}`,
+          { kind: "info" },
+        );
+      }
+    } finally {
+      setUndoing(false);
+    }
+  };
+
   return (
     <div className="h-full overflow-auto">
       <div className="px-6 py-8 max-w-3xl mx-auto space-y-5">
@@ -948,7 +985,23 @@ function OrganizeResultPanel({
         )}
 
         {/* Actions */}
-        <div className="flex items-center justify-end gap-2 pt-4">
+        <div className="flex items-center gap-2 pt-4">
+          {result.journalPath && result.moved > 0 && (
+            <button
+              className="btn-ghost text-accent-yellow"
+              onClick={handleUndo}
+              disabled={undoing || undone}
+              title="Move every file back to where it was before this organize"
+            >
+              {undoing ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Undo2 className="w-4 h-4" />
+              )}
+              {undone ? "Undone" : "Undo this organize"}
+            </button>
+          )}
+          <div className="flex-1" />
           <button className="btn-ghost" onClick={onAnother}>
             <RotateCcw className="w-4 h-4" />
             Organize another folder

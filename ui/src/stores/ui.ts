@@ -13,18 +13,23 @@ interface UIState {
   viewMode: ViewMode;
   sidebarCollapsed: boolean;
   selectedTrackPath: string | null;
+  /** Whether the "Recent operations" (undo) modal is open. */
+  historyOpen: boolean;
 
   setViewMode: (m: ViewMode) => void;
   toggleSidebar: () => void;
   setSelectedTrack: (path: string | null) => void;
+  setHistoryOpen: (open: boolean) => void;
 }
 
 export const useUIStore = create<UIState>((set) => ({
   viewMode: "library",
   sidebarCollapsed: false,
   selectedTrackPath: null,
+  historyOpen: false,
 
   setViewMode: (m) => set({ viewMode: m }),
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setSelectedTrack: (path) => set({ selectedTrackPath: path }),
+  setHistoryOpen: (open) => set({ historyOpen: open }),
 }));

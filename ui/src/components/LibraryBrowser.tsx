@@ -3,7 +3,7 @@ import { Virtuoso } from "react-virtuoso";
 import { AnimatePresence } from "framer-motion";
 import {
   FolderOpen, Sparkles, Search, Music, AlertCircle, CheckSquare, Square, Tag,
-  Eye, RefreshCw, Clock, Loader2, X, ChevronDown, Compass,
+  Eye, RefreshCw, Clock, Loader2, X, ChevronDown, Compass, Pencil,
 } from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -223,6 +223,45 @@ export function LibraryBrowser() {
     } finally {
       // Reconcile against the source of truth in case the optimistic
       // removal was wrong (or to pick up other concurrent changes).
+      await refreshRecent();
+    }
+  };
+
+  // Set a friendly display name on a recent library (rename_library RPC).
+  const handleRenameRecent = async (record: LibraryRecord, name: string) => {
+    const trimmed = name.trim();
+    // Optimistic update so the card relabels instantly.
+    setRecentLibraries((prev) =>
+      prev.map((r) =>
+        r.path === record.path
+          ? ({ ...r, name: trimmed } as LibraryRecord)
+          : r,
+      ),
+    );
+    try {
+      await rpc("rename_library", { path: record.path, name: trimmed });
+    } catch (e) {
+      fail(e);
+    } finally {
+      await refreshRecent();
+    }
+  };
+
+  // Replace a recent library's tag list (tag_library RPC). Tags are
+  // comma-separated in the UI; the server de-dupes + strips.
+  const handleTagRecent = async (record: LibraryRecord, tags: string[]) => {
+    setRecentLibraries((prev) =>
+      prev.map((r) =>
+        r.path === record.path
+          ? ({ ...r, tags } as LibraryRecord)
+          : r,
+      ),
+    );
+    try {
+      await rpc("tag_library", { path: record.path, tags });
+    } catch (e) {
+      fail(e);
+    } finally {
       await refreshRecent();
     }
   };
@@ -578,6 +617,8 @@ export function LibraryBrowser() {
                     disabled={active !== null}
                     onOpen={() => handleOpenRecent(rec)}
                     onForget={() => setConfirmForget(rec)}
+                    onRename={(name) => handleRenameRecent(rec, name)}
+                    onSetTags={(tags) => handleTagRecent(rec, tags)}
                   />
                 ))}
               </div>
@@ -1198,9 +1239,38 @@ interface RecentLibraryCardProps {
   disabled: boolean;
   onOpen: () => void;
   onForget: () => void;
+  onRename: (name: string) => void;
+  onSetTags: (tags: string[]) => void;
 }
 
-function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibraryCardProps) {
+function RecentLibraryCard({
+  record, disabled, onOpen, onForget, onRename, onSetTags,
+}: RecentLibraryCardProps) {
+  // Inline edit mode: edits the friendly name + comma-separated tags. Kept
+  // local to the card; the parent owns the rename_library / tag_library RPCs.
+  const [editing, setEditing] = useState(false);
+  const existingName = (record as LibraryRecord & { name?: string }).name ?? "";
+  const existingTags = (record as LibraryRecord & { tags?: string[] }).tags ?? [];
+  const [nameDraft, setNameDraft] = useState(existingName);
+  const [tagsDraft, setTagsDraft] = useState(existingTags.join(", "));
+
+  const beginEdit = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setNameDraft(existingName);
+    setTagsDraft(existingTags.join(", "));
+    setEditing(true);
+  };
+
+  const saveEdit = () => {
+    if (nameDraft.trim() !== existingName) onRename(nameDraft);
+    const nextTags = tagsDraft
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (nextTags.join(" ") !== existingTags.join(" ")) onSetTags(nextTags);
+    setEditing(false);
+  };
+
   // Right-click → forget. `onForget` opens the in-app ConfirmModal (parent
   // owns the modal state) — the previous `window.confirm` was OS-native,
   // off-brand, and could render behind the Tauri window on multi-monitor
@@ -1210,6 +1280,47 @@ function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibrary
     if (disabled) return;
     onForget();
   };
+
+  // Edit mode renders a self-contained form (not the clickable card) so the
+  // inputs don't trigger open-on-click.
+  if (editing) {
+    return (
+      <div className="panel-pad space-y-2" onClick={(e) => e.stopPropagation()}>
+        <div className="text-xs text-white/50 font-mono truncate" title={record.path}>
+          {record.path}
+        </div>
+        <input
+          autoFocus
+          className="input w-full"
+          placeholder="Friendly name (e.g. Friday Warmup)"
+          value={nameDraft}
+          onChange={(e) => setNameDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") saveEdit();
+            if (e.key === "Escape") setEditing(false);
+          }}
+        />
+        <input
+          className="input w-full"
+          placeholder="Tags, comma-separated (e.g. wedding, chill)"
+          value={tagsDraft}
+          onChange={(e) => setTagsDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") saveEdit();
+            if (e.key === "Escape") setEditing(false);
+          }}
+        />
+        <div className="flex justify-end gap-2">
+          <button className="btn-ghost text-xs" onClick={() => setEditing(false)}>
+            Cancel
+          </button>
+          <button className="btn-primary text-xs" onClick={saveEdit}>
+            Save
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -1274,6 +1385,15 @@ function RecentLibraryCard({ record, disabled, onOpen, onForget }: RecentLibrary
           </div>
         )}
       </div>
+      <button
+        className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent p-1.5 rounded transition-opacity"
+        onClick={beginEdit}
+        title="Rename / tag this library"
+        aria-label={`Rename ${displayName(record)}`}
+        disabled={disabled}
+      >
+        <Pencil className="w-4 h-4" />
+      </button>
       <button
         className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent-red p-1.5 rounded transition-opacity"
         onClick={(e) => {
