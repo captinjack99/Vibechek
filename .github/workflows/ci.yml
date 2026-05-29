@@ -83,7 +83,10 @@ jobs:
       - name: Type-check (tsc --noEmit)
         working-directory: ui
         run: ./node_modules/.bin/tsc --noEmit
-        continue-on-error: true  # advisory until pre-existing errors are cleaned up
+        # Enforcing: tsc is clean as of v0.4.0-beta.6. This is the guard that
+        # would have caught the release-breaking build failure (a failing
+        # `tsc --noEmit` makes tauri-action's `beforeBuildCommand: npm run
+        # build` abort, killing every desktop build).
 
       - name: Run vitest
         working-directory: ui
@@ -92,4 +95,6 @@ jobs:
       - name: Production build smoke test
         working-directory: ui
         run: npm run build
-        continue-on-error: true  # build deps need Tauri toolchain; gate after v0.4.0 ships
+        # Enforcing: mirrors tauri-action's beforeBuildCommand. If `npm run
+        # build` fails here, the release's desktop builds would fail too — so
+        # block the PR/commit instead of discovering it only on tag push.
