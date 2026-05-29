@@ -146,9 +146,28 @@ jobs:
           name: ${{ matrix.sidecar_name }}
           path: ui/src-tauri/binaries
 
-      - name: Make sidecar executable (Unix)
-        if: runner.os != 'Windows'
-        run: chmod +x ${{ matrix.sidecar_dest }}
+      - name: Stage sidecar at the externalBin name
+        shell: bash
+        run: |
+          # The sidecar artifact was uploaded from the PyInstaller onefile
+          # output `dist/vibechek` (or `vibechek.exe`), so download-artifact
+          # extracts it under that ORIGINAL basename — NOT the triple-suffixed
+          # name Tauri's externalBin expects. Rename it, then mark executable.
+          # (Without this every desktop build fails: Unix at chmod, Windows at
+          # the Tauri build's externalBin lookup.)
+          cd ui/src-tauri/binaries
+          dest="$(basename '${{ matrix.sidecar_dest }}')"
+          if [ ! -f "$dest" ]; then
+            found="$(find . -maxdepth 2 -type f -name 'vibechek*' ! -name "$dest" | head -1)"
+            if [ -z "$found" ]; then
+              echo "ERROR: no sidecar binary found in $(pwd)" >&2
+              ls -la; exit 1
+            fi
+            echo "Staging sidecar: $found -> $dest"
+            mv "$found" "$dest"
+          fi
+          if [ "$RUNNER_OS" != "Windows" ]; then chmod +x "$dest"; fi
+          ls -la
 
       - name: Install UI deps
         working-directory: ui
