@@ -47,17 +47,15 @@ jobs:
             artifact_glob: dist/vibechek-macos-*.tar.gz
             sidecar_name: vibechek-sidecar-aarch64-apple-darwin
             sidecar_source: dist/vibechek
-          # Intel Mac is still ~25% of the Mac market. macos-13 is GitHub's
-          # last x86_64 image; without it, Intel Mac users get nothing.
-          # `experimental: true` makes a failure here non-blocking — the rest
-          # of the release pipeline (arm64 Mac, Windows, Linux) still ships.
-          - os: macos-13
-            asset_name: vibechek-macos-x64.tar.gz
-            build_cmd: ./packaging/build-macos.sh
-            artifact_glob: dist/vibechek-macos-*.tar.gz
-            sidecar_name: vibechek-sidecar-x86_64-apple-darwin
-            sidecar_source: dist/vibechek
-            experimental: true
+          # NOTE: Intel Mac (`macos-13`) was removed from the release matrix.
+          # GitHub's free-tier x86_64 macOS runners queue for a long time, and
+          # because `build-tauri` / `release` use `needs: build-cli`, a queued
+          # macos-13 build STALLED the entire release (incl. the Windows/Linux/
+          # Apple-Silicon installers) for everyone. It was already `experimental`.
+          # To re-add Intel Mac without re-introducing that bottleneck, run it
+          # as a SEPARATE job that nothing `needs:` (best-effort, uploads its
+          # artifact directly), or use a larger/paid runner. Tracked as a v0.5
+          # follow-up.
           - os: windows-latest
             asset_name: vibechek-windows-x64.zip
             build_cmd: packaging\build-windows.bat
@@ -116,12 +114,7 @@ jobs:
           - os: windows-latest
             sidecar_name: vibechek-sidecar-x86_64-pc-windows-msvc.exe
             sidecar_dest: ui/src-tauri/binaries/vibechek-sidecar-x86_64-pc-windows-msvc.exe
-          # Intel Mac — paired with the `macos-13` build-cli entry above so the
-          # arm64 + x86_64 .dmg sit side-by-side in the release.
-          - os: macos-13
-            sidecar_name: vibechek-sidecar-x86_64-apple-darwin
-            sidecar_dest: ui/src-tauri/binaries/vibechek-sidecar-x86_64-apple-darwin
-            experimental: true
+          # Intel Mac (macos-13) removed — see the note in the build-cli matrix.
     steps:
       - uses: actions/checkout@v4
 
