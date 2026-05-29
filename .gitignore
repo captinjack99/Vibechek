@@ -103,9 +103,8 @@ desktop.ini
 _to_review/
 
 # --- Internal-only material (never published) ---
-# Quarantine for anything that references internal workflows, personal setup,
-# launch strategy, candid audit findings, or legacy scratch scripts. Kept
-# locally for the maintainer; excluded from the public repo entirely.
+# Kept locally for the maintainer; excluded from
+# the public repo entirely.
 internal/
 
 # OS-level junk inside the repo (rare but possible)
