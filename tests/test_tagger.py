@@ -19,7 +19,9 @@ from vibechek.tagger import (
     RemapRestoreStats,
     RestoreStats,
     _apply_mp3,
+    _derived_field_value,
     _first,
+    _resolve_vocal,
     _write_mp3_tags,
     apply_ml_tags,
     backup_tags,
@@ -573,7 +575,8 @@ def test_apply_mp3_uses_configured_encoding(
 
     config = TaggingConfig(
         id3_text_encoding=1,
-        skip_bpm_and_key=False,  # exercise the BPM/key paths too
+        write_bpm=True,   # exercise the BPM/key paths too
+        write_key=True,
         preserve_rekordbox_frames=False,
     )
     ml = {
@@ -660,3 +663,61 @@ def test_write_all_tags_passes_config_through(
     assert instances[0].tags
     for frame in instances[0].tags.values():
         assert frame.encoding == 1
+
+
+# ---------------------------------------------------------------------------
+# Vocal re-derivation at tag time (bug: instrumental dance mislabelled Vocal)
+#
+# These cover the WRITE path — what actually lands in the VOCAL tag — which is
+# distinct from analyzer._classify_vocal (the analysis path). The whole point of
+# storing ml_vocal_score is that the cutoffs can be retuned and re-applied at
+# tag time WITHOUT re-analyzing, so this path must honor config thresholds.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_vocal_rederives_from_score_with_default_cutoffs() -> None:
+    """Default config (0.72 / 0.88). The real measured scores must map to the
+    labels the user expects: Children/Pjanoo Instrumental, Adele Vocal."""
+    cfg = TaggingConfig()
+    assert _resolve_vocal({"ml_vocal_score": 0.703}, cfg) == "Instrumental"  # Children
+    assert _resolve_vocal({"ml_vocal_score": 0.642}, cfg) == "Instrumental"  # Pjanoo
+    assert _resolve_vocal({"ml_vocal_score": 0.972}, cfg) == "Vocal"         # Adele
+    assert _resolve_vocal({"ml_vocal_score": 0.80}, cfg) == "Light Vocal"    # hedge band
+
+
+def test_resolve_vocal_retunes_without_reanalysis() -> None:
+    """Changing the config cutoff re-labels a track from its STORED score — no
+    re-analyze needed. Children (0.703) flips Instrumental→Light Vocal if the
+    user loosens the instrumental cutoff below 0.703."""
+    ml = {"ml_vocal_score": 0.703}
+    strict = TaggingConfig(vocal_instrumental_max=0.72)
+    loose = TaggingConfig(vocal_instrumental_max=0.60)
+    assert _resolve_vocal(ml, strict) == "Instrumental"
+    assert _resolve_vocal(ml, loose) == "Light Vocal"
+
+
+def test_resolve_vocal_falls_back_to_stored_label_for_legacy_analyses() -> None:
+    """Analyses from before ml_vocal_score existed only have the ml_vocal label;
+    we must still write it rather than dropping the field."""
+    cfg = TaggingConfig()
+    assert _resolve_vocal({"ml_vocal": "Vocal"}, cfg) == "Vocal"
+    # Raw score wins over the stored label when both are present.
+    assert _resolve_vocal({"ml_vocal_score": 0.10, "ml_vocal": "Vocal"}, cfg) == "Instrumental"
+
+
+def test_resolve_vocal_none_when_no_vocal_data() -> None:
+    assert _resolve_vocal({}, TaggingConfig()) is None
+
+
+def test_derived_field_value_respects_write_toggles() -> None:
+    """A field's write_* toggle gates whether it produces a value at all."""
+    ml = {"ml_energy": "High", "ml_vocal_score": 0.972}
+    assert _derived_field_value("ENERGY", ml, TaggingConfig(write_energy=True)) == "High"
+    assert _derived_field_value("ENERGY", ml, TaggingConfig(write_energy=False)) is None
+    assert _derived_field_value("VOCAL", ml, TaggingConfig(write_vocal=True)) == "Vocal"
+    assert _derived_field_value("VOCAL", ml, TaggingConfig(write_vocal=False)) is None
+
+
+def test_derived_field_value_none_when_ml_field_absent() -> None:
+    """Toggle on but the ML record has no value for the field → nothing to write."""
+    assert _derived_field_value("MOOD", {}, TaggingConfig(write_mood=True)) is None

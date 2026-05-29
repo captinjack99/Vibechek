@@ -203,6 +203,10 @@ class MLResult:
     ml_timeslot: str | None = None
     ml_direction: str | None = None
     ml_vocal: str | None = None
+    # Raw voice probability (0..1) from the voice/instrumental model, stored so
+    # the classification can be re-derived or re-tuned without re-running the
+    # model. `ml_vocal` is the label derived from this via _classify_vocal.
+    ml_vocal_score: float | None = None
     ml_danceability: float | None = None
     ml_mood_scores: dict[str, float] | None = None
     ml_error: str | None = None
@@ -669,10 +673,33 @@ def load_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _classify_vocal(score: float) -> str:
-    if score < 0.3:
+# Voice/instrumental classification cutoffs (voice probability 0..1).
+#
+# Recalibrated after real-world misclassification: the model rates the
+# prominent melodic leads in instrumental dance tracks as voice-like, so genume
+# instrumentals land ~0.64-0.69 (Robert Miles "Children" 0.69, Eric Prydz
+# "Pjanoo" 0.64) while pure instrumentals sit at 0.06-0.22 and true vocals
+# cluster at 0.76+. The old 0.6 "Vocal" cutoff therefore mislabelled those
+# instrumentals as "Vocal". New bands:
+#   < 0.72           → Instrumental  (covers the melodic-hook instrumentals)
+#   0.72 .. 0.88     → Light Vocal   (ambiguous / sparse vocals)
+#   >= 0.88          → Vocal         (sustained lead vocals)
+# 0.72 (not 0.70) so Robert Miles "Children" (~0.70-0.71 depending on run)
+# lands as Instrumental rather than straddling the boundary. Both cutoffs are
+# configurable per-field via TaggingConfig so a user can tune them without code
+# changes (and re-derive from the stored ml_vocal_score).
+VOCAL_INSTRUMENTAL_MAX = 0.72
+VOCAL_FULL_MIN = 0.88
+
+
+def _classify_vocal(
+    score: float,
+    instrumental_max: float = VOCAL_INSTRUMENTAL_MAX,
+    full_min: float = VOCAL_FULL_MIN,
+) -> str:
+    if score < instrumental_max:
         return "Instrumental"
-    if score < 0.6:
+    if score < full_min:
         return "Light Vocal"
     return "Vocal"
 
@@ -785,6 +812,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         try:
             pred = np.mean(models["voice_instrumental"](embeddings), axis=0)
             voice_score = float(pred[1]) if len(pred) > 1 else float(pred[0])
+            result.ml_vocal_score = round(voice_score, 3)
             result.ml_vocal = _classify_vocal(voice_score)
         except Exception as e:  # noqa: BLE001
             log.debug("Vocal detection failed for %s: %s", filepath.name, e)

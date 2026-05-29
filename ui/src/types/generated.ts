@@ -61,7 +61,16 @@ export interface TaggingConfig {
   write_subgenre_as_main_genre: boolean;
   preserve_rekordbox_frames: boolean;
   backup_before_write: boolean;
-  skip_bpm_and_key: boolean;
+  write_genre: boolean;
+  write_bpm: boolean;
+  write_key: boolean;
+  write_energy: boolean;
+  write_mood: boolean;
+  write_timeslot: boolean;
+  write_direction: boolean;
+  write_vocal: boolean;
+  vocal_instrumental_max: number;
+  vocal_full_min: number;
   id3_text_encoding: number;
 }
 
@@ -182,6 +191,7 @@ export interface MLResult {
   ml_timeslot: string | null;
   ml_direction: string | null;
   ml_vocal: string | null;
+  ml_vocal_score: number | null;
   ml_danceability: number | null;
   ml_mood_scores: Record<string, number> | null;
   ml_error: string | null;

@@ -359,3 +359,36 @@ def test_mood_fallback_blends_with_two_or_more(monkeypatch, tmp_path) -> None:
     result = analyzer.analyze_audio_features(fake_file, models)
     assert result.ml_mood_scores is not None
     assert set(result.ml_mood_scores.keys()) == {"aggressive", "happy"}
+
+
+# ---------------------------------------------------------------------------
+# Vocal classification calibration (bug: instrumental dance mislabelled Vocal)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_vocal_instrumental_dance_not_vocal() -> None:
+    """Robert Miles 'Children' and Eric Prydz 'Pjanoo' are instrumental but
+    the model rates their melodic leads high. Measured on the user's library:
+    Children scored 0.703, Pjanoo 0.642. The 0.72 instrumental cutoff is set
+    specifically so Children (0.70-0.71) lands as Instrumental, not Vocal."""
+    assert analyzer._classify_vocal(0.703) == "Instrumental"  # Children (measured)
+    assert analyzer._classify_vocal(0.71) == "Instrumental"   # Children upper bound
+    assert analyzer._classify_vocal(0.642) == "Instrumental"  # Pjanoo (measured)
+    assert analyzer._classify_vocal(0.06) == "Instrumental"   # pure instrumental
+
+
+def test_classify_vocal_true_vocals_still_vocal() -> None:
+    assert analyzer._classify_vocal(0.97) == "Vocal"   # Adele
+    assert analyzer._classify_vocal(0.98) == "Vocal"   # Aerosmith
+    assert analyzer._classify_vocal(0.89) == "Vocal"   # vocal dance
+
+
+def test_classify_vocal_light_band() -> None:
+    # Between the two cutoffs → the hedged "Light Vocal".
+    assert analyzer._classify_vocal(0.78) == "Light Vocal"
+
+
+def test_classify_vocal_thresholds_are_configurable() -> None:
+    # A caller can override the cutoffs (e.g. a stricter or looser profile).
+    assert analyzer._classify_vocal(0.65, instrumental_max=0.5) == "Light Vocal"
+    assert analyzer._classify_vocal(0.65, instrumental_max=0.5, full_min=0.6) == "Vocal"

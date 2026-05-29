@@ -265,7 +265,21 @@ export type OrganizeRequest = PlanOrganizationRequest & {
 export type ApplyMlTagsRequest = AnalysisPayloadParam & {
   /** Genre confidence threshold, 0..1. */
   confidence?: number;
+  parent_genre_confidence_threshold?: number;
+  /** Per-field write toggles. `skip_bpm_and_key` is still accepted by the
+   *  server for back-compat but the GUI sends the explicit toggles. */
+  write_genre?: boolean;
+  write_bpm?: boolean;
+  write_key?: boolean;
+  write_energy?: boolean;
+  write_mood?: boolean;
+  write_timeslot?: boolean;
+  write_direction?: boolean;
+  write_vocal?: boolean;
   skip_bpm_and_key?: boolean;
+  /** Vocal classification cutoffs (voice probability 0..1). */
+  vocal_instrumental_max?: number;
+  vocal_full_min?: number;
   preserve_rekordbox_frames?: boolean;
   /** 3 = UTF-8 (ID3v2.4 default), 1 = UTF-16, 0 = ISO-8859-1. */
   id3_text_encoding?: number;

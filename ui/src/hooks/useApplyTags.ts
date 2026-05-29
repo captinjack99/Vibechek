@@ -87,13 +87,19 @@ export function useApplyTags(): UseApplyTagsReturn {
         const stats = await rpc<RpcStats>("apply_ml_tags", {
           analysis: { tracks: slim },
           confidence: taggingCfg.genre_confidence_threshold,
-          skip_bpm_and_key: taggingCfg.skip_bpm_and_key,
+          parent_genre_confidence_threshold: taggingCfg.parent_genre_confidence_threshold,
+          // Per-field write toggles — each ML field is written independently.
+          write_genre: taggingCfg.write_genre,
+          write_bpm: taggingCfg.write_bpm,
+          write_key: taggingCfg.write_key,
+          write_energy: taggingCfg.write_energy,
+          write_mood: taggingCfg.write_mood,
+          write_timeslot: taggingCfg.write_timeslot,
+          write_direction: taggingCfg.write_direction,
+          write_vocal: taggingCfg.write_vocal,
+          vocal_instrumental_max: taggingCfg.vocal_instrumental_max,
+          vocal_full_min: taggingCfg.vocal_full_min,
           preserve_rekordbox_frames: taggingCfg.preserve_rekordbox_frames,
-          // NOTE: backend `_apply_ml_tags` RPC handler does not yet extract
-          // this field from params — the integration step needs to add
-          // `id3_text_encoding=int(params.get("id3_text_encoding", 3))` to
-          // the `TaggingConfig(...)` constructor in `vibechek/rpc.py`
-          // (~L485). Sending it here so the wire is ready (Tags #3).
           id3_text_encoding: taggingCfg.id3_text_encoding,
         });
         finish();

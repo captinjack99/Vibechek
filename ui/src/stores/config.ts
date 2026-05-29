@@ -32,7 +32,20 @@ const DEFAULT_CONFIG: VibechekConfig = {
     write_subgenre_as_main_genre: true,
     preserve_rekordbox_frames: true,
     backup_before_write: true,
-    skip_bpm_and_key: true,
+    // Per-field write toggles (replace the old single skip_bpm_and_key flag).
+    // BPM/Key default off — Rekordbox's own detection is usually better.
+    write_genre: true,
+    write_bpm: false,
+    write_key: false,
+    write_energy: true,
+    write_mood: true,
+    write_timeslot: true,
+    write_direction: true,
+    write_vocal: true,
+    // Vocal classification cutoffs (voice probability 0..1), applied at tag
+    // time to ml_vocal_score so they can be tuned without re-analyzing.
+    vocal_instrumental_max: 0.72,
+    vocal_full_min: 0.88,
     // 3 = UTF-8 (the modern ID3v2.4 default). Settings exposes a picker for
     // users on legacy software (Rekordbox 5 only reads encoding=1 UTF-16).
     id3_text_encoding: 3,
