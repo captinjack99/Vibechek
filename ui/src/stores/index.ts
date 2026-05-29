@@ -11,6 +11,7 @@
  *   - useUIStore            (./ui)            view mode, sidebar, selected track
  *   - useConfigStore        (./config)        user-tunable settings
  *   - useNotificationStore  (./notification)  transient success/info toasts
+ *   - usePlayerStore        (./player)        the single global audio player
  */
 
 export { useLibraryStore } from "./library";
@@ -18,6 +19,7 @@ export { useOperationStore } from "./operation";
 export { useUIStore } from "./ui";
 export { useConfigStore } from "./config";
 export { useNotificationStore } from "./notification";
+export { usePlayerStore } from "./player";
 
 // Public types previously declared inline in this file. Kept exported here
 // so external imports like `import type { Notification } from "../stores"`

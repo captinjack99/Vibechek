@@ -244,6 +244,7 @@ def _analyze_directory(params: dict) -> dict:
     config = AnalysisConfig(
         workers=int(params.get("workers", 0)),
         use_gpu=str(params.get("use_gpu", "auto")),
+        hybrid_cpu_gpu=bool(params.get("hybrid_cpu_gpu", True)),
     )
     if "models_dir" in params and params["models_dir"]:
         config.models_dir = Path(params["models_dir"])

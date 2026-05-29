@@ -14,6 +14,17 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
 
 ---
 
+## [0.4.0-beta.6] — 2026-05-18
+
+### Added
+- **Hybrid CPU + GPU analysis (work-stealing).** Previously analyze ran ONE device — either ~3 GPU workers (VRAM-capped) OR N CPU workers — so a modest GPU's low worker cap throttled throughput while most cores sat idle. Now, when a GPU is available and GPU mode isn't "off", the analyzer runs GPU workers (`CUDA_VISIBLE_DEVICES=0`) AND CPU workers (`=-1`) concurrently against a single shared work queue. The queue *is* the load balancer: whichever device finishes a track grabs the next, so fast and slow devices self-balance with no predictive scheduling. Total workers are bounded by RAM; the GPU subset by VRAM; CPU fills the rest. Per-device throughput (count + avg latency) is measured and reported. Verified on an RTX 4070 Laptop: a 50-track run split GPU 9 (17.5s/track) + CPU 41 (23.5s/track), using all resources. New `AnalysisConfig.hybrid_cpu_gpu` (default on), `--hybrid/--no-hybrid` CLI flag, and a **Settings toggle**. Worker recycling (process-exit every 200 tracks) and the stall watchdog / cancellation are preserved. Linux-CI hybrid-pool tests added.
+- **Single global audio player.** Replaced the per-track embedded WaveSurfer (which kept playing after you navigated away, and let multiple previews sound at once) with one persistent player bar mounted at the app root. It survives tab/menu changes, always shows a stop control, and loading a new track stops the previous one (a single WaveSurfer instance — two previews can never overlap). `usePlayerStore` is the single source of truth; TrackDetails just calls `play(path, title)`. Removed the dead `AudioPreview` component.
+
+### Fixed
+- Audio playback: navigating away no longer leaves a track playing with no way to stop it; clicking a new track no longer stacks a second simultaneous preview.
+
+---
+
 ## [0.4.0-beta.5] — 2026-05-18
 
 Undo journal + the remaining audit LOW/informational fixes.

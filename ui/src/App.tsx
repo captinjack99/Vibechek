@@ -13,6 +13,7 @@ import { ErrorToast } from "./components/ErrorToast";
 import { Toast } from "./components/Toast";
 import { Onboarding } from "./components/Onboarding";
 import { OperationsHistory } from "./components/OperationsHistory";
+import { GlobalAudioPlayer } from "./components/GlobalAudioPlayer";
 
 import { useUIStore, useOperationStore, useConfigStore, useLibraryStore } from "./stores";
 import { useSidecarProgress, useSidecarEvent } from "./hooks/useSidecar";
@@ -105,16 +106,15 @@ export default function App() {
           {viewMode === "tags" && <TagsView />}
           {viewMode === "settings" && <Settings />}
         </main>
-        {/* TrackDetails is library-tab only. Mounting it everywhere meant
-            the embedded AudioPreview's WaveSurfer instance kept playing
-            after the user navigated to Duplicates / Organize / etc — there
-            was no UI to control or even see the player. Unmounting on tab
-            change destroys WaveSurfer (its useEffect cleanup), which
-            stops playback. The previously-selected track stays in the
-            store, so flipping back to Library shows the same panel again
-            (just without auto-resuming playback). */}
+        {/* TrackDetails is library-tab only (it's the track inspector for the
+            library list). Audio playback no longer lives here — the global
+            <GlobalAudioPlayer/> bar owns it and persists across tabs. */}
         {viewMode === "library" && <TrackDetails />}
       </div>
+
+      {/* The single global audio player — persists across every tab so
+          playback is always controllable and only one track ever sounds. */}
+      <GlobalAudioPlayer />
 
       <AnimatePresence>
         <AnalysisProgress />

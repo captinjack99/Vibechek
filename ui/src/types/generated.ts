@@ -38,6 +38,7 @@ export interface AnalysisConfig {
   workers: number;
   models_dir: string;
   use_gpu: string;
+  hybrid_cpu_gpu: boolean;
 }
 
 export interface DuplicateConfig {
@@ -84,6 +85,7 @@ export interface DistroInfo {
   vibechek_installed: boolean;
   essentia_installed: boolean;
   vibechek_path: string | null;
+  vibechek_version: string | null;
 }
 
 export interface EngineGpuDevice {
@@ -249,6 +251,7 @@ export interface OrganizeStats {
   planned: number;
   moved: number;
   errors: string[];
+  journal_path: string | null;
 }
 
 export interface PlannedMove {

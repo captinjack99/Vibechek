@@ -199,6 +199,8 @@ export interface AnalyzeDirectoryRequest {
   workers?: number;
   /** "auto" | "always" | "never". */
   use_gpu?: string;
+  /** Run GPU + CPU workers together (default true; ignored when use_gpu=off). */
+  hybrid_cpu_gpu?: boolean;
   /** Override the configured models directory. */
   models_dir?: string;
   /** Where to persist the resulting JSON; defaults to the recents folder. */
