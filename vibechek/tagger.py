@@ -346,7 +346,7 @@ def backup_tags(
             stats.errors.append(f"{filepath.name}: {e}")
 
     # Atomic write: a kill-during-write of a tag backup leaves the user
-    # unable to restore their original tags (audit Tags#1). The history-record
+    # unable to restore their original tags. The history-record
     # only fires after we're back from this function, so partial backups
     # never get indexed. Uses the shared `atomic_write_json` helper so the
     # crash-safety pattern lives in exactly one place across the codebase.
@@ -362,7 +362,7 @@ def _load_backup_files(backup_path: Path) -> dict[str, Any]:
     missing / empty / non-JSON / wrong-shape backup, instead of letting a raw
     JSONDecodeError or KeyError leak to the GUI. Shared by both restore paths
     (`restore_tags` and `restore_tags_with_remap`) so neither can regress the
-    audit Tags#2 hardening independently.
+    hardening independently.
     """
     path = Path(backup_path)
     if not path.exists():
@@ -405,7 +405,7 @@ def restore_tags(
 
     Raises `ValueError` (with a user-friendly message) on corrupt / wrong-shape
     backup files, rather than letting `json.loads` or `data["files"]` leak a
-    raw KeyError to the GUI (audit Tags#2).
+    raw KeyError to the GUI.
     """
     from vibechek import cancellation
 
@@ -724,7 +724,7 @@ def restore_tags_with_remap(
 ) -> RemapRestoreStats:
     """Restore a tag backup with automatic remap for moved libraries.
 
-    Audit #19: `restore_tags` keys exclusively on the original absolute path
+    `restore_tags` keys exclusively on the original absolute path
     captured at backup time. If the user backed up `D:\\Music\\foo.mp3` then
     renamed the drive to `E:\\` (or moved the whole library), restore skips
     every file. This function walks `library_root`, then for each backup entry

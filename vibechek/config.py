@@ -12,7 +12,7 @@ to defaults rather than raising.
 
 Why JSON instead of TOML: TOML has no null type, which forces an awkward "drop
 the key" round-trip every time a field defaults to `None` — silently lossy and
-a future-bug magnet (audit #10). JSON has native null, primitive types, and is
+a future-bug magnet. JSON has native null, primitive types, and is
 stdlib-only.
 """
 

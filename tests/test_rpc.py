@@ -340,14 +340,14 @@ def test_json_default_unknown_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Audit #18: install-path probe — warn on risky locations (My Drive, OneDrive,
+# install-path probe — warn on risky locations (My Drive, OneDrive,
 # very long paths, paths with many spaces).
 # ---------------------------------------------------------------------------
 
 
 def test_probe_install_path_flags_google_drive() -> None:
     result = rpc._probe_install_path(
-        r"C:\Users\Jack\My Drive\Vibechek\.venv\Scripts\python.exe"
+        r"C:\Users\dj\My Drive\Vibechek\.venv\Scripts\python.exe"
     )
     assert result is not None
     assert result["level"] == "warning"
@@ -398,15 +398,15 @@ def test_probe_install_path_handles_empty() -> None:
 def test_probe_install_path_substring_match_is_case_insensitive() -> None:
     # Real-world: Windows preserves case but our match shouldn't depend on it
     assert (
-        rpc._probe_install_path(r"C:\Users\jack\MY DRIVE\app.exe") is not None
+        rpc._probe_install_path(r"C:\Users\dj\MY DRIVE\app.exe") is not None
     )
     assert (
-        rpc._probe_install_path(r"C:\Users\jack\my drive\app.exe") is not None
+        rpc._probe_install_path(r"C:\Users\dj\my drive\app.exe") is not None
     )
 
 
 def test_silence_native_logs_sets_env_vars() -> None:
-    """audit #15: TF_CPP_MIN_LOG_LEVEL must be set before TF imports."""
+    """TF_CPP_MIN_LOG_LEVEL must be set before TF imports."""
     import os
     # Use a custom env to avoid trashing the real test process env
     prior = {
@@ -454,7 +454,7 @@ def test_serve_emits_install_path_warning_on_risky_path(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(
         "sys.executable",
-        r"C:\Users\Jack\My Drive\Vibechek\.venv\Scripts\python.exe",
+        r"C:\Users\dj\My Drive\Vibechek\.venv\Scripts\python.exe",
     )
 
     server_thread = threading.Thread(
@@ -530,7 +530,7 @@ def test_serve_skips_install_path_warning_on_clean_path(monkeypatch: pytest.Monk
 
 
 def test_emit_progress_throttles_to_about_20_per_sec(rpc_server) -> None:
-    """Audit #24: a burst of progress notifications must not flood stdout.
+    """A burst of progress notifications must not flood stdout.
 
     Emit 1000 calls back-to-back; only ~5% should actually reach the wire
     (50 ms interval = ~20/sec; 1000 calls in <1ms = at most a handful land).
@@ -749,7 +749,7 @@ def test_new_rpc_methods_are_not_cancellable(rpc_server) -> None:
 
 
 def test_long_op_lock_rejects_concurrent_cancellable_ops(rpc_server) -> None:
-    """Audit #9: two cancellable ops at once must NOT both grab the
+    """Two cancellable ops at once must NOT both grab the
     cancellation singleton. The second must get a clean 'busy' error
     instead of clobbering the first's _current_kind.
     """

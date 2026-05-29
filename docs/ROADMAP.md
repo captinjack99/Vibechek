@@ -97,7 +97,7 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 
 **Shipped during the beta.3 → beta.7 cycle:**
 
-- ✅ **Full codebase audit** (7 parallel review agents) — fixed every HIGH + MED finding (atomic writes, path-traversal guard, organize overwrite-prevention, cancellation coverage, RPC sync guardrail, …). See `docs/AUDIT_*.md` + CHANGELOG beta.4.
+- ✅ **Full codebase audit** — fixed every HIGH + MED finding (atomic writes, path-traversal guard, organize overwrite-prevention, cancellation coverage, RPC sync guardrail, …). See CHANGELOG beta.4.
 - ✅ **Hybrid CPU+GPU analysis** — GPU + CPU workers share one work-stealing queue; per-device throughput measured. `--hybrid/--no-hybrid` + Settings toggle.
 - ✅ **GPU on Windows via WSL CUDA wheels** — one-click "Enable GPU" installs NVIDIA pip wheels into the managed venv (works on any WSL distro, no apt/keyring/root).
 - ✅ **Operation undo journal** — append-only JSONL for organize + dedupe-move; one-click revert from a "Recent operations" panel; crash-recoverable.
@@ -112,7 +112,7 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 - [ ] Hand-test the full Windows flow end-to-end (install WSL → install essentia → analyze 12k tracks → organize → restore)
 - [ ] Signed + notarized macOS builds (and Authenticode for Windows)
 - [ ] Tag `v1.0.0`
-- [ ] Post to r/Beatmatch, r/DJs, r/Rekordbox, DJ TechTools, Pioneer DJ Forum (drafts in [REDDIT_LAUNCH.md](REDDIT_LAUNCH.md))
+- [ ] Community launch (DJ communities, forums, and DJ-software outlets)
 - ✅ GitHub Sponsors link live (README) — [ ] Ko-fi optional
 - [ ] Screenshots + animated GIFs in README
 - [ ] Demo video (90 sec)

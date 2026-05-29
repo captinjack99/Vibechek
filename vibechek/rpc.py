@@ -98,7 +98,6 @@ def _json_default(o: Any) -> Any:
 # notifications per second; if the Tauri stdout reader falls behind (frontend
 # unfocused / OS context switch), the pipe buffer fills and
 # `_StdoutWriter.write` blocks the worker thread, stalling the whole analyze.
-# Audit #24.
 _LAST_PROGRESS_TIME = 0.0
 _PROGRESS_MIN_INTERVAL_SEC = 0.05  # 20/sec cap
 _PROGRESS_LOCK = threading.Lock()
@@ -576,7 +575,7 @@ def _restore_tags(params: dict) -> dict:
 
 
 def _restore_tags_with_remap(params: dict) -> dict:
-    """Restore a tag backup with auto-remap for moved libraries (audit #19).
+    """Restore a tag backup with auto-remap for moved libraries.
 
     Params: {backup_path: str, library_root: str}. The Tags view exposes this
     as the "Restore (auto-detect moved files)" flow — the user picks both the
@@ -1068,7 +1067,7 @@ def _dispatch(request: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Startup hygiene: install-path probe (audit #18)
+# Startup hygiene: install-path probe
 # ---------------------------------------------------------------------------
 
 
@@ -1115,8 +1114,8 @@ def _probe_install_path(executable: Any = _DEFAULT_EXECUTABLE) -> dict | None:
         path = executable
     if not path:
         return None
-    # We compare against a normalized form so e.g. "C:/Users/Jack/My Drive"
-    # and "C:\\Users\\Jack\\My Drive" both match the substring rule.
+    # We compare against a normalized form so e.g. "C:/Users/dj/My Drive"
+    # and "C:\\Users\\dj\\My Drive" both match the substring rule.
     norm = path.replace("\\", "/")
     norm_lower = norm.lower()
 
@@ -1150,13 +1149,13 @@ def _probe_install_path(executable: Any = _DEFAULT_EXECUTABLE) -> dict | None:
 
 
 def _silence_native_logs() -> None:
-    """Reduce native stdout noise that breaks JSON-RPC framing (audit #15).
+    """Reduce native stdout noise that breaks JSON-RPC framing.
 
     TensorFlow, CUDA, and essentia C++ code write directly to fd 1 via
     `printf()` / `fprintf(stdout, ...)`, bypassing Python's `sys.stdout`
     and our `_StdoutWriter` lock. When that happens mid-frame, the Rust
     side's line-delimited JSON parser sees a malformed line and (until
-    audit #15's Rust-side fix) loses the response that follows.
+    the Rust-side fix) loses the response that follows.
 
     These env vars only suppress the loudest sources — they MUST be set
     before any of the offending libraries import. Setting them here in
@@ -1175,7 +1174,7 @@ def _silence_native_logs() -> None:
 def _cleanup_stale_tempfiles() -> None:
     """Best-effort sweep of `vibechek-wsl-*` files older than 24h.
 
-    Audit #7: `_stage_script_for_wsl` and `run_vibechek_in_wsl` write tempfiles
+    `_stage_script_for_wsl` and `run_vibechek_in_wsl` write tempfiles
     that are normally `unlink`'d in a `finally` block, but a hard kill (Tauri
     crash, OS reboot, force-quit) leaks them. Sweeps `%TEMP%` so they don't
     accumulate over months.
@@ -1208,7 +1207,7 @@ def serve(stdin=None, stdout=None) -> None:
     Blocks until EOF on stdin (i.e. parent process closes our stdin).
     """
     # Silence native (TF/CUDA/essentia) printf-to-stdout noise BEFORE any
-    # of those libraries get a chance to import (audit #15). Setting these
+    # of those libraries get a chance to import. Setting these
     # after first import is a no-op — the libs cache the value.
     _silence_native_logs()
 
@@ -1220,7 +1219,7 @@ def serve(stdin=None, stdout=None) -> None:
         # Logging is nice-to-have; don't take down the sidecar over it
         pass
 
-    # Sweep stale tempfiles from previous sidecar runs (audit #7). Cheap;
+    # Sweep stale tempfiles from previous sidecar runs. Cheap;
     # bounded by `vibechek-wsl-*` glob + 24h age cutoff. If sidecar was
     # force-killed mid-WSL-install, these accumulate forever.
     _cleanup_stale_tempfiles()
@@ -1237,7 +1236,7 @@ def serve(stdin=None, stdout=None) -> None:
         "params": {"version": __version__, "methods": sorted(METHODS.keys())},
     })
 
-    # Probe our own install path for known-bad locations (audit #18). If
+    # Probe our own install path for known-bad locations. If
     # PyInstaller's bootloader is going to hang or crash on first launch
     # (My Drive, OneDrive, iCloud, > 200 char paths, etc.), warn the user
     # so they can move the install before hitting it. Non-blocking: this is

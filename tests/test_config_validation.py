@@ -1,6 +1,6 @@
 """Tests for vibechek.config primitive type coercion.
 
-Audit #16: a corrupted or hand-edited config file can hand us a string where
+A corrupted or hand-edited config file can hand us a string where
 we expect an int. Without coercion, that crashes deep inside the analyze path
 with `TypeError: '>' not supported between instances of 'str' and 'int'`.
 We coerce primitives based on the declared dataclass field type and fall back

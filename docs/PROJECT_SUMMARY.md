@@ -11,8 +11,7 @@ no account, no telemetry, no upload. Free forever under **AGPL-3.0**.
 - **Current version:** `v0.4.0-beta.7` (public beta)
 - **Platforms:** Windows, macOS, Linux (desktop app + CLI)
 
-> This is the living project summary. For the point-in-time codebase audit see the
-> `docs/AUDIT_*.md` files; for release history see [CHANGELOG.md](../CHANGELOG.md).
+> This is the living project summary. For release history see [CHANGELOG.md](../CHANGELOG.md).
 
 ## Origins
 

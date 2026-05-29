@@ -44,7 +44,7 @@ class PlannedMove:
     # Destination expressed relative to `OrganizePlan.base_dir`. The UI uses
     # this for folder grouping in the plan preview + result panel so it never
     # has to do path arithmetic (which was wrong for Windows casing / sep
-    # mismatch / paths outside base_dir — see audit #9). Falls back to the
+    # mismatch / paths outside base_dir). Falls back to the
     # absolute destination if `os.path.relpath` raises (e.g. destination on a
     # different Windows drive than base_dir).
     relative_destination: str = ""

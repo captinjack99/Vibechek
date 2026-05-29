@@ -10,11 +10,11 @@
 
 Every paid library tool makes one of three trade-offs:
 
-- **Mixed In Key** is the gold standard for key + energy, but charges $58, only detects two attributes, and runs nothing else.
-- **Lexicon DJ** is the deepest library manager, but the good features sit behind a $20/month subscription and require an online account.
+- **Mixed In Key** is the gold standard for key + energy, but charges $58, only detects those two attributes, and (since v2.5) needs an internet connection + account to analyze.
+- **Lexicon DJ** is the deepest library manager, but its good features sit behind a paid tier (subscription *or* a one-time lifetime license) and it nudges you toward an online account.
 - **Rekordbox** is "free" if you accept Pioneer's account ecosystem, has had a "MOOD: HIGH/MID/LOW" column for years, and *still* won't auto-detect genre — the #1 request on their own forum.
 
-Vibechek does all of that, plus the things they don't bother with — ML genre classification across 400 Discogs subgenres, timeslot tagging (Opener / Warm-Up / Peak / Afterhours), Chromaprint-based acoustic de-duplication that catches re-encodes and remixes, and runs entirely on your machine with no accounts, no telemetry, and zero recurring cost.
+Vibechek does all of that, plus the things none of them offer — ML genre classification across ~400 Discogs subgenres and timeslot tagging (Opener / Warm-Up / Peak / Afterhours) — alongside acoustic de-duplication, genre-folder organization, and GPU-accelerated analysis, running entirely on your machine with no accounts, no telemetry, and zero recurring cost. It's also the only one that's open source.
 
 ```
 $0 forever  •  no account  •  no upload  •  AGPL-3.0  •  CPU or GPU
@@ -24,21 +24,26 @@ $0 forever  •  no account  •  no upload  •  AGPL-3.0  •  CPU or GPU
 
 ## What Vibechek does that the paid tools don't
 
-| Capability                                          | Vibechek     | Mixed In Key | Lexicon       | Rekordbox    | beaTunes | Tunebat     |
-| --------------------------------------------------- |:------------:|:------------:|:-------------:|:------------:|:--------:|:-----------:|
-| ML genre + subgenre (Discogs-400 taxonomy)          | ✅            | —            | —             | —            | —        | —           |
-| Timeslot tag (Opener / Warm-Up / Peak / Afterhours) | ✅            | —            | —             | —            | —        | —           |
-| Energy 0-5 + Dark/Neutral/Bright mood               | ✅            | Energy only  | —             | HIGH/MID/LOW | Loudness | "Happiness" |
-| **Acoustic** duplicate detection (Chromaprint)      | ✅            | —            | filename only | —            | filename | —           |
-| Bulk auto-organize into Genre/Subgenre folders      | ✅            | —            | partial       | —            | —        | —           |
-| Full tag backup / restore (incl. binary frames)     | ✅            | —            | $/mo tier     | $/mo tier    | —        | —           |
-| Preserves Rekordbox GEOB/PRIV cue frames            | ✅            | n/a          | sync only     | native       | unknown  | —           |
-| Works offline, no account                           | ✅            | ✅            | account req.  | account req. | ✅        | upload req. |
-| Open source                                         | **AGPL-3.0** | —            | —             | —            | —        | —           |
-| GPU acceleration                                    | ✅            | —            | —             | —            | —        | —           |
-| Price                                               | **$0**       | $58 once     | $10-20/mo     | $0-30/mo     | ~$35     | freemium    |
+_Verified 2026-05-29 — sources + caveats in [docs/COMPETITORS.md](docs/COMPETITORS.md)._
 
-Stacking the two most popular paid tools together (Mixed In Key + Lexicon DJ) still costs ~$58 up front + $10-20/month and *still* doesn't ML-classify genre, *still* doesn't tag timeslot, *still* doesn't do acoustic de-dup. Vibechek does all three, runs locally, and ships it open source.
+| Capability | Vibechek | Mixed In Key | Lexicon | Rekordbox | beaTunes | Tunebat |
+| --- |:--:|:--:|:--:|:--:|:--:|:--:|
+| ML genre + subgenre (Discogs-400 taxonomy) | ✅ | — | — | — | — | — |
+| Timeslot tag (Opener / Warm-Up / Peak / Afterhours) | ✅ | — | — | — | — | — |
+| Energy rating | ✅ 0-5 | ✅ 1-10 | ✅ | — | loudness | ✅ (Pro) |
+| Mood labels | ✅ | — | Spotify | HIGH/MID/LOW¹ | inferred | "Happiness" |
+| **Acoustic** duplicate detection | ✅ | — | ✅ | metadata | ✅ | — |
+| Bulk auto-organize into Genre/Subgenre folders | ✅ | — | ✅ | — | — | — |
+| Full tag backup / restore (incl. binary frames) | ✅ | — | DB only | library DB | — | — |
+| Preserves Rekordbox GEOB/PRIV cue frames | ✅ | n/a | sync only | native | — | n/a |
+| Works offline, no account | ✅ | online+acct | paid acct | acct | ✅ | web app |
+| Open source | **AGPL-3.0** | — | — | — | — | — |
+| GPU acceleration | ✅ | — | — | — | — | — |
+| Price | **$0** | $58 once | $10-20/mo or $199-399 once | $0-36/mo | €34.95 once | freemium |
+
+¹ Rekordbox's HIGH/MID/LOW is a track-structure label, not an energy rating.
+
+The honest gaps none of them fill: **ML genre/subgenre auto-detection** and **timeslot tagging** — no tool here does either — plus being **local-first, open source, and $0**. Several do more than they're sometimes credited for (Lexicon and beaTunes both have acoustic de-dup; Lexicon organizes into genre folders too), so Vibechek's pitch is the *combination*, run locally and for free, not a checklist nobody else can touch.
 
 ---
 

@@ -19,7 +19,7 @@ import { ConfirmModal } from "./ConfirmModal";
 import { LogsViewer } from "./LogsViewer";
 import { PreflightDialog } from "./PreflightDialog";
 
-// AUDIT_SETTINGS_TAB #11: the workers slider used to cap at sysInfo.cpu_count,
+// The workers slider used to cap at sysInfo.cpu_count,
 // which silently truncated a user-set value when sysInfo loaded asynchronously
 // (race: type 32, sysInfo arrives with cpu_count=8, slider clamps to 8). Use
 // a generous static ceiling instead — anyone with > 96 cores is going to set
@@ -43,11 +43,11 @@ export function Settings() {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [showPreflightDialog, setShowPreflightDialog] = useState(false);
-  // AUDIT_SETTINGS_TAB #12: restoring all defaults is destructive — gate it
+  // restoring all defaults is destructive — gate it
   // behind a confirm modal so a stray click can't wipe a tweaked setup.
   const [showRestoreConfirm, setShowRestoreConfirm] = useState(false);
 
-  // AUDIT_SETTINGS_TAB #7: track mount so async preflight / sysInfo callbacks
+  // track mount so async preflight / sysInfo callbacks
   // don't call setState after the component unmounts (the user switched
   // tabs while the slow WSL probe was in flight).
   const isMounted = useRef(true);
@@ -58,7 +58,7 @@ export function Settings() {
     };
   }, []);
 
-  // AUDIT_SETTINGS_TAB #15: handleDownloadModels used to close over the
+  // handleDownloadModels used to close over the
   // initial `cfg.analysis.models_dir`. If the user edited the field after
   // the component mounted, the closure kept the old value. Read from the
   // store at call time via a ref instead.
@@ -81,7 +81,7 @@ export function Settings() {
   const [sidecarBinary, setSidecarBinary] = useState<string | null>(null);
   const [sysInfo, setSysInfo] = useState<SystemResources | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
-  // AUDIT_SETTINGS_TAB #9: models_dir is a free-text input. Validate on blur
+  // models_dir is a free-text input. Validate on blur
   // (cheap `scan_directory` quick call) so an obvious typo or stale path
   // surfaces before the user kicks off a download or analyze.
   const [modelsDirWarning, setModelsDirWarning] = useState<string | null>(null);
@@ -256,7 +256,7 @@ export function Settings() {
         if (!isMounted.current) return;
         setPreflightResult(quick);
         // Upgrade: full preflight (slow WSL probe on Windows, ~5-10s).
-        // AUDIT_SETTINGS_TAB #8: the full preflight can take up to ~10s
+        // the full preflight can take up to ~10s
         // for cold WSL probes; sidecar.rs::timeout_for() categorises
         // "preflight" as QUICK (60s) which is enough headroom even when a
         // distro hasn't been booted in a while. If users start hitting
@@ -326,7 +326,7 @@ export function Settings() {
   const handleDownloadModels = async () => {
     begin("download-models");
     try {
-      // AUDIT_SETTINGS_TAB #15: read the latest models_dir from the store
+      // read the latest models_dir from the store
       // via cfgRef so we don't ship a stale value from the original render.
       await rpc("download_models", {
         models_dir: cfgRef.current.analysis.models_dir || undefined,
@@ -365,7 +365,7 @@ export function Settings() {
         analyzeVia={
           // Narrow the wire-level `string | null` to the literal union the
           // component expects. Anything unexpected falls back to null.
-          // AUDIT_SETTINGS_TAB #20: `native_venv` is a real value but the
+          // `native_venv` is a real value but the
           // old check dropped it, which made the engine GPU block render
           // the wrong copy when analyze routed through the managed venv.
           preflightResult?.analyze_via === "wsl" ||
@@ -392,7 +392,7 @@ export function Settings() {
             <input
               type="range"
               min={1}
-              // AUDIT_SETTINGS_TAB #11: static high ceiling instead of
+              // static high ceiling instead of
               // sysInfo.cpu_count, which used to snap a user-set value
               // (e.g. 32) down when sysInfo loaded asynchronously with a
               // smaller cpu_count. Warning below if value > cpu_count.
@@ -437,7 +437,7 @@ export function Settings() {
         <Field label="GPU acceleration">
           <div className="flex gap-2">
             {(["auto", "on", "off"] as const).map((mode) => {
-              // AUDIT_SETTINGS_TAB #10: when no GPU is available "on" silently
+              // when no GPU is available "on" silently
               // falls back to CPU. Disable the button (with a tooltip) so the
               // user understands why their choice doesn't stick.
               const noGpu = engineGpu?.ok === true && engineGpu.gpu_available === false;
@@ -661,7 +661,7 @@ export function Settings() {
           onChange={(v) => updateTagging({ backup_before_write: v })}
         />
 
-        {/* AUDIT_TAGS_TAB #4: surface id3_text_encoding so users on legacy
+        {/* surface id3_text_encoding so users on legacy
             software (especially Rekordbox 5, which only reads UTF-16 frames)
             can switch off the modern UTF-8 default without editing
             config.toml by hand. */}
@@ -1222,7 +1222,7 @@ function ResourcesSection({
           (and shows nothing in the UI) when no GPUs of any kind exist. */}
       <CrossVendorGpuInventory sysInfo={sysInfo} />
 
-      {/* AUDIT_SETTINGS_TAB #4: troubleshooting affordance for the broken
+      {/* troubleshooting affordance for the broken
           venv shim case (pre-beta.10 cuda-env.sh patch). Tiny low-visibility
           row — mirrors the one in PreflightDialog so users who keep Settings
           open can repair without re-opening the setup dialog. */}
@@ -1245,7 +1245,7 @@ function ResourcesSection({
 }
 
 /**
- * AUDIT_SETTINGS_TAB #4: explicit RPC button for `repair_wsl_shim`.
+ * Explicit RPC button for `repair_wsl_shim`.
  *
  * Keeps the user out of the docs/manual-repair path if their analyze starts
  * failing with a SyntaxError caused by the pre-beta.10 cuda-env.sh patch.
@@ -1312,12 +1312,12 @@ function TroubleshootingRow({
  * CUDA libs inside the engine). We tell the user what's missing and offer
  * an "Enable GPU" button that installs the libs.
  *
- * AUDIT_SETTINGS_TAB #5 + #16: shows live progress + Cancel while installing.
+ * Shows live progress + Cancel while installing.
  * The install timeout is one hour (sidecar.rs MEDIUM tier) but most installs
  * complete in 30-60 sec; we still want a Cancel button so a user on a flaky
  * mirror isn't stuck.
  *
- * AUDIT_SETTINGS_TAB #22: re-derive distro from the latest preflight result
+ * Re-derive distro from the latest preflight result
  * instead of the (possibly stale) engineGpu.distro snapshot. After a
  * successful install_essentia_native call on Windows, engineGpu can flip to
  * "native" while preflight.wsl?.usable_distro still names the right target.

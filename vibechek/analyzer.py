@@ -447,7 +447,7 @@ def _download_from_mirrors(
 
     Each URL gets `max_attempts_per_mirror` tries with exponential backoff
     before we fall through to the next mirror. Net effect: a UPF outage
-    (audit #21) hands off to the GitHub Release mirror, then to any
+    hands off to the GitHub Release mirror, then to any
     user-configured VIBECHEK_MODELS_URL, without the user noticing.
 
     Raises RuntimeError listing every mirror's last error if all fail.
@@ -1552,7 +1552,7 @@ def analyze_directory(
 
     # Surface "scanning files" as soon as the call starts. Without this, the
     # GUI's progress overlay sits at "starting…" through find_audio_files +
-    # the slow preflight for 5-30 s, which is the worst UX the audit hit. The
+    # the slow preflight for 5-30 s, which is a particularly bad UX problem. The
     # event channel ignores it when VIBECHEK_STREAM_PROGRESS isn't set, so
     # interactive CLI users don't see anything new.
     _emit_event("stage", name="scanning",
