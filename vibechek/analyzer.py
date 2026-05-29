@@ -1129,6 +1129,282 @@ def _probe_free_vram_mb() -> int | None:
 
 
 # ---------------------------------------------------------------------------
+# Hybrid CPU + GPU worker pool (work-stealing)
+# ---------------------------------------------------------------------------
+#
+# The old multi-worker path ran ONE device: either N GPU workers (capped by
+# VRAM, often just ~3 on an 8 GB card) OR N CPU workers — never both. On a box
+# with a modest GPU and many cores, the GPU's low worker cap throttled total
+# throughput while 16 CPU cores sat idle.
+#
+# The hybrid pool runs GPU workers (CUDA_VISIBLE_DEVICES=0) AND CPU workers
+# (CUDA_VISIBLE_DEVICES=-1) at the same time, all pulling from ONE shared work
+# queue. That queue IS the load balancer: a worker grabs the next track the
+# instant it finishes its current one, so a fast device naturally processes
+# more tracks than a slow one — no need to predict the split or clock devices
+# ahead of time (we DO measure per-device throughput, but only to report it).
+#
+# Recycling: each worker exits after `maxtasks` tracks (freeing any TF/essentia
+# native memory growth — the reliable way is process exit), and the supervisor
+# respawns a same-device replacement as long as work remains, keeping the
+# GPU/CPU ratio stable across the whole run.
+
+_HYBRID_SENTINEL = None  # not used as a queue item; termination is via done_event
+
+
+def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks):  # type: ignore[no-untyped-def]
+    """One worker process: load models for `device`, then pull+analyze tracks.
+
+    `device` is "0" for the GPU or "-1" for CPU-only (set as
+    CUDA_VISIBLE_DEVICES before TF imports). Exits after `maxtasks` tracks (so
+    the supervisor can recycle it) or when `done_event` is set. Init failure is
+    reported on `out_q` as a sentinel so the parent can fail fast instead of
+    hanging.
+    """
+    import queue as _queue
+    import time as _time
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = device
+    use_gpu = "off" if device == "-1" else "on"
+    try:
+        models = load_models(Path(model_dir), use_gpu=use_gpu)
+    except Exception as e:  # noqa: BLE001
+        import sys as _sys
+        import traceback as _tb
+        _sys.stderr.write(
+            f"VIBECHEK_WORKER_INIT_FAIL: {type(e).__name__}: {e}\n{_tb.format_exc()}\n"
+        )
+        _sys.stderr.flush()
+        try:
+            out_q.put(("__init_fail__", device, f"{type(e).__name__}: {e}"))
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    done = 0
+    while done < maxtasks and not done_event.is_set():
+        try:
+            item = in_q.get(timeout=0.5)
+        except _queue.Empty:
+            continue
+        if item is None:
+            break
+        idx, path = item
+        t0 = _time.monotonic()
+        try:
+            rec = asdict(analyze_track(Path(path), models))
+        except Exception as e:  # noqa: BLE001
+            p = Path(path)
+            rec = {
+                "path": path,
+                "filename": p.name,
+                "extension": p.suffix.lower(),
+                "size_mb": 0.0,
+                "error": str(e),
+            }
+        try:
+            out_q.put((idx, rec, device, _time.monotonic() - t0))
+        except Exception:  # noqa: BLE001
+            # Parent gone / queue closed — stop quietly.
+            break
+        done += 1
+    # Clean exit frees native TF memory; the supervisor respawns us if work
+    # remains (so memory growth is bounded to ~maxtasks per worker lifetime).
+
+
+class _HybridPool:
+    """Supervises a fixed set of GPU + CPU worker processes over a shared queue.
+
+    Exposes a tiny iterator-style surface (`next(timeout)` raising
+    `multiprocessing.TimeoutError`) so the existing analyze loop's stall
+    watchdog can drive it unchanged. Results arrive out of order (work-stealing);
+    the caller doesn't rely on ordering.
+    """
+
+    def __init__(self, ctx, file_strs, model_dir, gpu_workers, cpu_workers, maxtasks):  # type: ignore[no-untyped-def]
+        self._ctx = ctx
+        self._model_dir = str(model_dir)
+        self._maxtasks = maxtasks
+        self.total = len(file_strs)
+        self._results_out = 0
+        # Per-device throughput accounting (track count + summed seconds).
+        self.device_counts: dict[str, int] = {"0": 0, "-1": 0}
+        self.device_seconds: dict[str, float] = {"0": 0.0, "-1": 0.0}
+
+        self._in_q = ctx.Queue()
+        self._out_q = ctx.Queue()
+        self._done_event = ctx.Event()
+        for item in enumerate(file_strs):  # (idx, path)
+            self._in_q.put(item)
+
+        # The device plan: one slot per worker. Respawns replace the same slot
+        # device so the GPU:CPU ratio holds for the whole run.
+        self._slots = ["0"] * gpu_workers + ["-1"] * cpu_workers
+        self._procs: list = []
+        for device in self._slots:
+            self._procs.append(self._spawn(device))
+
+    def _spawn(self, device):  # type: ignore[no-untyped-def]
+        p = self._ctx.Process(
+            target=_hybrid_worker_loop,
+            args=(self._in_q, self._out_q, self._done_event,
+                  self._model_dir, device, self._maxtasks),
+            daemon=True,
+        )
+        p._vibechek_device = device  # type: ignore[attr-defined]
+        p.start()
+        return p
+
+    def _reap_and_respawn(self):
+        """Replace workers that exited (recycle/crash) while work remains."""
+        if self._done_event.is_set():
+            return
+        for i, p in enumerate(list(self._procs)):
+            if not p.is_alive():
+                p.join(timeout=0.1)
+                if self._results_out < self.total:
+                    device = getattr(p, "_vibechek_device", "-1")
+                    self._procs[i] = self._spawn(device)
+
+    def next(self, timeout):  # type: ignore[no-untyped-def]
+        """Return the next (idx, record, device, seconds) or raise on timeout."""
+        import multiprocessing as _mp
+        import queue as _queue
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while True:
+            self._reap_and_respawn()
+            try:
+                item = self._out_q.get(timeout=0.2)
+            except _queue.Empty:
+                if _time.monotonic() > deadline:
+                    raise _mp.TimeoutError
+                continue
+            if item and item[0] == "__init_fail__":
+                # A worker couldn't load models — fail fast with the reason
+                # rather than letting the stall watchdog time out in 5 min.
+                raise RuntimeError(
+                    f"Worker init failed on device "
+                    f"{'GPU' if item[1] == '0' else 'CPU'}: {item[2]}"
+                )
+            idx, rec, device, seconds = item
+            self._results_out += 1
+            self.device_counts[device] = self.device_counts.get(device, 0) + 1
+            self.device_seconds[device] = self.device_seconds.get(device, 0.0) + seconds
+            if self._results_out >= self.total:
+                self._done_event.set()
+            return idx, rec, device, seconds
+
+    def throughput_summary(self) -> str:
+        # Report per-device track COUNT (how the shared queue split the work)
+        # and average per-track latency (how fast each device is). We avoid a
+        # "tracks/sec" figure because workers run in parallel — summing
+        # per-track seconds and dividing would understate the real wall-clock
+        # rate and confuse rather than inform.
+        parts = []
+        for dev, label in (("0", "GPU"), ("-1", "CPU")):
+            n = self.device_counts.get(dev, 0)
+            secs = self.device_seconds.get(dev, 0.0)
+            if n > 0:
+                avg = secs / n if n else 0.0
+                parts.append(f"{label}: {n} tracks (avg {avg:.1f}s/track)")
+        return " • ".join(parts) if parts else "(no throughput data)"
+
+    def terminate(self):
+        self._done_event.set()
+        for p in self._procs:
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def join(self, timeout=5):  # type: ignore[no-untyped-def]
+        for p in self._procs:
+            try:
+                p.join(timeout=timeout)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _run_hybrid_pool(
+    file_strs: list[str],
+    config: "AnalysisConfig",
+    gpu_workers: int,
+    cpu_workers: int,
+    total: int,
+    results: list[dict[str, Any]],
+    on_progress: "ProgressCallback | None",
+    on_track: "TrackCallback | None",
+    output_path: Path | None,
+) -> None:
+    """Drive a `_HybridPool`, appending each completed record to `results`.
+
+    Mirrors the single-pool loop exactly — same stall watchdog (300s with no
+    result ⇒ dead pool), same cooperative cancellation, same per-track event /
+    on_track / checkpoint handling — so the GUI behaves identically whether the
+    run is hybrid or single-device.
+    """
+    import time as _time
+
+    spawn_ctx = multiprocessing.get_context("spawn")
+    _emit_event("stage", name="spawning_workers",
+                message=f"Spawning {gpu_workers} GPU + {cpu_workers} CPU "
+                        f"worker(s) (loading models, may take 10-30 s)...")
+    report_progress(on_progress, 0, total,
+                    f"Spawning {gpu_workers} GPU + {cpu_workers} CPU workers...")
+
+    pool = _HybridPool(
+        spawn_ctx, file_strs, str(config.models_dir),
+        gpu_workers, cpu_workers, maxtasks=200,
+    )
+    STALL_TIMEOUT = 300  # 5 min between any two results = dead pool
+
+    try:
+        for i in range(total):
+            deadline = _time.monotonic() + STALL_TIMEOUT
+            while True:
+                try:
+                    _idx, record, _device, _seconds = pool.next(timeout=10)
+                    break
+                except multiprocessing.TimeoutError:
+                    if _time.monotonic() > deadline:
+                        raise RuntimeError(
+                            f"Analyze stalled — no track completed in "
+                            f"{STALL_TIMEOUT}s. The hybrid worker pool is dead "
+                            f"(likely OOM or essentia init crash). Check the "
+                            f"sidecar log for VIBECHEK_WORKER_INIT_FAIL lines."
+                        )
+                    if cancellation.is_cancelled():
+                        raise cancellation.CancelledError("Analysis cancelled by user")
+
+            if cancellation.is_cancelled():
+                raise cancellation.CancelledError("Analysis cancelled by user")
+
+            results.append(record)
+            report_progress(on_progress, i + 1, total, Path(record.get("path", "")).name)
+            _emit_event("track", index=i + 1, total=total, record=record)
+            if on_track is not None:
+                try:
+                    on_track(record, i + 1, total)
+                except Exception:  # noqa: BLE001
+                    log.exception("on_track callback raised; ignoring")
+            if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
+                try:
+                    _write_partial(output_path, results, total, in_progress=(i + 1) < total)
+                except OSError as e:
+                    log.warning("Partial checkpoint write failed (continuing): %s", e)
+
+        # Per-device throughput — answers "how fast is each device working?"
+        summary = pool.throughput_summary()
+        log.info("Hybrid analyze throughput — %s", summary)
+        _emit_event("stage", name="throughput", message=f"Throughput — {summary}")
+    finally:
+        pool.terminate()
+        pool.join()
+
+
+# ---------------------------------------------------------------------------
 # Structured event stream — for surfacing analyze progress to a parent sidecar
 # ---------------------------------------------------------------------------
 #
@@ -1343,13 +1619,18 @@ def analyze_directory(
     except ImportError:
         pass  # psutil missing — fall through with the cpu_count-based number
 
-    # GPU contention cap — VRAM-aware (audit #11).
+    # Split the RAM-bounded budget into GPU + CPU workers.
     #
-    # Old behaviour: hardcoded `workers = 4`, regardless of card. That OOM-kills
-    # 4 GB cards (4 workers * 1.5 GB = 6 GB needed) and wastes 24 GB cards
-    # (4 workers leaves 18 GB idle). Now we probe free VRAM and pick
-    # max(1, free_mb // _GPU_WORKER_MB), falling back to the old cap of 4 if
-    # the probe fails (no nvidia-smi, WSL without GPU passthrough, etc).
+    # `workers` is the RAM-capped total. In GPU mode we probe free VRAM to size
+    # the GPU subset (`gpu_cap`), then — when hybrid is enabled — fill the rest
+    # of the RAM budget with CPU workers instead of throwing that headroom away.
+    # The old behaviour capped the WHOLE run to `gpu_cap` (≈3 on an 8 GB card),
+    # leaving most cores idle; hybrid keeps all of them busy via the shared
+    # work queue.
+    ram_cap = workers  # RAM-bounded total (== memory_cap when psutil present)
+    gpu_workers = 0
+    cpu_workers = ram_cap  # default (use_gpu=off, or no GPU): all CPU
+
     if config.use_gpu in ("auto", "on"):
         free_vram_mb = _probe_free_vram_mb()
         if free_vram_mb is not None:
@@ -1365,52 +1646,63 @@ def analyze_directory(
                 f"{_GPU_FALLBACK_CAP}"
             )
             log.warning(
-                "GPU mode active but VRAM probe failed — capping workers at %d. "
-                "Set workers explicitly in Settings if your GPU can handle more.",
+                "GPU mode active but VRAM probe failed — capping GPU workers at "
+                "%d. Hybrid CPU workers still fill the rest of the RAM budget.",
                 _GPU_FALLBACK_CAP,
             )
-        if gpu_cap < workers:
-            # Build a single actionable message. The user just configured N
-            # workers in Settings and sees the analyze run with way fewer —
-            # tell them WHY (free VRAM math) and HOW to opt out (toggle GPU
-            # off in Settings, the CPU memory cap is much higher on most
-            # machines). Without the hint, the cap looks broken.
-            requested_workers = (
-                config.workers if config.workers and config.workers > 0
-                else max(1, cpu_count() - 1)
-            )
-            # `memory_cap` is only bound if psutil was importable above; fall
-            # back to the cpu_count ceiling so the message stays accurate
-            # when psutil is missing.
-            cpu_ceiling = locals().get("memory_cap", cpu_count())
-            msg = (
-                f"Capped workers from {requested_workers} to {gpu_cap} "
-                f"({cap_reason}). Set 'GPU mode' to 'off' in Settings to use "
-                f"your full {cpu_ceiling}-worker CPU budget instead."
-            )
-            log.warning(msg)
-            # Surface to the GUI on BOTH channels: log.warning alone is
-            # invisible to interactive users, the progress callback drives
-            # the AnalysisProgress overlay's status text, and the structured
-            # event channel is what the typed event stream uses for
-            # explanatory stages. report_progress swallows exceptions, so a
-            # flaky callback won't crash the analyze. We send total=total so
-            # the GUI's progress bar state is unchanged — this is purely a
-            # status message piggybacked on the progress channel (current=0
-            # means "not yet started").
-            report_progress(on_progress, 0, total, msg)
-            _emit_event("stage", name="worker_cap", message=msg,
-                        requested=requested_workers, applied=gpu_cap,
-                        reason=cap_reason)
-            workers = gpu_cap
+        gpu_workers = min(gpu_cap, ram_cap)
 
-    log.info("Analyzing %d files with %d worker(s), GPU=%s", total, workers, config.use_gpu)
+        if config.hybrid_cpu_gpu and ram_cap > gpu_workers:
+            # Hybrid: GPU workers + CPU workers (filling remaining RAM, bounded
+            # by core count) run concurrently against one shared queue.
+            cpu_workers = max(0, min(cpu_count(), ram_cap) - gpu_workers)
+            msg = (
+                f"Hybrid mode: {gpu_workers} GPU + {cpu_workers} CPU workers "
+                f"({cap_reason}; CPU fills the rest of the RAM budget)."
+            )
+            log.info(msg)
+            report_progress(on_progress, 0, total, msg)
+            _emit_event("stage", name="hybrid_plan", message=msg,
+                        gpu_workers=gpu_workers, cpu_workers=cpu_workers,
+                        reason=cap_reason)
+        else:
+            # Single-device GPU pool: hybrid disabled, or GPU cap already
+            # covers the whole RAM budget. Surface the cap so the user
+            # understands why fewer workers than configured are running.
+            cpu_workers = 0
+            if gpu_workers < ram_cap:
+                requested_workers = (
+                    config.workers if config.workers and config.workers > 0
+                    else max(1, cpu_count() - 1)
+                )
+                msg = (
+                    f"Capped to {gpu_workers} GPU worker(s) from "
+                    f"{requested_workers} ({cap_reason}). Enable hybrid CPU+GPU "
+                    f"(Settings) or set GPU mode 'off' to use more CPU workers."
+                )
+                log.warning(msg)
+                report_progress(on_progress, 0, total, msg)
+                _emit_event("stage", name="worker_cap", message=msg,
+                            requested=requested_workers, applied=gpu_workers,
+                            reason=cap_reason)
+
+    workers = gpu_workers + cpu_workers
+    hybrid = gpu_workers > 0 and cpu_workers > 0
+
+    log.info("Analyzing %d files with %d worker(s) (GPU=%d, CPU=%d, mode=%s)",
+             total, workers, gpu_workers, cpu_workers, config.use_gpu)
     _emit_event("stage", name="analyzing",
-                message=f"Analyzing {total} files with {workers} worker(s)")
+                message=f"Analyzing {total} files with {workers} worker(s)"
+                        + (f" ({gpu_workers} GPU + {cpu_workers} CPU)" if hybrid else ""))
     report_progress(on_progress, 0, total,
                     f"Analyzing {total} files with {workers} worker(s)")
 
-    if workers == 1:
+    if hybrid:
+        _run_hybrid_pool(
+            file_strs, config, gpu_workers, cpu_workers, total,
+            results, on_progress, on_track, output_path,
+        )
+    elif workers == 1:
         _emit_event("stage", name="loading_models",
                     message="Loading ML models...")
         report_progress(on_progress, 0, total, "Loading ML models...")
@@ -1672,6 +1964,8 @@ def _analyze_via_native_venv(
         args += ["--skip", str(skip)]
     if limit:
         args += ["--limit", str(limit)]
+    if not config.hybrid_cpu_gpu:
+        args += ["--no-hybrid"]
 
     # Shared handler — parses both the structured VIBECHEK_EVENT channel
     # (stage transitions, per-track records) AND the legacy Rich-progress
@@ -1772,6 +2066,8 @@ def _analyze_via_wsl(
         args += ["--skip", str(skip)]
     if limit:
         args += ["--limit", str(limit)]
+    if not config.hybrid_cpu_gpu:
+        args += ["--no-hybrid"]
 
     # Drop high-volume essentia / TF noise lines from the bounded tail
     # buffer so an 80-line window survives the per-worker spam and actually

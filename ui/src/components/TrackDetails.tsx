@@ -12,13 +12,15 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, ChevronRight, FileAudio, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { X, ChevronRight, FileAudio, AlertTriangle, CheckCircle2, Play } from "lucide-react";
 
-import { useLibraryStore, useUIStore, useConfigStore, useOperationStore, useNotificationStore } from "../stores";
+import {
+  useLibraryStore, useUIStore, useConfigStore, useOperationStore,
+  useNotificationStore, usePlayerStore,
+} from "../stores";
 import { useApplyTags } from "../hooks/useApplyTags";
 import type { TrackAnalysis, ExistingTags, MLResult } from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
-import { AudioPreview } from "./AudioPreview";
 import {
   compatibleCamelot,
   useLibraryFiltersStore,
@@ -138,7 +140,7 @@ function DetailContent({
           <Notice kind="error">ML failed: {ml.ml_error}</Notice>
         )}
 
-        <AudioPreview path={track.path} />
+        <PreviewButton path={track.path} filename={track.filename} />
 
         <FileSection track={track} />
 
@@ -168,6 +170,29 @@ function DetailContent({
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * Hands the track to the global player. We don't embed a player here anymore —
+ * the single <GlobalAudioPlayer/> bar owns playback so navigating away or
+ * picking another track can't leave audio running. Shows "Now playing" when
+ * this track is the one loaded in the global player.
+ */
+function PreviewButton({ path, filename }: { path: string; filename: string }) {
+  const play = usePlayerStore((s) => s.play);
+  const currentPath = usePlayerStore((s) => s.path);
+  const isCurrent = currentPath === path;
+
+  return (
+    <button
+      className="btn-ghost w-full justify-center"
+      onClick={() => play(path, filename)}
+      title="Preview in the player bar"
+    >
+      <Play className="w-4 h-4" />
+      {isCurrent ? "Restart preview" : "Preview"}
+    </button>
+  );
+}
 
 function FileSection({ track }: { track: TrackAnalysis }) {
   return (

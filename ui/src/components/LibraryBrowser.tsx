@@ -453,6 +453,7 @@ export function LibraryBrowser() {
         path: libraryPath,
         workers: analysisCfg.workers,
         use_gpu: analysisCfg.use_gpu,
+        hybrid_cpu_gpu: analysisCfg.hybrid_cpu_gpu,
         skip_paths: alreadyAnalyzed,
       });
       if (analyzeGen.current !== myGen) return;
@@ -1267,7 +1268,7 @@ function RecentLibraryCard({
       .split(",")
       .map((t) => t.trim())
       .filter(Boolean);
-    if (nextTags.join(" ") !== existingTags.join(" ")) onSetTags(nextTags);
+    if (nextTags.join(",") !== existingTags.join(",")) onSetTags(nextTags);
     setEditing(false);
   };
 

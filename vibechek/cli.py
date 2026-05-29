@@ -83,12 +83,15 @@ def main() -> None:
               default=Path("analysis.json"), show_default=True)
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
               help="Override the ML model directory (defaults to user data dir).")
+@click.option("--hybrid/--no-hybrid", default=True, show_default=True,
+              help="Run GPU + CPU workers together against a shared queue "
+                   "(self-balancing). --no-hybrid uses a single device pool.")
 def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
-            output: Path, models_dir: Path | None) -> None:
+            output: Path, models_dir: Path | None, hybrid: bool) -> None:
     """Analyze every audio file under PATH with the ML models."""
     from vibechek.analyzer import analyze_directory
 
-    config = AnalysisConfig(workers=workers, use_gpu=gpu)
+    config = AnalysisConfig(workers=workers, use_gpu=gpu, hybrid_cpu_gpu=hybrid)
     if models_dir:
         config.models_dir = models_dir
 

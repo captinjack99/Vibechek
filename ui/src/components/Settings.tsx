@@ -501,6 +501,14 @@ export function Settings() {
           </Hint>
         </Field>
 
+        {/* Hybrid CPU+GPU. Only meaningful when GPU mode isn't "off". */}
+        <Toggle
+          label="Hybrid CPU + GPU"
+          checked={cfg.analysis.hybrid_cpu_gpu}
+          onChange={(v) => updateAnalysis({ hybrid_cpu_gpu: v })}
+          hint="Run GPU workers AND extra CPU workers together against a shared queue, so a small GPU worker-cap doesn't leave your cores idle. Whichever device finishes a track grabs the next — it self-balances. Ignored when GPU mode is off."
+        />
+
         <Field label="Models directory">
           <div className="flex gap-2">
             <input

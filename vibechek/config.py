@@ -54,6 +54,13 @@ class AnalysisConfig:
     # GPU usage. "auto" → TF picks GPU if available, falls back to CPU.
     # "on" → force GPU 0 visible (errors loudly if no GPU). "off" → CPU-only.
     use_gpu: str = "auto"
+    # Hybrid CPU+GPU analysis: when a GPU is available AND `use_gpu` isn't
+    # "off", run GPU workers (bounded by VRAM) AND extra CPU workers (filling
+    # the remaining RAM budget) concurrently against a shared work queue. The
+    # queue self-balances — whichever device finishes a track grabs the next —
+    # so a GPU that's only ~3-workers-deep no longer caps total throughput when
+    # there are 16 idle CPU cores. Set False to use the old single-device pool.
+    hybrid_cpu_gpu: bool = True
 
 
 @dataclass
