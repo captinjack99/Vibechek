@@ -113,6 +113,8 @@ vibechek backup-tags ~/Music     # snapshot before any write
 
 Either way: ~5-10 minutes total, no terminal, no `pip` to remember. Full walkthrough: [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
+> **macOS (beta builds are unsigned):** the `.dmg` isn't notarized yet, so on first launch macOS says *"Vibechek is damaged / can't be verified."* It isn't — it's just unsigned. Right-click **Vibechek.app → Open → Open**, or run `xattr -dr com.apple.quarantine /Applications/Vibechek.app` once. Signed + notarized builds land with the stable release.
+
 **Developers** (for contributing or running from source):
 
 ```bash
