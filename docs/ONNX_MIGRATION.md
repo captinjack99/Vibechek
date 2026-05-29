@@ -16,7 +16,7 @@ That excludes:
 - **Apple Silicon** (M1/M2/M3/M4) — no Metal support
 - **DirectML** users on Windows who don't have CUDA installed
 
-Today, every non-NVIDIA user falls back to CPU inference, which on a typical 1000-track library is the difference between a coffee break and a multi-hour wait. Reddit feedback has flagged this twice.
+Today, every non-NVIDIA user falls back to CPU inference, which on a typical 1000-track library is the difference between a coffee break and a multi-hour wait. Users have flagged this more than once.
 
 **ONNX Runtime** solves this directly. Its **Execution Provider (EP)** architecture lets a single runtime dispatch to:
 

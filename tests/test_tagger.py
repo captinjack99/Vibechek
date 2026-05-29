@@ -290,7 +290,7 @@ def test_backup_restore_roundtrip(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# restore_tags_with_remap — audit #19
+# restore_tags_with_remap
 # ---------------------------------------------------------------------------
 #
 # These tests exercise the match-strategy logic. The mock files are .mp3 files
@@ -509,7 +509,7 @@ def test_restore_remap_progress_callback_invoked(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ID3 text-frame encoding — audit #23
+# ID3 text-frame encoding
 # ---------------------------------------------------------------------------
 #
 # We can't write a real MP3 in pytest without a binary fixture, so we cover
@@ -567,7 +567,7 @@ def _install_fake_mp3(monkeypatch: pytest.MonkeyPatch) -> list[_FakeMP3]:
 def test_apply_mp3_uses_configured_encoding(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Audit #23: every TCON/TIT1/TXXX/TBPM/TKEY write uses
+    """Every TCON/TIT1/TXXX/TBPM/TKEY write uses
     config.id3_text_encoding (here 1 = UTF-16 for Rekordbox 5)."""
     instances = _install_fake_mp3(monkeypatch)
     track = tmp_path / "song.mp3"

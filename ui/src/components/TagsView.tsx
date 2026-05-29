@@ -22,7 +22,7 @@ import { rpc, useSidecarProgress } from "../hooks/useSidecar";
 import { ConfirmModal } from "./ConfirmModal";
 import type { AnalysisReport, BackupHistory, BackupRecord } from "../types";
 
-/** Result payload from `restore_tags_with_remap` (audit #19). */
+/** Result payload from `restore_tags_with_remap`. */
 interface RemapRestoreStats {
   total: number;
   restored: number;
@@ -44,10 +44,10 @@ interface RemapRestoreStats {
 /** Days after which we suggest re-running the backup. */
 const STALE_AFTER_DAYS = 30;
 
-/** Audit #12: after this long with no `setProgress`, surface a "seems stuck" banner. */
+/** After this long with no `setProgress`, surface a "seems stuck" banner. */
 const PROGRESS_STALL_MS = 60_000;
 
-/** Heuristic file-vs-folder check (audit #10). Tauri has no fs.stat API in our deps. */
+/** Heuristic file-vs-folder check. Tauri has no fs.stat API in our deps. */
 const AUDIO_EXTENSIONS = [
   ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".aif", ".aiff",
   ".alac", ".wma", ".dsf", ".dff", ".ape",
@@ -95,11 +95,11 @@ export function TagsView() {
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [history, setHistory] = useState<BackupRecord[]>([]);
 
-  // Audit #3: forget-backup confirmation. Stash the record so the modal
+  // Forget-backup confirmation. Stash the record so the modal
   // can show its path before we ask the user to confirm.
   const [forgetCandidate, setForgetCandidate] = useState<BackupRecord | null>(null);
 
-  // Audit #12: progress-stall detector. We don't render a progress bar in
+  // Progress-stall detector. We don't render a progress bar in
   // TagsView, but we do listen to progress events and reset a timer; if no
   // event arrives for PROGRESS_STALL_MS and an op is still active, we show
   // a "seems stuck" banner with a Cancel hint.
@@ -139,7 +139,7 @@ export function TagsView() {
     }
   });
 
-  // Remap restore dialog state (audit #19 — restore against a moved library)
+  // Remap restore dialog state (restore against a moved library)
   const [remapDialogOpen, setRemapDialogOpen] = useState(false);
   const [remapBackupPath, setRemapBackupPath] = useState<string>("");
   const [remapLibraryRoot, setRemapLibraryRoot] = useState<string>(libraryPath ?? "");
@@ -215,7 +215,7 @@ export function TagsView() {
     setConfirmRestore(true);
   };
 
-  // Audit #3: replaced the silent fire-and-forget X-button with a real
+  // Replaced the silent fire-and-forget X-button with a real
   // confirm. The actual call now happens via the ConfirmModal's onConfirm
   // (handleConfirmForget below).
   const handleAskForgetBackup = (record: BackupRecord) => {
@@ -230,14 +230,14 @@ export function TagsView() {
       await rpc("forget_backup", { backup_path: target.backup_path });
     } catch (e) {
       // Surface forget errors instead of swallowing them in a `finally`
-      // (per audit — the original was `try { ... } finally { refresh }`).
+      // (the original was `try { ... } finally { refresh }`).
       fail(e);
     } finally {
       await refreshHistory();
     }
   };
 
-  // Audit #5: after a successful restore, the on-disk tags no longer match
+  // After a successful restore, the on-disk tags no longer match
   // any in-memory analysis state. Re-scan the library so the Library tab
   // (and the next Apply) sees the freshly-restored values. If the library
   // path isn't known (restoring from a backup of a different library), just
@@ -272,7 +272,7 @@ export function TagsView() {
     if (!restoreCandidate) return;
     setConfirmRestore(false);
     // Look up the library_path the backup was originally for, so we can
-    // re-scan the right folder afterwards (audit #5). Fall back to the
+    // re-scan the right folder afterwards. Fall back to the
     // currently-open library when unknown.
     const record = history.find((r) => r.backup_path === restoreCandidate);
     const restoredFor = record?.library_path ?? null;
@@ -329,7 +329,7 @@ export function TagsView() {
   const handleRunRemapRestore = async () => {
     if (!remapBackupPath || !remapLibraryRoot) return;
 
-    // Audit #10: client-side guard against picking a single audio file as
+    // Client-side guard against picking a single audio file as
     // the library root. The Tauri folder picker enforces this, but the
     // input is freely editable so we still see paste-an-MP3 cases. We have
     // no fs.stat plugin so we use a filename-extension heuristic — good
@@ -350,7 +350,7 @@ export function TagsView() {
       });
       finish();
       setRemapResult(stats);
-      // Audit #5: same as straight restore — refresh the in-memory library
+      // Same as straight restore — refresh the in-memory library
       // so the user can't accidentally Apply over the freshly-restored tags.
       // The remap restore points at `remapLibraryRoot`, so use that.
       await refreshLibraryAfterRestore(remapLibraryRoot);
@@ -359,7 +359,7 @@ export function TagsView() {
     }
   };
 
-  // Audit #8: once a result is shown the dialog is "sticky" — the user must
+  // Once a result is shown the dialog is "sticky" — the user must
   // click X or Close. Backdrop clicks otherwise blow away the only place the
   // result panel renders, leaving the user with no way to see what happened.
   const handleCloseRemapDialog = () => {
@@ -392,7 +392,7 @@ export function TagsView() {
           </div>
         )}
 
-        {/* Audit #12: stall detector banner. Only shown during a backup-class
+        {/* Stall detector banner. Only shown during a backup-class
             op when no progress event has fired for PROGRESS_STALL_MS. */}
         {progressStalled && active === "backup" && (
           <div className="panel-pad bg-accent-yellow/5 border-accent-yellow/30 text-sm flex items-start gap-3">
@@ -553,7 +553,7 @@ export function TagsView() {
         onCancel={() => setConfirmRestore(false)}
       />
 
-      {/* Audit #3: forget-backup confirmation modal. */}
+      {/* Forget-backup confirmation modal. */}
       <ConfirmModal
         open={forgetCandidate !== null}
         variant="default"
@@ -604,7 +604,7 @@ export function TagsView() {
 }
 
 // ---------------------------------------------------------------------------
-// Remap restore dialog (audit #19) — restore against a moved library.
+// Remap restore dialog — restore against a moved library.
 // ---------------------------------------------------------------------------
 
 function RemapRestoreDialog({
@@ -699,7 +699,7 @@ function RemapRestoreDialog({
             <p className="text-[11px] text-white/40 mt-1">
               The folder where your audio currently lives — Vibechek walks it recursively.
             </p>
-            {/* Audit #10: client-side validation message. */}
+            {/* Client-side validation message. */}
             {validationError && (
               <div className="mt-2 text-xs text-accent-red flex items-start gap-1.5">
                 <AlertCircle className="w-3.5 h-3.5 flex-none mt-0.5" />
@@ -734,7 +734,7 @@ function RemapResultPanel({ result }: { result: RemapRestoreStats }) {
   const skipped = result.skipped_missing + result.skipped_size_mismatch;
   const allMissing = result.restored === 0 && skipped > 0;
 
-  // Audit #6: per-file detail. The backend already returns a `matches` array
+  // Per-file detail. The backend already returns a `matches` array
   // with per-file strategy info — surface it in a collapsible section so the
   // user can spot ambiguous matches and resolve them by picking a more
   // specific library root. Default: collapsed (the panel could be huge).

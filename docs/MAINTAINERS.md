@@ -48,7 +48,8 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
 - **PyInstaller `--onefile`.** The sidecar is one self-contained binary per platform
   (`packaging/vibechek.spec`). `--onedir` broke Tauri's single-file `externalBin` contract.
   On Windows, `--clean` can hit a `PermissionError` removing `build/…/localpycs` when the
-  repo lives on a synced drive (Google Drive "My Drive"); rebuild without `--clean`.
+  repo lives on a file-syncing or networked drive (e.g. a cloud-sync folder); rebuild
+  without `--clean`.
 - **GEOB/PRIV preservation is the product.** Every tag write must capture and restore
   Rekordbox's binary GEOB/PRIV frames (cue points, beat grids). This is guarded by a
   synthetic-MP3 regression test — never let a refactor strip it.

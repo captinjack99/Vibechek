@@ -273,7 +273,7 @@ done
         return
 
     # Decode like _wsl_run does — wsl can emit UTF-16 LE on some setups.
-    # (Audit #22: removed the dead _R wrapper class + tautological rc check
+    # (Removed the dead _R wrapper class + tautological rc check
     # that used to live here. The proc.returncode check above already
     # short-circuits all non-zero exits.)
     stdout = ""
@@ -2311,8 +2311,7 @@ def _gpu_mode_from_args(args: list[str]) -> str:
 
     Used by run_vibechek_in_wsl to decide whether to source cuda-env.sh:
     `--gpu off` means the user wants CPU-only, so we skip the LD_LIBRARY_PATH
-    injection that would otherwise prime TF's CUDA detection. Audit #2 in
-    docs/AUDIT_LANDMINES.md.
+    injection that would otherwise prime TF's CUDA detection.
     """
     for i, a in enumerate(args):
         if a == "--gpu" and i + 1 < len(args):

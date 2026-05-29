@@ -9,7 +9,7 @@ description = "ML-powered DJ library organizer — analyze, tag, and organize mu
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later" }
-authors = [{ name = "Jack" }]
+authors = [{ name = "papapew" }]
 keywords = ["dj", "music", "rekordbox", "essentia", "ml", "audio-analysis"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",

@@ -32,8 +32,8 @@ from vibechek.wsl import (
 @pytest.mark.parametrize(
     "win,wsl",
     [
-        ("C:\\Users\\Jack\\Music", "/mnt/c/Users/Jack/Music"),
-        ("C:/Users/Jack/Music", "/mnt/c/Users/Jack/Music"),
+        ("C:\\Users\\dj\\Music", "/mnt/c/Users/dj/Music"),
+        ("C:/Users/dj/Music", "/mnt/c/Users/dj/Music"),
         ("D:\\Tracks", "/mnt/d/Tracks"),
         ("z:\\foo\\bar\\baz", "/mnt/z/foo/bar/baz"),
     ],
@@ -52,7 +52,7 @@ def test_win_to_wsl_path_passthrough_for_non_windows() -> None:
 @pytest.mark.parametrize(
     "wsl,win",
     [
-        ("/mnt/c/Users/Jack/Music", "C:\\Users\\Jack\\Music"),
+        ("/mnt/c/Users/dj/Music", "C:\\Users\\dj\\Music"),
         ("/mnt/d/Tracks", "D:\\Tracks"),
         ("/mnt/c", "C:\\"),
         ("/mnt/c/", "C:\\"),
@@ -68,7 +68,7 @@ def test_wsl_to_win_path_passthrough() -> None:
 
 
 def test_path_translation_round_trip() -> None:
-    original = "C:\\Users\\Jack\\Music\\track.mp3"
+    original = "C:\\Users\\dj\\Music\\track.mp3"
     assert wsl_to_win_path(win_to_wsl_path(original)) == original
 
 
@@ -366,7 +366,7 @@ def test_detect_wsl_quick_mode_skips_probes(monkeypatch: pytest.MonkeyPatch) -> 
     "win,wsl",
     [
         # Spaces — common in Windows user paths like "My Drive"
-        ("C:\\Users\\Jack\\My Drive\\Vibechek", "/mnt/c/Users/Jack/My Drive/Vibechek"),
+        ("C:\\Users\\dj\\My Drive\\Vibechek", "/mnt/c/Users/dj/My Drive/Vibechek"),
         # Mixed separators
         ("C:\\a/mixed\\slashes.mp3", "/mnt/c/a/mixed/slashes.mp3"),
         # Special chars that don't need quoting in paths themselves
@@ -391,7 +391,7 @@ def test_win_to_wsl_unc_paths_pass_through() -> None:
 
 
 def test_round_trip_paths_with_spaces() -> None:
-    original = "C:\\Users\\Jack\\My Drive\\Music\\track 1.mp3"
+    original = "C:\\Users\\dj\\My Drive\\Music\\track 1.mp3"
     assert wsl_to_win_path(win_to_wsl_path(original)) == original
 
 
@@ -718,7 +718,7 @@ def test_resolve_cuda_packages_routes_to_cu11_for_tf25_soname() -> None:
 
 def test_resolve_cuda_packages_routes_to_cu12_for_tf213_soname() -> None:
     """When essentia upgrades to TF 2.13+, it'll dlopen libcublas.so.12,
-    libcudnn.so.9. Those route to cu12 wheels — audit #3."""
+    libcudnn.so.9. Those route to cu12 wheels."""
     from vibechek.wsl import _resolve_cuda_packages
 
     pkgs, unknown = _resolve_cuda_packages([
@@ -932,7 +932,7 @@ def test_native_install_run_with_progress_cancellation_terminates_child(
 ) -> None:
     """Setting the cancellation flag mid-run kills the child process.
 
-    Audit #1: previously the install subprocesses ran with no cancellation
+    Previously the install subprocesses ran with no cancellation
     polling, so a Cancel click left them running for up to 30 minutes while
     the long-op lock stayed held. The watchdog now fires within 500ms.
     """

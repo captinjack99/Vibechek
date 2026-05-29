@@ -75,7 +75,7 @@ Undo journal + the remaining audit LOW/informational fixes.
 
 ## [0.4.0-beta.4] — 2026-05-18
 
-End-to-end codebase audit (7 parallel review agents). Fixed all HIGH + MED findings.
+End-to-end codebase audit. Fixed all HIGH + MED findings.
 
 ### Fixed — data safety (HIGH)
 - **Non-atomic JSON writes in the analyzer.** The final report write, the every-50-tracks checkpoint (`_write_partial`), and the WSL path-rewrite all used `Path.write_text(json.dumps(...))` — a kill/power-loss/disk-full mid-write truncated the report (up to 32 MB / 30+ min of GPU time). All now use `vibechek.io.atomic_write_json`. Checkpoint writes are also wrapped so a transient write error logs-and-continues instead of aborting the whole run.
@@ -158,7 +158,7 @@ End-to-end codebase audit (7 parallel review agents). Fixed all HIGH + MED findi
 
 ## [0.3.0-beta.11] — 2026-05-17
 
-Beta cycle wrap-up. Eleventh beta exists because the public launch on Reddit surfaced real edge cases faster than any test matrix could.
+Beta cycle wrap-up. Eleventh beta exists because early user feedback surfaced real edge cases faster than any test matrix could.
 
 ### Fixed
 - Long-tail stability fixes from public beta feedback.

@@ -37,7 +37,7 @@ interface UseApplyTagsReturn {
   apply: (tracks: TrackAnalysis[]) => Promise<ApplyTagsResult | null>;
   /**
    * True while *any* long-running operation owned by the sidecar is in
-   * flight (audit Tags #7). The original implementation only checked for
+   * flight. The original implementation only checked for
    * `active === "tag"`, which let users click Apply while a Backup was
    * still running — the RPC would reject with `{busy: true}`, the local
    * `begin("tag")` had already wiped the backup's progress UI, and the user
@@ -62,7 +62,7 @@ export function useApplyTags(): UseApplyTagsReturn {
       // Gate against concurrent long-ops *before* we flip operation state.
       // If we begin("tag") first and then the sidecar rejects with busy,
       // we'd have already wiped the in-flight backup's progress UI — exactly
-      // the bug in Tags audit #7.
+      // the original bug.
       if (active !== null) {
         const label =
           active === "backup"
@@ -78,7 +78,7 @@ export function useApplyTags(): UseApplyTagsReturn {
         // `path` (used as the file identifier) and `ml_analysis` (the
         // source of all written tags). Sending the full TrackAnalysis with
         // existing_tags / filename_* fields is wasteful — on a 12k library
-        // the JSON-RPC payload shrinks by ~80% (Tags #11 / Audit Library #8).
+        // the JSON-RPC payload shrinks by ~80%.
         const slim = tracks.map((t) => ({
           path: t.path,
           ml_analysis: t.ml_analysis ?? null,

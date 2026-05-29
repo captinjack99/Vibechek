@@ -442,8 +442,7 @@ def handle_duplicates(
     Returns a `{moved, deleted, errors, error_messages}` summary. `errors` is
     the count; `error_messages` is a list of human-readable strings (one per
     failed file). The list is what the GUI shows in its "errors — see report"
-    toast — without it the toast pointed at a report that didn't exist
-    (duplicates audit #6).
+    toast — without it the toast pointed at a report that didn't exist.
     """
     # Local import — keeps cancellation a soft dep when duplicates is used as
     # a library outside the sidecar (mirrors the scan path).

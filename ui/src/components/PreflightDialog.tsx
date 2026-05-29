@@ -105,7 +105,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     try {
       const result = await rpc<T>(method, params);
       if (!result.ok) {
-        // AUDIT_LIBRARY_TAB #15: previously called `finish()` even when the
+        // previously called `finish()` even when the
         // op reported failure, which left the global op state inconsistent.
         // Route through `fail()` (which handles the cancellation case too).
         fail(result.error ?? "install failed");
@@ -113,7 +113,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
         return null;
       }
       finish();
-      // AUDIT_SETTINGS_TAB #13: install_wsl returns a `note` ("may need a
+      // install_wsl returns a `note` ("may need a
       // reboot...") that we used to drop on the floor. Surface it.
       if (result.note) setPostInstallNote(result.note);
       await reCheck();
@@ -136,7 +136,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   };
 
   /**
-   * Audit Settings #4: explicit "Repair WSL shim" affordance.
+   * Explicit "Repair WSL shim" affordance.
    *
    * The cuda-env.sh patch in pre-beta.10 builds wrote a bash line into the
    * Python entry-point script, breaking analyze with a SyntaxError. The
@@ -220,7 +220,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center px-4"
-      // AUDIT_SETTINGS_TAB #14: don't let a stray backdrop click dismiss the
+      // don't let a stray backdrop click dismiss the
       // dialog mid-install. The user would lose the live progress log and
       // the post-install note; the underlying install keeps running but they
       // can't see it. Suppress the click while any step is busy.
@@ -279,7 +279,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             </div>
           )}
 
-          {/* AUDIT_SETTINGS_TAB #13: surface install_wsl's "may need a reboot"
+          {/* surface install_wsl's "may need a reboot"
               note. Persists across re-renders until the next install runs. */}
           {postInstallNote && (
             <div className="panel-pad bg-accent-yellow/10 border-accent-yellow/30 text-xs text-accent-yellow/90">
@@ -294,7 +294,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
                   <Terminal className="w-3.5 h-3.5" />
                   Live progress
                 </div>
-                {/* AUDIT_SETTINGS_TAB #2: only offer Cancel when there is an
+                {/* only offer Cancel when there is an
                     actually-cancellable op in flight. Without the active
                     check we'd send a no-op cancel_operation that confuses
                     the user when nothing happens. */}
@@ -321,7 +321,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
           )}
 
           {/* Troubleshooting affordance — small, low-visibility "repair shim"
-              button (AUDIT_SETTINGS_TAB #4). Only shown when WSL is at least
+              button. Only shown when WSL is at least
               present; otherwise there's nothing to repair. */}
           {(preflight.wsl?.distros.length ?? 0) > 0 && (
             <div className="text-[11px] text-white/40 flex items-center gap-2 pt-1">

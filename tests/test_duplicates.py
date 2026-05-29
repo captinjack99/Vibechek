@@ -110,7 +110,7 @@ def test_handle_move_requires_review_folder(tmp_path: Path) -> None:
         )
 
 
-# ---------- Chromaprint similarity (audit #3) ----------
+# ---------- Chromaprint similarity ----------
 
 
 def test_fingerprint_similarity_identical_returns_one() -> None:
@@ -173,7 +173,7 @@ def test_chromaprint_threshold_clusters_similar_fingerprints(
     """find_duplicates groups files whose raw fingerprints are similar enough.
 
     Verifies the chromaprint_similarity_threshold field is actually consulted
-    — the bug (audit #3) was that the threshold was dead code.
+    — the bug was that the threshold was dead code.
     """
     from vibechek import duplicates
     from vibechek.config import DuplicateConfig
@@ -222,13 +222,13 @@ def test_chromaprint_threshold_clusters_similar_fingerprints(
     assert len(report_strict.audio_duplicates) == 0
 
 
-# ---------- Error surface (audit #6) ----------
+# ---------- Error surface ----------
 
 
 def test_handle_duplicates_error_messages_surface_to_caller(tmp_path: Path) -> None:
     """The summary must include `error_messages` so the GUI can show them.
 
-    Audit #6: errors were just a count — the toast said "errors — see report"
+    Errors were just a count — the toast said "errors — see report"
     but there was no report. The summary now includes a list of message strings.
     """
     from vibechek import duplicates as dd

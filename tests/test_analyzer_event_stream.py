@@ -159,7 +159,7 @@ def test_handler_does_not_crash_on_malformed_event_line() -> None:
 def test_handler_silences_callback_exceptions() -> None:
     """A handler that raises must NOT prevent later lines from being parsed.
     The analyze pipeline already lost too much progress to swallowed
-    exceptions in callbacks before audit #11."""
+    exceptions in callbacks."""
     def boom(*_args, **_kw):
         raise RuntimeError("simulated UI callback crash")
 

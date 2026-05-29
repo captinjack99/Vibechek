@@ -1,4 +1,4 @@
-"""Tests for the model-download mirror fallback path (audit #21).
+"""Tests for the model-download mirror fallback path.
 
 `_download_from_mirrors` walks a tuple of base URLs, trying each in turn so
 a single domain outage doesn't permanently break installs. We mock
@@ -34,7 +34,7 @@ def test_download_from_mirrors_uses_first_url_when_it_works(tmp_path: Path) -> N
 
 
 def test_download_from_mirrors_falls_through_on_first_failure(tmp_path: Path) -> None:
-    """The whole point of audit #21: when primary is down, fall to mirror."""
+    """The whole point: when primary is down, fall to mirror."""
     from vibechek import analyzer
 
     dest = tmp_path / "model.pb"

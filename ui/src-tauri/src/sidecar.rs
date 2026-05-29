@@ -25,7 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
 
-// Per-method RPC timeouts (audit #12). A single one-hour ceiling for every
+// Per-method RPC timeouts. A single one-hour ceiling for every
 // method is wrong in both directions: too long for a hung `system_info`
 // (the GUI sits at a spinner for an hour) and too short for analyzing a
 // 50,000-track library on a slow disk.
@@ -169,7 +169,7 @@ impl SidecarHandle {
             stdin.flush().await.context("flush sidecar stdin")?;
         }
 
-        // Per-method timeout (audit #12). `None` means "wait indefinitely" —
+        // Per-method timeout. `None` means "wait indefinitely" —
         // used for `analyze_directory`, where a long-running run is normal
         // and the only legitimate way to detect death is the sidecar-EOF
         // drain path that wakes our oneshot via `mark_dead_and_drain`.
@@ -225,7 +225,7 @@ pub fn spawn(app: AppHandle) -> Result<SidecarHandle> {
 async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandle> {
     let mut child = Command::new(&binary)
         .arg("rpc")
-        // Force UTF-8 mode in the sidecar Python (audit #8). Without this,
+        // Force UTF-8 mode in the sidecar Python. Without this,
         // pathlib.Path on Windows uses the legacy code page (cp1252) for
         // os.fspath() — track files with Cyrillic / CJK / emoji names round-
         // trip as mojibake through JSON-RPC and break the WSL path translation.
@@ -365,7 +365,7 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
         return Ok(());
     }
 
-    // Audit #15: native CUDA/TF/essentia code occasionally writes raw bytes
+    // native CUDA/TF/essentia code occasionally writes raw bytes
     // directly to fd 1, bypassing Python's `_StdoutWriter` lock. Those
     // appear as non-JSON lines (e.g. "2026-05-17 14:23:11.123456: I tensorflow/...")
     // and would otherwise abort dispatch with a parse error, losing whatever
@@ -409,7 +409,7 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
     }
 
     // Notification: emit as Tauri event. Includes `progress` (long ops),
-    // `ready` (startup), and `notify` (startup warnings — audit #18).
+    // `ready` (startup), and `notify` (startup warnings).
     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
         let event_name = format!("sidecar:{method}");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);

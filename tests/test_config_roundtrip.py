@@ -1,7 +1,7 @@
 """Tests for vibechek.config persistence — JSON round-trip + TOML migration.
 
 Covers:
-- JSON round-trip preserves None (audit #10 regression test).
+- JSON round-trip preserves None (regression test).
 - JSON round-trip preserves Path fields as strings on disk, Path objects in
   the loaded config.
 - Legacy `config.toml` is read as a one-time migration fallback.
@@ -41,7 +41,7 @@ def test_save_writes_json_not_toml(tmp_path: Path) -> None:
 
 
 def test_roundtrip_preserves_none_for_optional_path(tmp_path: Path) -> None:
-    """Audit #10 regression: review_folder=None must round-trip as None."""
+    """Regression: review_folder=None must round-trip as None."""
     cfg = VibechekConfig()
     assert cfg.duplicates.review_folder is None  # default
     assert cfg.organization.target_root is None  # default
