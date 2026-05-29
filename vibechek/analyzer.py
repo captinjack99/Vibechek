@@ -1164,22 +1164,32 @@ def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks):  
     import queue as _queue
     import time as _time
 
+    # Test hook (env-var, so it survives the spawn re-import that loses
+    # monkeypatches): exercise the FULL real machinery — spawn, the shared
+    # queue, work-stealing, recycling, the supervisor — with a fast fake
+    # analyze and no essentia/TF. This is what lets the hybrid pool be tested
+    # identically on Windows (spawn-only) and Linux, instead of skipping.
+    fake = os.environ.get("VIBECHEK_FAKE_ANALYZE") == "1"
+
     os.environ["CUDA_VISIBLE_DEVICES"] = device
     use_gpu = "off" if device == "-1" else "on"
-    try:
-        models = load_models(Path(model_dir), use_gpu=use_gpu)
-    except Exception as e:  # noqa: BLE001
-        import sys as _sys
-        import traceback as _tb
-        _sys.stderr.write(
-            f"VIBECHEK_WORKER_INIT_FAIL: {type(e).__name__}: {e}\n{_tb.format_exc()}\n"
-        )
-        _sys.stderr.flush()
+    if not fake:
         try:
-            out_q.put(("__init_fail__", device, f"{type(e).__name__}: {e}"))
-        except Exception:  # noqa: BLE001
-            pass
-        return
+            models = load_models(Path(model_dir), use_gpu=use_gpu)
+        except Exception as e:  # noqa: BLE001
+            import sys as _sys
+            import traceback as _tb
+            _sys.stderr.write(
+                f"VIBECHEK_WORKER_INIT_FAIL: {type(e).__name__}: {e}\n{_tb.format_exc()}\n"
+            )
+            _sys.stderr.flush()
+            try:
+                out_q.put(("__init_fail__", device, f"{type(e).__name__}: {e}"))
+            except Exception:  # noqa: BLE001
+                pass
+            return
+    else:
+        models = {"_fake": True}
 
     done = 0
     while done < maxtasks and not done_event.is_set():
@@ -1191,17 +1201,23 @@ def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks):  
             break
         idx, path = item
         t0 = _time.monotonic()
-        try:
-            rec = asdict(analyze_track(Path(path), models))
-        except Exception as e:  # noqa: BLE001
+        if fake:
+            _time.sleep(0.003)  # cheap, deterministic stand-in for analysis
             p = Path(path)
-            rec = {
-                "path": path,
-                "filename": p.name,
-                "extension": p.suffix.lower(),
-                "size_mb": 0.0,
-                "error": str(e),
-            }
+            rec = {"path": path, "filename": p.name,
+                   "extension": p.suffix.lower(), "size_mb": 1.0, "error": None}
+        else:
+            try:
+                rec = asdict(analyze_track(Path(path), models))
+            except Exception as e:  # noqa: BLE001
+                p = Path(path)
+                rec = {
+                    "path": path,
+                    "filename": p.name,
+                    "extension": p.suffix.lower(),
+                    "size_mb": 0.0,
+                    "error": str(e),
+                }
         try:
             out_q.put((idx, rec, device, _time.monotonic() - t0))
         except Exception:  # noqa: BLE001
