@@ -20,8 +20,13 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to repo root: an unanchored `lib/` also matched `ui/src/lib/`
+# (the frontend's keeperRules/keeperConstants source), so those files were
+# silently never committed — which broke `tsc`/`npm run build` on every fresh
+# checkout (CI + clones). Only the Python build-output lib dirs at the root
+# should be ignored.
+/lib/
+/lib64/
 parts/
 sdist/
 var/
