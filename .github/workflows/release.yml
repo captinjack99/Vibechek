@@ -173,34 +173,77 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      # Code-signing is OPT-IN. CRITICAL: Tauri 2's bundler reads signing certs
+      # via Rust's `std::env::var("APPLE_CERTIFICATE")`, which returns Ok("")
+      # for a variable that is DEFINED BUT EMPTY. GitHub injects an unset secret
+      # as an empty string, so passing `APPLE_CERTIFICATE: ${{ secrets.* }}`
+      # directly in the build step's `env:` makes the bundler believe a cert is
+      # present, run `security import` on empty data, and HARD-FAIL the macOS
+      # bundle with:
+      #   security: SecKeychainItemImport: One or more parameters ... not valid
+      #   failed codesign application: failed to run command security import
+      # (This is exactly the macОS release failure we hit.) The old comment here
+      # wrongly assumed empty strings => unsigned build; that's only true for
+      # tauri-action's JS checks, NOT the Rust bundler.
+      #
+      # Fix: export each signing var to $GITHUB_ENV ONLY when its secret is
+      # actually non-empty. An unconfigured repo (or fork) then builds UNSIGNED
+      # instead of failing; a properly-configured repo signs + notarizes. See
+      # docs/RELEASING.md for the one-time secret setup.
+      - name: Configure code signing (opt-in)
+        shell: bash
+        env:
+          IN_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          IN_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IN_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          IN_APPLE_ID: ${{ secrets.APPLE_ID }}
+          IN_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          IN_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          IN_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          IN_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # emit NAME VALUE -> append to $GITHUB_ENV only when VALUE is non-empty.
+          # Heredoc form preserves multi-line base64 .p12 values intact and never
+          # echoes the secret value to the log.
+          emit() {
+            local name="$1" value="$2"
+            if [ -n "$value" ]; then
+              { printf '%s<<__VIBECHEK_EOF__\n' "$name"; printf '%s\n' "$value"; printf '__VIBECHEK_EOF__\n'; } >> "$GITHUB_ENV"
+              echo "  $name: set"
+            else
+              echo "  $name: (absent)"
+            fi
+          }
+          echo "Code-signing (opt-in — absent secrets => UNSIGNED build):"
+          if [ -n "${IN_APPLE_CERTIFICATE:-}" ]; then
+            echo "Apple: certificate present — macOS build will be SIGNED."
+            emit APPLE_CERTIFICATE          "${IN_APPLE_CERTIFICATE:-}"
+            emit APPLE_CERTIFICATE_PASSWORD "${IN_APPLE_CERTIFICATE_PASSWORD:-}"
+            emit APPLE_SIGNING_IDENTITY     "${IN_APPLE_SIGNING_IDENTITY:-}"
+            emit APPLE_ID                   "${IN_APPLE_ID:-}"
+            emit APPLE_PASSWORD             "${IN_APPLE_PASSWORD:-}"
+            emit APPLE_TEAM_ID              "${IN_APPLE_TEAM_ID:-}"
+          else
+            echo "Apple: no APPLE_CERTIFICATE secret — macOS build will be UNSIGNED."
+          fi
+          if [ -n "${IN_WINDOWS_CERTIFICATE:-}" ]; then
+            echo "Windows: certificate present — Windows build will be SIGNED."
+            emit WINDOWS_CERTIFICATE          "${IN_WINDOWS_CERTIFICATE:-}"
+            emit WINDOWS_CERTIFICATE_PASSWORD "${IN_WINDOWS_CERTIFICATE_PASSWORD:-}"
+          else
+            echo "Windows: no WINDOWS_CERTIFICATE secret — Windows build will be UNSIGNED."
+          fi
+
       - name: Build Tauri bundles
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: ui
-        # Codesigning + notarization (audit #5). Unsigned macOS .dmg files get
-        # killed by Gatekeeper on first launch with a "can't verify" dialog
-        # that most users misread as malware; unsigned Windows .exe / .msi
-        # triggers Defender SmartScreen. Both are silent failures from the
-        # user's POV ("sidecar died").
-        #
-        # The env vars below are picked up by tauri-action when present. They
-        # need to be configured as GitHub repo secrets first — see
-        # docs/RELEASING.md for the one-time setup walk-through. When secrets
-        # are absent (as in fork CI), the env vars are empty strings and
-        # tauri-action does an UNSIGNED build with a loud warning in the log.
-        env:
-          # macOS — requires APPLE_CERTIFICATE (.p12 base64), password, the
-          # team/signing identity, plus an app-specific password for notarytool.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # Windows — Authenticode cert via SignTool. Tauri also accepts a
-          # WINDOWS_CERTIFICATE base64 + WINDOWS_CERTIFICATE_PASSWORD pair.
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        # Signing env vars are inherited from $GITHUB_ENV (set by the step
+        # above) ONLY when their secrets exist — so there is no empty-string
+        # cert to trip the Tauri 2 bundler. Do NOT add APPLE_*/WINDOWS_* back
+        # into this `env:` block directly; that reintroduces the empty-string
+        # codesign failure documented above.
 
       - name: Collect Tauri bundles
         shell: bash
@@ -267,11 +310,22 @@ jobs:
             ### Desktop app (recommended for most users)
 
             Download the installer for your platform:
-            - **Windows**: `.msi` or `.exe`
-            - **macOS**: `.dmg`
+            - **Windows**: `.exe` (NSIS installer)
+            - **macOS**: `.dmg` (Apple Silicon)
             - **Linux**: `.AppImage` or `.deb`
 
             Includes the CLI as a bundled sidecar — nothing else to install.
+
+            > **macOS first launch (unsigned beta build):** these beta `.dmg`s are
+            > not yet notarized by Apple, so Gatekeeper will refuse the first open
+            > with a "Vibechek is damaged / can't be verified" message. To run it:
+            > right-click **Vibechek.app → Open → Open**, or clear the quarantine
+            > flag in Terminal:
+            > ```
+            > xattr -dr com.apple.quarantine /Applications/Vibechek.app
+            > ```
+            > You only need to do this once. Signed + notarized builds are planned
+            > for the stable release.
 
             ### CLI only
 

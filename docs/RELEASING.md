@@ -161,7 +161,9 @@ If a release is already **published**, do not delete — issue a `v0.3.0-beta.2`
 
 ## Codesigning + notarization (one-time CI setup)
 
-Without codesigning, **macOS Gatekeeper kills the sidecar on first launch** with a generic "can't be opened because Apple cannot check it for malicious software" dialog — most users misread that as malware and uninstall. On Windows, **Defender SmartScreen** triggers similar warnings. The release workflow (`.github/workflows/release.yml`) is wired to pass certs through `tauri-action` when these repo secrets are set:
+Without codesigning, **macOS Gatekeeper kills the sidecar on first launch** with a generic "can't be opened because Apple cannot check it for malicious software" dialog — most users misread that as malware and uninstall. On Windows, **Defender SmartScreen** triggers similar warnings. The release workflow (`.github/workflows/release.yml`) is wired to pass certs through `tauri-action` when these repo secrets are set.
+
+> **Signing is OPT-IN (and must be).** The `Configure code signing (opt-in)` step in `build-tauri` exports each signing var to `$GITHUB_ENV` **only when its secret is non-empty**. This is not a nicety — it's required: Tauri 2's Rust bundler reads the cert via `std::env::var("APPLE_CERTIFICATE")`, which returns `Ok("")` for a *defined-but-empty* variable. If you wire `APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}` straight into the build step's `env:`, an **unset** secret still arrives as `APPLE_CERTIFICATE=` (empty but defined), the bundler thinks a cert is present, runs `security import` on empty data, and the whole macOS bundle dies with `SecKeychainItemImport: One or more parameters passed to a function were not valid`. Do **not** add `APPLE_*` / `WINDOWS_*` back into the build step's `env:` block — keep them flowing through the opt-in step.
 
 ### macOS
 
@@ -221,7 +223,9 @@ After the next release, `.exe` and `.msi` installers will be Authenticode-signed
 
 ### If you don't have certs yet
 
-CI will still build, just unsigned. Users will see Gatekeeper / SmartScreen warnings on first launch and have to right-click → Open (macOS) or click "More info" → "Run anyway" (Windows). Mention this in your release notes so users aren't surprised. The unsigned-build warning shows up in the CI log under the "Build Tauri bundles" step.
+CI builds **unsigned** — and the `Configure code signing (opt-in)` step makes that work cleanly: with no secrets set it logs `macOS build will be UNSIGNED` and never attempts a `security import`, so the `.dmg` / `.app` / `.exe` build to completion. Users will see Gatekeeper / SmartScreen warnings on first launch and have to right-click → Open (macOS) or click "More info" → "Run anyway" (Windows). The release notes (generated from the `body:` in `release.yml`) already include the macOS `xattr -dr com.apple.quarantine` workaround.
+
+> **Heads-up — a malformed cert secret will still fail the build.** The opt-in guard only protects the *empty/unset* case. If `APPLE_CERTIFICATE` is set to a **non-empty but invalid** value (base64 of a `.cer`/`.pem` instead of a `.p12`, line-wrapped base64, wrong `.p12` password, or a stray `data:` prefix), the bundler will try to import it and fail with the same `SecKeychainItemImport ... not valid`. To ship unsigned, **delete the secret entirely** (Settings → Secrets and variables → Actions) rather than blanking it. To ship signed, re-export a valid Developer ID Application `.p12` per the macOS steps above.
 
 ### Verifying a signed build
 
