@@ -583,15 +583,65 @@ export function Settings() {
               {Math.round(cfg.tagging.genre_confidence_threshold * 100)}%
             </span>
           </div>
-          <Hint>Tracks below this ML confidence won't get their genre tag rewritten.</Hint>
+          <Hint>Tracks below this ML confidence won't get their genre tag rewritten. Other fields below are independent.</Hint>
         </Field>
 
-        <Toggle
-          label="Skip BPM & key"
-          checked={cfg.tagging.skip_bpm_and_key}
-          onChange={(v) => updateTagging({ skip_bpm_and_key: v })}
-          hint="Rekordbox's BPM/key detection is more reliable than the ML's."
-        />
+        <Field label="Write these fields">
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+            <Toggle label="Genre" checked={cfg.tagging.write_genre}
+              onChange={(v) => updateTagging({ write_genre: v })}
+              hint="Subject to the confidence threshold above." />
+            <Toggle label="Energy" checked={cfg.tagging.write_energy}
+              onChange={(v) => updateTagging({ write_energy: v })} />
+            <Toggle label="Mood" checked={cfg.tagging.write_mood}
+              onChange={(v) => updateTagging({ write_mood: v })} />
+            <Toggle label="Vocal" checked={cfg.tagging.write_vocal}
+              onChange={(v) => updateTagging({ write_vocal: v })} />
+            <Toggle label="Timeslot" checked={cfg.tagging.write_timeslot}
+              onChange={(v) => updateTagging({ write_timeslot: v })} />
+            <Toggle label="Direction" checked={cfg.tagging.write_direction}
+              onChange={(v) => updateTagging({ write_direction: v })} />
+            <Toggle label="BPM" checked={cfg.tagging.write_bpm}
+              onChange={(v) => updateTagging({ write_bpm: v })}
+              hint="Off by default — Rekordbox is usually more accurate." />
+            <Toggle label="Key" checked={cfg.tagging.write_key}
+              onChange={(v) => updateTagging({ write_key: v })}
+              hint="Off by default — Rekordbox is usually more accurate." />
+          </div>
+          <Hint>Each field is written independently — genre confidence only gates the genre.</Hint>
+        </Field>
+
+        <Field label="Vocal detection sensitivity">
+          <div className="flex items-center gap-3">
+            <span className="text-[11px] text-white/40 w-20">Instrumental ≤</span>
+            <input
+              type="range" min={0.3} max={0.95} step={0.01}
+              value={cfg.tagging.vocal_instrumental_max}
+              onChange={(e) => updateTagging({ vocal_instrumental_max: Number(e.target.value) })}
+              className="flex-1 accent-accent"
+            />
+            <span className="text-sm font-mono w-12 text-right tabular-nums">
+              {Math.round(cfg.tagging.vocal_instrumental_max * 100)}%
+            </span>
+          </div>
+          <div className="flex items-center gap-3 mt-1">
+            <span className="text-[11px] text-white/40 w-20">Vocal ≥</span>
+            <input
+              type="range" min={0.5} max={1} step={0.01}
+              value={cfg.tagging.vocal_full_min}
+              onChange={(e) => updateTagging({ vocal_full_min: Number(e.target.value) })}
+              className="flex-1 accent-accent"
+            />
+            <span className="text-sm font-mono w-12 text-right tabular-nums">
+              {Math.round(cfg.tagging.vocal_full_min * 100)}%
+            </span>
+          </div>
+          <Hint>
+            Below the first cutoff → Instrumental; above the second → Vocal; between → Light Vocal.
+            Raise the first if instrumentals are tagged "Vocal". Re-tag to apply (no re-analysis needed).
+          </Hint>
+        </Field>
+
         <Toggle
           label="Preserve Rekordbox cue points & beat grids"
           checked={cfg.tagging.preserve_rekordbox_frames}

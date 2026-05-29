@@ -79,7 +79,30 @@ class TaggingConfig:
     write_subgenre_as_main_genre: bool = True  # Rekordbox can only sort by main genre
     preserve_rekordbox_frames: bool = True  # GEOB / PRIV — cue points, beat grids
     backup_before_write: bool = True
-    skip_bpm_and_key: bool = True  # Trust Rekordbox over the ML BPM/key models
+
+    # ----- Per-field write toggles -----------------------------------------
+    # Each ML field can be written independently. Genre is ADDITIONALLY gated
+    # by the confidence thresholds above; the rest are deterministic outputs
+    # that write whenever present AND their toggle is on. BPM/Key default OFF
+    # because Rekordbox's own detection is usually more reliable (this replaces
+    # the old single `skip_bpm_and_key` flag with granular control).
+    write_genre: bool = True
+    write_bpm: bool = False
+    write_key: bool = False
+    write_energy: bool = True
+    write_mood: bool = True
+    write_timeslot: bool = True
+    write_direction: bool = True
+    write_vocal: bool = True
+
+    # ----- Vocal classification thresholds (voice probability 0..1) --------
+    # Applied at tag time to the stored `ml_vocal_score`, so they can be tuned
+    # WITHOUT re-analyzing. See analyzer._classify_vocal for the rationale:
+    # instrumental dance tracks with prominent melodic leads score ~0.64-0.69,
+    # so the cutoff for "Vocal" sits well above the old 0.6.
+    vocal_instrumental_max: float = 0.72  # below → Instrumental
+    vocal_full_min: float = 0.88          # at/above → Vocal; between → Light Vocal
+
     # ID3 text-frame encoding for MP3 writes. 0 = ISO-8859-1, 1 = UTF-16,
     # 3 = UTF-8 (mutagen's `Encoding.UTF8`). Rekordbox 5 and some older DJ
     # software only read encoding 0 or 1 — UTF-8 frames look empty to them.

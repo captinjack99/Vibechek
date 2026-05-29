@@ -540,7 +540,11 @@ def apply_ml_tags(
             genre_to_write = ""
             stats.genre_skipped_low_confidence += 1
 
-        apply_genre = apply_subgenre or apply_parent_only
+        # The genre write is gated by BOTH the confidence thresholds above AND
+        # the per-field `write_genre` toggle. Every other field has its own
+        # independent toggle (checked in _apply_mp3/_apply_flac) — none are
+        # gated by genre confidence.
+        apply_genre = (apply_subgenre or apply_parent_only) and config.write_genre
 
         if dry_run:
             continue
@@ -559,6 +563,49 @@ def apply_ml_tags(
             stats.errors.append(f"{filepath.name}: {e}")
 
     return stats
+
+
+# Maps the derived-field tag name → the TaggingConfig toggle that gates it.
+# BPM/Key are handled separately (they have their own write_bpm/write_key
+# plus the skip-rich-write semantics). GENRE is gated upstream by apply_genre.
+_FIELD_WRITE_TOGGLES = {
+    "ENERGY": "write_energy",
+    "MOOD": "write_mood",
+    "TIMESLOT": "write_timeslot",
+    "DIRECTION": "write_direction",
+    "VOCAL": "write_vocal",
+}
+
+
+def _resolve_vocal(ml: dict[str, Any], config: TaggingConfig) -> str | None:
+    """The VOCAL value to write.
+
+    Prefer re-deriving from the raw `ml_vocal_score` using the config's
+    (tunable) thresholds, so changing the cutoff re-tags correctly WITHOUT a
+    re-analyze. Falls back to the stored `ml_vocal` label for older analyses
+    that predate the raw score.
+    """
+    from vibechek.analyzer import _classify_vocal  # noqa: PLC0415
+    score = ml.get("ml_vocal_score")
+    if isinstance(score, (int, float)):
+        return _classify_vocal(
+            float(score),
+            instrumental_max=config.vocal_instrumental_max,
+            full_min=config.vocal_full_min,
+        )
+    val = ml.get("ml_vocal")
+    return str(val) if val is not None else None
+
+
+def _derived_field_value(tag_name: str, ml: dict[str, Any], config: TaggingConfig):
+    """Value to write for a derived (non-genre) field, honoring its toggle."""
+    toggle = _FIELD_WRITE_TOGGLES[tag_name]
+    if not getattr(config, toggle):
+        return None
+    if tag_name == "VOCAL":
+        return _resolve_vocal(ml, config)
+    val = ml.get(f"ml_{tag_name.lower()}")
+    return val if val is not None else None
 
 
 def _apply_mp3(
@@ -596,16 +643,15 @@ def _apply_mp3(
             audio.tags.delall("TIT1")
             audio.tags.add(TIT1(encoding=enc, text=[genre_value]))
 
-    if not config.skip_bpm_and_key:
-        if ml.get("ml_bpm"):
-            audio.tags.delall("TBPM")
-            audio.tags.add(TBPM(encoding=enc, text=[str(int(round(ml["ml_bpm"])))]))
-        if ml.get("ml_key"):
-            audio.tags.delall("TKEY")
-            audio.tags.add(TKEY(encoding=enc, text=[ml["ml_key"]]))
+    if config.write_bpm and ml.get("ml_bpm"):
+        audio.tags.delall("TBPM")
+        audio.tags.add(TBPM(encoding=enc, text=[str(int(round(ml["ml_bpm"])))]))
+    if config.write_key and ml.get("ml_key"):
+        audio.tags.delall("TKEY")
+        audio.tags.add(TKEY(encoding=enc, text=[ml["ml_key"]]))
 
     for tag_name in ("ENERGY", "MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
-        val = ml.get(f"ml_{tag_name.lower()}")
+        val = _derived_field_value(tag_name, ml, config)
         if val is not None:
             audio.tags.delall(f"TXXX:{tag_name}")
             audio.tags.add(TXXX(encoding=enc, desc=tag_name, text=[str(val)]))
@@ -634,14 +680,13 @@ def _apply_flac(
         if genre_value == ml_subgenre:
             audio["CONTENTGROUP"] = genre_value
 
-    if not config.skip_bpm_and_key:
-        if ml.get("ml_bpm"):
-            audio["BPM"] = str(int(round(ml["ml_bpm"])))
-        if ml.get("ml_key"):
-            audio["INITIALKEY"] = ml["ml_key"]
+    if config.write_bpm and ml.get("ml_bpm"):
+        audio["BPM"] = str(int(round(ml["ml_bpm"])))
+    if config.write_key and ml.get("ml_key"):
+        audio["INITIALKEY"] = ml["ml_key"]
 
     for tag_name in ("ENERGY", "MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
-        val = ml.get(f"ml_{tag_name.lower()}")
+        val = _derived_field_value(tag_name, ml, config)
         if val is not None:
             audio[tag_name] = str(val)
 

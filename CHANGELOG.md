@@ -14,6 +14,24 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
 
 ---
 
+## [0.4.0-beta.7] — 2026-05-29
+
+Three user-reported accuracy/UX bugs.
+
+### Fixed
+- **Vocal detection mislabelled instrumental dance as "Vocal".** Instrumental tracks with prominent melodic leads (e.g. Robert Miles "Children", Eric Prydz "Pjanoo") score ~0.64–0.71 on essentia's voice/instrumental model — above the old 0.6 cutoff, so they were wrongly tagged "Vocal". Recalibrated the cutoffs against measured scores: voice probability `< 0.72` → **Instrumental**, `< 0.88` → **Light Vocal**, else **Vocal**. Verified: Children (0.703) and Pjanoo (0.642) now classify Instrumental; Adele "Chasing Pavements" (0.972) stays Vocal.
+- **Audio preview started a new track at the previous track's elapsed time.** Loading track B while track A was 35s in began B at 0:35 (and could seek past B's end if B was shorter). The global player now `stop()`s before loading and seeks to 0 on `ready`, so every preview starts at 0:00.
+
+### Added
+- **Raw vocal score is now stored** (`MLResult.ml_vocal_score`, 0–1), so the Instrumental/Light Vocal/Vocal label can be **retuned and re-applied at tag time without re-analyzing**. (Tracks analyzed before beta.7 lack the raw score and need one re-analysis to benefit.)
+- **Configurable vocal sensitivity.** New `TaggingConfig.vocal_instrumental_max` (0.72) and `vocal_full_min` (0.88), surfaced in Settings as a "Vocal detection sensitivity" dual slider (Instrumental ≤ / Vocal ≥). Plumbed through the `apply_ml_tags` RPC.
+- **Per-field write toggles.** Replaced the single `skip_bpm_and_key` flag with independent `write_genre / write_bpm / write_key / write_energy / write_mood / write_timeslot / write_direction / write_vocal` toggles (BPM & Key default **off** — Rekordbox's own detection is usually better). Each ML field can now be written independently; genre remains additionally gated by its confidence thresholds. Surfaced as a "Write these fields" grid in Settings. This is what makes non-genre tags writable independent of genre confidence — they were always computed independently, and the granular toggles make that explicit and controllable.
+
+### Changed
+- **BREAKING (config):** `TaggingConfig.skip_bpm_and_key` removed in favor of the `write_bpm` / `write_key` toggles. The RPC still accepts the legacy `skip_bpm_and_key` param for back-compat (maps to `write_bpm = not skip`); the CLI `tag` command maps `--skip-bpm-key` the same way.
+
+---
+
 ## [0.4.0-beta.6] — 2026-05-18
 
 ### Added

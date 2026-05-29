@@ -123,8 +123,8 @@ def test_subset_falls_back_to_default_on_bad_float() -> None:
 
 
 def test_subset_falls_back_to_default_on_bad_bool() -> None:
-    cfg = _subset(TaggingConfig, {"skip_bpm_and_key": "maybe"})
-    assert cfg.skip_bpm_and_key == TaggingConfig().skip_bpm_and_key
+    cfg = _subset(TaggingConfig, {"write_bpm": "maybe"})
+    assert cfg.write_bpm == TaggingConfig().write_bpm
 
 
 def test_subset_coerces_string_to_int() -> None:

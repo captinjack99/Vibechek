@@ -1007,7 +1007,7 @@ export function LibraryBrowser() {
             )}
             <ul className="list-disc list-inside text-xs text-white/60 space-y-1">
               <li>Rekordbox cue points and beat grids are preserved.</li>
-              <li>BPM and key {taggingCfg.skip_bpm_and_key ? "are NOT touched" : "will be overwritten by ML values"}.</li>
+              <li>BPM and key {(taggingCfg.write_bpm || taggingCfg.write_key) ? "will be overwritten by ML values" : "are NOT touched"}.</li>
               <li>This cannot be undone — back up your tags first (Tags tab).</li>
             </ul>
           </div>

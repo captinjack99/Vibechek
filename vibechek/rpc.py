@@ -517,9 +517,25 @@ def _organize(params: dict) -> dict:
 def _apply_ml_tags(params: dict) -> dict:
     from vibechek.tagger import apply_ml_tags
 
+    # Per-field write toggles. `skip_bpm_and_key` is still accepted for
+    # backward compatibility (older GUIs / scripts) and maps onto the new
+    # write_bpm/write_key pair when the explicit toggles aren't provided.
+    legacy_skip = bool(params.get("skip_bpm_and_key", True))
     config = TaggingConfig(
         genre_confidence_threshold=float(params.get("confidence", 0.85)),
-        skip_bpm_and_key=bool(params.get("skip_bpm_and_key", True)),
+        parent_genre_confidence_threshold=float(
+            params.get("parent_genre_confidence_threshold", 0.50)
+        ),
+        write_genre=bool(params.get("write_genre", True)),
+        write_bpm=bool(params.get("write_bpm", not legacy_skip)),
+        write_key=bool(params.get("write_key", not legacy_skip)),
+        write_energy=bool(params.get("write_energy", True)),
+        write_mood=bool(params.get("write_mood", True)),
+        write_timeslot=bool(params.get("write_timeslot", True)),
+        write_direction=bool(params.get("write_direction", True)),
+        write_vocal=bool(params.get("write_vocal", True)),
+        vocal_instrumental_max=float(params.get("vocal_instrumental_max", 0.72)),
+        vocal_full_min=float(params.get("vocal_full_min", 0.88)),
         preserve_rekordbox_frames=bool(params.get("preserve_rekordbox_frames", True)),
         # ID3 text-frame encoding: useApplyTags now forwards this from
         # cfg.tagging.id3_text_encoding (added in beta.9, wired in beta.11).

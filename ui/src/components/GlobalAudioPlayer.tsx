@@ -69,7 +69,13 @@ export function GlobalAudioPlayer() {
     ws.on("ready", () => {
       setReady(true);
       setDuration(ws.getDuration());
-      // Autoplay the freshly-loaded track.
+      // Always start a freshly-loaded track from 0:00. Reusing one WaveSurfer
+      // instance across tracks means the previous track's currentTime can
+      // carry over into the new source — so a new preview would resume at the
+      // old elapsed time (and, if the new track is shorter, seek past its end
+      // and wedge). Explicitly rewind before autoplay.
+      try { ws.seekTo(0); } catch { /* pre-decode edge */ }
+      setPosition(0);
       void ws.play();
     });
     ws.on("timeupdate", (t: number) => setPosition(t));
@@ -96,6 +102,10 @@ export function GlobalAudioPlayer() {
     setError(null);
     setDuration(0);
     setPosition(0);
+    // Stop + rewind the currently-playing source BEFORE loading the next one,
+    // so the old position can't bleed into the new track. `ready` also seeks
+    // to 0 (belt + suspenders against WaveSurfer carrying currentTime over).
+    try { ws.stop(); } catch { /* nothing loaded yet */ }
     try {
       void ws.load(convertFileSrc(path));
     } catch (e) {

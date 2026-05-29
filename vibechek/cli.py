@@ -142,9 +142,13 @@ def tag(analysis_json: Path, confidence: float, skip_bpm_key: bool,
     from vibechek.tagger import apply_ml_tags
 
     data = json.loads(analysis_json.read_text(encoding="utf-8"))
+    # --skip-bpm-key (default) maps to write_bpm/write_key=False; the inverse
+    # --write-bpm-key flag turns both on (per-field toggles superseded the old
+    # single skip_bpm_and_key flag).
     config = TaggingConfig(
         genre_confidence_threshold=confidence,
-        skip_bpm_and_key=skip_bpm_key,
+        write_bpm=not skip_bpm_key,
+        write_key=not skip_bpm_key,
         preserve_rekordbox_frames=not no_preserve_rekordbox,
     )
 
