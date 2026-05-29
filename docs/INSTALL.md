@@ -2,8 +2,14 @@
 
 Two flavors:
 
-- **Desktop app** (recommended for most users) — point-and-click. Handles its own dependencies via the in-app setup dialog. Download the installer for your OS from [Releases](https://github.com/papapew/Vibechek/releases).
+- **Desktop app** (recommended for most users) — point-and-click. Handles its own dependencies via the in-app setup dialog. Download the installer for your OS from [Releases](https://github.com/papapew/Vibechek/releases). Windows ships a `.exe` (NSIS) installer, Linux a `.deb`/`.AppImage`, macOS a `.dmg` (Apple Silicon).
 - **CLI** (`vibechek` command) — for scripting, headless use, or running on a server.
+
+> **macOS first launch (beta builds are unsigned).** The `.dmg` isn't notarized yet,
+> so macOS shows *"Vibechek is damaged / can't be verified."* It isn't — just unsigned.
+> Right-click **Vibechek.app → Open → Open**, or run
+> `xattr -dr com.apple.quarantine /Applications/Vibechek.app` once. Signed + notarized
+> builds land with the stable release.
 
 See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop app.
 
@@ -53,7 +59,7 @@ environment), the equivalents are:
 
 ```bash
 pip install essentia-tensorflow
-vibechek download-models     # one-time, ~200 MB
+vibechek download-models     # one-time, ~800 MB
 ```
 
 ### Windows (now fully automated)
@@ -66,9 +72,10 @@ through the whole thing — no terminal required:
    download (Windows handles the install itself).
 2. **Install Vibechek + Essentia inside Ubuntu** — one click, ~3-5 min,
    runs entirely inside WSL with no extra prompts.
-3. **Download ML models** — one click, ~200 MB.
+3. **Download ML models** — one click, ~800 MB.
 4. **(Optional) Enable GPU acceleration** — one click in **Settings → System**.
-   See the GPU section below.
+   See the GPU section below. Vibechek can also run **hybrid CPU+GPU**, using your
+   GPU and spare CPU cores at the same time.
 
 After setup, when you analyze a library on `C:\Music\Tracks` the app
 automatically routes that analyze through WSL, translates the path to
@@ -177,7 +184,7 @@ vibechek download-models   # one-time, ~800 MB
 
 | File / dir | Purpose | Example (Windows) |
 |---|---|---|
-| `<config_dir>/Vibechek/config.toml` | Your settings (auto-saved 500ms after change) | `%APPDATA%\Vibechek\Vibechek\config.toml` |
+| `<config_dir>/Vibechek/config.json` | Your settings (auto-saved 500ms after change) | `%APPDATA%\Vibechek\Vibechek\config.json` |
 | `<config_dir>/Vibechek/library_state.json` | Recent libraries index | `%APPDATA%\Vibechek\Vibechek\library_state.json` |
 | `<config_dir>/Vibechek/backup_history.json` | Past tag backups | `%APPDATA%\Vibechek\Vibechek\backup_history.json` |
 | `<data_dir>/Vibechek/models/` | Downloaded ML model `.pb` files (~800 MB total) | `%LOCALAPPDATA%\Vibechek\Vibechek\models\` |

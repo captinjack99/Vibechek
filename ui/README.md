@@ -32,7 +32,7 @@ ui/
 ┌────────────────────────────────────────────────────────┐
 │  React frontend (Vite)                                 │
 │  - Zustand stores, virtualized track list, settings UI │
-│  - 24 vitest tests (Tauri APIs mocked in setup)        │
+│  - 32 vitest tests (Tauri APIs mocked in setup)        │
 └──────────────────────────┬─────────────────────────────┘
                            │ Tauri invoke("rpc_call", method, params)
                            ▼
@@ -48,7 +48,7 @@ ui/
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │  `vibechek rpc` (Python sidecar)                       │
-│  - 28 RPC methods, threadpool dispatch (8 workers)     │
+│  - 44 RPC methods, threadpool dispatch (8 workers)     │
 │  - Stdout lock keeps concurrent JSON frames atomic     │
 │  - Cooperative cancellation token                      │
 │  - All real work: analyzer, tagger, dedup, organize    │
@@ -68,17 +68,18 @@ never freezes waiting for a 2-hour analyze.
 | `Sidebar.tsx` | Library / Duplicates / Organize / Tags / Settings nav with consistent badges |
 | `LibraryBrowser.tsx` | Virtualized track list, search filter, bulk select, "Apply ML tags to N", error badge, recent-libraries empty state |
 | `LibraryFilters.tsx` | Genre / energy / mood / vocal chip filters with controlled popovers (proper outside-click handling) |
-| `TrackDetails.tsx` | Side panel — file metadata, before/after tag diff, audio preview |
-| `AudioPreview.tsx` | WaveSurfer.js waveform via Tauri asset protocol, with loading state |
+| `TrackDetails.tsx` | Side panel — file metadata, before/after tag diff; triggers the global player |
+| `GlobalAudioPlayer.tsx` | Single persistent WaveSurfer.js player bar at the app root (via Tauri asset protocol). Survives navigation; only one preview ever plays; every track starts at 0:00 |
 | `DuplicatesView.tsx` | Per-group rules editor, auto-keeper picks, manual override, action bar |
-| `OrganizeView.tsx` | Source picker, rules, plan preview, polished confirm, post-op result panel with folder breakdown |
+| `OrganizeView.tsx` | Source picker, rules, plan preview, polished confirm, post-op result panel with folder breakdown + inline Undo |
+| `OperationsHistory.tsx` | "Recent operations" modal — lists past organize/dedupe runs (from the journal) with one-click revert |
 | `TagsView.tsx` | Backup, restore, history of past backups with stale warnings |
-| `Settings.tsx` | Preflight banner, System resources, Analysis (workers/GPU), Advanced disclosure, Restore defaults, View logs |
+| `Settings.tsx` | Preflight banner, System resources, Analysis (workers/GPU/hybrid), Tagging (per-field write grid + vocal sensitivity), DJ profiles, diagnostics (doctor/verify-models/update-WSL), Advanced disclosure, Restore defaults, View logs |
 | `ConfirmModal.tsx` | Reusable confirm dialog — replaces every `window.confirm` |
 | `Toast.tsx` | Bottom-right success/info notification stack |
 | `ErrorToast.tsx` | Top-center error banner with Copy details / View logs / Report on GitHub |
 | `LogsViewer.tsx` | Full log tail viewer with level filter, copy-all, refresh |
-| `Onboarding.tsx` | First-launch three-slide tour, persisted in TOML config |
+| `Onboarding.tsx` | First-launch three-slide tour, persisted in JSON config |
 | `PreflightDialog.tsx` | Setup walkthrough with one-click WSL install / Essentia install / model download |
 | `AnalysisProgress.tsx` | Floating progress overlay with Cancel button |
 | `TagBadges.tsx` | Reusable energy bar + tag pill |
@@ -93,13 +94,15 @@ never freezes waiting for a 2-hour analyze.
 
 ## Stores
 
-Four small Zustand stores, no cross-dependencies:
+Small Zustand stores, no cross-dependencies (split into one file each under `stores/`,
+re-exported from `stores/index.ts`):
 
 - `useLibraryStore` — tracks, libraryPath, selectedIds, searchFilter
 - `useOperationStore` — active op, progress, error, duplicateReport, organizePlan, clearError
 - `useUIStore` — viewMode, sidebarCollapsed, selectedTrackPath
 - `useConfigStore` — config (mirrors `VibechekConfig` from Python), loaded flag
 - `useNotificationStore` — toast queue with notify/dismiss
+- `usePlayerStore` — single source of truth for the global audio player (current track, play/stop/position)
 
 ## Prerequisites for development
 
@@ -137,13 +140,14 @@ First Tauri compile is 10-15 minutes (downloads + builds ~400 MB of crates). Sub
 
 ```bash
 cd ui
-npm test           # vitest run — 24 tests
+npm test           # vitest run — 32 tests
 npm run test:watch # watch mode
 npm run test:ui    # web UI for tests
 ```
 
 Tests cover:
 - `lib/keeperRules.test.ts` — pure auto-picker logic
+- `api/rpc.test.ts` — JSON-RPC client wrappers + error mapping
 - `components/LibraryFilters.test.tsx` — filter rendering + applyFilters
 - `components/ConfirmModal.test.tsx` — modal behavior
 - `components/Sidebar.test.tsx` — nav + viewMode
@@ -164,30 +168,38 @@ npm run tauri:build
 ```
 
 Output: `ui/src-tauri/target/release/bundle/`:
-- Windows: `.msi` + `.exe` installers
-- macOS: `.dmg`
+- Windows: `.exe` (NSIS installer)
+- macOS: `.dmg` (Apple Silicon; unsigned in beta — Gatekeeper bypass documented in the release notes)
 - Linux: `.AppImage` + `.deb`
 
-The CI workflow at `.github/workflows/release.yml` does this automatically on tag push (`v*`).
+(`bundle.targets` in `tauri.conf.json` pins these; MSI/RPM were dropped — MSI rejects
+non-numeric pre-release versions and RPM needs `rpmbuild`, absent on the runners.)
+
+The CI workflow at `.github/workflows/release.yml` does this automatically on tag push
+(`v*`). Code signing is opt-in: the `Configure code signing (opt-in)` step only enables
+signing when cert secrets are present, otherwise it builds unsigned.
 
 ## Sidecar protocol
 
-JSON-RPC 2.0, one message per line on stdin/stdout. 28 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
+JSON-RPC 2.0, one message per line on stdin/stdout. 44 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
 
 | Method | What |
 |---|---|
 | `ping`, `version` | Health check |
-| `system_info` | CPU/RAM/GPU |
-| `preflight`, `wsl_status` | Readiness checks |
-| `install_wsl`, `install_vibechek_in_wsl` | Auto-setup |
-| `scan_directory`, `scan_only` | List files / shallow track records (no ML) |
-| `analyze_directory` | Full ML pass (supports `skip_paths` for incremental) |
+| `system_info`, `engine_gpu_status` | CPU/RAM/GPU (host) + actual-engine GPU probe |
+| `preflight`, `wsl_status`, `doctor`, `verify_models`, `native_venv_status` | Readiness checks + diagnostics |
+| `install_wsl`, `install_vibechek_in_wsl`, `install_cuda_libs_in_wsl`, `install_essentia_native`, `upgrade_vibechek_in_wsl`, `repair_wsl_shim` | Auto-setup / GPU / version-drift repair |
+| `scan_directory`, `scan_only`, `count_new_tracks` | List files / shallow track records (no ML) |
+| `analyze_directory` | Full ML pass (CPU/GPU/hybrid; supports `skip_paths` for incremental) |
 | `find_duplicates`, `handle_duplicates` | Dedup scan + execute |
 | `plan_organization`, `organize` | Genre-folder reorganization |
-| `apply_ml_tags` | Write ML results to file tags |
-| `backup_tags`, `restore_tags` | Snapshot + replay |
+| `list_journals`, `revert_journal` | Operation undo (organize/dedupe) |
+| `apply_ml_tags` | Write ML results to file tags (per-field toggles + vocal cutoffs) |
+| `backup_tags`, `restore_tags`, `restore_tags_with_remap` | Snapshot + replay |
+| `rename_library`, `tag_library` | Recent-library maintenance |
+| `list_profiles`, `load_profile` | DJ setting presets |
 | `download_models` | Pull Essentia models |
-| `get_config`, `save_config`, `restore_default_config` | TOML persistence |
+| `get_config`, `save_config`, `restore_default_config` | JSON config persistence |
 | `library_state`, `forget_library`, `load_recent_analysis` | Recent-libraries |
 | `backup_history`, `forget_backup` | Tag backup history |
 | `get_log_tail` | Logs for LogsViewer |

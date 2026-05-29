@@ -2,7 +2,7 @@
 
 **Open-source ML for your DJ library.** Auto-tag genre, mood, energy, BPM, and key. Find duplicates the way your ears would. Organize 10,000 tracks in an afternoon. Keep every Rekordbox cue point intact.
 
-> **Status:** `v0.3.0-beta.1` — feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux). Free forever under AGPL-3.0.
+> **Status:** `v0.4.0-beta.7` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux). Free forever under AGPL-3.0.
 
 ---
 
@@ -71,9 +71,23 @@ Plan and execute a clean `Music/Genre/Subgenre/` tree from your analysis. Rare g
 
 One click snapshots every ID3, Vorbis, and MP4 tag — **including the binary GEOB and PRIV frames Rekordbox stores cue points and beat grids in.** Most tag editors silently strip these when they rewrite a file. Vibechek preserves them by default and offers full restore. Your performance data is never at risk.
 
-### 🤖 Cross-Platrform GPU acceleration
+### 🤖 Cross-platform GPU acceleration — *and* hybrid CPU+GPU
 
-Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to see if TensorFlow can really use it... AND, if your GPU is hardware-visible but missing CUDA runtime libraries, the UI says so plainly and offers a one-click "Enable GPU" install. No false promises, no silent CPU fallback you don't know about. This helps speed up the analysis engine tremendously.
+Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to see if TensorFlow can really use it... AND, if your GPU is hardware-visible but missing CUDA runtime libraries, the UI says so plainly and offers a one-click "Enable GPU" install. No false promises, no silent CPU fallback you don't know about.
+
+Better yet: **hybrid analysis runs your GPU and your spare CPU cores at the same time.** A modest laptop GPU might only fit ~3 analysis workers in VRAM, which used to leave 16 CPU cores idle. Now Vibechek runs GPU workers *and* CPU workers against one shared work queue that self-balances — whichever device finishes a track grabs the next. On an RTX 4070 Laptop + i9, a 50-track run split GPU 9 / CPU 41 and used every resource at once. Toggle it in Settings.
+
+### ⏪ Undo that actually undoes
+
+Organize and dedupe-move write an append-only journal as they go — one flushed line per file moved, *before* the next move. So a run that dies halfway (disk full, power loss) is recoverable, and a finished run can be reverted with one click from the **Recent operations** panel. Files go back to exactly where they came from, newest-first, never clobbering anything that's since moved into the origin.
+
+### 🎚️ Tag exactly the fields you want
+
+Every ML field has an independent write toggle — genre, BPM, key, energy, mood, timeslot, direction, vocal. BPM and key default *off* (Rekordbox's own detection is usually better), genre is additionally gated by a confidence threshold, and the rest write whenever you want them to. Vocal detection has a tunable sensitivity (Instrumental ≤ / Vocal ≥) that re-labels tracks **without re-analyzing**, because the raw model score is stored alongside the label.
+
+### 🎧 One global player, always in reach
+
+A single persistent player bar lives at the app root. Preview any track from anywhere, and it follows you across tabs. Two previews can never overlap, every track starts cleanly at 0:00, and there's always a visible stop control.
 
 ### 🪟 🍎 🐧 Zero-CLI setup on every platform
 
@@ -89,17 +103,19 @@ No terminal required. On any platform.
 
 ## Built for power users *and* people who hate CLIs
 
-- **Desktop app** (Tauri 2.x + React) for click-and-go users. Five tabs: Library, Duplicates, Organize, Tags, Settings.
+- **Desktop app** (Tauri 2.x + React) for click-and-go users. Five tabs: Library, Duplicates, Organize, Tags, Settings — plus a persistent audio player bar and a **Recent operations** undo panel.
 - **CLI** (`vibechek`) for scriptability, headless servers, cron jobs, Makefiles. Every GUI button is a subcommand.
 - Cancel any long operation at any time. Progress bars are real (byte-level for downloads, track-level for analysis).
-- Auto-saved analysis state per library. Re-open the app, your last library is right there.
+- Auto-saved analysis state per library. Re-open the app, your last library is right there. One-click **DJ profiles** preset your settings for different workflows.
 
 ```
-vibechek analyze ~/Music         # full ML pass
+vibechek analyze ~/Music         # full ML pass (CPU, GPU, or hybrid)
 vibechek dedupe ~/Music          # MD5 + Chromaprint
 vibechek organize analysis.json  # plan + execute genre folders
 vibechek tag analysis.json       # apply tags (Rekordbox-safe)
 vibechek backup-tags ~/Music     # snapshot before any write
+vibechek journals                # list past organize/dedupe operations
+vibechek revert <journal>        # undo an organize/dedupe move
 ```
 
 ---
@@ -147,15 +163,17 @@ Full developer setup + the platform-specific bits: [docs/INSTALL.md](docs/INSTAL
 React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]──► Python sidecar
                                                                           │
                               ┌───────────────────────────────────────────┴───────────┐
-                              │ vibechek package (29 RPC methods)                     │
+                              │ vibechek package (44 RPC methods)                     │
                               │  analyzer · tagger · duplicates · organizer · genres  │
-                              │  config · cancellation · library_state · backup_history│
-                              │  preflight · wsl · resources · logging_setup           │
+                              │  journal · profiles · config · cancellation            │
+                              │  library_state · backup_history · preflight · wsl      │
+                              │  resources · logging_setup                             │
                               └───────────────────────────────────────────────────────┘
 ```
 
 - Python sidecar handles every long-running operation in a thread pool (8 workers) so the UI never freezes.
-- Long ops are cancellable. JSON-RPC progress notifications stream live to the UI.
+- Long ops are cancellable. JSON-RPC progress notifications stream live to the UI; analyzed tracks also stream in one-by-one so the library populates live.
+- Analysis runs CPU-only, GPU-only, or **hybrid CPU+GPU** (work-stealing across one shared queue).
 - On Windows without native Essentia, analyze transparently routes through `vibechek` in WSL Ubuntu.
 - Auto-generated TypeScript types mirror Python dataclasses so the wire stays type-safe.
 
@@ -168,7 +186,7 @@ Full deep dive: [ui/README.md](ui/README.md).
 | Phase | Goal                                                                                                                 | Status                       |
 | ----- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
 | 1     | Package the proven Python pipeline into `vibechek`                                                                   | ✅ Done                       |
-| 2     | Cross-platform installer + signed CI release pipeline                                                                | ✅ Done                       |
+| 2     | Cross-platform installer + CI release pipeline (Win/macOS/Linux; code signing opt-in)                                | ✅ Done                       |
 | 3     | Desktop UI, full WSL automation, GPU truth detection                                                                 | ✅ Done                       |
 | 4     | Polish, docs, community launch                                                                                       | 🚧 In progress (you're here) |
 | 5+    | Smart playlist rules engine • Mashup recommender • Cue-point auto-generation • MusicBrainz lookup • Mobile companion | 💭 Ideas                     |
@@ -183,7 +201,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 **487 Python tests** · **44 JSON-RPC methods** · **27 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 24 frontend tests across keeperRules, LibraryFilters, ConfirmModal, Sidebar
+- 32 frontend tests across keeperRules, LibraryFilters, ConfirmModal, Sidebar
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 

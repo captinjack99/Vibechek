@@ -26,7 +26,7 @@ Goal: a working `pip install -e .` package that mirrors the legacy CLI scripts v
 - ✅ Port `legacy/apply_tags_filtered.py` → `vibechek/tagger.py`
 - ✅ Port `legacy/find_duplicates.py` + `move_safe_duplicates.py` → `vibechek/duplicates.py`
 - ✅ Port `legacy/organize_by_genre.py` + `copy_to_genre_folders.py` → `vibechek/organizer.py`
-- ✅ TOML config persistence in `vibechek/config.py` (delivered Phase 3)
+- ✅ JSON config persistence in `vibechek/config.py` (delivered Phase 3; migrated from TOML in 0.3.0)
 - ✅ 67 pytest tests
 - [ ] Tag a `v0.1.0` release
 
@@ -42,20 +42,20 @@ Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 - ✅ GitHub Actions:
   - CI: tests on Linux/macOS/Windows × Python 3.10/3.12
   - Release: on tag, builds PyInstaller CLI + Tauri installers, drafts a GitHub Release
-- [ ] `dmgbuild` config for macOS (currently ships `.tar.gz` inside the Tauri `.dmg`)
-- [ ] Code signing for Windows + macOS notarization (deferred — paid certs)
+- ✅ macOS `.dmg` (Apple Silicon) built by Tauri in CI
+- ✅ Code-signing plumbing is opt-in (cert secrets → signed; none → unsigned). Beta ships **unsigned**; actual Developer ID / Authenticode signing + notarization deferred (paid certs).
 
 ### Phase 3 — Desktop UI _(complete)_
 
 Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI required.
 
-- ✅ **JSON-RPC sidecar** ([`vibechek/rpc.py`](../vibechek/rpc.py)): 28 methods, threadpool dispatch (8 workers), stdout lock, progress notifications, structured error codes.
+- ✅ **JSON-RPC sidecar** ([`vibechek/rpc.py`](../vibechek/rpc.py)): 44 methods (28 at first ship, grown since), threadpool dispatch (8 workers), stdout lock, progress + per-track notifications, structured error codes.
 - ✅ **Async sidecar**: long ops don't block fast ones. Fast endpoints (system_info, preflight) interleave with running analyze/dedupe/organize.
 - ✅ **Cancellation** ([`vibechek/cancellation.py`](../vibechek/cancellation.py)): cooperative token; multiprocessing pool terminates cleanly on cancel; WSL subprocess gets SIGTERM+SIGKILL.
 - ✅ **Auto-saved analysis state** ([`vibechek/library_state.py`](../vibechek/library_state.py)): analysis result writes to `<data_dir>/analyses/...` automatically; recent libraries index surfaces them on the Library tab's empty state.
 - ✅ **Structured logging** ([`vibechek/logging_setup.py`](../vibechek/logging_setup.py)): rotating file logs; `get_log_tail` RPC + LogsViewer modal in the GUI.
 - ✅ **System resource detection** ([`vibechek/resources.py`](../vibechek/resources.py)): CPU/RAM/GPU detection; workers slider snaps to recommended; GPU auto/on/off control.
-- ✅ **TOML settings persistence** ([`vibechek/config.py`](../vibechek/config.py)): debounced auto-save 500ms after any UI change; restore-defaults; Simple/Advanced split.
+- ✅ **JSON settings persistence** ([`vibechek/config.py`](../vibechek/config.py)): debounced auto-save 500ms after any UI change; restore-defaults; Simple/Advanced split. (Reads pre-0.3.0 `config.toml` once as a migration.)
 - ✅ **Tauri 2.x Rust shell** ([`ui/src-tauri/`](../ui/src-tauri/)):
   - Spawns Python sidecar
   - Sidecar-death detection (atomic flag, drains pending oneshots on EOF)
@@ -77,10 +77,10 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 - ✅ **Onboarding overlay**: three-slide tour shown once on first launch, persisted in TOML
 - ✅ **Recent libraries**: empty Library tab shows clickable cards for past libraries with relative timestamps
 - ✅ **Error UX**: global ErrorToast with Copy details + View logs + Report on GitHub (prefilled issue)
-- ✅ **24 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
-- ✅ **109 backend tests** added (modules: wsl, preflight, cancellation, library_state, logging_setup, RPC dispatch with concurrency check)
+- ✅ **Frontend tests** (vitest + RTL + jsdom + Tauri mocks) — 24 at Phase 3, 32 now
+- ✅ **109 backend tests** added in Phase 3 (modules: wsl, preflight, cancellation, library_state, logging_setup, RPC dispatch with concurrency check); 487 total now
 - ✅ **Generated TS types**: `scripts/generate_ts_types.py` walks 9 Python modules and emits 27 TS interfaces. `__ts_overrides__` mechanism handles wire-form ≠ storage-form cases.
-- [ ] Tag a `v0.3.0` release with the desktop app
+- ✅ Tagged `v0.3.0` then iterated to `v0.4.0-beta.7` (see CHANGELOG)
 
 ### Phase 4 — Polish, docs, community launch _(in progress)_
 
@@ -94,10 +94,26 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 - ✅ Real audio waveform via WaveSurfer.js
 - ✅ Toast notifications for success / info
 - ✅ `.gitignore` hygiene (test artifacts, IDE settings, OS junk)
+
+**Shipped during the beta.3 → beta.7 cycle:**
+
+- ✅ **Full codebase audit** (7 parallel review agents) — fixed every HIGH + MED finding (atomic writes, path-traversal guard, organize overwrite-prevention, cancellation coverage, RPC sync guardrail, …). See `docs/AUDIT_*.md` + CHANGELOG beta.4.
+- ✅ **Hybrid CPU+GPU analysis** — GPU + CPU workers share one work-stealing queue; per-device throughput measured. `--hybrid/--no-hybrid` + Settings toggle.
+- ✅ **GPU on Windows via WSL CUDA wheels** — one-click "Enable GPU" installs NVIDIA pip wheels into the managed venv (works on any WSL distro, no apt/keyring/root).
+- ✅ **Operation undo journal** — append-only JSONL for organize + dedupe-move; one-click revert from a "Recent operations" panel; crash-recoverable.
+- ✅ **Global persistent audio player** — one player bar at the app root; survives navigation; previews never overlap; always start at 0:00.
+- ✅ **Per-field tag write toggles** + configurable vocal sensitivity (raw score stored, re-label without re-analyze); recalibrated vocal cutoffs (instrumental dance no longer mislabelled Vocal).
+- ✅ **Wired the rest of the backend into the UI** — DJ profiles picker, doctor (copy diagnostic), verify-models, update-WSL-install, rename/tag a recent library.
+- ✅ **CI release pipeline working** — Windows `.exe` (NSIS) + Linux `.deb`/`.AppImage` + macOS `.dmg` build on tag push. Code signing made opt-in; beta ships unsigned (Gatekeeper bypass documented).
+- ✅ **PyInstaller `--onefile` sidecar** (single signed-able binary per platform) + version-drift guard for the WSL install.
+
+**Remaining for the launch:**
+
 - [ ] Hand-test the full Windows flow end-to-end (install WSL → install essentia → analyze 12k tracks → organize → restore)
+- [ ] Signed + notarized macOS builds (and Authenticode for Windows)
 - [ ] Tag `v1.0.0`
-- [ ] Post to r/Beatmatch, r/DJs, r/Rekordbox, DJ TechTools, Pioneer DJ Forum
-- [ ] Set up GitHub Sponsors / Ko-fi
+- [ ] Post to r/Beatmatch, r/DJs, r/Rekordbox, DJ TechTools, Pioneer DJ Forum (drafts in [REDDIT_LAUNCH.md](REDDIT_LAUNCH.md))
+- ✅ GitHub Sponsors link live (README) — [ ] Ko-fi optional
 - [ ] Screenshots + animated GIFs in README
 - [ ] Demo video (90 sec)
 
@@ -116,14 +132,14 @@ Logged here so they don't get forgotten:
 - **Smart playlist export.** Generate `.m3u8` for "Peak House, 125-128 BPM, Camelot 8A-9A".
 - **Multi-library support.** Some DJs split by genre — let them work on multiple library roots in one Vibechek session.
 - **A/B compare two tracks.** Side-by-side waveform + tag diff for the "are these actually duplicates?" question.
-- **Tag undo / history.** Per-file tag history so you can roll back specific writes, not just full restores.
+- **Per-file tag undo / history.** Operation-level undo (organize/dedupe) shipped in beta.5; per-file tag-write history (roll back a single field write, not just a full restore) is still open.
 - **MixedInKey/Lexicon/Beatport tag import.** "I already have data from $TOOL, use that as ground truth instead of/alongside ML."
-- **GPU support on Windows.** Currently auto-routes through WSL on Windows; if/when Essentia ships Windows wheels with CUDA, route native.
-- **Cancel mid-step in WSL install.** The bootstrap is a single `bash -s` invocation — cancellation kills the whole thing. Could split into phases.
+- **Native GPU on Windows.** ~~Currently auto-routes through WSL~~ — done: GPU works through WSL CUDA wheels today. A native path is only worth it if/when Essentia ships Windows wheels with CUDA.
+- **Cancel mid-step in WSL install.** Largely addressed in beta.3 (setsid process-group kill); further per-phase granularity could still help.
 
 ## Architectural notes
 
 - **Sidecar concurrency.** 8 workers in a ThreadPoolExecutor. Quick ops (config, system_info, preflight, library_state) interleave freely. Long ops (analyze, dedupe, organize, install) can run concurrently with quick ops; only the cancellation token is a singleton, so only ONE long op can be cancellable at a time.
 - **Path translation lives only in `wsl.py`.** The frontend never sees `/mnt/c/...`. The analyzer's WSL detour translates on the way in and out.
-- **TOML config drops unknown keys.** Adding fields is safe — old configs just inherit the defaults for new fields.
+- **JSON config drops unknown keys.** Adding fields is safe — old configs just inherit the defaults for new fields. (Config is JSON since 0.3.0; a pre-0.3.0 `config.toml` is read once as a migration.)
 - **`__ts_overrides__` pattern.** A class attribute that the TS generator reads — used when the JSON wire form is narrower than the Python storage form (e.g., `TrackAnalysis.existing_tags: dict[str, Any]` is typed as `ExistingTags` in TypeScript).

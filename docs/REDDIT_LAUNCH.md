@@ -1,6 +1,6 @@
 # Reddit launch plan
 
-Drafts and subreddit list for the v0.3.0 launch. The post is written first-person, no AI giveaways (no em-dashes, no "this isn't just X, it's Y", no "delve", no "in today's fast-paced world"). Tone is a DJ talking to other DJs.
+Drafts and subreddit list for the v0.4.0 beta launch. The post is written first-person, no AI giveaways (no em-dashes, no "this isn't just X, it's Y", no "delve", no "in today's fast-paced world"). Tone is a DJ talking to other DJs.
 
 Adjust details (track count, years, story specifics) to match what you actually want to share. The arc is what matters: frustration with paid tools, hacky python scripts, friends asking for them, "fine, I'll make this real."
 
@@ -41,9 +41,11 @@ What it does:
 - Organizes into Genre/Subgenre/ folders with rules you control
 - Writes tags back to your files WITHOUT touching Rekordbox cue points, beat grids, or memory cues (this is the thing I was most afraid of breaking and spent the most time getting right)
 - One-click backup and restore of every tag on every file, in case you do something dumb
-- Runs on CPU just fine, uses your NVIDIA GPU if you have one and want it to
+- Undo button for organize and dedupe. If a move goes wrong you click revert and everything goes back where it was
+- Pick exactly which fields get written. I leave BPM and key off because Rekordbox is better at those, but you choose
+- Runs on CPU just fine, uses your NVIDIA GPU if you have one, and can run both at once so a small laptop GPU plus spare cores both pitch in
 
-It's a public beta right now (v0.3.0-beta.3), so there are rough edges. I'd rather ship and get hit with real feedback than polish for six more months. If you try it and something doesn't work, please tell me. Bug reports are gold.
+It's a public beta right now (v0.4.0-beta.7), so there are rough edges. I'd rather ship and get hit with real feedback than polish for six more months. If you try it and something doesn't work, please tell me. Bug reports are gold.
 
 Repo: https://github.com/papapew/Vibechek
 Releases (Win/Mac/Linux installers): https://github.com/papapew/Vibechek/releases
@@ -82,7 +84,8 @@ Cross-post once, wait at least 6 hours between posts so it doesn't look spammy. 
 
 - **Answer every comment.** Even the salty ones. Especially the salty ones. People are more impressed by "here's why I disagree" than by silence.
 - **Don't argue Mixed In Key sucks.** It doesn't. It's narrow. There's a difference. If someone defends MIK, the right answer is "agreed, MIK is great at key detection — this is for the parts MIK doesn't cover."
-- **The beta status is the credibility move.** Don't oversell. Say "v0.3.0-beta.3, expect some rough edges, please report bugs."
+- **The beta status is the credibility move.** Don't oversell. Say "v0.4.0-beta.7, expect some rough edges, please report bugs."
+- **Get ahead of the macOS "damaged" warning.** The beta `.dmg` is unsigned, so Mac users get a scary "Vibechek is damaged / can't be verified" dialog on first open. Say so up front in the post or a pinned comment: right-click the app and Open, or run `xattr -dr com.apple.quarantine /Applications/Vibechek.app` once. If you don't pre-empt it, someone will call it malware in the comments.
 - **Screenshots help massively.** Take five clean screenshots (Library view full of analyzed tracks, the Duplicates view showing a chromaprint catch, the Settings panel with the GPU row green, the PreflightDialog mid-install, the OrganizeView dry-run plan) and attach them.
 - **Have a demo video ready.** A 90-second screen recording of "open folder → analyze 200 tracks → see results → apply tags → done" is worth more than the whole post.
 - **Don't post all twelve subs in one day.** Spread it over a week. Adjust based on what lands.

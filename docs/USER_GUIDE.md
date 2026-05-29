@@ -35,6 +35,11 @@ You'll see five tabs in the sidebar:
 | **Tags** | Back up / restore tags |
 | **Settings** | Tune defaults, see system resources, view logs |
 
+Two things live outside the tabs: a **persistent audio player bar** (preview any track
+from anywhere — it follows you across tabs and never plays two previews at once) and a
+**Recent operations** entry in the sidebar that lists past organize/dedupe runs with a
+one-click Undo.
+
 ---
 
 ## Workflow 1: First scan of a new library
@@ -46,7 +51,7 @@ Library tab → **Open folder** → pick your music folder.
 You get two big buttons:
 
 - **Just show me my library** — instant. Reads filenames and any existing tags. No ML, no waiting. Use this if you mostly want to browse, dedupe, or organize.
-- **Analyze with ML** — the full ML pass. Reads every file, runs all the models, gives you genre / mood / energy / BPM / key / direction / vocal for every track. Takes 1-3 hours on a 12k-track library depending on your CPU. Cancellable any time.
+- **Analyze with ML** — the full ML pass. Reads every file, runs all the models, gives you genre / mood / energy / BPM / key / direction / vocal for every track. On a 12k-track library this takes roughly 1-3 hours on CPU, much less with a GPU — and Vibechek can run **hybrid CPU+GPU** to use both at once. Tracks stream into the list as they finish, and it's cancellable any time.
 
 ### Step 2 — (Windows only) Auto-setup if needed
 
@@ -54,7 +59,7 @@ The first time you click **Analyze with ML** on Windows, a dialog appears showin
 
 - **WSL not installed?** → click "Install WSL + Ubuntu". You'll get a UAC prompt (this is Windows enabling a system feature). 5-15 minutes.
 - **Vibechek + Essentia not in WSL?** → click "Install in Ubuntu". 3-5 minutes. No prompts.
-- **Models not downloaded?** → click "Download models now". ~200 MB, takes 30 seconds on a fast connection.
+- **Models not downloaded?** → click "Download models now". ~800 MB, takes a couple of minutes on a fast connection.
 
 When everything's green, the dialog closes itself and analysis starts.
 
@@ -142,8 +147,8 @@ Click any file in a group to make it the new keeper. The status updates to show 
 
 Two big buttons:
 
-- **Move to review folder** — non-destructive. Picks a folder, moves all duplicates there. You can delete them later when you're sure.
-- **Send to trash** — into your OS trash (recoverable until you empty it).
+- **Move to review folder** — non-destructive. Picks a folder, moves all duplicates there. You can delete them later when you're sure. This is journaled, so you can **Undo** it from the Recent operations panel (files go back to their originals).
+- **Send to trash** — into your OS trash (recoverable until you empty it). Trash is journaled for transparency but flagged non-revertible (the OS recycle bin has no reliable programmatic restore) — recover from the bin itself if needed.
 
 Both show a confirm dialog with the final count + space freed before doing anything.
 
@@ -192,7 +197,15 @@ After execution, you get a full recap:
 - **View library** button to jump back to the Library tab
 - **Organize another folder** to keep going
 
-Worth knowing: there's no automatic undo. The result panel is your audit trail. If you opted into the tag backup, you can restore tags via the Tags tab even if the file moves looked wrong.
+### Step 6 — Undo if needed
+
+Organize writes an append-only journal as it moves files, so it's revertible. Open
+**Recent operations** (in the sidebar), find this organize run, and click **Undo** —
+every file goes back to where it came from (newest move first, never overwriting
+anything that's since taken the original spot). The Organize result panel also has an
+inline **Undo this organize** button. If you opted into the tag backup, you can
+additionally restore tags via the Tags tab. The journal is your safety net *and* your
+audit trail.
 
 ---
 
@@ -255,8 +268,8 @@ Three possible states:
   visible to WSL, but Essentia's TF couldn&apos;t load the CUDA runtime
   libraries it needs (typically `libcublas`, `libcufft`, `libcudnn`,
   `libcusparse`). Analysis would silently fall back to CPU. Click
-  **Enable GPU (install CUDA libs)** to install them via NVIDIA&apos;s
-  apt repo (~600 MB, ~5 min).
+  **Enable GPU (install CUDA libs)** to install them as NVIDIA&apos;s
+  PyPI wheels into the managed venv (~200 MB, ~30 sec — no apt repo, no root).
 
 - **No GPU** (grey) — either you have no NVIDIA card or the WSL kernel
   isn&apos;t passing it through. Analysis runs on CPU. On a modern multi-core
@@ -267,7 +280,7 @@ cached for 5 minutes. Click **Re-probe** to force a fresh check.
 
 Click **Advanced settings** to expand:
 
-- **Tagging** — genre confidence threshold (slider), preserve Rekordbox frames (always on by default — *don't turn this off unless you really know what you're doing*), write subgenre as main genre, backup before write.
+- **Tagging** — genre confidence threshold (slider); a **"Write these fields" grid** to turn each ML field on/off independently (Genre, Energy, Mood, Vocal, Timeslot, Direction, BPM, Key — BPM & Key default off because Rekordbox is usually better); a **"Vocal detection sensitivity"** dual slider (Instrumental ≤ / Vocal ≥) that re-labels tracks from their stored score without re-analyzing; preserve Rekordbox frames (always on by default — *don't turn this off unless you really know what you're doing*), write subgenre as main genre, backup before write.
 - **Duplicate detection** — toggle MD5 / Chromaprint, similarity threshold, action (report / move / trash).
 - **Organization** — use subgenres, min genre size, target root.
 
@@ -287,7 +300,7 @@ All changes auto-save 500ms after you stop typing/dragging. No "Save" button.
 The Preflight dialog should be handling this for you. If you closed it, click Analyze again — it'll re-open. The dialog will walk you through:
 1. Installing WSL Ubuntu (one-time, ~5-15 min, UAC prompt)
 2. Installing Vibechek + Essentia inside WSL (3-5 min, no prompts)
-3. Downloading the ML models (~200 MB, 30 sec)
+3. Downloading the ML models (~800 MB, a couple of minutes)
 
 Once everything is green, the analyze proceeds automatically.
 
@@ -316,9 +329,9 @@ Or just leave it — MD5 catches the bulk of duplicates anyway.
 ### Settings reset themselves
 
 Look for write errors in the logs (Settings → View logs → filter by ERROR). The most common cause is the config folder being read-only or full. The config lives at:
-- Windows: `%APPDATA%\Vibechek\Vibechek\config.toml`
-- macOS: `~/Library/Application Support/Vibechek/Vibechek/config.toml`
-- Linux: `~/.config/Vibechek/Vibechek/config.toml`
+- Windows: `%APPDATA%\Vibechek\Vibechek\config.json`
+- macOS: `~/Library/Application Support/Vibechek/Vibechek/config.json`
+- Linux: `~/.config/Vibechek/Vibechek/config.json`
 
 ### "Something went wrong" toast keeps appearing
 
@@ -337,7 +350,7 @@ Click **Copy details** to grab the full error, **View logs** to see what the sid
 
 | What | Location |
 |---|---|
-| **Config** (auto-saved) | `<config_dir>/Vibechek/config.toml` |
+| **Config** (auto-saved) | `<config_dir>/Vibechek/config.json` |
 | **Recent libraries index** | `<config_dir>/Vibechek/library_state.json` |
 | **Tag backup history** | `<config_dir>/Vibechek/backup_history.json` |
 | **ML models** | `<data_dir>/Vibechek/models/` |
@@ -375,6 +388,6 @@ The CLI is the same code the GUI uses; anything the GUI can do, the CLI can do.
 - **Bugs**: [github.com/papapew/Vibechek/issues](https://github.com/papapew/Vibechek/issues). The error toast has a "Report on GitHub" button that pre-fills the issue with your platform + sidecar info.
 - **Features**: same place. Open an issue describing the use case.
 - **Code**: see [CONTRIBUTING](../README.md#contributing) in the main README.
-- **Money**: GitHub Sponsors + Ko-fi coming with the v1.0 launch.
+- **Money**: [GitHub Sponsors](https://github.com/sponsors/papapew) if Vibechek saved you a license fee. Entirely optional — starring the repo helps too.
 
 Thanks for using Vibechek. Hope it saves you a weekend.
