@@ -1,101 +1,105 @@
-# Vibechek - DJ Library ML Analysis Project Summary
+# Vibechek — Project Summary
 
-## What We Built
-An ML-powered DJ library organizer that analyzes audio files using Essentia ML models and automatically classifies genre, subgenre, energy, mood, timeslot, direction, and vocal content.
+**Vibechek** is an open-source, ML-powered DJ library tool. It analyzes audio with
+Essentia ML models and auto-classifies genre/subgenre, BPM, key, energy, mood,
+timeslot, direction, and vocal type; finds true (acoustic) duplicates; organizes
+files into genre/subgenre folders; and backs up / restores every tag — all while
+preserving Rekordbox cue points and beat grids. It runs entirely on your machine:
+no account, no telemetry, no upload. Free forever under **AGPL-3.0**.
 
-## What Was Accomplished
+- **Repo:** https://github.com/papapew/Vibechek
+- **Current version:** `v0.4.0-beta.7` (public beta)
+- **Platforms:** Windows, macOS, Linux (desktop app + CLI)
 
-### 1. Duplicate Removal
-- Scanned 12,674 files using MD5 hash + Chromaprint audio fingerprinting
-- Found and removed 202 duplicates (2.64 GB recovered)
-- Moved duplicates to `/mnt/d/Music/Duplicates` for review
-- Final library: ~12,466 unique tracks
+> This is the living project summary. For the point-in-time codebase audit see the
+> `docs/AUDIT_*.md` files; for release history see [CHANGELOG.md](../CHANGELOG.md).
 
-### 2. ML Analysis
-- Analyzed all 12,466 tracks using Essentia-TensorFlow ML models
-- Models detect: genre (400 classes), subgenre, BPM, key, energy (0-5), mood (Dark/Neutral/Bright), timeslot (Opener/Warm-Up/Peak/Afterhours), direction (Up/Steady/Down), vocal (Instrumental/Light Vocal/Vocal)
-- Analysis was parallelized across 4 separate processes (--skip/--limit flags) to work around Python's GIL
-- Results stored in analysis_1.json through analysis_8.json, merged into analysis.json
-- One corrupted file removed during analysis: "Samim - Heater (Tube & Berger Remix).mp3"
+## Origins
 
-### 3. Tag Application
-- Backed up all existing tags (including Rekordbox GEOB/PRIV frames) to tags_backup.json (~2GB due to base64-encoded binary data)
-- Applied ML tags with confidence filtering:
-  - Genre/Subgenre: only applied when confidence >= 85% (~6,623 of 12,466 tracks)
-  - Subgenre is written as the main genre tag (TCON) so Rekordbox can filter by it
-  - Energy, Mood, Timeslot, Direction, Vocal: always applied
-  - BPM and Key: SKIPPED (Rekordbox detection is more reliable)
-- All tag writes explicitly preserve Rekordbox GEOB and PRIV frames
+Vibechek grew out of a pile of personal Python scripts used to clean up a real
+~12,000-track DJ library: dedupe (MD5 + Chromaprint), full Essentia ML analysis,
+confidence-filtered tag application that preserved Rekordbox GEOB/PRIV frames, and
+genre/subgenre folder organization. The scripts worked, friends wanted them, and
+"here's a folder of .py files, install Python first" was too embarrassing to keep
+sending. So the pipeline got packaged into a real cross-platform app. That original
+12k-track library is still the primary real-world test bed.
 
-### 4. Folder Organization
-- Organized tracks into genre/subgenre folder structure under D:\Music\Tracks\
-- Genres with <10 tracks consolidated into Other/GenreName/ folders
-- Structure: Tracks/House/Deep House/, Tracks/Techno/Minimal Techno/, Tracks/Other/Vaporwave/, etc.
-- Rekordbox files relinked via Relocate → "Search in subfolders" pointing to D:\Music\Tracks
+## Architecture
 
-### 5. New Tracks Workflow
-- Created script to copy manually-tagged new tracks from "New Tracks" folder to appropriate genre folders in "Tracks"
-- Supports MP3, FLAC, M4A, AIFF/AIF formats
+```
+React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]──► Python sidecar
+```
 
-### 6. Flat Backup
-- Copied all tracks (flat structure) to E:\Tracks as backup
+- **Frontend:** Tauri 2.x + React (Vite, TypeScript, Tailwind, Zustand, react-virtuoso,
+  framer-motion, WaveSurfer.js). Five views — Library, Duplicates, Organize, Tags,
+  Settings — plus a persistent global audio player and a "Recent operations" undo panel.
+- **Rust shell:** spawns the Python sidecar, multiplexes JSON-RPC by id, re-broadcasts
+  progress + per-track records as Tauri events, detects sidecar death on EOF.
+- **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 44 JSON-RPC
+  methods, threadpool dispatch (8 workers) so fast reads interleave with long ops,
+  cooperative cancellation, and all the real work (analyzer, tagger, duplicates,
+  organizer, journal, profiles, config, wsl, resources, …).
+- **Auto-generated types:** `scripts/generate_ts_types.py` mirrors Python dataclasses
+  into `ui/src/types/generated.ts` so the wire stays type-safe.
 
-## Library Stats
-- **Total tracks**: ~12,466
-- **Top genres**: House (48.6%), Trance (15.7%), Techno (9.7%), Hip Hop (5.8%), Dubstep (3.6%)
-- **Energy distribution**: Mostly levels 2-3 (80%)
-- **Mood**: 50% Bright, 47% Neutral, 3% Dark
-- **Timeslots**: 47% Opener, 42% Warm-Up, 10% Peak
+## What it does
 
-## File Locations
+| Area | Summary |
+|---|---|
+| **ML analysis** | Essentia + Discogs-EffNet: genre/subgenre (~400 classes), BPM, key (Camelot), energy 0-5, mood (Dark/Neutral/Bright), timeslot (Opener/Warm-Up/Peak/Afterhours), direction (Up/Steady/Down), vocal (Instrumental/Light Vocal/Vocal), danceability. Per-field confidence + a two-stage genre fallback (write the parent genre when the subgenre is unsure). |
+| **Hybrid CPU+GPU** | Analysis runs CPU-only, GPU-only, or **hybrid** — GPU workers and CPU workers share one work-stealing queue, so a VRAM-limited GPU no longer caps throughput while cores idle. Per-device throughput is measured + reported. |
+| **De-duplication** | MD5 (byte-identical) + Chromaprint (acoustic — catches re-encodes/remixes). Rules-based keeper picker (codec → bitrate → size → newest → shortest path), manual override, move-to-review or trash. |
+| **Organize** | Plan + execute a `Genre/Subgenre/` tree; small genres bucket into `Other/`; dry-run preview; overwrite-safe moves. |
+| **Tag write** | Per-field write toggles (genre/BPM/key/energy/mood/timeslot/direction/vocal; BPM+Key default off). Tunable vocal sensitivity re-labels from the stored raw score without re-analyzing. **Always preserves Rekordbox GEOB/PRIV binary frames.** |
+| **Backup / restore** | One-click snapshot of every tag (incl. binary frames) + full restore, with backup history and stale-backup warnings. |
+| **Undo journal** | Organize + dedupe-move write an append-only JSONL journal (one flushed line per move). Partial runs are recoverable; finished runs revert with one click. |
+| **DJ profiles** | One-click setting presets for different workflows. |
+| **Zero-CLI setup** | Windows auto-installs WSL Ubuntu (UAC) + Essentia and routes analysis through it with transparent path translation; macOS/Linux create a hermetic `~/.vibechek/venv/`. Optional one-click GPU (CUDA pip wheels). |
 
-### Scripts (all on D:\Music\)
-| Script | Purpose |
-|--------|---------|
-| `analyze_dj_tracks_v2.py` | Main ML analysis script. Supports --workers, --skip, --limit, --apply |
-| `backup_tags.py` | Backup/restore all tags including GEOB frames. Commands: backup, restore |
-| `apply_tags_filtered.py` | Apply ML tags with confidence threshold. Flags: --confidence, --skip-bpm-key, --genre-only |
-| `organize_by_genre.py` | Move files into genre/subgenre folders. Flags: --no-subgenres, --min-genre-size |
-| `copy_to_genre_folders.py` | Copy new tracks to genre folders based on existing tags |
-| `find_duplicates.py` | Find exact + audio duplicates via MD5 + Chromaprint |
-| `move_safe_duplicates.py` | Move identified duplicates to review folder |
+## Platform model
 
-### Data Files (all on D:\Music\)
-| File | Purpose |
-|------|---------|
-| `analysis.json` | Merged ML analysis results for all tracks |
-| `analysis_1.json` - `analysis_8.json` | Individual analysis chunks |
-| `tags_backup.json` | Pre-ML tag backup (~2GB, includes GEOB/PRIV frames) |
-| `safe_duplicates.json` | 193 safe-to-remove duplicates |
-| `suspect_duplicates.json` | 9 version-different duplicates |
+- **Windows:** Essentia has no Windows wheel, so analysis routes through `vibechek`
+  installed in WSL Ubuntu. Paths translate `C:\…` ↔ `/mnt/c/…` at the boundary; the
+  frontend never sees WSL. A version-drift guard refuses to dispatch when the WSL
+  install doesn't match the sidecar version (one-click repair via "Update WSL install").
+- **macOS / Linux:** a managed venv at `~/.vibechek/venv/` runs Essentia directly.
+- **GPU:** NVIDIA CUDA runtime via PyPI wheels installed into the venv (works on any
+  Linux/WSL distro, no apt/keyring/root). The Settings GPU row probes the *actual*
+  analysis engine (TF inside WSL on Windows), never a host-only `nvidia-smi`.
 
-### Directories
-| Directory | Contents |
-|-----------|----------|
-| `D:\Music\Tracks\` | Main library, organized in genre/subgenre folders |
-| `D:\Music\New Tracks\` | Manually tagged new tracks (staging area) |
-| `D:\Music\Duplicates\` | Removed duplicates (can be deleted) |
-| `E:\Tracks\` | Flat backup of all tracks |
+## Distribution
 
-## Environment Setup
-- **WSL Ubuntu 24** running on Windows (hostname: JACK-PC4)
-- **Python venv**: `/root/djenv/` (activate with `source /root/djenv/bin/activate`)
-- **Key packages**: essentia-tensorflow, mutagen, chromaprint (fpcalc)
-- **ML models**: ~/essentia_models/ (downloaded automatically on first run)
-- **Hardware**: i9-13900H, RTX 4070 Laptop (GPU not used - CUDA 11/12 incompatibility with Essentia's bundled TensorFlow)
-- **Music accessed via**: /mnt/d/Music/ (Windows D:\ drive)
+- **Desktop installers** built in CI on tag push: Windows `.exe` (NSIS), Linux
+  `.deb`/`.AppImage`, macOS `.dmg` (Apple Silicon). CLI archives too.
+- **Code signing is opt-in.** With no cert secrets configured, builds ship **unsigned**
+  — current state for the beta. macOS users clear Gatekeeper once (right-click → Open,
+  or `xattr -dr com.apple.quarantine`). Signed + notarized builds are planned for
+  stable. See [docs/RELEASING.md](RELEASING.md).
 
-## Key Technical Decisions
-1. **CPU-only analysis**: GPU acceleration abandoned due to CUDA version mismatch with Essentia's bundled TensorFlow
-2. **Multi-process parallelism**: Python GIL prevents true threading parallelism for CPU-bound ML inference. Solution: 4 separate processes via --skip/--limit flags (~35 tracks/min vs 10 tracks/min single-process)
-3. **Confidence threshold at 85%**: Only ~53% of tracks get ML genre tags applied; rest keep original tags
-4. **BPM/Key preserved**: Rekordbox's own detection is more reliable than ML models
-5. **Subgenre as main genre**: Rekordbox can only sort/filter by the main genre field, so subgenres (e.g., "Deep House" not "House") are written to TCON
-6. **GEOB/PRIV preservation**: All tag writes explicitly capture and restore Rekordbox binary frames
+## Key technical decisions
 
-## Future Plans: Vibechek App
-- **Stack**: Tauri + React + Python sidecar
-- **Features**: ML genre/subgenre detection, energy/mood/timeslot analysis, smart organization, Rekordbox/Serato integration
-- **Estimated effort**: 10-14 weeks solo dev
-- **Monetization**: $29-49 one-time or $5-10/mo subscription
-- **Key challenge**: Bundling ~800MB Essentia ML models
+1. **Hybrid CPU+GPU over single-device.** A shared work-stealing queue self-balances
+   fast/slow devices instead of predictive scheduling.
+2. **Store the raw vocal score.** Labels (Instrumental/Light Vocal/Vocal) are derived
+   from a stored 0-1 score at tag time, so cutoffs are tunable without re-analyzing.
+   Calibrated so instrumental-dance melodic leads (~0.64-0.71) stay Instrumental.
+3. **Per-field write toggles** replaced the old single skip-BPM/key flag; genre is
+   additionally gated by a confidence threshold; BPM/Key default off.
+4. **Subgenre as main genre.** Rekordbox sorts by the main genre field, so subgenres
+   (e.g. "Deep House") are written to TCON.
+5. **GEOB/PRIV preservation** on every tag write — guarded by a regression test.
+6. **JSON config** (not TOML): native null type, graceful load, drops unknown keys so
+   adding fields is backwards-safe.
+
+## Project stats
+
+<!-- These mirror the README stats line (auto-updated by scripts/update_readme_stats.py). -->
+- **487 Python tests**, **44 JSON-RPC methods**, **27 Python modules**
+- **32 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+- Production-tested against a ~12,000-track personal DJ library
+
+## Roadmap
+
+See [docs/ROADMAP.md](ROADMAP.md). Near-term: polish + community launch toward
+`v1.0`. Later ideas: smart-playlist export, per-genre confidence thresholds,
+multi-library support, MixedInKey/Lexicon/Beatport tag import, signed macOS builds.

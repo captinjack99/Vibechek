@@ -119,16 +119,30 @@ Vibechek's UI talks to the Python sidecar over JSON-RPC. To keep the wire type-s
 
 **To extend the mapping (a new Python type kind, a new shared constant):** edit `scripts/generate_ts_types.py` — the docstring at the top walks through both extension points.
 
-**To add a new RPC method:** see [docs/CONTRACTS.md](docs/CONTRACTS.md) for the five-step walkthrough.
+**To add a new RPC method** (end to end):
+
+1. Implement the handler in `vibechek/rpc.py` — `def _my_method(params: dict) -> dict:`.
+2. Register it in the `METHODS` dict. If it's long-running, route it through the
+   cancellation singleton so it can be cancelled and so concurrent reads still interleave.
+3. If it accepts or returns a dataclass, define it in the relevant `vibechek/` module and
+   run `python scripts/generate_ts_types.py` to regenerate the TS interfaces.
+4. Add a typed wrapper in `ui/src/api/rpc.ts` so the UI calls it type-safely.
+5. Add a test. `tests/test_rpc_method_sync.py` cross-checks that every `METHODS` entry has
+   a matching TS wrapper, so a missing wrapper fails CI.
+
+Full walkthrough (wire format, error codes, checklist): [docs/CONTRACTS.md](docs/CONTRACTS.md).
+The authoritative method list lives in [`vibechek/rpc.py`](vibechek/rpc.py).
 
 ---
 
 ## Where to look next
 
-- [docs/MAINTAINERS.md](docs/MAINTAINERS.md) — bus-factor notes: how to release, why certain pieces look the way they do, what to watch for when debugging WSL.
 - [docs/CONTRACTS.md](docs/CONTRACTS.md) — adding a new RPC method end to end.
-- [docs/RELEASING.md](docs/RELEASING.md) — version bumps and tag flow.
+- [docs/MAINTAINERS.md](docs/MAINTAINERS.md) — bus-factor notes: release flow, architecture landmines, CI gotchas, WSL debugging.
+- [docs/RELEASING.md](docs/RELEASING.md) — version bumps, tag flow, the opt-in code-signing setup.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — what's planned and what's deliberately out of scope.
+- [docs/PROJECT_SUMMARY.md](docs/PROJECT_SUMMARY.md) — the high-level architecture + feature map.
+- [ui/README.md](ui/README.md) — the desktop UI internals + sidecar protocol.
 
 If you get stuck, open a [Discussion](https://github.com/papapew/Vibechek/discussions) or a draft PR with `WIP:` in the title. We'd rather help early than review a finished thing that took a wrong turn.
 
