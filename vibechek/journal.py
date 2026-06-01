@@ -42,9 +42,10 @@ import json
 import logging
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from vibechek.config import DATA_DIR
 
@@ -114,7 +115,7 @@ class JournalWriter:
             self._fh = None
 
     # Context-manager sugar so callers can `with start_journal(...) as j:`.
-    def __enter__(self) -> "JournalWriter":
+    def __enter__(self) -> JournalWriter:
         return self
 
     def __exit__(self, *_exc: object) -> None:

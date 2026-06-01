@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from vibechek.config import OrganizationConfig
 from vibechek.organizer import (
     organize_from_analysis,
     plan_organization,
+    route_new_tracks,
 )
 
 
@@ -67,3 +70,46 @@ def test_plan_with_explicit_base_dir_overrides_inferred(synthetic_analysis: dict
     assert plan.base_dir == custom_root
     for move in plan.moves:
         assert custom_root in move.destination.parents
+
+
+def test_route_new_tracks_uniquifies_colliding_basenames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different staging track with a colliding basename is imported under a
+    uniquified name, not silently dropped.
+
+    Regression for the audit's LOW finding: skip-on-exists discarded a
+    legitimately-different same-named track (it only showed in skipped_exists,
+    never in the library).
+    """
+    from vibechek import organizer
+
+    staging = tmp_path / "staging"
+    library = tmp_path / "library"
+    staging.mkdir()
+
+    # A track already in the library's House folder.
+    existing = library / "House" / "track.mp3"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"ORIGINAL library track")
+
+    # A DIFFERENT track in staging that happens to share the basename.
+    incoming = staging / "track.mp3"
+    incoming.write_bytes(b"DIFFERENT staging track content")
+
+    # Avoid needing real ID3 tags: every staging file resolves to genre "House".
+    monkeypatch.setattr(organizer, "_read_genre_tag", lambda _fp: "House")
+
+    summary = route_new_tracks(staging, library)
+
+    # The collision was detected (reported) AND the file was still imported.
+    assert summary["skipped_exists"] == 1
+    assert summary["copied"] == 1
+    assert summary["errors"] == 0
+
+    # The original library track is untouched...
+    assert existing.read_bytes() == b"ORIGINAL library track"
+    # ...and the different incoming track lives alongside it under a unique name.
+    house_files = sorted(p.name for p in (library / "House").iterdir())
+    assert house_files == ["track.mp3", "track_1.mp3"]
+    assert (library / "House" / "track_1.mp3").read_bytes() == b"DIFFERENT staging track content"

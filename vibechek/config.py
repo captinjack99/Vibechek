@@ -153,7 +153,7 @@ class VibechekConfig:
     ui: UIConfig = field(default_factory=UIConfig)
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "VibechekConfig":
+    def load(cls, path: Path | None = None) -> VibechekConfig:
         """Load config from disk, falling back to defaults on any error.
 
         Never raises — corrupted user config shouldn't break the app.
@@ -180,7 +180,7 @@ class VibechekConfig:
         return cls()
 
     @classmethod
-    def _load_json(cls, target: Path) -> "VibechekConfig":
+    def _load_json(cls, target: Path) -> VibechekConfig:
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
@@ -193,7 +193,7 @@ class VibechekConfig:
             return cls()
 
     @classmethod
-    def _load_toml(cls, target: Path) -> "VibechekConfig":
+    def _load_toml(cls, target: Path) -> VibechekConfig:
         # Import lazily — tomllib is only needed for the rare migration path,
         # and we want module import to stay cheap.
         #
@@ -239,7 +239,7 @@ class VibechekConfig:
         return target
 
     @classmethod
-    def _from_dict(cls, data: dict[str, Any]) -> "VibechekConfig":
+    def _from_dict(cls, data: dict[str, Any]) -> VibechekConfig:
         return cls(
             analysis=_subset(AnalysisConfig, data.get("analysis", {})),
             tagging=_subset(TaggingConfig, data.get("tagging", {})),
@@ -268,13 +268,24 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
             continue  # Unknown / removed field — ignore
         f = valid_fields[key]
         try:
-            kwargs[key] = _coerce(f.type, value)
+            coerced = _coerce(f.type, value)
         except (TypeError, ValueError) as e:
             log.warning(
                 "Config field %s.%s has invalid value %r (%s); using default",
                 cls.__name__, key, value, e,
             )
             # Falling through without setting kwargs[key] uses the dataclass default.
+            continue
+        # id3_text_encoding feeds mutagen's ID3 frame constructors directly, so
+        # a hand-edited / stale value outside {0,1,2,3} would write a corrupt
+        # encoding byte. Snap it back to UTF-8 (3) rather than propagating it.
+        if key == "id3_text_encoding" and coerced not in (0, 1, 2, 3):
+            log.warning(
+                "Config field %s.id3_text_encoding has out-of-range value %r; "
+                "falling back to 3 (UTF-8)", cls.__name__, coerced,
+            )
+            continue  # use the dataclass default (3)
+        kwargs[key] = coerced
     return cls(**kwargs)
 
 

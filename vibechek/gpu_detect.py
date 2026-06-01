@@ -23,13 +23,14 @@ filesystem checks.
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import platform
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -453,23 +454,128 @@ def _parse_macos_vram(value: object) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# Windows: wmic shared helper for AMD + Intel
+# Windows: video-controller enumeration shared helper for AMD + Intel
 # ---------------------------------------------------------------------------
 
 
-def _detect_gpus_wmic(vendor_filter: str) -> list[DetectedGpu]:
-    """Parse `wmic path win32_videocontroller get name,adapterram /format:csv`.
+def _classify_windows_gpu(
+    name: str, vram_mb: int | None, vendor_filter: str
+) -> DetectedGpu | None:
+    """Turn one (name, vram) Win32_VideoController row into a `DetectedGpu`.
 
-    `vendor_filter` is matched (case-insensitive substring) against the Name
-    field so the same helper handles AMD ("amd") and Intel ("intel").
-
-    NB: `wmic` is deprecated on Windows 11 (24H2 dropped it by default) but is
-    still available on the vast majority of systems Vibechek ships against.
-    PowerShell `Get-CimInstance` would be the modern replacement; we keep
-    wmic for now because spawning powershell.exe is much slower (~600ms) and
-    we already pay that elsewhere. If wmic is missing we just return [] and
-    the user sees fewer detected GPUs — acceptable graceful degradation.
+    Returns None when `name` doesn't match the requested `vendor_filter`
+    ("amd" or "intel"). Shared by the PowerShell-CIM and wmic-CSV paths so the
+    vendor-match + integrated/discrete heuristics live in exactly one place.
     """
+    if not name:
+        return None
+    filter_lc = vendor_filter.lower()
+    name_lc = name.lower()
+    if filter_lc == "amd" and not (
+        "amd" in name_lc or "ati" in name_lc or "radeon" in name_lc
+    ):
+        return None
+    if filter_lc == "intel" and "intel" not in name_lc:
+        return None
+
+    if filter_lc == "amd":
+        vendor: GpuVendor = "amd"
+        reason: str | None = _REASON_AMD
+    else:
+        vendor = "intel"
+        reason = _REASON_INTEL
+
+    # Heuristic for integrated vs discrete: Intel UHD/Iris/Xe (non-Arc)
+    # are iGPUs; AMD "Radeon Graphics" without an RX is the APU.
+    kind: GpuKind = "discrete"
+    if vendor == "intel" and not re.search(r"\bArc\s+A\d+", name, flags=re.IGNORECASE):
+        kind = "integrated"
+    if vendor == "amd" and re.search(r"Radeon\s+Graphics$", name, flags=re.IGNORECASE):
+        kind = "integrated"
+
+    return DetectedGpu(
+        vendor=vendor,
+        name=name,
+        device_kind=kind,
+        vram_mb=vram_mb,
+        accelerated_by_vibechek=False,
+        unsupported_reason=reason,
+    )
+
+
+def _vram_mb_from_adapter_ram(ram: object) -> int | None:
+    """AdapterRAM (bytes) → MB. 0/None/unparseable → None (shared/unknown iGPU)."""
+    try:
+        ram_i = int(ram)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return ram_i // (1024 * 1024) if ram_i > 0 else None
+
+
+def _detect_gpus_cim(vendor_filter: str) -> list[DetectedGpu] | None:
+    """Enumerate via PowerShell `Get-CimInstance Win32_VideoController` (JSON).
+
+    Preferred over `wmic` because (a) `wmic` is deprecated and absent by
+    default on Windows 11 24H2, and (b) JSON parsing is immune to the
+    comma-in-name bug that the CSV path suffers (e.g. "Intel(R) Iris(R) Xe
+    Graphics" is fine, but some OEM adapter names DO contain commas).
+
+    Returns a (possibly empty) device list on success, or None when PowerShell
+    is unavailable / failed — letting the caller fall back to wmic.
+    """
+    pwsh = shutil.which("powershell") or shutil.which("pwsh")
+    if not pwsh:
+        return None
+    # -NoProfile keeps startup fast; ConvertTo-Json emits a single object for one
+    # controller and an array for several, so we normalise below.
+    script = (
+        "Get-CimInstance Win32_VideoController | "
+        "Select-Object Name,AdapterRAM | ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.run(
+            [pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        data = json.loads(out.stdout)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None
+
+    devices: list[DetectedGpu] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("Name") or "").strip()
+        vram_mb = _vram_mb_from_adapter_ram(row.get("AdapterRAM"))
+        dev = _classify_windows_gpu(name, vram_mb, vendor_filter)
+        if dev is not None:
+            devices.append(dev)
+    return devices
+
+
+def _detect_gpus_wmic(vendor_filter: str) -> list[DetectedGpu]:
+    """Enumerate Windows GPUs for `vendor_filter` ("amd"/"intel").
+
+    Prefers PowerShell `Get-CimInstance` (modern, JSON, comma-safe) and falls
+    back to the legacy `wmic ... /format:csv` parser only when PowerShell is
+    missing or errors. The CSV fallback uses the stdlib `csv` module so quoted
+    adapter names containing commas no longer corrupt the column split (the old
+    `line.split(",")` shredded them). If neither tool is available we return []
+    and the user simply sees fewer detected GPUs — acceptable degradation.
+    """
+    cim = _detect_gpus_cim(vendor_filter)
+    if cim is not None:
+        return cim
+
     wmic = shutil.which("wmic")
     if not wmic:
         return []
@@ -484,66 +590,29 @@ def _detect_gpus_wmic(vendor_filter: str) -> list[DetectedGpu]:
     if out.returncode != 0:
         return []
 
-    filter_lc = vendor_filter.lower()
     devices: list[DetectedGpu] = []
-    # CSV header is typically: "Node,AdapterRAM,Name"; skip header + blanks.
+    # CSV header is typically: "Node,AdapterRAM,Name". Parse with the csv module
+    # so a comma INSIDE a quoted Name field doesn't desync the columns.
     lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
     if len(lines) < 2:
         return []
-    header = [h.strip().lower() for h in lines[0].split(",")]
+    reader = csv.reader(lines)
+    rows = list(reader)
+    header = [h.strip().lower() for h in rows[0]]
     try:
         i_name = header.index("name")
         i_ram = header.index("adapterram")
     except ValueError:
         return []
 
-    for line in lines[1:]:
-        parts = [p.strip() for p in line.split(",")]
+    for parts in rows[1:]:
         if len(parts) <= max(i_name, i_ram):
             continue
-        name = parts[i_name]
-        if not name:
-            continue
-        name_lc = name.lower()
-        if filter_lc == "amd" and not (
-            "amd" in name_lc or "ati" in name_lc or "radeon" in name_lc
-        ):
-            continue
-        if filter_lc == "intel" and "intel" not in name_lc:
-            continue
-
-        vram_mb: int | None = None
-        try:
-            ram = int(parts[i_ram])
-            # AdapterRAM is in bytes; 0 means "shared/unknown" on iGPUs.
-            if ram > 0:
-                vram_mb = ram // (1024 * 1024)
-        except (TypeError, ValueError):
-            vram_mb = None
-
-        if filter_lc == "amd":
-            vendor: GpuVendor = "amd"
-            reason: str | None = _REASON_AMD
-        else:
-            vendor = "intel"
-            reason = _REASON_INTEL
-
-        # Heuristic for integrated vs discrete: Intel UHD/Iris/Xe (non-Arc)
-        # are iGPUs; AMD "Radeon Graphics" without an RX is the APU.
-        kind: GpuKind = "discrete"
-        if vendor == "intel" and not re.search(r"\bArc\s+A\d+", name, flags=re.IGNORECASE):
-            kind = "integrated"
-        if vendor == "amd" and re.search(r"Radeon\s+Graphics$", name, flags=re.IGNORECASE):
-            kind = "integrated"
-
-        devices.append(DetectedGpu(
-            vendor=vendor,
-            name=name,
-            device_kind=kind,
-            vram_mb=vram_mb,
-            accelerated_by_vibechek=False,
-            unsupported_reason=reason,
-        ))
+        name = parts[i_name].strip()
+        vram_mb = _vram_mb_from_adapter_ram(parts[i_ram].strip())
+        dev = _classify_windows_gpu(name, vram_mb, vendor_filter)
+        if dev is not None:
+            devices.append(dev)
     return devices
 
 

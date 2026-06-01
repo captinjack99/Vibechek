@@ -16,17 +16,18 @@ stdout is reserved for protocol traffic only. All logging goes to stderr.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
 import sys
 import threading
 import traceback
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-import dataclasses
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from vibechek import __version__, cancellation
 from vibechek.config import (
@@ -49,6 +50,77 @@ _DISPATCH_WORKERS = 8
 # both pass the `is current_kind() None` check, both call `begin(kind)`, and
 # the second clobbers the first's `_current_kind` entry.
 _LONG_OP_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Write-path parameter validation
+# ---------------------------------------------------------------------------
+#
+# The CLI clamps numeric inputs via click's FloatRange/IntRange; the RPC
+# boundary historically did not, so a GUI bug or a hand-crafted request could
+# push out-of-range values straight into the tagger/analyzer. A `0.0` (or
+# negative) confidence threshold over-tags the WHOLE library; an inverted vocal
+# band misclassifies every track; a negative worker/skip count goes downstream
+# undefined; an `id3_text_encoding` outside {0,1,2,3} writes a corrupt encoding
+# byte into MP3 frames (or raises per-file). These tiny helpers re-establish the
+# same guarantees the CLI already gives, at the RPC seam.
+
+# Encodings mutagen's ID3 frame constructors accept: 0=ISO-8859-1, 1=UTF-16,
+# 2=UTF-16BE, 3=UTF-8. Anything else is corrupt; fall back to UTF-8 (3).
+_VALID_ID3_ENCODINGS = frozenset({0, 1, 2, 3})
+
+# Distro names we'll let through to the elevated PowerShell installer. Matches
+# the WSL-side allowlist; validated centrally here so a malicious/garbled
+# `distro` can't escape the literal and run arbitrary PowerShell behind UAC.
+import re as _re
+
+_DISTRO_RE = _re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _clamp01(value: Any, default: float) -> float:
+    """Coerce `value` to a float in [0, 1]; fall back to `default` on garbage."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return min(1.0, max(0.0, v))
+
+
+def _nonneg_int(value: Any, default: int = 0) -> int:
+    """Coerce `value` to an int >= 0; fall back to `default` on garbage."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return v if v >= 0 else 0
+
+
+def _valid_id3_encoding(value: Any, default: int = 3) -> int:
+    """Return `value` if it's a valid ID3 text encoding {0,1,2,3}, else `default`."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return v if v in _VALID_ID3_ENCODINGS else default
+
+
+def _validate_distro(value: Any, default: str = "Ubuntu-24.04") -> str:
+    """Validate a WSL distro name against the safe charset.
+
+    Raises ValueError (→ INVALID_PARAMS at the dispatch seam) on anything that
+    could break out of the PowerShell command string. An empty/None value falls
+    back to the default distro.
+    """
+    if value is None or value == "":
+        return default
+    s = str(value)
+    if not _DISTRO_RE.match(s):
+        raise ValueError(
+            f"Invalid distro name {s!r}: must match {_DISTRO_RE.pattern}"
+        )
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +173,20 @@ def _json_default(o: Any) -> Any:
 _LAST_PROGRESS_TIME = 0.0
 _PROGRESS_MIN_INTERVAL_SEC = 0.05  # 20/sec cap
 _PROGRESS_LOCK = threading.Lock()
+
+
+def _reset_progress_throttle() -> None:
+    """Clear the throttle clock so the first tick of a new long op always lands.
+
+    `_LAST_PROGRESS_TIME` is module-global and shared across ops; without a
+    reset, a long op that starts within 50 ms of the previous op's last tick has
+    its own first progress frame swallowed by the rate limiter (cosmetic, but it
+    makes back-to-back ops look momentarily stalled). Called once when a
+    cancellable long op is reserved.
+    """
+    global _LAST_PROGRESS_TIME
+    with _PROGRESS_LOCK:
+        _LAST_PROGRESS_TIME = 0.0
 
 
 def _emit_progress(current: int, total: int, message: str = "") -> None:
@@ -198,6 +284,7 @@ def _scan_only(params: dict) -> dict:
     for dedupe / organize / tag-backup workflows.
     """
     from dataclasses import asdict
+
     from vibechek.analyzer import analyze_track
     from vibechek.utils import find_audio_files
 
@@ -237,11 +324,13 @@ def _analyze_directory(params: dict) -> dict:
     recent-libraries index unless `auto_save=False` is passed (e.g. for
     one-off CLI runs that already specify their own --output).
     """
-    from vibechek.analyzer import analyze_directory
     from vibechek import library_state
+    from vibechek.analyzer import analyze_directory
 
     config = AnalysisConfig(
-        workers=int(params.get("workers", 0)),
+        # workers >= 0 (0 means "auto" downstream); a negative count is
+        # undefined to the pool sizing math.
+        workers=_nonneg_int(params.get("workers", 0), 0),
         use_gpu=str(params.get("use_gpu", "auto")),
         hybrid_cpu_gpu=bool(params.get("hybrid_cpu_gpu", True)),
     )
@@ -258,8 +347,9 @@ def _analyze_directory(params: dict) -> dict:
         on_progress=_emit_progress,
         on_track=_emit_track_analyzed,
         output_path=Path(params["output_path"]) if params.get("output_path") else None,
-        skip=int(params.get("skip", 0)),
-        limit=int(params.get("limit") or 0) or None,
+        # skip/limit are counts — a negative value would slice unexpectedly.
+        skip=_nonneg_int(params.get("skip", 0), 0),
+        limit=_nonneg_int(params.get("limit") or 0, 0) or None,
         skip_paths=skip_set,
     )
 
@@ -330,7 +420,11 @@ def _wsl_status(params: dict) -> dict:
 def _install_wsl(params: dict) -> dict:
     """Install WSL + the named distro via elevated PowerShell. Triggers UAC."""
     from vibechek.wsl import install_wsl
-    distro = str(params.get("distro", "Ubuntu-24.04"))
+    # Validate centrally at the RPC boundary: `distro` is assembled into a
+    # PowerShell command string, so a quote/semicolon could escape the literal
+    # and run arbitrary PowerShell behind the UAC prompt. Reject anything
+    # outside the safe charset before it reaches the installer.
+    distro = _validate_distro(params.get("distro"), "Ubuntu-24.04")
     return install_wsl(distro=distro, on_progress=_emit_progress)
 
 
@@ -400,10 +494,20 @@ def _install_cuda_libs_in_wsl(params: dict) -> dict:
 def _find_duplicates(params: dict) -> dict:
     from vibechek.duplicates import find_duplicates
 
+    # Accept the threshold under either key: the frontend now forwards
+    # `chromaprint_similarity_threshold` (the config field name), older clients
+    # send `threshold`. Clamp to [0, 1] — a value outside that range makes the
+    # similarity comparison either match everything (0) or nothing (>1).
+    threshold = _clamp01(
+        params.get(
+            "chromaprint_similarity_threshold", params.get("threshold", 0.95)
+        ),
+        0.95,
+    )
     config = DuplicateConfig(
         use_md5=bool(params.get("use_md5", True)),
         use_chromaprint=bool(params.get("use_chromaprint", True)),
-        chromaprint_similarity_threshold=float(params.get("threshold", 0.95)),
+        chromaprint_similarity_threshold=threshold,
         action=params.get("action", "report"),
         review_folder=Path(params["review_folder"]) if params.get("review_folder") else None,
     )
@@ -416,15 +520,15 @@ def _find_duplicates(params: dict) -> dict:
         config,
         on_progress=_emit_progress,
         read_metadata=read_metadata,
+        # Forward explicitly so the configured chromaprint threshold (the
+        # previously-dead Settings slider) actually reaches the matcher.
+        similarity_threshold=threshold,
     )
     return report.to_dict()
 
 
 def _handle_duplicates(params: dict) -> dict:
     from vibechek.duplicates import (
-        DuplicateGroup,
-        DuplicateReport,
-        FileInfo,
         handle_duplicates,
     )
 
@@ -440,7 +544,10 @@ def _handle_duplicates(params: dict) -> dict:
 
 def _rebuild_report(d: dict) -> Any:
     from vibechek.duplicates import (
-        DuplicateGroup, DuplicateReport, DuplicateSummary, FileInfo,
+        DuplicateGroup,
+        DuplicateReport,
+        DuplicateSummary,
+        FileInfo,
     )
 
     def _group(g: dict) -> DuplicateGroup:
@@ -520,11 +627,29 @@ def _apply_ml_tags(params: dict) -> dict:
     # backward compatibility (older GUIs / scripts) and maps onto the new
     # write_bpm/write_key pair when the explicit toggles aren't provided.
     legacy_skip = bool(params.get("skip_bpm_and_key", True))
+
+    # Confidence thresholds are probabilities — clamp to [0, 1] so a `0.0`/
+    # negative value can't over-tag the entire library and a `>1` value can't
+    # silently disable a head.
+    genre_conf = _clamp01(params.get("confidence", 0.85), 0.85)
+    parent_conf = _clamp01(
+        params.get("parent_genre_confidence_threshold", 0.50), 0.50
+    )
+    # Vocal classification bands (voice probability 0..1). They MUST stay
+    # ordered instrumental_max < full_min or every track is misclassified
+    # (the "between" Light-Vocal window inverts). Clamp both, then reject an
+    # inverted pair rather than silently mangling the whole library.
+    vocal_inst_max = _clamp01(params.get("vocal_instrumental_max", 0.72), 0.72)
+    vocal_full_min = _clamp01(params.get("vocal_full_min", 0.88), 0.88)
+    if vocal_inst_max >= vocal_full_min:
+        raise ValueError(
+            "vocal_instrumental_max "
+            f"({vocal_inst_max}) must be < vocal_full_min ({vocal_full_min})"
+        )
+
     config = TaggingConfig(
-        genre_confidence_threshold=float(params.get("confidence", 0.85)),
-        parent_genre_confidence_threshold=float(
-            params.get("parent_genre_confidence_threshold", 0.50)
-        ),
+        genre_confidence_threshold=genre_conf,
+        parent_genre_confidence_threshold=parent_conf,
         write_genre=bool(params.get("write_genre", True)),
         write_bpm=bool(params.get("write_bpm", not legacy_skip)),
         write_key=bool(params.get("write_key", not legacy_skip)),
@@ -533,13 +658,23 @@ def _apply_ml_tags(params: dict) -> dict:
         write_timeslot=bool(params.get("write_timeslot", True)),
         write_direction=bool(params.get("write_direction", True)),
         write_vocal=bool(params.get("write_vocal", True)),
-        vocal_instrumental_max=float(params.get("vocal_instrumental_max", 0.72)),
-        vocal_full_min=float(params.get("vocal_full_min", 0.88)),
+        vocal_instrumental_max=vocal_inst_max,
+        vocal_full_min=vocal_full_min,
         preserve_rekordbox_frames=bool(params.get("preserve_rekordbox_frames", True)),
+        # Forward the Settings toggles so they actually take effect. Both have
+        # safe TaggingConfig defaults (True), so omitting them preserves prior
+        # behaviour; the GUI's Settings switches were previously dead because
+        # the values never reached the config.
+        write_subgenre_as_main_genre=bool(
+            params.get("write_subgenre_as_main_genre", True)
+        ),
+        backup_before_write=bool(params.get("backup_before_write", True)),
         # ID3 text-frame encoding: useApplyTags now forwards this from
         # cfg.tagging.id3_text_encoding (added in beta.9, wired in beta.11).
         # 3 = UTF-8 default; 1 = UTF-16 for Rekordbox 5 compat; 0 = ISO-8859-1.
-        id3_text_encoding=int(params.get("id3_text_encoding", 3)),
+        # Validated to {0,1,2,3} so a stray value can't write a corrupt
+        # encoding byte into MP3 frames; anything else falls back to UTF-8 (3).
+        id3_text_encoding=_valid_id3_encoding(params.get("id3_text_encoding", 3), 3),
     )
     analysis_data = _load_analysis_payload(params)
     stats = apply_ml_tags(
@@ -551,8 +686,8 @@ def _apply_ml_tags(params: dict) -> dict:
 
 
 def _backup_tags(params: dict) -> dict:
-    from vibechek.tagger import backup_tags
     from vibechek import backup_history
+    from vibechek.tagger import backup_tags
 
     library = Path(params["path"])
     output = Path(params["output_path"])
@@ -584,10 +719,17 @@ def _restore_tags_with_remap(params: dict) -> dict:
     """
     from vibechek.tagger import restore_tags_with_remap
 
+    # Forward the user's tagging config so the remap-restore path honours
+    # id3_text_encoding (otherwise it defaults to UTF-8 and silently re-encodes
+    # MP3 text frames — empty in Rekordbox 5 / UTF-16 setups — on the exact
+    # path used after a library move). Loaded from disk so the wired toggle
+    # reaches the restorer.
+    cfg = VibechekConfig.load().tagging
     stats = restore_tags_with_remap(
         Path(params["backup_path"]),
         Path(params["library_root"]),
         on_progress=_emit_progress,
+        config=cfg,
     )
     return asdict(stats)
 
@@ -609,6 +751,12 @@ def _get_config(_params: dict) -> dict:
 def _save_config(params: dict) -> dict:
     """Persist a VibechekConfig dict to disk. Returns the saved file path."""
     data = params.get("config", {})
+    # Guard the payload type explicitly: a non-dict (list/str/number) would hit
+    # `_from_dict`'s `.get(...)` and raise AttributeError, which the dispatcher
+    # classifies as APP_ERROR (-32000) + a traceback. A malformed `config`
+    # payload is a caller bug, so surface it as INVALID_PARAMS instead.
+    if not isinstance(data, dict):
+        raise ValueError("'config' must be an object")
     cfg = VibechekConfig._from_dict(data)
     path = cfg.save()
     return {"saved_to": str(path)}
@@ -705,7 +853,8 @@ def _verify_models(_params: dict) -> dict:
     build), `ok=False` for actual mismatches.
     """
     import hashlib as _hashlib
-    from vibechek.analyzer import MODELS, MODEL_SHA256
+
+    from vibechek.analyzer import MODEL_SHA256, MODELS
     from vibechek.config import MODELS_DIR
 
     results: list[dict] = []
@@ -791,7 +940,14 @@ def _count_new_tracks(params: dict) -> dict:
         return {"new_count": 0, "total_count": 0, "analyzed_count": 0,
                 "reason": str(e)}
     total = len(on_disk)
-    on_disk_set = {str(p) for p in on_disk}
+    # Compare by basename rather than full path. A library the user MOVED
+    # (D:/Music → E:/Music, or renamed the drive) has different absolute paths
+    # for the same files, so full-path equality would report every track as
+    # "new" the moment the folder moves. Basenames survive the move. Trade-off:
+    # two distinct files with the same name in different subfolders collapse to
+    # one key — acceptable for a cheap "🆕 N new" banner (the incremental
+    # analyze itself still keys on full path).
+    on_disk_names = {p.name for p in on_disk}
 
     if record is None:
         # No prior analysis means every file is "new" — but emitting that as
@@ -807,17 +963,20 @@ def _count_new_tracks(params: dict) -> dict:
         return {"new_count": 0, "total_count": total, "analyzed_count": 0,
                 "reason": "analysis file missing"}
 
-    analyzed_paths = {
-        t.get("path") for t in (report.get("tracks") or []) if t.get("path")
+    analyzed_names = {
+        Path(t["path"]).name
+        for t in (report.get("tracks") or [])
+        if t.get("path")
     }
-    # "New" = on disk now AND not in the saved analysis. We don't count
-    # tracks that vanished from disk as "new" (negative number would be
-    # silly); the GUI's incremental analyze handles ghost pruning.
-    new_count = len(on_disk_set - analyzed_paths)
+    # "New" = on disk now AND not in the saved analysis (by basename, so a
+    # moved library doesn't read as all-new). We don't count tracks that
+    # vanished from disk as "new" (a negative number would be silly); the GUI's
+    # incremental analyze handles ghost pruning.
+    new_count = len(on_disk_names - analyzed_names)
     return {
         "new_count": new_count,
         "total_count": total,
-        "analyzed_count": len(analyzed_paths & on_disk_set),
+        "analyzed_count": len(analyzed_names & on_disk_names),
     }
 
 
@@ -923,7 +1082,16 @@ def _load_analysis_payload(params: dict) -> dict:
     if "analysis" in params:
         return params["analysis"]
     if "analysis_path" in params:
-        return json.loads(Path(params["analysis_path"]).read_text(encoding="utf-8"))
+        # Guard the client-supplied path: a missing file or a directory would
+        # otherwise surface as an opaque OSError/IsADirectoryError → APP_ERROR.
+        # Classify it as a caller error (ValueError → INVALID_PARAMS) with a
+        # clear message instead.
+        ap = Path(params["analysis_path"])
+        if not ap.exists():
+            raise ValueError(f"analysis_path does not exist: {ap}")
+        if not ap.is_file():
+            raise ValueError(f"analysis_path is not a file: {ap}")
+        return json.loads(ap.read_text(encoding="utf-8"))
     raise ValueError("params must include 'analysis' (object) or 'analysis_path' (string)")
 
 
@@ -1041,6 +1209,9 @@ def _dispatch(request: dict[str, Any]) -> None:
                 )
                 return
             cancellation.begin(kind)
+            # Fresh op → fresh throttle clock, so its first progress tick isn't
+            # suppressed by the previous op's last-emit timestamp.
+            _reset_progress_throttle()
 
     try:
         result = handler(params)

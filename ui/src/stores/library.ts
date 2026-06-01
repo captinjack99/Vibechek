@@ -10,14 +10,52 @@ import { create } from "zustand";
 
 import type { TrackAnalysis } from "../types";
 
+/**
+ * Identity of the analyze run currently authorized to live-merge streamed
+ * `track_analyzed` events. `id` is a monotonic token bumped on every new run
+ * (and on every library switch, which invalidates any in-flight run); `root`
+ * is the exact library path that run was launched against.
+ *
+ * The `track_analyzed` listener uses this to drop "phantom" events from a
+ * superseded run: a cancelled/replaced analyze keeps streaming events that are
+ * already queued in the sidecar + Tauri's event channel, and a path-prefix-only
+ * guard merges them into the wrong library after a switch (e.g. switching from
+ * `D:/Music/House` to its parent `D:/Music` — the old folder's events are still
+ * "under" the new library). Anchoring the merge to an explicit run token that a
+ * switch invalidates closes that hole.
+ */
+export interface AnalyzeRun {
+  id: number;
+  root: string;
+}
+
 interface LibraryState {
   libraryPath: string | null;
   tracks: TrackAnalysis[];
   selectedIds: Set<string>;
   searchFilter: string;
+  /** The run allowed to live-merge streamed events, or null when none. */
+  analyzeRun: AnalyzeRun | null;
 
   setLibraryPath: (path: string | null) => void;
   setTracks: (tracks: TrackAnalysis[]) => void;
+  /**
+   * Open a new live-merge run rooted at `root`, returning its token. Any
+   * previously-active run is implicitly superseded (its token no longer
+   * matches), so its still-streaming events are dropped by the listener.
+   */
+  beginAnalyzeRun: (root: string) => number;
+  /**
+   * Close the run with token `id` if it's still the active one. A no-op if a
+   * newer run has already superseded it (so a slow run finishing late can't
+   * clear a fresh run's authorization).
+   */
+  endAnalyzeRun: (id: number) => void;
+  /**
+   * Invalidate any active live-merge run without starting a new one. Called on
+   * library switches so a stale run's queued events stop merging immediately.
+   */
+  invalidateAnalyzeRun: () => void;
   /**
    * Merge one analyzed-track record into the library, by path. Used by the
    * `sidecar:track_analyzed` event handler so the user sees tracks populate
@@ -48,14 +86,34 @@ interface LibraryState {
   setSearchFilter: (s: string) => void;
 }
 
+// Monotonic source for analyze-run tokens. Module-level so it survives the
+// store closure and never collides across runs within a session.
+let nextAnalyzeRunId = 1;
+
 export const useLibraryStore = create<LibraryState>((set, get) => ({
   libraryPath: null,
   tracks: [],
   selectedIds: new Set(),
   searchFilter: "",
+  analyzeRun: null,
 
   setLibraryPath: (path) => set({ libraryPath: path }),
   setTracks: (tracks) => set({ tracks, selectedIds: new Set() }),
+
+  beginAnalyzeRun: (root) => {
+    const id = nextAnalyzeRunId++;
+    set({ analyzeRun: { id, root } });
+    return id;
+  },
+  endAnalyzeRun: (id) => {
+    const current = get().analyzeRun;
+    // Only the run that's still active may clear itself — a late-finishing
+    // older run must not wipe a newer run's authorization.
+    if (current && current.id === id) set({ analyzeRun: null });
+  },
+  invalidateAnalyzeRun: () => {
+    if (get().analyzeRun) set({ analyzeRun: null });
+  },
 
   mergeAnalyzedTrack: (record) => {
     const { tracks } = get();

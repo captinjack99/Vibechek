@@ -17,15 +17,11 @@ import pytest
 
 from vibechek.config import (
     AnalysisConfig,
-    DuplicateConfig,
-    OrganizationConfig,
     TaggingConfig,
-    UIConfig,
     VibechekConfig,
     _coerce,
     _subset,
 )
-
 
 # ---------------------------------------------------------------------------
 # _coerce — primitive level
@@ -142,6 +138,29 @@ def test_subset_drops_unknown_fields() -> None:
     cfg = _subset(AnalysisConfig, {"workers": 2, "made_up_field": "x"})
     assert cfg.workers == 2
     assert not hasattr(cfg, "made_up_field")
+
+
+# ---------------------------------------------------------------------------
+# id3_text_encoding range validation (audit MEDIUM)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("good", [0, 1, 2, 3])
+def test_subset_keeps_valid_id3_encoding(good: int) -> None:
+    cfg = _subset(TaggingConfig, {"id3_text_encoding": good})
+    assert cfg.id3_text_encoding == good
+
+
+@pytest.mark.parametrize("bad", [4, 99, -1, 7])
+def test_subset_rejects_out_of_range_id3_encoding(
+    bad: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stale/hand-edited encoding outside {0,1,2,3} would write a corrupt
+    encoding byte into MP3 frames — snap it back to the UTF-8 default (3)."""
+    caplog.set_level(logging.WARNING, logger="vibechek.config")
+    cfg = _subset(TaggingConfig, {"id3_text_encoding": bad})
+    assert cfg.id3_text_encoding == TaggingConfig().id3_text_encoding == 3
+    assert any("id3_text_encoding" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

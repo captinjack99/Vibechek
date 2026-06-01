@@ -33,11 +33,15 @@ import shutil
 import subprocess
 import sys
 import threading as _threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
 
-from vibechek.platform import IS_LINUX, IS_MAC, IS_WINDOWS
+from vibechek.platform import (  # noqa: F401  (IS_WINDOWS re-exported from the single platform source; guarded by test_platform)
+    IS_LINUX,
+    IS_MAC,
+    IS_WINDOWS,
+)
 
 log = logging.getLogger(__name__)
 

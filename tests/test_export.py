@@ -117,7 +117,7 @@ def test_export_m3u8_lists_paths(tmp_path: Path) -> None:
                                   "--output", str(output)])
     assert result.exit_code == 0, result.output
     text = output.read_text(encoding="utf-8")
-    lines = [l for l in text.splitlines() if l.strip()]
+    lines = [ln for ln in text.splitlines() if ln.strip()]
     assert len(lines) == 2
     assert lines[0].endswith("a.mp3")
     assert lines[1].endswith("b.flac")

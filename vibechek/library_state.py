@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,6 +31,17 @@ log = logging.getLogger(__name__)
 MAX_RECENT = 10
 STATE_FILE = CONFIG_DIR / "library_state.json"
 ANALYSES_DIR = DATA_DIR / "analyses"
+
+# Serializes every load-modify-save of the index. The RPC dispatch pool runs
+# several mutators (record_open, record_analysis, forget, rename_library,
+# tag_library) concurrently, each doing an unsynchronized read-then-write — a
+# classic lost-update race (two writers both load the old index, each adds its
+# own change, and whichever saves last wins, silently dropping the other's
+# mutation). atomic_write_json already prevents a *torn* file via its unique
+# temp suffix; this lock prevents the lost *update*. It's re-entrant so a
+# mutator can call save_state() (which would otherwise want the lock too)
+# without deadlocking.
+_STATE_LOCK = threading.RLock()
 
 
 @dataclass
@@ -105,22 +117,23 @@ def save_state(state: LibraryState) -> None:
 
 def record_open(library_path: Path | str) -> LibraryRecord:
     """Note that the user opened this library. Bumps it to the top of recent."""
-    state = load_state()
-    path_str = str(library_path)
-    existing = _find(state, path_str)
-    if existing:
-        existing.last_opened = time.time()
-        _bump_to_front(state, existing)
-    else:
-        existing = LibraryRecord(
-            path=path_str,
-            analysis_path=str(_analysis_path_for(path_str)),
-            last_opened=time.time(),
-        )
-        state.recent.insert(0, existing)
-    _truncate(state)
-    save_state(state)
-    return existing
+    with _STATE_LOCK:
+        state = load_state()
+        path_str = str(library_path)
+        existing = _find(state, path_str)
+        if existing:
+            existing.last_opened = time.time()
+            _bump_to_front(state, existing)
+        else:
+            existing = LibraryRecord(
+                path=path_str,
+                analysis_path=str(_analysis_path_for(path_str)),
+                last_opened=time.time(),
+            )
+            state.recent.insert(0, existing)
+        _truncate(state)
+        save_state(state)
+        return existing
 
 
 def record_analysis(library_path: Path | str, report: dict[str, Any]) -> LibraryRecord:
@@ -133,34 +146,38 @@ def record_analysis(library_path: Path | str, report: dict[str, Any]) -> Library
     # truncated 32 MB JSON makes the entire library "lost" on next launch.
     atomic_write_json(analysis_path, report, indent=2, ensure_ascii=False)
 
-    state = load_state()
-    existing = _find(state, path_str)
-    if not existing:
-        existing = LibraryRecord(path=path_str, analysis_path=str(analysis_path))
-        state.recent.insert(0, existing)
-    else:
-        _bump_to_front(state, existing)
+    # Only the index load-modify-save needs serializing; the (large) analysis
+    # JSON above is keyed by a unique per-library path so it never races.
+    with _STATE_LOCK:
+        state = load_state()
+        existing = _find(state, path_str)
+        if not existing:
+            existing = LibraryRecord(path=path_str, analysis_path=str(analysis_path))
+            state.recent.insert(0, existing)
+        else:
+            _bump_to_front(state, existing)
 
-    summary = report.get("summary", {}) or {}
-    existing.analysis_path = str(analysis_path)
-    existing.track_count = int(summary.get("total_files", 0))
-    existing.analyzed_count = int(summary.get("analyzed", 0))
-    existing.last_opened = time.time()
-    existing.last_analyzed = time.time()
+        summary = report.get("summary", {}) or {}
+        existing.analysis_path = str(analysis_path)
+        existing.track_count = int(summary.get("total_files", 0))
+        existing.analyzed_count = int(summary.get("analyzed", 0))
+        existing.last_opened = time.time()
+        existing.last_analyzed = time.time()
 
-    _truncate(state)
-    save_state(state)
-    return existing
+        _truncate(state)
+        save_state(state)
+        return existing
 
 
 def forget(library_path: Path | str) -> bool:
     """Drop a library from the recent list. Returns True if it was there."""
-    state = load_state()
-    path_str = str(library_path)
-    before = len(state.recent)
-    state.recent = [r for r in state.recent if r.path != path_str]
-    save_state(state)
-    return len(state.recent) < before
+    with _STATE_LOCK:
+        state = load_state()
+        path_str = str(library_path)
+        before = len(state.recent)
+        state.recent = [r for r in state.recent if r.path != path_str]
+        save_state(state)
+        return len(state.recent) < before
 
 
 def rename_library(library_path: Path | str, new_name: str) -> LibraryRecord | None:
@@ -171,17 +188,18 @@ def rename_library(library_path: Path | str, new_name: str) -> LibraryRecord | N
     `None` if the library isn't in the recent list (don't promote an
     unknown library just because the user renamed it).
     """
-    state = load_state()
-    path_str = str(library_path)
-    record = _find(state, path_str)
-    if record is None:
-        return None
-    # Strip whitespace — leading/trailing spaces in a UI text field are
-    # almost always typos, never intentional. Empty string is the sentinel
-    # for "use the basename" (see LibraryRecord.display_name).
-    record.name = (new_name or "").strip()
-    save_state(state)
-    return record
+    with _STATE_LOCK:
+        state = load_state()
+        path_str = str(library_path)
+        record = _find(state, path_str)
+        if record is None:
+            return None
+        # Strip whitespace — leading/trailing spaces in a UI text field are
+        # almost always typos, never intentional. Empty string is the sentinel
+        # for "use the basename" (see LibraryRecord.display_name).
+        record.name = (new_name or "").strip()
+        save_state(state)
+        return record
 
 
 def tag_library(library_path: Path | str, tags: list[str]) -> LibraryRecord | None:
@@ -192,27 +210,28 @@ def tag_library(library_path: Path | str, tags: list[str]) -> LibraryRecord | No
     dropped. Returns the updated record, or `None` if the library isn't
     in the recent list.
     """
-    state = load_state()
-    path_str = str(library_path)
-    record = _find(state, path_str)
-    if record is None:
-        return None
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for t in tags or []:
-        s = str(t).strip()
-        if not s:
-            continue
-        # Case-insensitive dedupe — "Friday Set" and "friday set" are the
-        # same gig in the user's head; collapse them.
-        key = s.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(s)
-    record.tags = cleaned
-    save_state(state)
-    return record
+    with _STATE_LOCK:
+        state = load_state()
+        path_str = str(library_path)
+        record = _find(state, path_str)
+        if record is None:
+            return None
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for t in tags or []:
+            s = str(t).strip()
+            if not s:
+                continue
+            # Case-insensitive dedupe — "Friday Set" and "friday set" are the
+            # same gig in the user's head; collapse them.
+            key = s.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(s)
+        record.tags = cleaned
+        save_state(state)
+        return record
 
 
 def load_analysis(record: LibraryRecord) -> dict[str, Any] | None:

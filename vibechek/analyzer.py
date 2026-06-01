@@ -16,15 +16,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import re
 import urllib.request
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-import multiprocessing
 from multiprocessing import cpu_count
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from mutagen import File as MutagenFile  # noqa: N812 (mutagen's API)
 from mutagen.flac import FLAC
@@ -120,6 +121,14 @@ MODELS: dict[str, tuple[str, str, str]] = {
 # Mood model class-index lookup: which output index represents the positive
 # (named) class. Determined by Essentia model documentation.
 _MOOD_INDEX = {"aggressive": 0, "happy": 0, "relaxed": 1, "sad": 1}
+
+# Essentia KeyExtractor pitch profile. The default profile is general-purpose
+# and lands around KeyFinder tier (~77%) on EDM. Essentia ships an EDM-tuned
+# profile ("edma", from Faraldo et al., "Key Estimation in EDM", ISMIR 2016)
+# that materially improves accuracy on the electronic-music-heavy libraries
+# Vibechek targets — the single highest-ROI accuracy change in the audit.
+# Exposed as a module constant so it can be tuned without touching call sites.
+KEY_PROFILE = "edma"
 
 
 # Content-hash pinning for downloaded model files. A compromised or
@@ -297,14 +306,14 @@ def download_models(
         # ---- weights ----
         weights_step = i * 2
         weights_urls = _candidate_urls(subdir, weights_name)
-        if _needs_download(weights_path, weights_urls[0]):
+        if _needs_download(weights_path, weights_urls[0], _expected_sha256(name, "pb")):
             try:
                 _download_from_mirrors(
                     weights_urls,
                     weights_path,
                     label=f"{name}.pb",
-                    on_progress=lambda done, total, n=name: emit(
-                        weights_step, (done, total), f"{n} weights ({_fmt_bytes(done)}/{_fmt_bytes(total)})"
+                    on_progress=lambda done, total, n=name, step=weights_step: emit(
+                        step, (done, total), f"{n} weights ({_fmt_bytes(done)}/{_fmt_bytes(total)})"
                     ),
                 )
             except Exception as e:  # noqa: BLE001
@@ -329,14 +338,14 @@ def download_models(
         # ---- metadata ----
         metadata_step = i * 2 + 1
         metadata_urls = _candidate_urls(subdir, metadata_name)
-        if _needs_download(metadata_path, metadata_urls[0]):
+        if _needs_download(metadata_path, metadata_urls[0], _expected_sha256(name, "json")):
             try:
                 _download_from_mirrors(
                     metadata_urls,
                     metadata_path,
                     label=f"{name}.json",
-                    on_progress=lambda done, total, n=name: emit(
-                        metadata_step, (done, total), f"{n} metadata"
+                    on_progress=lambda done, total, n=name, step=metadata_step: emit(
+                        step, (done, total), f"{n} metadata"
                     ),
                 )
             except Exception as e:  # noqa: BLE001
@@ -389,15 +398,28 @@ def _fmt_bytes(n: int) -> str:
     return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
 
-def _needs_download(path: Path, url: str) -> bool:
+def _needs_download(path: Path, url: str, expected_sha256: str | None = None) -> bool:
     """True if `path` is missing OR clearly truncated relative to `url`.
 
-    *Important*: if the HEAD probe fails (network error, DNS, server down),
-    we now trust the local file only if it passes a basic sanity check
-    (>100KB for .pb, >200B for .json). A failed HEAD used to silently
-    accept ANY local file, which meant a previous run that wrote a 50KB
-    "Service Unavailable" HTML page would sit there forever — every
-    install reporting "models OK" while analyze blew up at runtime.
+    The HEAD probe (server `Content-Length`) is our primary "is the cached file
+    complete?" signal. The size sanity check (>100KB for .pb, >200B for .json)
+    is a fast first gate that rejects truncated downloads and HTML error pages
+    a previous run may have written.
+
+    *On HEAD failure (network error, DNS, server down) the completeness of the
+    cached file is genuinely UNKNOWN* — we have no `Content-Length` to compare
+    against. Audit fix (LOW): we no longer treat that "unknown" as "valid"
+    unconditionally. The resolution depends on whether we have an out-of-band
+    integrity check:
+
+      * If a pinned SHA256 exists for this file, return True so it is
+        re-downloaded and then strictly re-verified by `verify_model_sha256` —
+        the only way to be sure an unverifiable-via-HEAD cached file is sound.
+      * If no SHA is pinned (the current default — `MODEL_SHA256` is empty),
+        keep the size-sane cached file rather than forcing a re-download we
+        can't validate anyway; this preserves offline / flaky-network reuse and
+        matches the prior behaviour, but is now an explicit, documented choice
+        rather than a silent "HEAD failed → trust it".
     """
     if not path.exists():
         return True
@@ -417,11 +439,20 @@ def _needs_download(path: Path, url: str) -> bool:
         with urllib.request.urlopen(req, timeout=10) as resp:
             expected = int(resp.headers.get("Content-Length") or 0)
     except Exception as e:  # noqa: BLE001
-        # Network blip: keep the file IF it passed the size sanity check above.
-        # We DON'T trust a download that never finished — that's caught by the
-        # size check. We do trust a complete previous download.
+        # HEAD failed → completeness is unknown. Re-download ONLY if we can
+        # subsequently verify it via a pinned SHA256; otherwise keep the
+        # size-sane cached file (re-downloading an unverifiable file gains
+        # nothing and breaks offline reuse).
+        if expected_sha256:
+            log.info(
+                "HEAD probe failed for %s (%s) — refetching to re-verify against "
+                "pinned SHA256 (cannot confirm cached %d-byte file otherwise).",
+                url, e, local_size,
+            )
+            return True
         log.info(
-            "HEAD probe failed for %s (%s) — using existing %d-byte local file (passed size sanity check).",
+            "HEAD probe failed for %s (%s) — keeping existing %d-byte local file "
+            "(passed size sanity check; no SHA pin to verify against).",
             url, e, local_size,
         )
         return False
@@ -493,7 +524,6 @@ def _download_with_progress(
       model files.
     - Honors HTTP_PROXY / HTTPS_PROXY env vars via urllib's default handler.
     """
-    import socket as _socket
     import time as _time
     import urllib.error
 
@@ -511,8 +541,7 @@ def _download_with_progress(
         try:
             _do_one_download(url, dest, on_progress, chunk_size)
             return  # success
-        except (urllib.error.URLError, _socket.timeout, ConnectionResetError,
-                TimeoutError, OSError) as e:
+        except (urllib.error.URLError, ConnectionResetError, TimeoutError, OSError) as e:
             last_err = e
             # Network error: retry.
             continue
@@ -664,6 +693,14 @@ def load_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
             model = _try_load(name, descriptors[name]["weights"])
             if model is not None:
                 loaded[name] = model
+                # Stash the model's class label order so downstream column
+                # selection resolves by NAME rather than a hardcoded index.
+                # A re-ordered model release would otherwise silently invert
+                # labels (e.g. voice↔instrumental). Falls back to index when
+                # metadata is absent (see `_class_index`).
+                classes = descriptors[name].get("classes")
+                if classes:
+                    loaded[f"{name}_classes"] = classes
 
     return loaded
 
@@ -692,6 +729,26 @@ VOCAL_INSTRUMENTAL_MAX = 0.72
 VOCAL_FULL_MIN = 0.88
 
 
+def _class_index(
+    classes: list[str] | None,
+    label: str,
+    fallback: int,
+) -> int:
+    """Resolve the output-vector index for `label` from a model's class list.
+
+    Matches case-insensitively and tolerates substring labels (Essentia heads
+    name classes "voice"/"instrumental", "danceable"/"not_danceable", etc.).
+    Returns `fallback` when `classes` is missing or the label isn't found, so a
+    model whose metadata we couldn't read still behaves exactly as before.
+    """
+    if classes:
+        target = label.lower()
+        for i, c in enumerate(classes):
+            if isinstance(c, str) and target in c.lower():
+                return i
+    return fallback
+
+
 def _classify_vocal(
     score: float,
     instrumental_max: float = VOCAL_INSTRUMENTAL_MAX,
@@ -710,6 +767,115 @@ def _classify_mood(brightness: float) -> str:
     if brightness > 0.6:
         return "Bright"
     return "Neutral"
+
+
+# Minimum start→end delta in the per-frame aggressive (energy proxy) score
+# before we call a track "Up"/"Down" rather than "Steady".
+DIRECTION_DELTA = 0.08
+
+
+def _classify_direction(
+    aggressive_raw: Any,
+    agg_idx: int = _MOOD_INDEX["aggressive"],
+    delta: float = DIRECTION_DELTA,
+) -> str:
+    """Classify a track's energy *direction* from the per-frame aggressive head.
+
+    `aggressive_raw` is the raw, pre-mean output of the mood_aggressive model:
+    shape ``(frames, 2)`` (a 2-class softmax per frame, columns = [aggressive,
+    not-aggressive]). We compare the mean of the AGGRESSIVE column over the
+    first third of the track against the last third.
+
+    Historical bug (audit HIGH): the old code did ``np.mean(aggressive_raw[:third])``
+    with no column selection, averaging BOTH softmax columns of the slice. Since
+    each row sums to ~1.0, that mean was ~0.5 for every slice, so start≈end and
+    EVERY track collapsed to "Steady" — a silently-dead feature still written to
+    files. We now slice the aggressive column (`[:, agg_idx]`) before averaging.
+
+    Returns "Up" / "Down" / "Steady". Defensive against short clips, 1-D inputs
+    (already a column), and anything malformed (returns "Steady").
+    """
+    try:
+        import numpy as np  # noqa: PLC0415 (lazy: keeps module import essentia-free)
+
+        arr = np.asarray(aggressive_raw, dtype=float)
+        if arr.ndim >= 2 and arr.shape[1] > agg_idx:
+            col = arr[:, agg_idx]
+        else:
+            # 1-D fallback: treat the input as the energy curve directly.
+            col = arr.reshape(-1)
+        third = len(col) // 3
+        if third <= 0:
+            return "Steady"
+        start_e = float(np.mean(col[:third]))
+        end_e = float(np.mean(col[-third:]))
+        diff = end_e - start_e
+        if diff > delta:
+            return "Up"
+        if diff < -delta:
+            return "Down"
+        return "Steady"
+    except Exception:  # noqa: BLE001
+        return "Steady"
+
+
+# DJ-plausible tempo band. RhythmExtractor2013 is solid but prone to the
+# classic octave errors DJs hit constantly: a 140-BPM techno track detected as
+# 70, or 174 drum-and-bass detected as 87 (and vice-versa). Real dance tempos
+# overwhelmingly live in [70, 200); we fold detected values by halving/doubling
+# into that band, then — when the filename advertises a BPM — snap to whichever
+# octave matches the filename, since DJs name files deliberately.
+BPM_BAND_MIN = 70.0
+BPM_BAND_MAX = 200.0  # exclusive upper edge of the canonical band
+
+
+def _snap_bpm_octave(
+    detected_bpm: float | None,
+    filename_bpm: int | None = None,
+    band_min: float = BPM_BAND_MIN,
+    band_max: float = BPM_BAND_MAX,
+) -> float | None:
+    """Fold a detected BPM into a DJ-plausible band and reconcile with the
+    filename-advertised BPM when present. Pure + side-effect free.
+
+    1. Fold the raw value by ×2 / ÷2 until it lands in ``[band_min, band_max)``
+       (canonicalises octave errors like 70→140 or 348→87).
+    2. If ``filename_bpm`` is given, compare the folded value against the
+       filename value AND its ÷2 / ×2 octaves; if the half/double octave is a
+       closer match to the filename than the folded value, prefer it. This
+       fixes the case where the detector locked onto the wrong octave but the
+       filename tells us the DJ's intended tempo (e.g. detected 87, filename
+       174 → return 174).
+
+    Returns the reconciled BPM (rounded to 1 dp) or None when no detection.
+    """
+    if detected_bpm is None:
+        return None
+    try:
+        bpm = float(detected_bpm)
+    except (TypeError, ValueError):
+        return None
+    if bpm <= 0:
+        return None
+
+    # Step 1: fold into the canonical band.
+    while bpm < band_min:
+        bpm *= 2.0
+    while bpm >= band_max:
+        bpm /= 2.0
+
+    # Step 2: reconcile against the filename BPM, considering both octaves.
+    if filename_bpm and filename_bpm > 0:
+        target = float(filename_bpm)
+        candidates = (bpm, bpm * 2.0, bpm / 2.0)
+        best = min(candidates, key=lambda c: abs(c - target))
+        # Only accept the octave-shifted candidate if it's meaningfully closer
+        # to the filename than the folded value (guards against noise nudging us
+        # off a correct detection when the filename itself is half/double).
+        if abs(best - target) + 1e-9 < abs(bpm - target):
+            bpm = best
+
+    return round(bpm, 1)
 
 
 def _pick_timeslot(genre: str | None, energy: int, bpm: float | None) -> str:
@@ -793,7 +959,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 
     # ---------- Key ----------
     try:
-        key, scale, _strength = KeyExtractor()(audio_44k)
+        key, scale, _strength = KeyExtractor(profileType=KEY_PROFILE)(audio_44k)
         result.ml_key = key_to_camelot(f"{key} {scale}")
     except Exception as e:  # noqa: BLE001
         log.debug("Key detection failed for %s: %s", filepath.name, e)
@@ -811,7 +977,16 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
     if "voice_instrumental" in models:
         try:
             pred = np.mean(models["voice_instrumental"](embeddings), axis=0)
-            voice_score = float(pred[1]) if len(pred) > 1 else float(pred[0])
+            # Resolve the "voice" column by label NAME from the model's class
+            # metadata, falling back to index 1 (the historical hardcode) when
+            # metadata is unavailable. A re-ordered model release would otherwise
+            # silently invert every vocal label, and that score is written to
+            # files. Same hardening would apply to danceability/moods if their
+            # heads were ever re-ordered (those use _MOOD_INDEX / index 0).
+            voice_idx = _class_index(
+                models.get("voice_instrumental_classes"), "voice", fallback=1
+            )
+            voice_score = float(pred[voice_idx]) if len(pred) > 1 else float(pred[0])
             result.ml_vocal_score = round(voice_score, 3)
             result.ml_vocal = _classify_vocal(voice_score)
         except Exception as e:  # noqa: BLE001
@@ -883,25 +1058,11 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 
     # ---------- Direction (energy curve over the track) ----------
     # Reuse the aggressive prediction computed in the mood loop above instead
-    # of re-running the model (the array is per-frame; we slice it into thirds).
-    try:
-        if aggressive_raw is not None:
-            third = len(aggressive_raw) // 3
-            if third > 0:
-                start_e = float(np.mean(aggressive_raw[:third]))
-                end_e = float(np.mean(aggressive_raw[-third:]))
-                diff = end_e - start_e
-                if diff > 0.08:
-                    result.ml_direction = "Up"
-                elif diff < -0.08:
-                    result.ml_direction = "Down"
-                else:
-                    result.ml_direction = "Steady"
-            else:
-                result.ml_direction = "Steady"
-        else:
-            result.ml_direction = "Steady"
-    except Exception:  # noqa: BLE001
+    # of re-running the model (the array is per-frame; the helper slices it
+    # into thirds and compares the AGGRESSIVE column start-vs-end).
+    if aggressive_raw is not None:
+        result.ml_direction = _classify_direction(aggressive_raw)
+    else:
         result.ml_direction = "Steady"
 
     return result
@@ -1014,6 +1175,12 @@ def analyze_track(filepath: Path, models: dict[str, Any] | None = None) -> Track
 
     if models:
         ml = analyze_audio_features(filepath, models)
+        # DJ octave-error guard: fold the detected BPM into a plausible band
+        # and reconcile against the filename-advertised BPM (now that both are
+        # available on the record). Keeps the raw value out of files when the
+        # detector locked onto the wrong octave (70↔140, 87↔174).
+        if ml.ml_bpm is not None:
+            ml.ml_bpm = _snap_bpm_octave(ml.ml_bpm, record.filename_bpm)
         record.ml_analysis = {k: v for k, v in asdict(ml).items() if v is not None}
 
     return record
@@ -1036,9 +1203,19 @@ def _worker_init(model_dir: str, use_gpu: str) -> None:
 
     We wrap load_models so init errors crash the worker FAST and visibly:
       - log the traceback to stderr (will end up in the WSL stderr stream
-        the parent captures)
-      - re-raise so the pool sees the worker as broken; we set
-        maxtasksperchild=1 in the Pool call so the bad init doesn't auto-respawn
+        the parent captures), prefixed `VIBECHEK_WORKER_INIT_FAIL:`
+      - re-raise so the pool sees the worker as broken.
+
+    Note on respawn behaviour: this `multiprocessing.Pool` path runs with
+    `maxtasksperchild=200` (the value in the `Pool(...)` call below), NOT 1, so
+    a worker that fails *init* is respawned by the pool and re-fails until the
+    300s stall watchdog tears the run down with a useful error. The
+    deterministic fail-fast init-failure detection lives on the hybrid
+    work-stealing pool, which reports an init-failure sentinel on its result
+    queue (`__init_fail__`) so the parent aborts immediately. The lower-risk
+    documentation fix here is to describe what actually happens rather than
+    change the recycle cadence and risk a regression in the steady-state TF
+    memory-leak mitigation the 200-task recycle provides.
     """
     global _WORKER_MODELS
     try:
@@ -1051,10 +1228,10 @@ def _worker_init(model_dir: str, use_gpu: str) -> None:
             f"{_tb.format_exc()}\n"
         )
         _sys.stderr.flush()
-        # Re-raise so the pool marks this worker as broken. Combined with
-        # maxtasksperchild=1, this triggers a single retry; if it fails again,
-        # the second attempt's exception kills the pool cleanly instead of
-        # hanging forever.
+        # Re-raise so the pool marks this worker as broken. With this path's
+        # maxtasksperchild=200 the pool respawns the worker, which re-fails on
+        # init; the 300s stall watchdog then tears the run down with a useful
+        # error. (The hybrid pool fails fast via its `__init_fail__` sentinel.)
         raise
 
 
@@ -1075,6 +1252,35 @@ def _normalize_version(v: str) -> str:
     s = s.replace("beta", "b").replace("alpha", "a")
     # Drop everything that isn't [a-z0-9] — periods, dashes, underscores.
     return _re.sub(r"[^a-z0-9]", "", s)
+
+
+def _wsl_install_is_outdated(wsl_version: str, sidecar_version: str) -> bool:
+    """True only when the WSL `vibechek` install is STRICTLY OLDER than the sidecar.
+
+    Audit fix (LOW): the old guard blocked on *any* version mismatch
+    (`_normalize_version(a) != _normalize_version(b)`), which wrongly rejected a
+    WSL install that was actually NEWER than the sidecar (e.g. a user who
+    upgraded the WSL venv ahead of the desktop app) and relied on a non-PEP-440
+    string-normalization that mis-handles forms like "0.4.0rc1" vs "0.4.0".
+
+    We now compare with `packaging.version.parse`, which canonicalises both pip
+    ("0.4.0b2") and human ("0.4.0-beta.2") spellings to the same PEP 440 version
+    and orders pre-releases correctly. Only a strictly-older WSL install is
+    missing whatever safety patch landed since, so only that case is worth
+    refusing to dispatch on. If either string can't be parsed as PEP 440 we
+    fall back to the previous normalized-string EQUALITY test (block on
+    mismatch) so we never *loosen* the guard on un-parseable inputs.
+    """
+    try:
+        from packaging.version import InvalidVersion, parse  # noqa: PLC0415
+    except ImportError:
+        # packaging missing (shouldn't happen — it's a pip dependency): fall
+        # back to the conservative equality check.
+        return _normalize_version(wsl_version) != _normalize_version(sidecar_version)
+    try:
+        return parse(wsl_version) < parse(sidecar_version)
+    except InvalidVersion:
+        return _normalize_version(wsl_version) != _normalize_version(sidecar_version)
 
 
 # Per-worker GPU memory budget. ~2.5 GB covers a steady-state essentia + TF
@@ -1110,18 +1316,41 @@ _GPU_WORKER_MB = 2500
 _GPU_FALLBACK_CAP = 4
 
 
+def _visible_gpu_index() -> int:
+    """The physical GPU index our workers will actually use.
+
+    Every worker pins a single device: the GPU path sets
+    `CUDA_VISIBLE_DEVICES=0`, so by default that's physical GPU 0. If the
+    environment already constrains `CUDA_VISIBLE_DEVICES` (a power user pinning
+    a specific card), honor the FIRST entry of that list instead. Returns 0 on
+    anything unparseable.
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not raw:
+        return 0
+    first = raw.split(",")[0].strip()
+    try:
+        idx = int(first)
+        return idx if idx >= 0 else 0
+    except ValueError:
+        # Could be a GPU UUID (CUDA accepts those) — we can't map it to an
+        # nvidia-smi row index cheaply, so fall back to device 0.
+        return 0
+
+
 def _probe_free_vram_mb() -> int | None:
-    """Return free VRAM in MB across all visible GPUs via `nvidia-smi`, or None.
+    """Return free VRAM in MB on the SINGLE GPU our workers pin, via `nvidia-smi`.
 
-    We sum free memory across devices because TF with the default
-    `CUDA_VISIBLE_DEVICES` picks GPU 0; if the user has a multi-GPU rig and
-    GPU 0 is busy (e.g. driving the display), summing slightly overestimates.
-    That's OK — the cap is a *ceiling* anchored by `_GPU_FALLBACK_CAP` below
-    and the user's `workers` setting above. We err toward more workers than
-    fewer on multi-GPU rigs; OOM still surfaces via the stall watchdog.
+    Audit fix (MED): the old probe SUMMED `memory.free` across every visible
+    GPU, but every worker pins one device (`CUDA_VISIBLE_DEVICES=0`, or the
+    first entry the environment already set). On a 2×8 GB rig the sum (~16 GB)
+    sized ~6 workers that ALL piled onto GPU 0 → CUDA OOM, with only the 5-min
+    stall watchdog as a backstop. We now query just the honored device's free
+    VRAM so the worker cap reflects the card that's actually used.
 
-    Returns None on any failure (binary missing, timeout, parse error). Callers
-    must treat None as "unknown" and fall back to the conservative cap.
+    Returns None on any failure (binary missing, timeout, parse error, or the
+    target index not present). Callers must treat None as "unknown" and fall
+    back to the conservative cap.
     """
     import shutil as _shutil  # noqa: PLC0415  (lazy to keep import cost flat)
     import subprocess as _subprocess  # noqa: PLC0415
@@ -1141,19 +1370,27 @@ def _probe_free_vram_mb() -> int | None:
         log.debug("nvidia-smi returned %d: %s", out.returncode, out.stderr.strip())
         return None
 
-    total_free = 0
-    saw_any = False
+    # One row per physical GPU, in index order. Pick the row for the device our
+    # workers actually pin rather than summing across the whole machine.
+    rows: list[int] = []
     for line in out.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            total_free += int(line)
-            saw_any = True
+            rows.append(int(line))
         except ValueError:
             # A malformed row (rare) shouldn't poison the whole probe — skip it.
             continue
-    return total_free if saw_any else None
+    if not rows:
+        return None
+
+    target = _visible_gpu_index()
+    if target < len(rows):
+        return rows[target]
+    # Target index out of range (e.g. CUDA_VISIBLE_DEVICES points past the
+    # visible cards) — fall back to the first card we can see.
+    return rows[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1323,7 +1560,7 @@ class _HybridPool:
                 item = self._out_q.get(timeout=0.2)
             except _queue.Empty:
                 if _time.monotonic() > deadline:
-                    raise _mp.TimeoutError
+                    raise _mp.TimeoutError from None
                 continue
             if item and item[0] == "__init_fail__":
                 # A worker couldn't load models — fail fast with the reason
@@ -1373,13 +1610,13 @@ class _HybridPool:
 
 def _run_hybrid_pool(
     file_strs: list[str],
-    config: "AnalysisConfig",
+    config: AnalysisConfig,
     gpu_workers: int,
     cpu_workers: int,
     total: int,
     results: list[dict[str, Any]],
-    on_progress: "ProgressCallback | None",
-    on_track: "TrackCallback | None",
+    on_progress: ProgressCallback | None,
+    on_track: TrackCallback | None,
     output_path: Path | None,
 ) -> None:
     """Drive a `_HybridPool`, appending each completed record to `results`.
@@ -1418,9 +1655,9 @@ def _run_hybrid_pool(
                             f"{STALL_TIMEOUT}s. The hybrid worker pool is dead "
                             f"(likely OOM or essentia init crash). Check the "
                             f"sidecar log for VIBECHEK_WORKER_INIT_FAIL lines."
-                        )
+                        ) from None
                     if cancellation.is_cancelled():
-                        raise cancellation.CancelledError("Analysis cancelled by user")
+                        raise cancellation.CancelledError("Analysis cancelled by user") from None
 
             if cancellation.is_cancelled():
                 raise cancellation.CancelledError("Analysis cancelled by user")
@@ -1835,11 +2072,11 @@ def analyze_directory(
                                 f"(likely OOM or essentia init crash). Check "
                                 f"the sidecar log for VIBECHEK_WORKER_INIT_FAIL "
                                 f"lines."
-                            )
+                            ) from None
                         if cancellation.is_cancelled():
                             raise cancellation.CancelledError(
                                 "Analysis cancelled by user"
-                            )
+                            ) from None
 
             for i in range(total):
                 try:
@@ -1980,7 +2217,6 @@ def _analyze_via_native_venv(
     result JSON back.
     """
     import json as _json
-    import re
     import tempfile
 
     from vibechek.native_install import run_vibechek_in_native_venv
@@ -2174,7 +2410,10 @@ def _analyze_via_wsl(
     # analyze on a flaky detection.
     if wsl_vibechek_version is not None:
         from vibechek import __version__ as _sidecar_version  # noqa: PLC0415
-        if _normalize_version(wsl_vibechek_version) != _normalize_version(_sidecar_version):
+        # Block ONLY when the WSL install is strictly older — a newer WSL venv
+        # (user upgraded it ahead of the desktop app) is fine and must not be
+        # rejected.
+        if _wsl_install_is_outdated(wsl_vibechek_version, _sidecar_version):
             raise RuntimeError(
                 f"WSL vibechek is out of date: {distro} has "
                 f"{wsl_vibechek_version}, sidecar is {_sidecar_version}. "

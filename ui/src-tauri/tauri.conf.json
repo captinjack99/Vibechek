@@ -27,7 +27,17 @@
       "assetProtocol": {
         "enable": true,
         "scope": {
-          "allow": ["**/*"],
+          "allow": [
+            "**/*.mp3", "**/*.MP3",
+            "**/*.flac", "**/*.FLAC",
+            "**/*.m4a", "**/*.M4A",
+            "**/*.wav", "**/*.WAV",
+            "**/*.aiff", "**/*.AIFF",
+            "**/*.aif", "**/*.AIF",
+            "**/*.ogg", "**/*.OGG",
+            "**/*.aac", "**/*.AAC",
+            "**/*.wma", "**/*.WMA"
+          ],
           "deny": []
         }
       }

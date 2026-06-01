@@ -86,11 +86,11 @@ def test_tail_default_n_returns_all_when_fewer() -> None:
     logging_setup.configure()
     logging.getLogger("tail-test").warning("only-line")
     lines = logging_setup.tail()
-    assert any("only-line" in l for l in lines)
+    assert any("only-line" in ln for ln in lines)
 
 
 def test_tail_strips_trailing_newlines() -> None:
     logging_setup.configure()
     logging.getLogger("t").warning("hello")
     lines = logging_setup.tail()
-    assert all(not l.endswith("\n") for l in lines)
+    assert all(not ln.endswith("\n") for ln in lines)

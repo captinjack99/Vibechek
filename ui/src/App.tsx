@@ -27,18 +27,15 @@ interface TrackAnalyzedPayload {
 }
 
 /**
- * True if `trackPath` lives under `libraryPath`. Used to drop stale
- * `track_analyzed` events from a previous/cancelled analyze run that arrive
- * after the user has switched to a different library — without this, those
- * events get merged (appended) into the new library as phantom tracks.
- * Normalizes separators + case so Windows `C:\Foo\bar.flac` matches a
- * library path of `C:/Foo` regardless of slash direction or casing.
+ * True if `trackPath` lives under `root`. Normalizes separators + case so
+ * Windows `C:\Foo\bar.flac` matches a root of `C:/Foo` regardless of slash
+ * direction or casing.
  */
-function isUnderLibrary(trackPath: string, libraryPath: string | null): boolean {
-  if (!libraryPath) return false;
+function isUnderLibrary(trackPath: string, root: string | null): boolean {
+  if (!root) return false;
   const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
   const t = norm(trackPath);
-  const lib = norm(libraryPath);
+  const lib = norm(root);
   return t === lib || t.startsWith(lib + "/");
 }
 
@@ -61,17 +58,27 @@ export default function App() {
   //
   // Stale-event guard: a cancelled/superseded analyze keeps streaming events
   // that are already queued in the sidecar's thread pool + Tauri's event
-  // channel. If the user switched libraries in the meantime, those events
-  // carry paths from the OLD folder and would be appended into the NEW
-  // library as phantom tracks (mergeAnalyzedTrack appends on path-not-found).
-  // We read libraryPath fresh from the store on each event (not via a
-  // subscription, so this closure never goes stale) and drop any event whose
-  // track isn't under the currently-open library.
+  // channel. A path-prefix-only check ("is this track under the current
+  // library?") is NOT enough — switching from `D:/Music/House` to its parent
+  // `D:/Music` leaves the old run's events still "under" the new library, so
+  // they phantom-merge (mergeAnalyzedTrack appends on path-not-found).
+  //
+  // Instead we anchor live-merge to an explicit run token (LibraryBrowser
+  // bumps it per analyze; any library switch invalidates it). We accept an
+  // event only when (a) a run is currently authorized and (b) the track lives
+  // under THAT run's launch root — not merely under whatever library is open
+  // now. State is read fresh from the store on each event (not via a
+  // subscription) so this closure never goes stale.
+  //
+  // Note: the sidecar's `track_analyzed` notification carries no run id of its
+  // own, so this is the strongest guard available frontend-side; once the run
+  // is invalidated, every still-queued event from it is dropped.
   useSidecarEvent<TrackAnalyzedPayload>("track_analyzed", (payload) => {
     const path = payload?.track?.path;
     if (!path) return;
-    const libraryPath = useLibraryStore.getState().libraryPath;
-    if (!isUnderLibrary(path, libraryPath)) return;
+    const { analyzeRun } = useLibraryStore.getState();
+    if (!analyzeRun) return;
+    if (!isUnderLibrary(path, analyzeRun.root)) return;
     mergeAnalyzedTrack(payload.track);
   });
 

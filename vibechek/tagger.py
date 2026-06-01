@@ -2,9 +2,13 @@
 
 Three responsibilities:
 
-1. **Snapshot** every ID3/Vorbis frame on every file before any write — including
+1. **Snapshot** every ID3/Vorbis/atom on every file before any write — including
    Rekordbox-specific GEOB and PRIV frames (cue points, beat grids, memory cues).
-   Binary frames are base64-encoded for JSON safety.
+   ID3-bearing formats (MP3 *and* AIFF/WAV) capture GEOB/PRIV; FLAC captures every
+   Vorbis comment; M4A captures every atom (binary atoms like ``covr`` / Serato
+   freeform are base64-encoded). Binary payloads are base64-encoded for JSON safety.
+   Formats with no tag-reader path are recorded as ``_unsupported`` so the count
+   surfaces in ``BackupStats`` rather than masquerading as a complete backup.
 2. **Restore** the snapshot exactly, frame-for-frame, with no loss.
 3. **Apply** ML analysis results back to files with confidence filtering,
    while preserving any Rekordbox binary frames that already exist.
@@ -27,9 +31,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from mutagen.aiff import AIFF
 from mutagen.flac import FLAC
 from mutagen.id3 import (
     GEOB,
+    ID3,
+    PRIV,
     TALB,
     TBPM,
     TCON,
@@ -38,10 +45,10 @@ from mutagen.id3 import (
     TKEY,
     TPE1,
     TXXX,
-    PRIV,
 )
 from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4
+from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
+from mutagen.wave import WAVE
 
 from vibechek.config import TaggingConfig
 from vibechek.io import atomic_write_json
@@ -69,6 +76,12 @@ CUSTOM_TAGS = ("energy", "mood", "timeslot", "direction", "vocal")
 class BackupStats:
     total: int = 0
     backed_up: int = 0
+    # Files that were scanned and written into the backup but whose format has
+    # no tag-reader path (`read_all_tags` returned `_unsupported`). These carry
+    # NO tags, so a restore can't put anything back — they are NOT a safety net.
+    # Surfaced so the UI can warn "N files not fully backed up" instead of the
+    # backup silently claiming "no loss" for formats it can't actually read.
+    not_fully_backed_up: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -77,6 +90,11 @@ class RestoreStats:
     total: int = 0
     restored: int = 0
     skipped_missing: int = 0
+    # Backup entries whose format had no reader at backup time (`_unsupported`):
+    # there is nothing to restore, but we count them explicitly rather than
+    # silently skipping, so the caller can tell "30 files had no backup to
+    # restore" apart from "30 files were already up to date".
+    skipped_unsupported: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -103,15 +121,30 @@ class ApplyStats:
 def read_all_tags(filepath: Path) -> dict[str, Any]:
     """Extract every relevant tag from `filepath` as a JSON-safe dict.
 
-    For MP3, this includes Rekordbox-specific GEOB and PRIV binary frames,
-    base64-encoded for serialization safety. For FLAC/M4A, only the standard
-    text frames are captured (Rekordbox stores its data in MP3 GEOB anyway).
+    The backup is FORMAT-COMPLETE for every reader we have:
+
+    - **MP3 / AIFF / WAV** (all ID3-based): every text frame plus all TXXX, and
+      the Rekordbox-specific GEOB and PRIV binary frames base64-encoded. AIFF
+      and WAV carry the *same* ID3 cue/beatgrid frames as MP3, so dropping them
+      (as the old code did) was a real cue-loss risk on restore.
+    - **FLAC**: every Vorbis comment (not a fixed subset), so ReplayGain,
+      label/catalog, comments and Serato fields all survive.
+    - **M4A**: every atom, with binary atoms (``covr`` artwork, Serato
+      ``----``-freeform atoms) base64-encoded.
+
+    Any extension we have no reader for is recorded as ``{"_unsupported": True}``
+    so the count surfaces in `BackupStats.not_fully_backed_up` and restore can
+    report it, rather than the backup silently claiming "no loss".
     """
     ext = filepath.suffix.lower()
     tags: dict[str, Any] = {}
     try:
         if ext == ".mp3":
-            tags = _read_mp3_tags(filepath)
+            tags = _read_id3_tags(MP3(filepath).tags)
+        elif ext in (".aiff", ".aif"):
+            tags = _read_id3_tags(AIFF(filepath).tags)
+        elif ext == ".wav":
+            tags = _read_id3_tags(WAVE(filepath).tags)
         elif ext == ".flac":
             tags = _read_flac_tags(filepath)
         elif ext == ".m4a":
@@ -123,10 +156,15 @@ def read_all_tags(filepath: Path) -> dict[str, Any]:
     return {k: v for k, v in tags.items() if v is not None}
 
 
-def _read_mp3_tags(filepath: Path) -> dict[str, Any]:
-    audio = MP3(filepath)
+def _read_id3_tags(id3: ID3 | None) -> dict[str, Any]:
+    """Snapshot an ID3 tag block (shared by MP3, AIFF and WAV).
+
+    AIFF/WAV embed a standard ID3v2 chunk, so the same GEOB/PRIV cue frames a
+    DJ tool writes to MP3 can live here too — this is the single place that
+    captures them for every ID3-bearing format.
+    """
     out: dict[str, Any] = {}
-    if not audio.tags:
+    if not id3:
         return out
 
     text_frame_map = {
@@ -134,15 +172,15 @@ def _read_mp3_tags(filepath: Path) -> dict[str, Any]:
         "TBPM": "bpm", "TKEY": "key", "TIT1": "subgenre",
     }
     for frame_id, field_name in text_frame_map.items():
-        if frame_id in audio.tags:
-            out[field_name] = str(audio.tags[frame_id])
+        if frame_id in id3:
+            out[field_name] = str(id3[frame_id])
 
-    for key in audio.tags:
+    for key in id3:
         if key.startswith("TXXX:"):
             desc = key.split(":", 1)[1]
-            out[f"txxx_{desc.lower()}"] = str(audio.tags[key])
+            out[f"txxx_{desc.lower()}"] = str(id3[key])
         elif key.startswith("GEOB:"):
-            frame = audio.tags[key]
+            frame = id3[key]
             out[f"geob_{key}"] = {
                 "encoding": frame.encoding,
                 "mime": frame.mime,
@@ -151,7 +189,7 @@ def _read_mp3_tags(filepath: Path) -> dict[str, Any]:
                 "data": base64.b64encode(frame.data).decode("ascii"),
             }
         elif key.startswith("PRIV:"):
-            frame = audio.tags[key]
+            frame = id3[key]
             out[f"priv_{key}"] = {
                 "owner": frame.owner,
                 "data": base64.b64encode(frame.data).decode("ascii"),
@@ -163,19 +201,30 @@ def _read_flac_tags(filepath: Path) -> dict[str, Any]:
     audio = FLAC(filepath)
     if not audio.tags:
         return {}
-    out: dict[str, Any] = {
-        "title": _first(audio.tags.get("title")),
-        "artist": _first(audio.tags.get("artist")),
-        "album": _first(audio.tags.get("album")),
-        "genre": _first(audio.tags.get("genre")),
-        "bpm": _first(audio.tags.get("bpm")),
-        "key": _first(audio.tags.get("key")),
-        "subgenre": _first(audio.tags.get("grouping")),
+    # Pull the well-known DJ fields into our canonical names so restore writes
+    # them back to the right Vorbis key (genre→GENRE, subgenre→GROUPING, ...).
+    canonical = {
+        "title": "title", "artist": "artist", "album": "album",
+        "genre": "genre", "bpm": "bpm", "key": "key", "grouping": "subgenre",
     }
-    for custom in CUSTOM_TAGS:
-        val = _first(audio.tags.get(custom))
+    out: dict[str, Any] = {}
+    handled: set[str] = set()
+    for vorbis_key, field_name in canonical.items():
+        val = _first(audio.tags.get(vorbis_key))
         if val is not None:
-            out[f"txxx_{custom}"] = val
+            out[field_name] = val
+            handled.add(vorbis_key)
+    # Format-complete: capture EVERY remaining Vorbis comment (ReplayGain,
+    # label/catalog, comment, Serato fields, custom energy/mood/etc.) as a
+    # `txxx_<key>` entry so restore puts it back verbatim. The old code only
+    # snapshotted a fixed field set and dropped everything else.
+    for vorbis_key in audio.tags.keys():
+        lk = vorbis_key.lower()
+        if lk in handled:
+            continue
+        val = _first(audio.tags.get(vorbis_key))
+        if val is not None:
+            out[f"txxx_{lk}"] = val
     return out
 
 
@@ -183,15 +232,63 @@ def _read_m4a_tags(filepath: Path) -> dict[str, Any]:
     audio = MP4(filepath)
     if not audio.tags:
         return {}
-    out: dict[str, Any] = {
-        "title": _first(audio.tags.get("\xa9nam")),
-        "artist": _first(audio.tags.get("\xa9ART")),
-        "album": _first(audio.tags.get("\xa9alb")),
-        "genre": _first(audio.tags.get("\xa9gen")),
+    # Pull the well-known atoms into canonical names; everything else is
+    # captured generically below so the backup is format-complete.
+    canonical = {
+        "\xa9nam": "title", "\xa9ART": "artist", "\xa9alb": "album",
+        "\xa9gen": "genre",
     }
+    out: dict[str, Any] = {}
+    handled: set[str] = set()
+    for atom, field_name in canonical.items():
+        val = _first(audio.tags.get(atom))
+        if val is not None:
+            out[field_name] = val
+            handled.add(atom)
     if "tmpo" in audio.tags:
         out["bpm"] = str(audio.tags["tmpo"][0])
+        handled.add("tmpo")
+
+    # Format-complete: snapshot EVERY other atom. Binary atoms (artwork `covr`,
+    # Serato `----:...` freeform atoms, any bytes payload) are base64-encoded
+    # under an `mp4atom_<atom>` key so they round-trip exactly; text/numeric
+    # atoms keep their values. The old code dropped all of these.
+    for atom in audio.tags.keys():
+        if atom in handled:
+            continue
+        out[f"mp4atom_{atom}"] = _encode_m4a_atom(audio.tags[atom])
     return out
+
+
+def _encode_m4a_atom(value: Any) -> Any:
+    """JSON-safe encoding of an arbitrary MP4 atom value list.
+
+    Returns a dict tagged with how it was encoded so `_write_m4a_tags` can
+    rebuild the exact mutagen type on restore (base64 for binary atoms,
+    freeform metadata preserved).
+    """
+    items: list[Any] = []
+    for item in value if isinstance(value, list) else [value]:
+        if isinstance(item, MP4FreeForm):
+            items.append({
+                "kind": "freeform",
+                "dataformat": int(item.dataformat),
+                "data": base64.b64encode(bytes(item)).decode("ascii"),
+            })
+        elif isinstance(item, MP4Cover):
+            items.append({
+                "kind": "cover",
+                "imageformat": int(item.imageformat),
+                "data": base64.b64encode(bytes(item)).decode("ascii"),
+            })
+        elif isinstance(item, (bytes, bytearray)):
+            items.append({
+                "kind": "bytes",
+                "data": base64.b64encode(bytes(item)).decode("ascii"),
+            })
+        else:
+            items.append({"kind": "plain", "value": item})
+    return {"_mp4atom": True, "items": items}
 
 
 def _first(value: Any) -> Any:
@@ -214,14 +311,31 @@ def write_all_tags(
 ) -> tuple[bool, str | None]:
     """Restore tag snapshot from `tags` onto `filepath`. Returns (success, error).
 
-    `config` controls the ID3 text-frame encoding used for MP3 writes; when
-    omitted we use a fresh `TaggingConfig()` (UTF-8). FLAC/M4A ignore it.
+    `config` controls the ID3 text-frame encoding used for ID3 writes (MP3 and
+    AIFF/WAV); when omitted we use a fresh `TaggingConfig()` (UTF-8). FLAC/M4A
+    ignore it.
     """
     ext = filepath.suffix.lower()
     cfg = config or TaggingConfig()
     try:
         if ext == ".mp3":
-            _write_mp3_tags(filepath, tags, cfg)
+            audio = MP3(filepath)
+            if audio.tags is None:
+                audio.add_tags()
+            _write_id3_tags(audio.tags, tags, cfg.id3_text_encoding)
+            audio.save()
+        elif ext in (".aiff", ".aif"):
+            audio = AIFF(filepath)
+            if audio.tags is None:
+                audio.add_tags()
+            _write_id3_tags(audio.tags, tags, cfg.id3_text_encoding)
+            audio.save()
+        elif ext == ".wav":
+            audio = WAVE(filepath)
+            if audio.tags is None:
+                audio.add_tags()
+            _write_id3_tags(audio.tags, tags, cfg.id3_text_encoding)
+            audio.save()
         elif ext == ".flac":
             _write_flac_tags(filepath, tags)
         elif ext == ".m4a":
@@ -234,12 +348,23 @@ def write_all_tags(
 
 
 def _write_mp3_tags(filepath: Path, tags: dict[str, Any], config: TaggingConfig) -> None:
+    """Restore an ID3 snapshot to an MP3 (kept for the public test surface)."""
     audio = MP3(filepath)
     if audio.tags is None:
         audio.add_tags()
+    _write_id3_tags(audio.tags, tags, config.id3_text_encoding)
+    audio.save()
 
-    enc = config.id3_text_encoding
 
+def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
+    """Write a tag snapshot into an ID3 block (shared by MP3, AIFF and WAV).
+
+    Pre-clears any existing GEOB/PRIV frames before re-adding the snapshot's
+    own, so a restore is idempotent and can't leave a *stale* cue/beatgrid
+    frame from the live file sitting alongside the restored one. (Text frames
+    are already overwritten by key; only the keyed-by-description binary frames
+    needed the explicit clear.)
+    """
     text_frame_writers = {
         "title": (TIT2, "TIT2"),
         "artist": (TPE1, "TPE1"),
@@ -251,14 +376,21 @@ def _write_mp3_tags(filepath: Path, tags: dict[str, Any], config: TaggingConfig)
     }
     for field_name, (frame_cls, frame_id) in text_frame_writers.items():
         if field_name in tags:
-            audio.tags[frame_id] = frame_cls(encoding=enc, text=str(tags[field_name]))
+            id3[frame_id] = frame_cls(encoding=enc, text=str(tags[field_name]))
+
+    # Pre-clear existing GEOB/PRIV so the snapshot's frames fully replace
+    # whatever is on disk rather than accumulating duplicates.
+    if any(k.startswith(("geob_", "priv_")) for k in tags):
+        for existing in [k for k in list(id3.keys())
+                         if k.startswith("GEOB:") or k.startswith("PRIV:")]:
+            del id3[existing]
 
     for key, val in tags.items():
         if key.startswith("txxx_"):
             tag_name = key[5:].upper()
-            audio.tags.add(TXXX(encoding=enc, desc=tag_name, text=str(val)))
+            id3.add(TXXX(encoding=enc, desc=tag_name, text=str(val)))
         elif key.startswith("geob_"):
-            audio.tags.add(GEOB(
+            id3.add(GEOB(
                 encoding=val["encoding"],
                 mime=val["mime"],
                 filename=val["filename"],
@@ -266,12 +398,10 @@ def _write_mp3_tags(filepath: Path, tags: dict[str, Any], config: TaggingConfig)
                 data=base64.b64decode(val["data"]),
             ))
         elif key.startswith("priv_"):
-            audio.tags.add(PRIV(
+            id3.add(PRIV(
                 owner=val["owner"],
                 data=base64.b64decode(val["data"]),
             ))
-
-    audio.save()
 
 
 def _write_flac_tags(filepath: Path, tags: dict[str, Any]) -> None:
@@ -307,7 +437,41 @@ def _write_m4a_tags(filepath: Path, tags: dict[str, Any]) -> None:
             audio["tmpo"] = [int(float(str(tags["bpm"]).split()[0]))]
         except (ValueError, IndexError):
             log.debug("Skipping non-numeric M4A bpm %r", tags.get("bpm"))
+    # Restore the generic atoms captured by `_read_m4a_tags` — binary atoms
+    # (artwork, Serato freeform) are rebuilt as their exact mutagen type.
+    for key, val in tags.items():
+        if key.startswith("mp4atom_"):
+            atom = key[len("mp4atom_"):]
+            try:
+                audio[atom] = _decode_m4a_atom(val)
+            except Exception:  # noqa: BLE001
+                log.debug("Skipping un-decodable M4A atom %r", atom)
     audio.save()
+
+
+def _decode_m4a_atom(encoded: Any) -> list[Any]:
+    """Rebuild a list of mutagen MP4 atom values from `_encode_m4a_atom`."""
+    if not (isinstance(encoded, dict) and encoded.get("_mp4atom")):
+        # Legacy/plain value — wrap as-is.
+        return encoded if isinstance(encoded, list) else [encoded]
+    out: list[Any] = []
+    for item in encoded["items"]:
+        kind = item.get("kind")
+        if kind == "freeform":
+            out.append(MP4FreeForm(
+                base64.b64decode(item["data"]),
+                dataformat=item["dataformat"],
+            ))
+        elif kind == "cover":
+            out.append(MP4Cover(
+                base64.b64decode(item["data"]),
+                imageformat=item["imageformat"],
+            ))
+        elif kind == "bytes":
+            out.append(base64.b64decode(item["data"]))
+        else:
+            out.append(item["value"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +504,20 @@ def backup_tags(
         cancellation.check()
         report_progress(on_progress, i + 1, stats.total, filepath.name)
         try:
-            backup["files"][str(filepath)] = read_all_tags(filepath)
+            entry = read_all_tags(filepath)
+            # Record byte size so `restore_tags_with_remap`'s (filename, size)
+            # strategy can disambiguate same-named tracks in a moved library
+            # instead of falling back to the risky basename-only match.
+            try:
+                entry["_size"] = filepath.stat().st_size
+            except OSError:
+                pass
+            backup["files"][str(filepath)] = entry
             stats.backed_up += 1
+            # A format we have no reader for carries NO tags — count it so the
+            # caller can warn instead of treating it as a real safety net.
+            if entry.get("_unsupported"):
+                stats.not_fully_backed_up += 1
         except Exception as e:  # noqa: BLE001
             stats.errors.append(f"{filepath.name}: {e}")
 
@@ -418,6 +594,14 @@ def restore_tags(
 
         if "_error" in tags:
             continue  # File had a backup error — nothing to restore
+
+        if tags.get("_unsupported"):
+            # This format had no reader at backup time, so there's nothing to
+            # put back. Record it explicitly rather than letting it fall through
+            # to `write_all_tags` (which would log a misleading "Unsupported
+            # format" *error* for a file the backup never actually captured).
+            stats.skipped_unsupported += 1
+            continue
 
         path = Path(filepath_str)
         if not path.exists():
@@ -721,6 +905,8 @@ def restore_tags_with_remap(
     backup_path: Path,
     library_root: Path,
     on_progress: ProgressCallback | None = None,
+    config: TaggingConfig | None = None,
+    allow_filename_only: bool = False,
 ) -> RemapRestoreStats:
     """Restore a tag backup with automatic remap for moved libraries.
 
@@ -732,12 +918,18 @@ def restore_tags_with_remap(
 
     1. **Exact path** — the backup's original path exists on disk verbatim.
     2. **Filename + size** — a file under `library_root` has the same name
-       AND the same byte size as the backup entry. This covers moved-but-
-       unmodified libraries (drive rename, folder relocation).
+       AND the same byte size as the backup entry. Backups now record `_size`,
+       so this strategy is the live disambiguator for moved-but-unmodified
+       libraries (drive rename, folder relocation).
     3. **Filename alone** — a single file under `library_root` has the same
-       name (no other file in the library shares the name). Last-resort
-       fallback for libraries where file sizes have drifted (e.g., a tagger
-       changed bytes after the backup).
+       name (no other file in the library shares the name). This is OFF by
+       default (`allow_filename_only=False`): for common DJ filenames
+       (`track01.mp3`, `Untitled.mp3`) a basename-only match can write one
+       track's cue frames onto a *different* same-named track. The caller must
+       explicitly opt in once they understand that risk.
+
+    `config` is forwarded to `write_all_tags` so MP3/AIFF/WAV restores honor the
+    user's chosen ID3 text-frame encoding (the RPC layer passes `config=cfg`).
 
     A backup entry whose `filename + size` matches *multiple* files in
     `library_root` is marked `ambiguous` (skipped) — restoring to the wrong
@@ -784,6 +976,12 @@ def restore_tags_with_remap(
             stats.matches.append(match_record)
             continue
 
+        if tags.get("_unsupported"):
+            # No tags were captured for this format — nothing to remap/restore.
+            match_record["strategy"] = "unsupported"
+            stats.matches.append(match_record)
+            continue
+
         # Strategy 1: exact path
         target: Path | None = None
         strategy: str = ""
@@ -812,8 +1010,13 @@ def restore_tags_with_remap(
                     stats.matches.append(match_record)
                     continue
 
-            # Strategy 3: filename alone — only safe when unique in the library.
-            if target is None:
+            # Strategy 3: filename alone — only safe when unique in the library,
+            # and even then only when the caller opted in. A unique basename is
+            # NOT proof it's the same track (two different `Untitled.mp3` files
+            # in different libraries), so writing cue frames on a basename match
+            # alone can corrupt a different track. Gated behind
+            # `allow_filename_only` so it can't fire silently.
+            if target is None and allow_filename_only:
                 if len(candidates) == 1:
                     target = candidates[0]
                     strategy = "filename"
@@ -844,7 +1047,7 @@ def restore_tags_with_remap(
         elif strategy == "filename":
             stats.matched_filename += 1
 
-        success, error = write_all_tags(target, tags)
+        success, error = write_all_tags(target, tags, config)
         if success:
             stats.restored += 1
         else:

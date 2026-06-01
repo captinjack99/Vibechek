@@ -228,8 +228,9 @@ def restore_tags_cmd(backup_file: Path) -> None:
 @main.command("journals")
 def journals_cmd() -> None:
     """List recent organize/dedupe operation journals (for `revert`)."""
-    from vibechek.journal import list_journals
     import datetime as _dt
+
+    from vibechek.journal import list_journals
 
     items = list_journals()
     if not items:
@@ -472,7 +473,8 @@ def preflight(models_dir: Path | None, quick: bool) -> None:
     `--quick` to skip that probe (returns in <1 sec but won't tell you whether
     essentia is installed inside your WSL distros).
     """
-    from vibechek.preflight import preflight as run_preflight, summary_lines
+    from vibechek.preflight import preflight as run_preflight
+    from vibechek.preflight import summary_lines
 
     result = run_preflight(models_dir, quick_wsl=quick)
     for line in summary_lines(result):

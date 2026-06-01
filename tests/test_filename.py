@@ -10,6 +10,50 @@ def test_extract_bpm_from_trailing_number() -> None:
     assert info["filename_bpm"] == 128
 
 
+# ---------------------------------------------------------------------------
+# BPM false-positive regressions (audit: support-modules MED)
+# ---------------------------------------------------------------------------
+
+
+def test_dash_delimited_trailing_number_not_treated_as_bpm() -> None:
+    """`Artist - Title - 128` is a track/catalog number, not a tempo."""
+    info = extract_from_filename("Artist - Title - 128.mp3")
+    assert info["filename_bpm"] is None
+
+
+def test_year_in_parens_not_treated_as_bpm() -> None:
+    """A trailing `(1998)` year must not be mined as BPM."""
+    info = extract_from_filename("Artist - Title (1998).mp3")
+    assert info["filename_bpm"] is None
+
+
+def test_bare_four_digit_year_not_treated_as_bpm() -> None:
+    info = extract_from_filename("Artist - Live At Somewhere 1998.mp3")
+    assert info["filename_bpm"] is None
+
+
+def test_explicit_bpm_token_overrides_dash_delimiter() -> None:
+    """An explicit `bpm` suffix is authoritative even after a ` - ` separator."""
+    info = extract_from_filename("Artist - Title - 128bpm.mp3")
+    assert info["filename_bpm"] == 128
+
+
+def test_explicit_bpm_token_with_space() -> None:
+    info = extract_from_filename("Artist - Title 124 BPM.flac")
+    assert info["filename_bpm"] == 124
+
+
+def test_underscore_joined_trailing_number_is_bpm() -> None:
+    info = extract_from_filename("track_128.mp3")
+    assert info["filename_bpm"] == 128
+
+
+def test_camelot_key_at_end_of_stem_no_delimiter() -> None:
+    """End-of-stem keys (no trailing delimiter/extension) must still parse."""
+    info = extract_from_filename("Artist - Title - 5A")
+    assert info["filename_key"] == "5A"
+
+
 def test_extract_bpm_with_explicit_bpm_suffix() -> None:
     info = extract_from_filename("Some Track - 124bpm.flac")
     assert info["filename_bpm"] == 124

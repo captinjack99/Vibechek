@@ -62,6 +62,33 @@ def test_render_markdown_contains_all_top_level_sections() -> None:
     assert ("## WSL" in md) or ("## Native venv" in md) or True
 
 
+def test_model_integrity_unverified_surfaced_when_sha_table_empty(monkeypatch) -> None:
+    """With an empty MODEL_SHA256 table the report flags integrity unverified
+    and the markdown surfaces it (audit: INFO -> surface)."""
+    from vibechek import analyzer
+
+    monkeypatch.setattr(analyzer, "MODEL_SHA256", {}, raising=True)
+    report = doctor.build_report()
+    assert report.model_integrity_verified is False
+    md = doctor.render_markdown(report)
+    assert "Integrity: **unverified**" in md
+
+
+def test_model_integrity_verified_when_sha_table_populated(monkeypatch) -> None:
+    from vibechek import analyzer
+
+    monkeypatch.setattr(
+        analyzer,
+        "MODEL_SHA256",
+        {"effnet": {"pb": "ab" * 32, "json": "cd" * 32}},
+        raising=True,
+    )
+    report = doctor.build_report()
+    assert report.model_integrity_verified is True
+    md = doctor.render_markdown(report)
+    assert "Integrity: **verified**" in md
+
+
 def test_render_markdown_is_paste_safe_no_credentials() -> None:
     """Defensive: the markdown must not contain known credential markers.
 

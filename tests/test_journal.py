@@ -7,9 +7,6 @@ trash-not-revertible guards.
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 
 from vibechek import journal
