@@ -61,6 +61,13 @@ class AnalysisConfig:
     # so a GPU that's only ~3-workers-deep no longer caps total throughput when
     # there are 16 idle CPU cores. Set False to use the old single-device pool.
     hybrid_cpu_gpu: bool = True
+    # Neural-net inference backend. "essentia_tf" (default) runs the
+    # Discogs-EffNet models through essentia-tensorflow exactly as before.
+    # "onnx" (experimental) runs the same models through ONNX Runtime
+    # (vibechek/onnx_backend.py): cross-vendor GPU + no end-of-life TF runtime,
+    # validated to parity in docs/ONNX_MIGRATION.md. essentia is still used for
+    # the DSP (decode, melspec, BPM, key) under either engine.
+    inference_engine: str = "essentia_tf"  # "essentia_tf" | "onnx"
 
 
 @dataclass
