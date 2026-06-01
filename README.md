@@ -82,6 +82,8 @@ Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to s
 
 Better yet: **hybrid analysis runs your GPU and your spare CPU cores at the same time.** A modest laptop GPU might only fit ~3 analysis workers in VRAM, which used to leave 16 CPU cores idle. Now Vibechek runs GPU workers *and* CPU workers against one shared work queue that self-balances — whichever device finishes a track grabs the next. On an RTX 4070 Laptop + i9, a 50-track run split GPU 9 / CPU 41 and used every resource at once. Toggle it in Settings.
 
+There's also an **experimental ONNX Runtime inference engine** (`AnalysisConfig.inference_engine = "onnx"`, opt-in) that runs the same models with **cross-vendor GPU acceleration — AMD, Intel, and Apple via DirectML/CoreML, not just NVIDIA/CUDA**. It's validated to match the default TensorFlow path on a real track, but it's still experimental (the converted head models need hosting first), so the default stays the essentia-tensorflow engine.
+
 ### ⏪ Undo that actually undoes
 
 Organize and dedupe-move write an append-only journal as they go — one flushed line per file moved, *before* the next move. So a run that dies halfway (disk full, power loss) is recoverable, and a finished run can be reverted with one click from the **Recent operations** panel. Files go back to exactly where they came from, newest-first, never clobbering anything that's since moved into the origin.
@@ -210,7 +212,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 **665 Python tests** · **44 JSON-RPC methods** · **29 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 32 frontend tests across keeperRules, LibraryFilters, ConfirmModal, Sidebar
+- 38 frontend tests across keeperRules, rpc, LibraryFilters, ConfirmModal, Sidebar, DuplicatesView
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 

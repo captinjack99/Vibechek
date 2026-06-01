@@ -8,7 +8,7 @@ preserving Rekordbox cue points and beat grids. It runs entirely on your machine
 no account, no telemetry, no upload. Free forever under **AGPL-3.0**.
 
 - **Repo:** https://github.com/papapew/Vibechek
-- **Current version:** `v0.4.0-beta.7` (public beta)
+- **Current version:** `v0.4.0-beta.8` (public beta)
 - **Platforms:** Windows, macOS, Linux (desktop app + CLI)
 
 > This is the living project summary. For release history see [CHANGELOG.md](../CHANGELOG.md).
@@ -37,7 +37,10 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 - **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 44 JSON-RPC
   methods, threadpool dispatch (8 workers) so fast reads interleave with long ops,
   cooperative cancellation, and all the real work (analyzer, tagger, duplicates,
-  organizer, journal, profiles, config, wsl, resources, …).
+  organizer, journal, profiles, config, wsl, resources, …). Two beta.8 additions:
+  `cdj_export` (FLAC → AIFF transcode + Rekordbox-XML rewrite for older CDJs, CLI-only)
+  and `onnx_backend` (an opt-in ONNX Runtime inference engine that mirrors
+  `analyzer.load_models`, selected via the `inference_engine` config field).
 - **Auto-generated types:** `scripts/generate_ts_types.py` mirrors Python dataclasses
   into `ui/src/types/generated.ts` so the wire stays type-safe.
 
@@ -53,6 +56,9 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 | **Backup / restore** | One-click snapshot of every tag (incl. binary frames) + full restore, with backup history and stale-backup warnings. |
 | **Undo journal** | Organize + dedupe-move write an append-only JSONL journal (one flushed line per move). Partial runs are recoverable; finished runs revert with one click. |
 | **DJ profiles** | One-click setting presets for different workflows. |
+| **FLAC → CDJ export** | `vibechek cdj-export <rekordbox.xml> --out <dir>` transcodes a FLAC library to sample-identical 16-bit **AIFF** and rewrites the Rekordbox XML so beat grids + cues copy across with zero offset math — lets older Pioneer CDJs play a FLAC collection. Strictly additive (sources never touched); never MP3 (its encoder delay shifts the grid). CLI-only; optional `[cdj]` extra (soundfile) with an ffmpeg fallback. |
+| **Inference engine (opt-in ONNX)** | Analysis runs on the bundled essentia-TensorFlow path by default (`inference_engine = "essentia_tf"`). An opt-in **ONNX Runtime** backend (`"onnx"`) runs every neural forward pass off the EOL TF 2.5 runtime with a cross-vendor GPU EP chain (CUDA → ROCm → DirectML → CoreML → CPU); validated to match the TF path end-to-end. Essentia stays for DSP either way. |
+| **In-app auto-update** | Opt-in `tauri-plugin-updater`: Settings → "Software updates" → check / download / install / relaunch. CI signs artifacts + publishes `latest.json` when a signing key is configured; ships inert until one is enrolled. |
 | **Zero-CLI setup** | Windows auto-installs WSL Ubuntu (UAC) + Essentia and routes analysis through it with transparent path translation; macOS/Linux create a hermetic `~/.vibechek/venv/`. Optional one-click GPU (CUDA pip wheels). |
 
 ## Platform model
@@ -89,12 +95,18 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 5. **GEOB/PRIV preservation** on every tag write — guarded by a regression test.
 6. **JSON config** (not TOML): native null type, graceful load, drops unknown keys so
    adding fields is backwards-safe.
+7. **Opt-in heavy deps stay out of the core install.** The ONNX engine is config-gated
+   (`inference_engine`, default `essentia_tf`) and imports `onnxruntime`/`essentia` lazily;
+   CDJ export's `soundfile` lives in the optional `[cdj]` extra (ffmpeg fallback otherwise).
+   `numpy` is declared in the `[dev]` extra (not core) because the analysis code imports it
+   lazily while the pure-logic tests import it directly — so a clean `[dev]` install can run
+   them without erroring at collection.
 
 ## Project stats
 
 <!-- These mirror the README stats line (auto-updated by scripts/update_readme_stats.py). -->
-- **487 Python tests**, **44 JSON-RPC methods**, **27 Python modules**
-- **32 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+- **665 Python tests**, **44 JSON-RPC methods**, **29 Python modules**
+- **38 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
 - Production-tested against a ~12,000-track personal DJ library
 
 ## Roadmap

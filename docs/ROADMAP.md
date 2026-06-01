@@ -95,9 +95,14 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 - ✅ Toast notifications for success / info
 - ✅ `.gitignore` hygiene (test artifacts, IDE settings, OS junk)
 
-**Shipped during the beta.3 → beta.7 cycle:**
+**Shipped during the beta.3 → beta.8 cycle:**
 
 - ✅ **Full codebase audit** — fixed every HIGH + MED finding (atomic writes, path-traversal guard, organize overwrite-prevention, cancellation coverage, RPC sync guardrail, …). See CHANGELOG beta.4.
+- ✅ **End-to-end audit closeout** — the beta.8 remediation cleared the remaining findings: all 4 HIGH (lossy tag backup now format-complete incl. AIFF/WAV cue frames, dead Direction classifier, opaque UNC/network-share error, racing concurrent index writes) plus the MED/LOW sweep (RPC input validation/clamping, `sanitize_folder_name` reserved-name rejection, multi-GPU device-0 pin, atomic WSL shim rewrites, …). See CHANGELOG beta.8.
+- ✅ **FLAC → CDJ export** ([`vibechek/cdj_export.py`](../vibechek/cdj_export.py)) — `vibechek cdj-export <rekordbox.xml> --out <dir>` transcodes a FLAC library to sample-identical 16-bit AIFF and rewrites the Rekordbox XML so beat grids (`TEMPO`) + cues (`POSITION_MARK`) copy across with zero offset math, letting older Pioneer CDJs play a FLAC collection. Strictly additive; never MP3 (its encoder delay shifts the grid). Optional `[cdj]` extra (soundfile) with an ffmpeg fallback.
+- ✅ **In-app auto-update wiring (opt-in)** — `tauri-plugin-updater`; Settings → "Software updates" → check / download / install / relaunch. CI signs artifacts + publishes `latest.json` when a signing key is configured; ships inert (unsigned) until one is enrolled.
+- ✅ **ONNX inference backend (opt-in, validated end-to-end)** ([`vibechek/onnx_backend.py`](../vibechek/onnx_backend.py)) — selectable via `AnalysisConfig.inference_engine = "onnx"` (default stays `essentia_tf`, byte-unchanged). Runs every neural forward pass on ONNX Runtime (MTG's official EffNet ONNX backbone + tf2onnx-converted heads) with a cross-vendor GPU EP chain (CUDA → ROCm → DirectML → CoreML → CPU); essentia stays only for DSP. Validated to match the TF path on a real track (embedding cosine 0.99942, sub-0.005 deltas) via `scripts/onnx_parity.py`.
+- ✅ **SOTA accuracy wins** — Essentia's EDM-tuned `edma` key profile; BPM octave-error guard (folds 70↔140 / 87↔174 and cross-checks the filename BPM); de-dup recall via Chromaprint sliding-offset alignment + multi-probe bucketing.
 - ✅ **Hybrid CPU+GPU analysis** — GPU + CPU workers share one work-stealing queue; per-device throughput measured. `--hybrid/--no-hybrid` + Settings toggle.
 - ✅ **GPU on Windows via WSL CUDA wheels** — one-click "Enable GPU" installs NVIDIA pip wheels into the managed venv (works on any WSL distro, no apt/keyring/root).
 - ✅ **Operation undo journal** — append-only JSONL for organize + dedupe-move; one-click revert from a "Recent operations" panel; crash-recoverable.
@@ -135,6 +140,7 @@ Logged here so they don't get forgotten:
 - **Per-file tag undo / history.** Operation-level undo (organize/dedupe) shipped in beta.5; per-file tag-write history (roll back a single field write, not just a full restore) is still open.
 - **MixedInKey/Lexicon/Beatport tag import.** "I already have data from $TOOL, use that as ground truth instead of/alongside ML."
 - **Native GPU on Windows.** ~~Currently auto-routes through WSL~~ — done: GPU works through WSL CUDA wheels today. A native path is only worth it if/when Essentia ships Windows wheels with CUDA.
+- **ONNX inference backend.** ~~Retire the EOL bundled TensorFlow 2.5 from the inference path~~ — implemented in beta.8 behind `AnalysisConfig.inference_engine = "onnx"` (default still `essentia_tf`), validated end-to-end against the TF path. Remaining before flipping the default: host the converted head `.onnx` files on the model mirror (so no local `tf2onnx` conversion is needed) and run a full-library smoke test.
 - **Cancel mid-step in WSL install.** Largely addressed in beta.3 (setsid process-group kill); further per-phase granularity could still help.
 
 ## Architectural notes
