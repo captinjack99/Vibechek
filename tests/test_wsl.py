@@ -951,12 +951,18 @@ def test_build_try_chain_handles_unknown_libs_gracefully() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_native_venv_probe_reports_supported_on_unix(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_native_venv_probe_reports_supported_on_unix(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
     """probe_native_venv reports supported=True on Linux/macOS, False on Windows."""
     from vibechek import native_install
 
     # Force the supported flag for the test
     monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
+    # Point the probe at an empty tmp dir so the "nothing installed" assertions are
+    # deterministic regardless of whether the dev machine happens to have a real
+    # ~/.vibechek/venv (otherwise this flakes on any machine that does).
+    monkeypatch.setattr(native_install, "VENV_DIR", tmp_path / ".vibechek" / "venv")
     status = native_install.probe_native_venv()
     assert status.supported is True
     assert status.venv_dir.endswith(".vibechek/venv") or status.venv_dir.endswith(".vibechek\\venv")
