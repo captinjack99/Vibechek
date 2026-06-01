@@ -144,12 +144,15 @@ wsl -d Ubuntu -- bash -lc '
 Then set `LD_LIBRARY_PATH` to include the resulting `~/.vibechek/venv/lib/python3.*/site-packages/nvidia/*/lib` directories, or just re-run the GUI "Enable GPU" button and it'll regenerate `cuda-env.sh` for you.
 
 > **Experimental: non-NVIDIA GPUs via ONNX.** The default analysis engine
-> (essentia-tensorflow) only accelerates on NVIDIA/CUDA. An experimental, opt-in ONNX
-> Runtime engine (`AnalysisConfig.inference_engine = "onnx"`) runs the same models with
-> cross-vendor GPU support (AMD/Intel/Apple via DirectML/CoreML). It's validated to
-> match the default engine but isn't production-ready yet (the converted models aren't
-> hosted), so the essentia path stays the default. See
-> [docs/ONNX_MIGRATION.md](ONNX_MIGRATION.md).
+> (essentia-tensorflow) only accelerates on NVIDIA/CUDA. An experimental, opt-in
+> **ONNX Runtime** engine (Settings → Analysis → Inference engine) runs the same
+> models with cross-vendor GPU support (AMD/Intel/Apple via DirectML/CoreML) on
+> **plain Essentia with no TensorFlow**. Validated to match the default engine.
+> Turn it on in Settings → **Set up ONNX engine** (provisions a separate
+> `~/.vibechek/venv-onnx`). For a manual CLI install: `pip install vibechek[onnx]`
+> (CPU), then optionally `pip install onnxruntime-gpu` (NVIDIA/AMD-ROCm) or
+> `onnxruntime-directml` (Windows any-vendor GPU) to replace the CPU runtime.
+> See [docs/ONNX_MIGRATION.md](ONNX_MIGRATION.md).
 
 ### Skipping analyze entirely
 
