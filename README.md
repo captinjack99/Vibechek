@@ -207,7 +207,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**639 Python tests** · **44 JSON-RPC methods** · **28 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**665 Python tests** · **44 JSON-RPC methods** · **29 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
 - 32 frontend tests across keeperRules, LibraryFilters, ConfirmModal, Sidebar
