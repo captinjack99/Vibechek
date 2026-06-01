@@ -44,6 +44,13 @@ dependencies = [
 ml = [
     "essentia-tensorflow>=2.1b6.dev1110; platform_system != 'Windows'",
 ]
+# FLAC→CDJ export: soundfile (libsndfile) does the sample-accurate FLAC→AIFF
+# transcode. Optional and gated at import time inside vibechek/cdj_export.py —
+# if it's absent the tool falls back to an ffmpeg subprocess.
+# Install with: pip install vibechek[cdj]
+cdj = [
+    "soundfile>=0.12",
+]
 # Dev / tests
 dev = [
     "pytest>=8.0",

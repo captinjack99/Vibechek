@@ -773,6 +773,65 @@ def profile_load_cmd(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# cdj-export — transcode a FLAC library to AIFF + rewrite Rekordbox XML
+# ---------------------------------------------------------------------------
+
+
+@main.command("cdj-export")
+@click.argument("rekordbox_xml", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--out", "out_dir", required=True, type=click.Path(file_okay=False, path_type=Path),
+              help="Directory for the AIFFs and the rewritten rekordbox_cdj.xml.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Plan the export (counts + intended files) without writing audio or XML.")
+def cdj_export_cmd(rekordbox_xml: Path, out_dir: Path, dry_run: bool) -> None:
+    """Transcode FLAC tracks to AIFF and rewrite a Rekordbox XML for old CDJs.
+
+    Input is a Rekordbox collection XML (File → Export Collection in xml
+    format). For every FLAC TRACK this transcodes the audio to a 16-bit AIFF
+    under --out and writes <out>/rekordbox_cdj.xml repointed at those AIFFs,
+    keeping every beatgrid (TEMPO) and cue (POSITION_MARK) intact. Import that
+    XML back into Rekordbox and export to USB to play FLAC libraries on CDJs
+    (e.g. CDJ-2000nexus) that can't read FLAC. Non-FLAC tracks pass through.
+    """
+    from vibechek.cdj_export import CdjExportError, export_for_cdj
+
+    try:
+        with _progress_bar("CDJ export") as progress:
+            task = progress.add_task("transcoding…", total=None)
+
+            def _on_progress(done: int, total: int, name: str) -> None:
+                progress.update(task, total=total or None, completed=done, description=name)
+
+            result = export_for_cdj(
+                rekordbox_xml, out_dir, on_progress=_on_progress, dry_run=dry_run
+            )
+    except CdjExportError as e:
+        raise click.ClickException(str(e)) from e
+
+    verb = "Planned" if dry_run else "Converted"
+    console.print(
+        f"[green]{verb}[/] [bold]{result.flac_planned}[/] FLAC → AIFF • "
+        f"[dim]{result.passthrough} passthrough • "
+        f"{result.skipped} skipped • {result.errors} errors[/]"
+    )
+    if result.track_errors:
+        console.print("[yellow]Per-track issues:[/]")
+        for te in result.track_errors[:20]:
+            console.print(f"  [red]{te.location}[/] — {te.message}")
+        if len(result.track_errors) > 20:
+            console.print(f"  [dim]… and {len(result.track_errors) - 20} more[/]")
+    if dry_run:
+        console.print(
+            f"[dim]Dry run — no audio or XML written. Output would go to[/] [cyan]{out_dir}[/]"
+        )
+    else:
+        console.print(f"[green]Wrote[/] [cyan]{result.output_xml}[/]")
+        console.print(
+            "[dim]Next: import this XML into Rekordbox, then export to USB for the CDJ.[/]"
+        )
+
+
+# ---------------------------------------------------------------------------
 # rpc — JSON-RPC server for the desktop sidecar
 # ---------------------------------------------------------------------------
 
