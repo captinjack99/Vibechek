@@ -57,6 +57,11 @@ dev = [
     "pytest-cov>=4.1",
     "ruff>=0.4",
     "mypy>=1.10",
+    # numpy is a real (lazily-imported) dependency of the analysis code; the ML
+    # extras pull it transitively, but the pure-logic tests (ONNX patch math,
+    # direction/BPM, etc.) need it directly. Declared here so CI's `[dev]`-only
+    # install can run those tests instead of erroring at collection.
+    "numpy>=1.24",
 ]
 
 [project.scripts]
