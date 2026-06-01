@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import json
 import subprocess
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
 from vibechek import gpu_detect
 from vibechek.gpu_detect import DetectedGpu, detect_all_gpus
-
 
 # ---------------------------------------------------------------------------
 # Sample fixtures — real-world output snippets from each tool.
@@ -263,6 +262,95 @@ def test_intel_detection_on_windows_via_wmic(monkeypatch: pytest.MonkeyPatch) ->
     assert d.vendor == "intel"
     assert d.device_kind == "integrated"
     assert d.vram_mb == 1024
+
+
+# ---------------------------------------------------------------------------
+# Windows: PowerShell Get-CimInstance path (preferred over wmic) + comma safety
+# ---------------------------------------------------------------------------
+
+
+# ConvertTo-Json emits a bare object for one controller, an array for several.
+CIM_OUTPUT_SINGLE_AMD = json.dumps(
+    {"Name": "AMD Radeon RX 7800 XT", "AdapterRAM": 17179869184}
+)
+CIM_OUTPUT_ARRAY = json.dumps([
+    {"Name": "Intel(R) UHD Graphics 730", "AdapterRAM": 1073741824},
+    {"Name": "AMD Radeon RX 7800 XT", "AdapterRAM": 17179869184},
+])
+# Real-world: some OEM adapter names contain a comma — the old CSV split
+# (`line.split(",")`) desynced columns on these.
+CIM_OUTPUT_COMMA_NAME = json.dumps(
+    {"Name": "AMD Radeon RX 7800 XT, Gaming OC", "AdapterRAM": 17179869184}
+)
+
+
+def test_windows_prefers_powershell_cim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When PowerShell is available, CIM JSON is used (not wmic)."""
+    monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("powershell"))
+    monkeypatch.setattr(
+        gpu_detect.subprocess, "run",
+        lambda *a, **kw: _fake_completed(CIM_OUTPUT_SINGLE_AMD),
+    )
+    devices = gpu_detect._detect_amd()
+    assert len(devices) == 1
+    d = devices[0]
+    assert d.vendor == "amd"
+    assert d.name == "AMD Radeon RX 7800 XT"
+    assert d.vram_mb == 16384
+
+
+def test_cim_handles_array_and_vendor_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An array of controllers is filtered by vendor."""
+    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("powershell"))
+    monkeypatch.setattr(
+        gpu_detect.subprocess, "run",
+        lambda *a, **kw: _fake_completed(CIM_OUTPUT_ARRAY),
+    )
+    intel = gpu_detect._detect_gpus_cim("intel")
+    assert intel is not None and len(intel) == 1
+    assert intel[0].vendor == "intel"
+    assert intel[0].device_kind == "integrated"
+    amd = gpu_detect._detect_gpus_cim("amd")
+    assert amd is not None and len(amd) == 1
+    assert amd[0].name == "AMD Radeon RX 7800 XT"
+
+
+def test_cim_comma_in_name_is_not_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The JSON path keeps a comma-containing adapter name intact."""
+    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("powershell"))
+    monkeypatch.setattr(
+        gpu_detect.subprocess, "run",
+        lambda *a, **kw: _fake_completed(CIM_OUTPUT_COMMA_NAME),
+    )
+    devices = gpu_detect._detect_gpus_cim("amd")
+    assert devices is not None and len(devices) == 1
+    assert devices[0].name == "AMD Radeon RX 7800 XT, Gaming OC"
+
+
+def test_cim_returns_none_without_powershell(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No powershell/pwsh -> None so the caller falls back to wmic."""
+    monkeypatch.setattr(gpu_detect.shutil, "which", lambda _: None)
+    assert gpu_detect._detect_gpus_cim("amd") is None
+
+
+def test_wmic_csv_fallback_is_comma_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When PowerShell is absent, the wmic CSV fallback uses the csv module so a
+    quoted comma in the Name field no longer corrupts the column split."""
+    monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("wmic"))
+    wmic_csv = (
+        "Node,AdapterRAM,Name\n"
+        'DESKTOP,17179869184,"AMD Radeon RX 7800 XT, Gaming OC"\n'
+    )
+    monkeypatch.setattr(
+        gpu_detect.subprocess, "run",
+        lambda *a, **kw: _fake_completed(wmic_csv),
+    )
+    devices = gpu_detect._detect_amd()
+    assert len(devices) == 1
+    assert devices[0].name == "AMD Radeon RX 7800 XT, Gaming OC"
+    assert devices[0].vram_mb == 16384
 
 
 # ---------------------------------------------------------------------------

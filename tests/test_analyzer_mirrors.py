@@ -84,6 +84,7 @@ def test_env_var_override_replaces_default_mirrors(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("VIBECHEK_MODELS_URL", "https://my-mirror.example/models")
     # Re-import to pick up the env var
     import importlib
+
     import vibechek.analyzer
     importlib.reload(vibechek.analyzer)
 
@@ -124,6 +125,7 @@ def test_verify_model_sha256_noop_when_expected_none(tmp_path: Path) -> None:
 
 def test_verify_model_sha256_accepts_correct_hash(tmp_path: Path) -> None:
     import hashlib
+
     from vibechek import analyzer
 
     target = tmp_path / "model.pb"

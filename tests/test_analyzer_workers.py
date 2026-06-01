@@ -2,7 +2,10 @@
 
 The cap logic lives in `vibechek.analyzer`:
 - `_probe_free_vram_mb` shells out to `nvidia-smi` and returns free VRAM in MB
-  (summed across visible GPUs), or None on any failure.
+  for the SINGLE GPU our workers pin (device 0, or the honored
+  CUDA_VISIBLE_DEVICES index) — NOT summed across all cards — or None on any
+  failure. (Audit fix: summing over-provisioned workers that all landed on
+  GPU 0 → OOM.)
 - `analyze_directory` uses that probe (when `use_gpu in ("auto", "on")`) to set
   `gpu_cap = max(1, free_mb // _GPU_WORKER_MB)` and emit a `report_progress`
   message so the GUI can surface "Capped workers from X to Y due to Z".
@@ -19,7 +22,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibechek import analyzer
-
 
 # ---------------------------------------------------------------------------
 # _probe_free_vram_mb — direct unit tests
@@ -48,11 +50,35 @@ def test_probe_parses_single_gpu_output() -> None:
         assert analyzer._probe_free_vram_mb() == 9216
 
 
-def test_probe_sums_free_across_multiple_gpus() -> None:
-    """Multi-GPU rig -> sum of free VRAM (documented behaviour)."""
+def test_probe_returns_device0_on_multi_gpu_by_default() -> None:
+    """Multi-GPU rig -> free VRAM of device 0 ONLY (workers all pin GPU 0).
+
+    Audit fix: the old probe summed (8000+4000=12000) which over-provisioned
+    workers that then all piled onto GPU 0 and OOM'd. We now report only the
+    device the workers actually use.
+    """
     with patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
-         patch("subprocess.run", return_value=_mock_smi_result("8000\n4000\n")):
-        assert analyzer._probe_free_vram_mb() == 12000
+         patch("subprocess.run", return_value=_mock_smi_result("8000\n4000\n")), \
+         patch.dict("os.environ", {}, clear=False):
+        # Ensure no CUDA_VISIBLE_DEVICES override leaks from the host env.
+        with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": ""}, clear=False):
+            assert analyzer._probe_free_vram_mb() == 8000
+
+
+def test_probe_honors_cuda_visible_devices_index() -> None:
+    """CUDA_VISIBLE_DEVICES=1 -> report the SECOND nvidia-smi row's free VRAM."""
+    with patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
+         patch("subprocess.run", return_value=_mock_smi_result("8000\n4000\n")), \
+         patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "1"}, clear=False):
+        assert analyzer._probe_free_vram_mb() == 4000
+
+
+def test_probe_falls_back_to_first_row_when_index_out_of_range() -> None:
+    """CUDA_VISIBLE_DEVICES points past the visible cards -> first row."""
+    with patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
+         patch("subprocess.run", return_value=_mock_smi_result("8000\n4000\n")), \
+         patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "5"}, clear=False):
+        assert analyzer._probe_free_vram_mb() == 8000
 
 
 def test_probe_returns_none_on_timeout() -> None:
@@ -90,10 +116,15 @@ def test_probe_returns_none_on_empty_output() -> None:
 
 
 def test_probe_skips_malformed_rows_but_keeps_good_ones() -> None:
-    """One bad row shouldn't poison the probe — sum the parseable rows."""
+    """A bad leading row shouldn't poison the probe — device 0 = first parseable.
+
+    With "not-a-number\n8000\n4000\n" the malformed row is skipped, leaving
+    [8000, 4000]; device 0 reports 8000.
+    """
     with patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
-         patch("subprocess.run", return_value=_mock_smi_result("8000\nnot-a-number\n4000\n")):
-        assert analyzer._probe_free_vram_mb() == 12000
+         patch("subprocess.run", return_value=_mock_smi_result("not-a-number\n8000\n4000\n")), \
+         patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": ""}, clear=False):
+        assert analyzer._probe_free_vram_mb() == 8000
 
 
 # ---------------------------------------------------------------------------

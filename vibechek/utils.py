@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Callable, Iterable
 
 log = logging.getLogger(__name__)
 
@@ -15,6 +15,18 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
 })
 
 INVALID_FOLDER_CHARS = '<>:"/\\|?*'
+
+# Windows reserved device names. A folder named exactly one of these (case-
+# insensitively, with or without an extension) is uncreatable on Windows and
+# behaves as a device on the legacy DOS namespace — `CON`, `PRN`, `AUX`, `NUL`,
+# `COM1`..`COM9`, `LPT1`..`LPT9`. A genre tag of "CON" (or "nul.mp3") would
+# otherwise produce a folder the OS refuses to create, failing every move into
+# it. We map these to a safe sentinel instead.
+_WIN_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -67,7 +79,8 @@ def sanitize_folder_name(name: str | None) -> str:
     library root — `library_root / ".."` writes into the PARENT directory.
 
     Guarantees the result is a single, safe path segment: no separators, no
-    leading/trailing dots, never "." or "..".
+    leading/trailing dots, never "." or "..", never a Windows reserved device
+    name (CON/PRN/AUX/NUL/COM1-9/LPT1-9).
     """
     if not name:
         return "Unknown"
@@ -76,12 +89,21 @@ def sanitize_folder_name(name: str | None) -> str:
     # Collapse any stray separators the loop above already turned into "_"
     # is handled, but a literal forward slash on POSIX is in INVALID_FOLDER_CHARS
     # so it's covered. Now strip leading/trailing dots + whitespace so "..",
-    # ".", " ..", "..hidden" etc. can't traverse or create dotfiles.
-    name = name.strip().strip(".").strip()
+    # ".", " ..", "..hidden" etc. can't traverse or create dotfiles. Trailing
+    # dots/spaces are also silently dropped by the Windows shell ("foo." → "foo"),
+    # so stripping them keeps the on-disk name and our intended name in sync.
+    # `strip(" .")` removes any mix of trailing/leading dots and spaces in one
+    # pass (so "House. . " → "House"), which the older chained
+    # `.strip().strip(".")` missed when dots and spaces were interleaved.
+    name = name.strip(" .")
     # After stripping, a name that was purely dots/separators is empty, OR a
     # residual "." / ".." would still be dangerous — reject them outright.
     if not name or name in (".", ".."):
         return "Unknown"
+    # Windows reserved device names are uncreatable. Match case-insensitively on
+    # the stem before the first dot ("nul.mp3" is just as reserved as "NUL").
+    if name.split(".", 1)[0].lower() in _WIN_RESERVED_NAMES:
+        return f"_{name}"
     return name
 
 

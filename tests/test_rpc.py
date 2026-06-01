@@ -18,7 +18,6 @@ import pytest
 
 from vibechek import rpc
 
-
 # ---------------------------------------------------------------------------
 # A pipe-like stdin we can write to from the test thread
 # ---------------------------------------------------------------------------
@@ -44,7 +43,7 @@ class _QueueStdin:
     def close(self) -> None:
         self._q.put(None)
 
-    def __iter__(self) -> "_QueueStdin":
+    def __iter__(self) -> _QueueStdin:
         return self
 
     def __next__(self) -> str:
@@ -70,7 +69,7 @@ class _SyncedStringIO(io.StringIO):
     def read_lines(self) -> list[str]:
         with self._lock:
             text = self.getvalue()
-        return [l for l in text.splitlines() if l.strip()]
+        return [ln for ln in text.splitlines() if ln.strip()]
 
 
 # ---------------------------------------------------------------------------

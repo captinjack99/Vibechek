@@ -87,6 +87,13 @@ export function LibraryBrowser() {
   const toggleSelect = useLibraryStore((s) => s.toggleSelect);
   const selectPaths = useLibraryStore((s) => s.selectPaths);
   const clearSelection = useLibraryStore((s) => s.clearSelection);
+  // Live-merge run token API. `beginAnalyzeRun` authorizes streamed
+  // `track_analyzed` events for a run; `invalidateAnalyzeRun` drops that
+  // authorization on a library switch so a prior run's queued events can't
+  // phantom-merge into the new library.
+  const beginAnalyzeRun = useLibraryStore((s) => s.beginAnalyzeRun);
+  const endAnalyzeRun = useLibraryStore((s) => s.endAnalyzeRun);
+  const invalidateAnalyzeRun = useLibraryStore((s) => s.invalidateAnalyzeRun);
 
   const active = useOperationStore((s) => s.active);
   const begin = useOperationStore((s) => s.begin);
@@ -166,6 +173,9 @@ export function LibraryBrowser() {
   // there's drift on disk. The probe is best-effort — a failure leaves the
   // banner empty rather than blocking the load.
   const handleOpenRecent = async (record: LibraryRecord) => {
+    // Switching libraries: drop any in-flight analyze's live-merge token so its
+    // still-streaming events don't phantom-merge into the library we're loading.
+    invalidateAnalyzeRun();
     begin("analyze");
     try {
       const result = await rpc<{ loaded: boolean; report?: AnalysisReport; reason?: string }>(
@@ -406,6 +416,9 @@ export function LibraryBrowser() {
     const selected = await openDialog({ directory: true, multiple: false });
     if (typeof selected !== "string") return;
 
+    // New folder = library switch: invalidate any in-flight analyze's
+    // live-merge token before we swap the path + tracks out from under it.
+    invalidateAnalyzeRun();
     setLibraryPath(selected);
     setTracks([]);
     begin("analyze");
@@ -447,6 +460,11 @@ export function LibraryBrowser() {
       ? tracks.filter((t) => t.ml_analysis).map((t) => t.path)
       : [];
     const myGen = ++analyzeGen.current;
+    // Authorize live-merge of streamed `track_analyzed` events for THIS run,
+    // rooted at the library we're analyzing. The token supersedes any prior
+    // run so a cancelled/replaced analyze's queued events stop merging (see
+    // the listener in App.tsx). Cleared in `finally` once this run settles.
+    const runId = beginAnalyzeRun(libraryPath);
     begin("analyze");
     try {
       const report = await rpc<AnalysisReport>("analyze_directory", {
@@ -455,6 +473,9 @@ export function LibraryBrowser() {
         use_gpu: analysisCfg.use_gpu,
         hybrid_cpu_gpu: analysisCfg.hybrid_cpu_gpu,
         skip_paths: alreadyAnalyzed,
+        // Forwarded for forward-compat / debugging; the current sidecar ignores
+        // unknown params. The authoritative guard is the frontend run token.
+        analyze_run_id: runId,
       });
       if (analyzeGen.current !== myGen) return;
       if (incremental) {
@@ -476,6 +497,11 @@ export function LibraryBrowser() {
       finish();
     } catch (e) {
       if (analyzeGen.current === myGen) fail(e);
+    } finally {
+      // Close this run's live-merge authorization. No-ops if a newer run (or a
+      // library switch) already superseded us, so we never wipe a fresh run's
+      // token. Any of this run's still-queued events are dropped from here on.
+      endAnalyzeRun(runId);
     }
   };
 

@@ -21,14 +21,21 @@ the bytes are on disk, then `Path.replace()`s into place (POSIX atomic rename;
 Windows uses MoveFileExW which is also atomic for same-volume renames). On any
 exception the partial file is unlinked so we don't leave junk behind.
 
+The temp name carries a per-writer suffix (`.<pid>.<tid>.partial`) so two
+threads/processes writing the SAME destination at the same time don't truncate
+each other's bytes or race on a shared temp file. Each writer builds its own
+partial and the final `replace()` is the only contended step — and that step is
+itself atomic, so the loser's bytes simply lose the race cleanly rather than
+producing a torn file. (Concurrent *load-modify-save* on a single index file is
+serialized separately by the caller via a module-level lock; this suffix closes
+the lower-level torn-write window for everything else.)
+
 Why we don't just use `tempfile.NamedTemporaryFile`:
   - It creates the temp file in the system temp dir by default, which can be on
     a different volume — `Path.replace()` would then fall back to non-atomic
     copy+delete and lose the crash-safety guarantee.
-  - It picks a random name, defeating the "user can see this partial belongs
-    to file X" debugging affordance.
 
-The sibling-`.partial` pattern keeps the temp file on the SAME volume as the
+The sibling-partial pattern keeps the temp file on the SAME volume as the
 destination, guaranteeing the rename is atomic.
 """
 
@@ -37,6 +44,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -81,11 +89,16 @@ def atomic_write_json(
         data, indent=indent, ensure_ascii=ensure_ascii, sort_keys=sort_keys
     )
 
-    # `.partial` rather than `.tmp` so it's obvious from `ls` what file the
-    # partial belongs to (e.g. `analyses/abc.json.partial` next to
-    # `analyses/abc.json`). Same volume as the destination, so the rename
-    # below is guaranteed atomic.
-    tmp = path.with_suffix(path.suffix + ".partial")
+    # Unique-per-writer `.partial` suffix so concurrent writers (the dispatch
+    # thread pool can run rename_library / tag_library / forget_backup at once)
+    # each get their OWN temp file instead of truncating a shared
+    # `<name>.partial`. Including pid+tid keeps it obvious from `ls` what file
+    # the partial belongs to while still being collision-free across
+    # threads/processes. Same volume as the destination, so the rename below is
+    # guaranteed atomic.
+    tmp = path.with_suffix(
+        path.suffix + f".{os.getpid()}.{threading.get_ident()}.partial"
+    )
     try:
         # Open + write + fsync. fsync forces the bytes to physical disk so a
         # power loss between write and rename doesn't leave a renamed-but-

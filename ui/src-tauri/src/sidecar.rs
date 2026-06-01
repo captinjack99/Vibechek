@@ -392,9 +392,20 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
         }
     };
 
-    // Response: has `id` and either `result` or `error`
+    // Response: has `id` and either `result` or `error`.
+    //
+    // We always send numeric (`u64`) ids, but accept a stringified id
+    // defensively: a JSON-RPC peer (or a future sidecar build) is free to echo
+    // the id back as a string like `"5"`, and JS round-trips through Number can
+    // also stringify. Without this, `as_u64()` returns None, we fall through to
+    // the notification branch, the response is silently dropped, and the caller
+    // hangs until its per-method timeout. Coerce a numeric-string id back to
+    // u64 so it matches the pending map.
     if let Some(id_val) = msg.get("id") {
-        if let Some(id) = id_val.as_u64() {
+        let id = id_val
+            .as_u64()
+            .or_else(|| id_val.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+        if let Some(id) = id {
             let mut pending = inner.pending.lock().await;
             if let Some(tx) = pending.remove(&id) {
                 let _ = tx.send(msg);
@@ -404,6 +415,13 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
                 // the caller already got a timeout error). Not an error.
                 eprintln!("[sidecar] late/duplicate response for id {id} (likely post-timeout) — ignoring");
             }
+            return Ok(());
+        }
+        // A non-null id we couldn't coerce to u64 (e.g. a non-numeric string).
+        // We never issue such ids, so this is a protocol oddity worth logging
+        // rather than silently treating as a notification.
+        if !id_val.is_null() {
+            eprintln!("[sidecar] response with non-numeric id {id_val} — cannot match a pending request; ignoring");
             return Ok(());
         }
     }

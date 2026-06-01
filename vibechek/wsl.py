@@ -27,12 +27,11 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable
 
 from vibechek.platform import IS_WINDOWS
 
@@ -40,6 +39,12 @@ from vibechek.platform import IS_WINDOWS
 # either fail with garbage output or hang for the full subprocess timeout.
 # Add new known-bad names here as we encounter them.
 _NON_LINUX_DISTROS = {"docker-desktop", "docker-desktop-data", "rancher-desktop"}
+
+# Allowed characters in a WSL distro name. Used to reject injection attempts
+# before a name is interpolated into the PowerShell `install_wsl` command (a
+# single quote would otherwise break out and run arbitrary elevated commands).
+# Real distro names — "Ubuntu-24.04", "Debian", "kali-linux" — all match this.
+_VALID_DISTRO_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 log = logging.getLogger(__name__)
 
@@ -179,21 +184,26 @@ def _parse_distro_list(stdout: str) -> list[DistroInfo]:
         Debian              Stopped   2
     """
     distros: list[DistroInfo] = []
-    lines = [l.rstrip() for l in stdout.splitlines() if l.strip()]
+    lines = [ln.rstrip() for ln in stdout.splitlines() if ln.strip()]
     # Skip header
     for line in lines[1:]:
         is_default = line.lstrip().startswith("*")
         clean = line.lstrip().lstrip("*").strip()
-        parts = re.split(r"\s+", clean)
-        if len(parts) >= 3:
+        # The trailing two columns are always STATE and VERSION (single tokens);
+        # everything before them is the distro NAME, which CAN contain spaces
+        # (e.g. "Ubuntu 22.04 LTS"). Peeling from the RIGHT with maxsplit=2
+        # keeps the name intact, whereas a left `split(r"\s+")` shredded it into
+        # `["Ubuntu", "22.04", "LTS", ...]` and mis-assigned the columns.
+        parts = clean.rsplit(maxsplit=2)
+        if len(parts) == 3:
             distros.append(DistroInfo(
                 name=parts[0],
                 state=parts[1],
                 version=parts[2],
                 is_default=is_default,
             ))
-        elif parts:
-            distros.append(DistroInfo(name=parts[0], is_default=is_default))
+        elif clean:
+            distros.append(DistroInfo(name=clean, is_default=is_default))
     return distros
 
 
@@ -225,10 +235,15 @@ SHIM="$HOME_DIR/.vibechek/venv/bin/vibechek"
 if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
     # Strip the bad line. Done at probe time so users don't have to think.
     TMP="$(mktemp)"
-    grep -v "cuda-env.sh" "$SHIM" > "$TMP"
-    cat "$TMP" > "$SHIM"
+    # Atomic rewrite: only replace the live shim if grep produced a non-empty
+    # result, then `mv` (rename) over it. The old `cat "$TMP" > "$SHIM"`
+    # truncated the shim FIRST, so a disk-full between truncate and copy left
+    # `vibechek` empty — and this repair runs on every status probe.
+    if grep -v "cuda-env.sh" "$SHIM" > "$TMP" && [ -s "$TMP" ]; then
+        mv "$TMP" "$SHIM"
+        printf 'repaired=1\n'
+    fi
     rm -f "$TMP"
-    printf 'repaired=1\n'
 fi
 for p in "$SHIM" "$HOME_DIR/.local/bin/vibechek"; do
   if [ -x "$p" ]; then
@@ -897,20 +912,66 @@ def engine_gpu_info_to_dict(info: EngineGpuInfo) -> dict:
 
 _WIN_PATH_RE = re.compile(r"^([A-Za-z]):[/\\](.*)$")
 _WSL_MNT_RE = re.compile(r"^/mnt/([a-z])(/.*)?$")
+# UNC / network-share inputs: `\\server\share\...`, `//server/share/...`, or the
+# `\\?\UNC\server\share\...` long-path form. These have no `/mnt/<drive>/`
+# equivalent inside WSL (the share isn't mounted there), so analyze would either
+# fail or silently scan zero files. We detect and refuse them with a clear,
+# actionable error rather than passing the unusable path through.
+_UNC_PATH_RE = re.compile(r"^(?:\\\\|//)(?:\?\\UNC\\|\?/UNC/)?[^\\/]")
+# `\\?\` / `\\.\` long-path and device prefixes wrapping a normal drive path,
+# e.g. `\\?\C:\Music`. We strip the prefix before translating.
+_LONGPATH_DRIVE_RE = re.compile(r"^[\\/]{2}[?.][\\/]([A-Za-z]:[\\/].*)$")
+
+
+class UnsupportedWslPathError(ValueError):
+    """Raised when a Windows path can't be represented inside WSL.
+
+    Subclasses ValueError so existing `except ValueError` handlers (and the
+    RPC/analyzer error surfacing) catch it without code changes.
+    """
 
 
 def win_to_wsl_path(path: str) -> str:
     """Convert a Windows path to its WSL `/mnt/<drive>/...` form.
 
     Idempotent: returns the input unchanged if it doesn't look like a Win path.
+
+    Raises `UnsupportedWslPathError` (a `ValueError`) for UNC / network-share
+    paths (`\\\\server\\share\\...`), which have no `/mnt/<drive>/...` equivalent
+    inside WSL — letting one through would make analyze fail opaquely or find
+    zero files instead of telling the user what's wrong.
     """
     if not path:
         return path
+
+    # Reject UNC / network-share paths up front with an actionable message.
+    # `\\?\C:\...` (long-path-prefixed *drive* paths) are NOT UNC — strip the
+    # prefix below and translate normally. `\\?\UNC\server\share` IS a share.
+    longpath = _LONGPATH_DRIVE_RE.match(path)
+    if longpath:
+        path = longpath.group(1)
+    elif _UNC_PATH_RE.match(path):
+        raise UnsupportedWslPathError(
+            "Network/UNC library paths aren't supported through WSL — "
+            "copy the library to a local drive (e.g. C:\\ or D:\\) and try "
+            f"again. Got: {path}"
+        )
+
     m = _WIN_PATH_RE.match(path)
     if not m:
         return path  # Already WSL-style or unparseable
     drive = m.group(1).lower()
     rest = m.group(2).replace("\\", "/")
+    # Windows silently strips trailing dots/spaces from each path component
+    # (`C:\Foo.\Bar ` opens `C:\Foo\Bar`), but Linux treats them literally, so
+    # the translated path wouldn't exist inside WSL. Normalize to match
+    # Windows' own behaviour. We never strip a lone "." or ".." segment.
+    parts = []
+    for seg in rest.split("/"):
+        if seg not in (".", ".."):
+            seg = seg.rstrip(". ")
+        parts.append(seg)
+    rest = "/".join(parts)
     return f"/mnt/{drive}/{rest}"
 
 
@@ -1076,6 +1137,20 @@ def install_wsl(
     """
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
+
+    # `distro` is interpolated into a PowerShell command string below. A single
+    # quote (or any shell metacharacter) would escape the literal and run
+    # arbitrary PowerShell behind the UAC elevation. Real WSL distro names only
+    # use letters, digits, dot, underscore, and hyphen (e.g. "Ubuntu-24.04"),
+    # so we hard-reject anything else. The RPC boundary adds the same guard.
+    if not _VALID_DISTRO_RE.match(distro):
+        return {
+            "ok": False,
+            "error": (
+                f"Invalid distro name {distro!r}: only letters, digits, "
+                f"'.', '_', and '-' are allowed."
+            ),
+        }
 
     from vibechek import cancellation  # noqa: PLC0415
 
@@ -1668,12 +1743,15 @@ chmod +x "$ENV_FILE"
 SHIM="$HOME/.vibechek/venv/bin/vibechek"
 if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
     echo "      Repairing previously-corrupted vibechek shim..."
-    # Strip any line containing cuda-env.sh from the shim.
+    # Strip any line containing cuda-env.sh from the shim. Atomic: write to a
+    # temp, verify non-empty, then `mv` over the live shim — never truncate it
+    # first (a disk-full mid-copy would zero the entry point).
     TMP_SHIM="$(mktemp)"
-    grep -v "cuda-env.sh" "$SHIM" > "$TMP_SHIM"
-    cat "$TMP_SHIM" > "$SHIM"
+    if grep -v "cuda-env.sh" "$SHIM" > "$TMP_SHIM" && [ -s "$TMP_SHIM" ]; then
+        mv "$TMP_SHIM" "$SHIM"
+        echo "      Shim repaired."
+    fi
     rm -f "$TMP_SHIM"
-    echo "      Shim repaired."
 fi
 
 echo "INSTALLED: ${LIB_DIRS}"
@@ -1777,7 +1855,7 @@ def _build_try_chain(missing_libs: list[str]) -> tuple[str, list[str]]:
             continue
         all_pkgs.update(fallbacks)
         lines.append(f'# --- {lib} ---')
-        lines.append(f'INSTALLED_THIS=""')
+        lines.append('INSTALLED_THIS=""')
         for pkg in fallbacks:
             # `apt-get install` returns 100 on missing package; we let that
             # fall through to the next fallback.
@@ -1826,11 +1904,18 @@ if [ ! -f "$SHIM" ]; then
     exit 0
 fi
 if grep -q "cuda-env.sh" "$SHIM"; then
+    # Atomic rewrite: write the cleaned shim to a temp, verify it's non-empty,
+    # then `mv` (rename) over the live shim. Truncating the shim first (the old
+    # `cat "$TMP" > "$SHIM"`) risked leaving `vibechek` empty on a disk-full.
     TMP="$(mktemp)"
-    grep -v "cuda-env.sh" "$SHIM" > "$TMP"
-    cat "$TMP" > "$SHIM"
-    rm -f "$TMP"
-    echo "REPAIRED"
+    if grep -v "cuda-env.sh" "$SHIM" > "$TMP" && [ -s "$TMP" ]; then
+        mv "$TMP" "$SHIM"
+        rm -f "$TMP"
+        echo "REPAIRED"
+    else
+        rm -f "$TMP"
+        echo "REPAIR_FAILED"
+    fi
 else
     echo "ALREADY_OK"
 fi
@@ -1880,6 +1965,10 @@ fi
             break
         except UnicodeDecodeError:
             continue
+    if "REPAIR_FAILED" in stdout:
+        return {"ok": False, "error": "Shim repair aborted: the cleaned shim "
+                "would have been empty (possible disk-full). The original shim "
+                "was left intact. Free up disk space in WSL and try again."}
     if "REPAIRED" in stdout:
         return {"ok": True, "repaired": True,
                 "message": "Shim repaired. Analyze should work now."}
@@ -2106,6 +2195,7 @@ def run_vibechek_in_wsl(
     a Cancel click during a multi-hour analyze inside WSL would do nothing.
     """
     import threading as _threading
+
     from vibechek import cancellation
 
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
@@ -2335,11 +2425,37 @@ def _shell_quote(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _detect_wsl_encoding_order(sample: bytes) -> tuple[str, ...]:
+    """Pick the decode-attempt order for wsl.exe output by sniffing `sample`.
+
+    wsl.exe historically emits UTF-16 LE on Windows, but some builds (and
+    non-default code pages) emit UTF-8. Blindly trying utf-16-le first would
+    mis-decode UTF-8 output into CJK/garbage when the byte stream happens to
+    have even length and no invalid surrogate. We detect the actual encoding:
+
+      - A BOM is decisive: ``\\xff\\xfe`` → UTF-16 LE, ``\\xef\\xbb\\xbf`` → UTF-8.
+      - Otherwise, genuine UTF-16-LE ASCII text has a NUL as every other byte
+        (``A`` → ``\\x41\\x00``). If we see no interleaved NULs, it's not
+        UTF-16 — prefer UTF-8.
+    """
+    if sample.startswith(b"\xff\xfe"):
+        return ("utf-16-le", "utf-8", "cp1252")
+    if sample.startswith((b"\xef\xbb\xbf", b"\xff\xfe\x00\x00")):
+        return ("utf-8", "utf-16-le", "cp1252")
+    # No BOM: UTF-16-LE ASCII has a high density of NUL bytes (one per char).
+    # UTF-8 ASCII has essentially none. Use that to order the attempts.
+    if sample and b"\x00" in sample[: min(len(sample), 64)]:
+        return ("utf-16-le", "utf-8", "cp1252")
+    return ("utf-8", "utf-16-le", "cp1252")
+
+
 def _wsl_run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
-    """Run a wsl.exe command, decoding the UTF-16 output Windows uses for it."""
+    """Run a wsl.exe command, decoding the UTF-16-or-UTF-8 output Windows uses."""
     result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
-    # wsl.exe outputs UTF-16 LE by default on Windows. Try that first.
-    for enc in ("utf-16-le", "utf-8", "cp1252"):
+    # Sniff the encoding instead of assuming UTF-16-LE: a UTF-8 wsl.exe build
+    # would otherwise be mis-decoded into garbage on the first attempt.
+    order = _detect_wsl_encoding_order(result.stdout or result.stderr)
+    for enc in order:
         try:
             stdout = result.stdout.decode(enc).replace("\x00", "")
             stderr = result.stderr.decode(enc).replace("\x00", "")
@@ -2371,5 +2487,6 @@ __all__ = [
     "engine_gpu_info_to_dict",
     "win_to_wsl_path",
     "wsl_to_win_path",
+    "UnsupportedWslPathError",
     "to_dict",
 ]

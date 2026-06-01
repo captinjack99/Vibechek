@@ -36,7 +36,7 @@ Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 
 - ✅ PyInstaller spec ([`packaging/vibechek.spec`](../packaging/vibechek.spec))
 - ✅ Build scripts per OS: `build-windows.bat` / `build-macos.sh` / `build-linux.sh`
-- ✅ Inno Setup installer config — per-user, optional PATH integration
+- ✅ Windows desktop installer — Tauri-built NSIS `.exe` (per-user); CLI distributed as `vibechek-windows-x64.zip` (manual PATH)
 - ✅ Branded app icons in every format Tauri needs (`packaging/generate-icons.py`)
 - ✅ First-run model downloader command + GUI button
 - ✅ GitHub Actions:

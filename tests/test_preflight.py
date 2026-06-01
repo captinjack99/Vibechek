@@ -9,7 +9,6 @@ import pytest
 from vibechek import preflight as preflight_mod
 from vibechek.preflight import (
     EssentiaCheck,
-    ModelCheck,
     ModelsCheck,
     PreflightResult,
     check_models,
@@ -18,7 +17,6 @@ from vibechek.preflight import (
     to_dict,
 )
 from vibechek.wsl import DistroInfo, WSLStatus
-
 
 # ---------------------------------------------------------------------------
 # PreflightResult.reasons_not_ready

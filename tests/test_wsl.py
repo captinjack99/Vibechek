@@ -14,7 +14,9 @@ import pytest
 
 from vibechek.wsl import (
     DistroInfo,
+    UnsupportedWslPathError,
     WSLStatus,
+    _detect_wsl_encoding_order,
     _parse_distro_list,
     _shell_quote,
     _wsl_run,
@@ -22,7 +24,6 @@ from vibechek.wsl import (
     win_to_wsl_path,
     wsl_to_win_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Path translation
@@ -148,6 +149,28 @@ def test_parse_distro_list_partial_row() -> None:
     distros = _parse_distro_list(stdout)
     assert len(distros) == 1
     assert distros[0].name == "Ubuntu-24.04"
+
+
+def test_parse_distro_list_spaced_distro_name() -> None:
+    # A distro NAME can contain spaces ("Ubuntu 22.04 LTS"). The trailing two
+    # columns are always STATE and VERSION; everything before them is the name.
+    stdout = (
+        "  NAME                STATE     VERSION\n"
+        "* Ubuntu 22.04 LTS    Running   2\n"
+        "  Debian              Stopped   2\n"
+    )
+    distros = _parse_distro_list(stdout)
+    assert len(distros) == 2
+
+    spaced = distros[0]
+    assert spaced.name == "Ubuntu 22.04 LTS"
+    assert spaced.state == "Running"
+    assert spaced.version == "2"
+    assert spaced.is_default is True
+
+    assert distros[1].name == "Debian"
+    assert distros[1].state == "Stopped"
+    assert distros[1].version == "2"
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +407,44 @@ def test_win_to_wsl_drive_only_passes_through() -> None:
     assert win_to_wsl_path("C:") == "C:"
 
 
-def test_win_to_wsl_unc_paths_pass_through() -> None:
-    # UNC paths (\\server\share\...) don't have a clean /mnt/c/-style equivalent
-    # in WSL. We leave them alone rather than producing a broken path.
-    assert win_to_wsl_path(r"\\server\share\file.mp3") == r"\\server\share\file.mp3"
+def test_win_to_wsl_unc_paths_raise() -> None:
+    # UNC paths (\\server\share\...) don't have a /mnt/c/-style equivalent in
+    # WSL (the share isn't mounted there), so we refuse them with a clear,
+    # actionable error instead of passing a broken path through to analyze.
+    with pytest.raises(UnsupportedWslPathError) as exc:
+        win_to_wsl_path(r"\\server\share\file.mp3")
+    msg = str(exc.value).lower()
+    assert "network" in msg or "unc" in msg
+    assert "local" in msg  # tells the user the fix: copy to a local drive
+    # UnsupportedWslPathError must be a ValueError so existing handlers catch it.
+    assert isinstance(exc.value, ValueError)
+
+
+@pytest.mark.parametrize(
+    "unc",
+    [
+        r"\\NAS\Music\track.mp3",
+        r"\\192.168.1.10\share\a.flac",
+        "//server/share/file.mp3",          # forward-slash UNC form
+        r"\\?\UNC\server\share\file.mp3",    # long-path UNC form
+    ],
+)
+def test_win_to_wsl_unc_variants_raise(unc: str) -> None:
+    with pytest.raises(UnsupportedWslPathError):
+        win_to_wsl_path(unc)
+
+
+def test_win_to_wsl_longpath_drive_prefix_is_stripped() -> None:
+    # `\\?\C:\...` is a long-path-prefixed *drive* path, NOT a UNC share. We
+    # strip the prefix and translate it normally rather than rejecting it.
+    assert win_to_wsl_path(r"\\?\C:\Music\track.mp3") == "/mnt/c/Music/track.mp3"
+
+
+def test_win_to_wsl_strips_trailing_dot_and_space() -> None:
+    # Windows silently drops trailing dots/spaces per path component; Linux
+    # treats them literally, so the translated path must match Windows' view.
+    assert win_to_wsl_path("C:\\Foo.\\Bar ") == "/mnt/c/Foo/Bar"
+    assert win_to_wsl_path("C:\\Music \\track.mp3 ") == "/mnt/c/Music/track.mp3"
 
 
 def test_round_trip_paths_with_spaces() -> None:
@@ -436,8 +493,8 @@ def test_engine_gpu_native_returns_native_engine(monkeypatch: pytest.MonkeyPatch
 
 
 def test_engine_gpu_native_reports_devices(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vibechek.wsl import probe_engine_gpu
     from vibechek import resources
+    from vibechek.wsl import probe_engine_gpu
 
     monkeypatch.setattr("vibechek.wsl._ENGINE_GPU_CACHE", {})
 
@@ -467,8 +524,8 @@ def test_engine_gpu_native_reports_devices(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_engine_gpu_caches_results(monkeypatch: pytest.MonkeyPatch) -> None:
     """Second call within TTL hits the cache."""
-    from vibechek.wsl import probe_engine_gpu
     from vibechek import resources
+    from vibechek.wsl import probe_engine_gpu
 
     monkeypatch.setattr("vibechek.wsl._ENGINE_GPU_CACHE", {})
 
@@ -491,8 +548,8 @@ def test_engine_gpu_caches_results(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_engine_gpu_force_bypasses_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    from vibechek.wsl import probe_engine_gpu
     from vibechek import resources
+    from vibechek.wsl import probe_engine_gpu
 
     monkeypatch.setattr("vibechek.wsl._ENGINE_GPU_CACHE", {})
 
@@ -516,6 +573,7 @@ def test_engine_gpu_force_bypasses_cache(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_engine_gpu_info_to_dict_is_jsonable() -> None:
     """The wire form must round-trip through json so the GUI can read it."""
     import json
+
     from vibechek.wsl import EngineGpuDevice, EngineGpuInfo, engine_gpu_info_to_dict
 
     info = EngineGpuInfo(
@@ -633,6 +691,7 @@ def test_generated_cuda_script_parses_as_bash() -> None:
     """
     import shutil as _shutil
     import subprocess as _subprocess
+
     from vibechek.wsl import _CUDA_LIBS_BOOTSTRAP, _build_try_chain
 
     bash = _shutil.which("bash")
@@ -780,6 +839,7 @@ def test_generated_pip_cuda_script_parses_as_bash() -> None:
     """The new pip bootstrap is syntactically valid bash."""
     import shutil as _shutil
     import subprocess as _subprocess
+
     from vibechek.wsl import _CUDA_LIBS_PIP_BOOTSTRAP
 
     bash = _shutil.which("bash")
@@ -938,6 +998,7 @@ def test_native_install_run_with_progress_cancellation_terminates_child(
     """
     import sys as _sys
     import time as _time
+
     from vibechek import cancellation
     from vibechek.native_install import _run_with_progress
 
@@ -976,8 +1037,9 @@ def test_native_install_run_subprocess_cancellable_terminates_child(
 ) -> None:
     """Short-running cancellable wrapper also honors mid-run cancellation."""
     import sys as _sys
-    import time as _time
     import threading as _threading
+    import time as _time
+
     from vibechek import cancellation
     from vibechek.native_install import _run_subprocess_cancellable
 
@@ -1052,6 +1114,7 @@ def test_wsl_install_cancellation_watchdog_kills_child(
     import sys as _sys
     import threading as _threading
     import time as _time
+
     from vibechek import cancellation
     from vibechek.wsl import _start_cancellation_watchdog
 
@@ -1087,6 +1150,7 @@ def test_wsl_install_wsl_returns_cancelled_dict(monkeypatch: pytest.MonkeyPatch)
     import sys as _sys
     import threading as _threading
     import time as _time
+
     from vibechek import cancellation
     from vibechek import wsl as wsl_mod
 
@@ -1128,9 +1192,96 @@ def test_wsl_install_wsl_returns_cancelled_dict(monkeypatch: pytest.MonkeyPatch)
     cancellation.end()
 
 
+@pytest.mark.parametrize(
+    "evil_distro",
+    [
+        "Ubuntu'; Remove-Item C:\\ -Recurse -Force; '",  # classic injection
+        "Ubuntu' ; calc ; '",
+        "Ubuntu`nwhoami",                                  # newline
+        "Ubuntu 24.04",                                    # space
+        "Ubuntu$(whoami)",                                 # subshell
+        "",                                                # empty
+    ],
+)
+def test_install_wsl_rejects_unsafe_distro(
+    evil_distro: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """install_wsl refuses distro names with shell metacharacters.
+
+    The name is interpolated into a PowerShell command behind a UAC
+    elevation; a quote would break out and run arbitrary code. Validation
+    must reject BEFORE any subprocess is spawned.
+    """
+    from vibechek import wsl as wsl_mod
+
+    monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
+
+    # If validation is bypassed and a subprocess is launched, fail loudly.
+    def _boom(*_a, **_k):  # pragma: no cover - must not be reached
+        raise AssertionError("install_wsl spawned a process for an unsafe distro")
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", _boom)
+
+    result = wsl_mod.install_wsl(evil_distro)
+    assert result["ok"] is False
+    assert "invalid distro" in result["error"].lower()
+
+
+def test_install_wsl_accepts_valid_distro_name() -> None:
+    """A well-formed distro name passes the validation guard.
+
+    We only check the guard, not the full install: monkeypatch isn't needed
+    because on non-Windows CI install_wsl returns early before validation —
+    so assert the regex the guard uses accepts the canonical names directly.
+    """
+    from vibechek.wsl import _VALID_DISTRO_RE
+
+    for ok_name in ("Ubuntu-24.04", "Debian", "kali-linux", "openSUSE-Tumbleweed"):
+        assert _VALID_DISTRO_RE.match(ok_name), ok_name
+
+
+# ---------------------------------------------------------------------------
+# _wsl_run encoding detection
+# ---------------------------------------------------------------------------
+
+
+def test_detect_wsl_encoding_prefers_utf8_when_no_nul_bytes() -> None:
+    # A UTF-8 wsl.exe build emits plain ASCII/UTF-8 with no interleaved NULs.
+    assert _detect_wsl_encoding_order(b"Ubuntu-24.04 Running 2\n")[0] == "utf-8"
+
+
+def test_detect_wsl_encoding_prefers_utf16_for_interleaved_nuls() -> None:
+    # Classic wsl.exe UTF-16-LE output: each ASCII char followed by \x00.
+    utf16 = "Ubuntu".encode("utf-16-le")
+    assert _detect_wsl_encoding_order(utf16)[0] == "utf-16-le"
+
+
+def test_detect_wsl_encoding_honors_boms() -> None:
+    assert _detect_wsl_encoding_order(b"\xff\xfeU\x00")[0] == "utf-16-le"
+    assert _detect_wsl_encoding_order(b"\xef\xbb\xbfhello")[0] == "utf-8"
+
+
+def test_wsl_run_decodes_utf8_build_output() -> None:
+    # Regression: a UTF-8 wsl.exe build must not be mis-decoded as UTF-16.
+    payload = b"Ubuntu-24.04 LTS\n"
+    completed = subprocess.CompletedProcess(["wsl"], 0, payload, b"")
+    with patch("vibechek.wsl.subprocess.run", return_value=completed):
+        result = _wsl_run(["wsl", "--list"])
+    assert "Ubuntu-24.04 LTS" in result.stdout
+
+
+def test_wsl_run_decodes_utf16_build_output() -> None:
+    payload = "Ubuntu\n".encode("utf-16-le")
+    completed = subprocess.CompletedProcess(["wsl"], 0, payload, b"")
+    with patch("vibechek.wsl.subprocess.run", return_value=completed):
+        result = _wsl_run(["wsl", "--list"])
+    assert "Ubuntu" in result.stdout
+
+
 def test_native_venv_status_to_dict_is_jsonable() -> None:
     """The wire form round-trips through json so the GUI can read it."""
     import json
+
     from vibechek.native_install import NativeVenvStatus, to_dict
 
     status = NativeVenvStatus(

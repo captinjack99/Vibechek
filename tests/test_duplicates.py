@@ -16,7 +16,6 @@ from vibechek.duplicates import (
     handle_duplicates,
 )
 
-
 # ---------- Pure helpers ----------
 
 
@@ -155,6 +154,7 @@ def test_fingerprint_similarity_empty_returns_zero() -> None:
 def test_audio_fingerprint_raw_parses_fpcalc_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """audio_fingerprint_raw returns a list of unsigned 32-bit ints."""
     import subprocess as _subprocess
+
     from vibechek import duplicates
 
     fake_stdout = "DURATION=120\nFINGERPRINT=305419896,-559038737,3735928559\n"
@@ -220,6 +220,114 @@ def test_chromaprint_threshold_clusters_similar_fingerprints(
     )
     report_strict = duplicates.find_duplicates(tmp_path, cfg_strict)
     assert len(report_strict.audio_duplicates) == 0
+
+
+def test_fingerprint_similarity_matches_offset_transcode() -> None:
+    """A fingerprint shifted by a few frames (encoder delay) still scores high.
+
+    The old index-0-only comparison lined up frame i of one against frame i of
+    the other, so even a few-frame shift between two otherwise-identical tracks
+    collapsed similarity. Sliding alignment recovers it.
+    """
+    from vibechek.duplicates import _aligned_similarity, fingerprint_similarity
+
+    base = [(0x11111111 * i) & 0xFFFFFFFF for i in range(1, 41)]
+    # `shifted` is `base` delayed by 3 frames (3 junk frames prepended) — the
+    # acoustic content is identical, just offset, as a transcode/encoder-delay
+    # pair would be.
+    junk = [0xDEADBEEF, 0xCAFEBABE, 0x0BADF00D]
+    shifted = [*junk, *base]
+
+    # The OLD behaviour (offset-0 only) lines up junk against base → poor score.
+    naive = _aligned_similarity(base, shifted)
+    assert naive < 0.9
+    # The NEW sliding alignment finds the 3-frame offset → perfect overlap.
+    aligned = fingerprint_similarity(base, shifted)
+    assert aligned == 1.0
+
+
+def test_chromaprint_buckets_on_multiple_probes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Two transcodes whose FIRST sub-fingerprint differs still get compared.
+
+    The old single-first-subfingerprint bucketing filed them in different
+    buckets and never compared them — a missed duplicate. Multi-probe bucketing
+    files each track under several leading sub-fingerprints, so agreement on any
+    later probe puts them in a shared bucket.
+    """
+    from vibechek import duplicates
+    from vibechek.config import DuplicateConfig
+
+    a = tmp_path / "a.mp3"
+    b = tmp_path / "b.mp3"
+    a.write_bytes(b"a-content")
+    b.write_bytes(b"b-content")
+
+    # Identical from frame 1 onward, but frame 0 differs (as a transcode can
+    # perturb the very first frame). They share probe keys at indices >= 1.
+    tail = [(0x01020304 * i) & 0xFFFFFFFF for i in range(1, 40)]
+    fps = {
+        str(a): [0xAAAAAAAA, *tail],
+        str(b): [0xBBBBBBBB, *tail],  # different first frame, identical tail
+    }
+
+    monkeypatch.setattr(duplicates, "find_fpcalc", lambda: "fpcalc")
+    monkeypatch.setattr(
+        duplicates, "audio_fingerprint_raw",
+        lambda path, _cmd, duration=120: fps.get(str(path)),
+    )
+
+    cfg = DuplicateConfig(
+        use_md5=False,
+        use_chromaprint=True,
+        chromaprint_similarity_threshold=0.90,
+    )
+    report = duplicates.find_duplicates(tmp_path, cfg)
+    assert len(report.audio_duplicates) == 1
+    group = report.audio_duplicates[0]
+    all_paths = {group.keep.path, *(d.path for d in group.duplicates)}
+    assert all_paths == {str(a), str(b)}
+
+
+def test_find_duplicates_similarity_threshold_param_used(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The `similarity_threshold` parameter is honored when config is left default.
+
+    Contract with the RPC layer: find_duplicates exposes `similarity_threshold`
+    and uses it as the match cutoff. When the config carries the default
+    threshold, the explicit parameter wins.
+    """
+    from vibechek import duplicates
+    from vibechek.config import DuplicateConfig
+
+    a = tmp_path / "a.mp3"
+    b = tmp_path / "b.mp3"
+    a.write_bytes(b"a-content")
+    b.write_bytes(b"b-content")
+
+    # a + b differ in 1 bit / 96 bits → similarity ≈ 0.9896.
+    fps = {
+        str(a): [0x12345678, 0xABCDEF01, 0xDEADBEEF],
+        str(b): [0x12345678, 0xABCDEF01, 0xDEADBEEE],
+    }
+    monkeypatch.setattr(duplicates, "find_fpcalc", lambda: "fpcalc")
+    monkeypatch.setattr(
+        duplicates, "audio_fingerprint_raw",
+        lambda path, _cmd, duration=120: fps.get(str(path)),
+    )
+
+    # config at the default 0.95 → the explicit param decides the cutoff.
+    cfg = DuplicateConfig(use_md5=False, use_chromaprint=True)  # default 0.95
+
+    # Loose explicit threshold → they cluster.
+    loose = duplicates.find_duplicates(tmp_path, cfg, similarity_threshold=0.85)
+    assert len(loose.audio_duplicates) == 1
+
+    # Strict explicit threshold above their similarity → no cluster.
+    strict = duplicates.find_duplicates(tmp_path, cfg, similarity_threshold=0.999)
+    assert len(strict.audio_duplicates) == 0
 
 
 # ---------- Error surface ----------
