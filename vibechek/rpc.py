@@ -428,11 +428,22 @@ def _install_wsl(params: dict) -> dict:
     return install_wsl(distro=distro, on_progress=_emit_progress)
 
 
+def _valid_engine(value: Any, default: str = "essentia_tf") -> str:
+    """Whitelist the inference-engine name before it steers install/venv logic."""
+    return value if value in ("essentia_tf", "onnx") else default
+
+
 def _install_vibechek_in_wsl(params: dict) -> dict:
-    """Install vibechek + essentia-tensorflow + chromaprint inside a WSL distro."""
+    """Install vibechek + the ML stack + chromaprint inside a WSL distro.
+
+    `engine` picks the stack/venv: "essentia_tf" (default; essentia-tensorflow
+    in ~/.vibechek/venv) or "onnx" (plain essentia + onnxruntime in venv-onnx,
+    the TF-free engine).
+    """
     from vibechek.wsl import install_vibechek_in_wsl
     distro = str(params["distro"])
-    return install_vibechek_in_wsl(distro, on_progress=_emit_progress)
+    engine = _valid_engine(params.get("engine"))
+    return install_vibechek_in_wsl(distro, on_progress=_emit_progress, engine=engine)
 
 
 def _upgrade_vibechek_in_wsl(params: dict) -> dict:
@@ -449,14 +460,16 @@ def _upgrade_vibechek_in_wsl(params: dict) -> dict:
     return upgrade_vibechek_in_wsl(distro, on_progress=_emit_progress)
 
 
-def _install_essentia_native(_params: dict) -> dict:
-    """Install essentia-tensorflow + vibechek into ~/.vibechek/venv/.
+def _install_essentia_native(params: dict) -> dict:
+    """Install the ML stack + vibechek into ~/.vibechek/venv[-onnx]/.
 
-    The Linux/macOS counterpart to install_vibechek_in_wsl. On Windows this
-    short-circuits — Windows always uses the WSL path.
+    The Linux/macOS counterpart to install_vibechek_in_wsl. `engine` picks the
+    stack/venv ("essentia_tf" default, or "onnx" → plain essentia + onnxruntime
+    in venv-onnx). On Windows this short-circuits — Windows uses the WSL path.
     """
     from vibechek.native_install import install_essentia_native
-    return install_essentia_native(on_progress=_emit_progress)
+    engine = _valid_engine(params.get("engine"))
+    return install_essentia_native(on_progress=_emit_progress, engine=engine)
 
 
 def _native_venv_status(_params: dict) -> dict:
