@@ -125,7 +125,7 @@ export function Settings() {
   };
 
   // ---- Diagnostics & maintenance (doctor / verify_models / upgrade WSL) ----
-  const [diagBusy, setDiagBusy] = useState<null | "doctor" | "verify" | "upgrade">(null);
+  const [diagBusy, setDiagBusy] = useState<null | "doctor" | "verify" | "upgrade" | "onnx-setup">(null);
 
   const handleCopyDiagnostic = async () => {
     setDiagBusy("doctor");
@@ -198,6 +198,46 @@ export function Settings() {
         refreshPreflight();
       } else {
         notify(`Update failed: ${res.error ?? "unknown error"}`, { kind: "info" });
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      if (isMounted.current) setDiagBusy(null);
+    }
+  };
+
+  // Provision the TF-free ONNX engine: a separate managed venv (~/.vibechek/
+  // venv-onnx) with plain essentia + onnxruntime. essentia and essentia-
+  // tensorflow can't share a venv, so the ONNX engine gets its own. Idempotent
+  // — safe to re-run. Routes to the WSL or native installer per analyze_via.
+  const handleSetupOnnx = async () => {
+    const via = preflightResult?.analyze_via;
+    setDiagBusy("onnx-setup");
+    begin("install-essentia");
+    try {
+      let res: { ok?: boolean; error?: string };
+      if (via === "wsl") {
+        const distro = preflightResult?.wsl?.usable_distro;
+        if (!distro) {
+          notify("No usable WSL distro detected — finish the standard WSL setup first.", { kind: "info" });
+          finish();
+          return;
+        }
+        res = await rpc<{ ok?: boolean; error?: string }>(
+          "install_vibechek_in_wsl", { distro, engine: "onnx" });
+      } else {
+        res = await rpc<{ ok?: boolean; error?: string }>(
+          "install_essentia_native", { engine: "onnx" });
+      }
+      finish();
+      if (res.ok) {
+        notify("ONNX engine ready", {
+          kind: "success",
+          detail: "Plain Essentia + ONNX Runtime installed (no TensorFlow). Re-analyze your library to use it.",
+        });
+        refreshPreflight();
+      } else {
+        notify(`ONNX engine setup failed: ${res.error ?? "unknown error"}`, { kind: "info" });
       }
     } catch (e) {
       fail(e);
@@ -539,12 +579,22 @@ export function Settings() {
             <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
               <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
               <span>
-                Experimental. The first analyze after switching sets up a
-                separate ONNX engine (plain Essentia + ONNX Runtime, no
-                TensorFlow) — a one-time install. Re-analyze your library so
-                every track is scored by the same engine.
+                Experimental. ONNX runs in a separate engine (plain Essentia +
+                ONNX Runtime, no TensorFlow). Click <strong>Set up ONNX
+                engine</strong> below to install it (one-time), then re-analyze
+                your library so every track is scored by the same engine.
               </span>
             </div>
+          )}
+          {cfg.analysis.inference_engine === "onnx" && (
+            <button
+              className="btn-primary mt-2"
+              onClick={handleSetupOnnx}
+              disabled={diagBusy !== null || active !== null}
+            >
+              <Download className="w-4 h-4" />
+              {diagBusy === "onnx-setup" ? "Setting up ONNX engine…" : "Set up ONNX engine"}
+            </button>
           )}
           <Hint>
             <strong>Essentia · TensorFlow</strong> is the default (NVIDIA-only
