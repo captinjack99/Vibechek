@@ -1,6 +1,6 @@
 # ONNX Runtime Migration Plan
 
-Status: **Core viability VALIDATED (2026-06-01).** Production wiring not yet landed. Estimated remaining effort: **~1 week** (down from ~2 — the dominant melspec risk is largely retired, see results). A reusable parity harness is committed at [`scripts/onnx_parity.py`](../scripts/onnx_parity.py).
+Status: **WIRED + VALIDATED TF-FREE (2026-06-01).** The ONNX engine is selectable in the app (Settings → Analysis → Inference engine) and runs end-to-end on **plain Essentia + ONNX Runtime with zero TensorFlow** — confirmed by running the real analyzer in a plain-essentia venv (genre=Rock, vocal=Vocal 0.977 vs the TF baseline Rock/0.972; `tensorflow` never imported). The melspec linchpin is settled: plain `essentia` ships `TensorflowInputMusiCNN` and its output is **bit-identical** to the essentia-tensorflow build (no NumPy reimplementation needed — the migration's dominant risk is gone, not just reduced). The default stays `essentia_tf`. **Remaining to flip the default:** (1) host the converted head bundle on the `models-onnx-v1` release (`scripts/build_onnx_model_bundle.py` produces it + the pinned SHA256s — owner-only upload); (2) cross-platform GPU smoke tests (AMD/Intel/Apple). Parity harness: [`scripts/onnx_parity.py`](../scripts/onnx_parity.py).
 
 This document is the contract a contributor should be able to pick up and execute against. If something here is ambiguous, file an issue before writing code.
 

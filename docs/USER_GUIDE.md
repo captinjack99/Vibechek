@@ -331,13 +331,22 @@ All changes auto-save 500ms after you stop typing/dragging. No "Save" button.
 
 ### Experimental: ONNX inference engine
 
-There's an experimental alternative analysis engine (`AnalysisConfig.inference_engine
-= "onnx"`, opt-in) that runs the same models through ONNX Runtime instead of the
-bundled TensorFlow. Its draw is **cross-vendor GPU acceleration** — AMD, Intel, and
-Apple GPUs via DirectML/CoreML, not just NVIDIA/CUDA. It's validated to match the
-default engine's output, but it's still experimental (the converted models aren't
-hosted yet), so the default stays the essentia-tensorflow path. Most users should
-leave this alone.
+**Settings → Analysis → Inference engine** picks how the ML models run:
+
+- **Essentia · TensorFlow** (default) — the bundled, NVIDIA-only path.
+- **ONNX Runtime** (experimental) — runs the *same* models through ONNX Runtime
+  on **plain Essentia with no TensorFlow at all**. Two draws: **cross-vendor GPU
+  acceleration** (AMD, Intel, and Apple GPUs via DirectML/CoreML, not just
+  NVIDIA/CUDA) and dropping the **end-of-life TensorFlow 2.5** runtime (the
+  migration's real motivation). Validated to match the default engine's output
+  on real tracks (genre/vocal/mood/BPM/key all match; embedding cosine 0.99942).
+
+Because the two Essentia builds can't share an environment, ONNX runs in its own
+managed setup. To turn it on: select **ONNX Runtime**, click **Set up ONNX
+engine** (a one-time install of plain Essentia + ONNX Runtime — on Windows this
+is a second WSL venv, `~/.vibechek/venv-onnx`), then **re-analyze your library**
+so every track is scored by the same engine. Switch back any time. Most users can
+leave the default; reach for ONNX if you have a non-NVIDIA GPU or want off TF.
 
 ---
 

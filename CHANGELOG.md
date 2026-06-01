@@ -12,6 +12,22 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged release.
 
+### Added
+- **ONNX inference engine is now user-selectable and TensorFlow-free.** Builds on
+  beta.8's validated backend into a shippable feature: a **Settings → Analysis →
+  Inference engine** toggle + a **Set up ONNX engine** button provision a separate
+  managed environment (`~/.vibechek/venv-onnx`, a second WSL venv on Windows) with
+  **plain Essentia + ONNX Runtime and zero TensorFlow**. Confirmed end-to-end by
+  running the real analyzer in a plain-essentia venv on a real track — genre/vocal
+  match the TF path and `tensorflow` is never imported. The melspec linchpin is
+  settled: plain Essentia ships `TensorflowInputMusiCNN` with **bit-identical**
+  output to the TF build, so no NumPy reimplementation is needed. New:
+  `download_models(engine="onnx")` fetches SHA256-pinned converted heads from the
+  `models-onnx-v1` mirror; `vibechek analyze --engine {essentia_tf,onnx}`;
+  engine-aware install/routing across `wsl.py` + `native_install.py`; `vibechek[onnx]`
+  extra; `scripts/build_onnx_model_bundle.py`. Default stays `essentia_tf` until the
+  head bundle is hosted + cross-platform GPU smoke tests land. See `docs/ONNX_MIGRATION.md`.
+
 ---
 
 ## [0.4.0-beta.8] — 2026-06-01
