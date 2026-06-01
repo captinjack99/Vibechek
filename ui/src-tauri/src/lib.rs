@@ -17,9 +17,21 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_shell::init());
+
+    // Auto-updater + relaunch. Both plugins are desktop-only (the updater pulls
+    // the signed `latest.json` release artifact; process::relaunch restarts the
+    // app after install). Mobile builds skip them.
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
+    }
+
+    builder
         .setup(|app| {
             // Spawn the Python sidecar at startup. If it dies later we don't
             // try to restart automatically — surface the failure to the user

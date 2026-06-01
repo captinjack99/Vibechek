@@ -45,6 +45,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": false,
     "targets": ["nsis", "deb", "appimage", "dmg", "app"],
     "icon": [
       "icons/32x32.png",
@@ -59,6 +60,14 @@
     "externalBin": ["binaries/vibechek-sidecar"],
     "macOS": {
       "entitlements": "entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/papapew/Vibechek/releases/latest/download/latest.json"
+      ],
+      "pubkey": "PLACEHOLDER_REPLACE_WITH_TAURI_SIGNER_PUBKEY"
     }
   }
 }
