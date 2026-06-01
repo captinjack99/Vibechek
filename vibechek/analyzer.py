@@ -261,6 +261,7 @@ class TrackAnalysis:
 def download_models(
     model_dir: Path,
     on_progress: ProgressCallback | None = None,
+    engine: str = "essentia_tf",
 ) -> dict[str, dict[str, Any]]:
     """Download missing model files. Returns descriptors keyed by model name.
 
@@ -273,6 +274,13 @@ def download_models(
 
     Idempotent: existing valid files are skipped. A file whose size doesn't
     match the server's Content-Length is treated as missing and re-fetched.
+
+    `engine`: when "onnx", ALSO fetch the official EffNet backbone `.onnx`
+    (`discogs-effnet-bsdynamic-1.onnx`) into `model_dir`. The `.pb` download is
+    kept intact so the default essentia path is unaffected and so the heads' .pb
+    (needed by the one-off conversion in scripts/convert_heads_to_onnx.py) are
+    still fetched. essentia does NOT host the head `.onnx` files — those are
+    produced by that conversion script, not by this download.
     """
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -377,6 +385,35 @@ def download_models(
                 log.warning("Bad metadata for %s: %s", name, e)
 
         descriptors[name] = desc
+
+    # ---- ONNX backbone (only when the onnx engine is selected) ----
+    # The official EffNet backbone ONNX lives at the same essentia.upf.edu
+    # subdir as its .pb. We fetch it alongside the .pb files (which the head
+    # conversion script still needs); the head .onnx are produced by
+    # scripts/convert_heads_to_onnx.py, not hosted upstream.
+    if engine == "onnx":
+        from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME  # noqa: PLC0415
+
+        onnx_path = model_dir / BACKBONE_ONNX_FILENAME
+        onnx_urls = _candidate_urls(
+            "feature-extractors/discogs-effnet", BACKBONE_ONNX_FILENAME
+        )
+        if _needs_download(onnx_path, onnx_urls[0], None):
+            try:
+                _download_from_mirrors(
+                    onnx_urls,
+                    onnx_path,
+                    label=BACKBONE_ONNX_FILENAME,
+                    on_progress=lambda done, total: report_progress(
+                        on_progress, done, max(total, done),
+                        f"effnet backbone ONNX ({_fmt_bytes(done)}/{_fmt_bytes(total)})",
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.error("Failed to download EffNet backbone ONNX: %s", e)
+                errors.append(f"{BACKBONE_ONNX_FILENAME}: {e}")
+                onnx_path.unlink(missing_ok=True)
+        descriptors["effnet_onnx"] = {"weights": str(onnx_path)}
 
     if errors:
         raise RuntimeError(
@@ -614,13 +651,33 @@ def _do_one_download(
             raise
 
 
-def load_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
-    """Instantiate Essentia model wrappers. Raises if essentia isn't installed.
+def load_models(
+    model_dir: Path,
+    use_gpu: str = "auto",
+    engine: str = "essentia_tf",
+) -> dict[str, Any]:
+    """Instantiate the model callables for the analysis pipeline.
+
+    `engine` selects the inference backend (from `AnalysisConfig.inference_engine`):
+      * "essentia_tf" (default) — the essentia-tensorflow path below, UNCHANGED.
+      * "onnx" (experimental) — delegates to `vibechek.onnx_backend.load_onnx_models`,
+        which returns callables with the IDENTICAL signatures so every downstream
+        caller (`analyze_audio_features` and its vocal/mood/genre logic) is
+        byte-unchanged. Only this function knows which engine is in play.
 
     `use_gpu` is forwarded to apply_gpu_preference BEFORE the essentia/tensorflow
     import — this is the only point where CUDA_VISIBLE_DEVICES can still affect
-    TF's device enumeration.
+    TF's device enumeration. (For the onnx engine, GPU selection happens via the
+    ONNX Runtime execution-provider chain instead.)
     """
+    if engine == "onnx":
+        # Ensure the backbone .onnx is present (heads come from the conversion
+        # script), then hand off entirely to the ONNX backend.
+        download_models(model_dir, engine="onnx")
+        from vibechek.onnx_backend import load_onnx_models  # noqa: PLC0415
+
+        return load_onnx_models(model_dir, use_gpu=use_gpu)
+
     apply_gpu_preference(use_gpu)
 
     # *Critical for multi-worker GPU mode*: TF allocates ALL GPU memory at
@@ -1195,7 +1252,7 @@ def analyze_track(filepath: Path, models: dict[str, Any] | None = None) -> Track
 _WORKER_MODELS: dict[str, Any] | None = None
 
 
-def _worker_init(model_dir: str, use_gpu: str) -> None:
+def _worker_init(model_dir: str, use_gpu: str, engine: str = "essentia_tf") -> None:
     """multiprocessing.Pool initializer. If load_models raises, multiprocessing
     silently restarts the worker in an infinite loop — masking real errors
     like OOM, missing essentia install, or corrupted model files behind a
@@ -1219,7 +1276,7 @@ def _worker_init(model_dir: str, use_gpu: str) -> None:
     """
     global _WORKER_MODELS
     try:
-        _WORKER_MODELS = load_models(Path(model_dir), use_gpu=use_gpu)
+        _WORKER_MODELS = load_models(Path(model_dir), use_gpu=use_gpu, engine=engine)
     except Exception as e:  # noqa: BLE001
         import sys as _sys
         import traceback as _tb
@@ -1417,7 +1474,7 @@ def _probe_free_vram_mb() -> int | None:
 _HYBRID_SENTINEL = None  # not used as a queue item; termination is via done_event
 
 
-def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks):  # type: ignore[no-untyped-def]
+def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks, engine="essentia_tf"):  # type: ignore[no-untyped-def]
     """One worker process: load models for `device`, then pull+analyze tracks.
 
     `device` is "0" for the GPU or "-1" for CPU-only (set as
@@ -1440,7 +1497,7 @@ def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks):  
     use_gpu = "off" if device == "-1" else "on"
     if not fake:
         try:
-            models = load_models(Path(model_dir), use_gpu=use_gpu)
+            models = load_models(Path(model_dir), use_gpu=use_gpu, engine=engine)
         except Exception as e:  # noqa: BLE001
             import sys as _sys
             import traceback as _tb
@@ -1502,10 +1559,11 @@ class _HybridPool:
     the caller doesn't rely on ordering.
     """
 
-    def __init__(self, ctx, file_strs, model_dir, gpu_workers, cpu_workers, maxtasks):  # type: ignore[no-untyped-def]
+    def __init__(self, ctx, file_strs, model_dir, gpu_workers, cpu_workers, maxtasks, engine="essentia_tf"):  # type: ignore[no-untyped-def]
         self._ctx = ctx
         self._model_dir = str(model_dir)
         self._maxtasks = maxtasks
+        self._engine = engine
         self.total = len(file_strs)
         self._results_out = 0
         # Per-device throughput accounting (track count + summed seconds).
@@ -1529,7 +1587,7 @@ class _HybridPool:
         p = self._ctx.Process(
             target=_hybrid_worker_loop,
             args=(self._in_q, self._out_q, self._done_event,
-                  self._model_dir, device, self._maxtasks),
+                  self._model_dir, device, self._maxtasks, self._engine),
             daemon=True,
         )
         p._vibechek_device = device  # type: ignore[attr-defined]
@@ -1637,7 +1695,7 @@ def _run_hybrid_pool(
 
     pool = _HybridPool(
         spawn_ctx, file_strs, str(config.models_dir),
-        gpu_workers, cpu_workers, maxtasks=200,
+        gpu_workers, cpu_workers, maxtasks=200, engine=config.inference_engine,
     )
     STALL_TIMEOUT = 300  # 5 min between any two results = dead pool
 
@@ -1987,7 +2045,9 @@ def analyze_directory(
         _emit_event("stage", name="loading_models",
                     message="Loading ML models...")
         report_progress(on_progress, 0, total, "Loading ML models...")
-        models = load_models(config.models_dir, use_gpu=config.use_gpu)
+        models = load_models(
+            config.models_dir, use_gpu=config.use_gpu, engine=config.inference_engine
+        )
         for i, filepath in enumerate(files):
             cancellation.check()  # Raises CancelledError if user clicked Cancel
             report_progress(on_progress, i + 1, total, filepath.name)
@@ -2044,7 +2104,7 @@ def analyze_directory(
         with spawn_ctx.Pool(
             processes=workers,
             initializer=_worker_init,
-            initargs=(str(config.models_dir), config.use_gpu),
+            initargs=(str(config.models_dir), config.use_gpu, config.inference_engine),
             maxtasksperchild=200,
         ) as pool:
             # Stall watchdog: if no result arrives in STALL_TIMEOUT seconds, the
