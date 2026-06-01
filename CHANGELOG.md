@@ -16,12 +16,13 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
 
 ## [0.4.0-beta.8] — 2026-06-01
 
-End-to-end engineering audit + remediation, a new flagship feature, and the
-auto-update pipeline. Full suite: 639 Python tests, ruff (now enforcing) clean,
-32→38 frontend tests, cargo check clean.
+End-to-end engineering audit + remediation, two new flagship features (FLAC→CDJ
+export, opt-in ONNX inference), and the auto-update pipeline. Full suite: 664
+Python tests, ruff (now enforcing) clean, 32→38 frontend tests, cargo check clean.
 
 ### Added
 - **FLAC → CDJ export** (`vibechek cdj-export <rekordbox.xml> --out <dir>`). Lets DJs play a FLAC library on older Pioneer CDJs (CDJ-2000nexus and earlier) that don't support FLAC, **without losing cues or beat grids**: each FLAC is transcoded to a sample-identical 16-bit **AIFF**, and the Rekordbox XML is rewritten so the `TEMPO` (grid) + `POSITION_MARK` (cues) copy across with zero offset math (never MP3 — its ~26 ms encoder delay shifts the grid). Strictly additive; source files never modified. Optional `[cdj]` extra (`soundfile`) with an `ffmpeg` fallback. New `vibechek/cdj_export.py` + 20 tests.
+- **ONNX inference backend** (`AnalysisConfig.inference_engine = "onnx"`, opt-in; default stays `essentia_tf`). A path off the end-of-life bundled TensorFlow 2.5 onto ONNX Runtime (`vibechek/onnx_backend.py`), using MTG's official EffNet ONNX backbone (CUDA→ROCm→DirectML→CoreML→CPU execution-provider chain; cross-vendor GPU) + `tf2onnx`-converted heads, with essentia kept only for DSP (melspec/BPM/key). **Validated end-to-end**: on a real track every categorical field (genre, subgenre, vocal, mood, energy, BPM, key, direction, timeslot) matches the TF path, with sub-0.005 float deltas (embedding cosine 0.99942) — see `scripts/onnx_parity.py`. The essentia-tensorflow path is byte-unchanged. (Release follow-up: host the converted head `.onnx` on the model mirror so the engine needs no local conversion.)
 - **In-app auto-updater** (`tauri-plugin-updater`, opt-in). Settings → "Software updates" → check / download / install / relaunch. CI signs update artifacts + publishes `latest.json` when a signing key is configured; ships inert (unsigned) until you enroll one — see `docs/RELEASING.md`. Public-key-verified payloads.
 - **Configurable key-detection profile** + **BPM octave-error guard** (folds 70↔140 / 87↔174 and cross-checks the filename BPM).
 
