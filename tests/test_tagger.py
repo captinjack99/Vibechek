@@ -177,8 +177,8 @@ def _make_silent_mp3(path: Path) -> None:
 def test_apply_ml_tags_preserves_rekordbox_geob_priv(tmp_path: Path) -> None:
     """A genre tag write must NOT strip GEOB/PRIV frames — losing those would
     silently destroy a DJ's Serato/Rekordbox cue points and beat grids."""
-    from mutagen.mp3 import MP3
     from mutagen.id3 import GEOB, PRIV
+    from mutagen.mp3 import MP3
 
     track = tmp_path / "cued.mp3"
     _make_silent_mp3(track)
@@ -215,10 +215,41 @@ def test_apply_ml_tags_preserves_rekordbox_geob_priv(tmp_path: Path) -> None:
     assert str(after.tags.get("TCON")) == "Deep House"
 
 
+def test_apply_ml_tags_geob_priv_survive_with_preserve_false(tmp_path: Path) -> None:
+    """The real guarantee is that the apply path NEVER delall's GEOB/PRIV — so
+    even with preserve_rekordbox_frames=False (snapshot-restore disabled) a
+    genre write must not strip a DJ's existing cue/beatgrid frames."""
+    from mutagen.id3 import GEOB, PRIV
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "cued.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags.add(GEOB(encoding=0, mime="x", filename="", desc="Serato Markers_",
+                        data=b"cuebytes"))
+    audio.tags.add(PRIV(owner="Serato Markers2", data=b"gridbytes"))
+    audio.save()
+
+    analysis = {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "House", "ml_subgenre": "Deep House",
+        "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+    }}]}
+    apply_ml_tags(analysis, TaggingConfig(preserve_rekordbox_frames=False))
+
+    after = MP3(track)
+    geob = [after.tags[k] for k in after.tags if k.startswith("GEOB")]
+    priv = [after.tags[k] for k in after.tags if k.startswith("PRIV")]
+    assert len(geob) == 1 and geob[0].data == b"cuebytes", "GEOB stripped/changed"
+    assert len(priv) == 1 and priv[0].data == b"gridbytes", "PRIV stripped/changed"
+    assert str(after.tags.get("TCON")) == "Deep House"
+
+
 def test_apply_ml_tags_preserves_geob_across_reapply(tmp_path: Path) -> None:
     """Re-applying tags twice must not drop or duplicate the GEOB frame."""
-    from mutagen.mp3 import MP3
     from mutagen.id3 import GEOB
+    from mutagen.mp3 import MP3
 
     track = tmp_path / "x.mp3"
     _make_silent_mp3(track)
@@ -351,7 +382,8 @@ def test_restore_remap_moved_library_matches_by_filename(tmp_path: Path) -> None
     backup_file = tmp_path / "backup.json"
     _write_backup(backup_file, {backup_path_str: {"artist": "Foo"}})
 
-    stats = restore_tags_with_remap(backup_file, new_lib)
+    # Filename-alone remap is opt-in (a unique basename isn't proof of identity).
+    stats = restore_tags_with_remap(backup_file, new_lib, allow_filename_only=True)
     assert stats.total == 1
     assert stats.matched_exact == 0
     assert stats.matched_filename == 1
@@ -377,7 +409,8 @@ def test_restore_remap_ambiguous_filename_is_skipped(tmp_path: Path) -> None:
     backup_file = tmp_path / "backup.json"
     _write_backup(backup_file, {backup_path_str: {"artist": "Foo"}})
 
-    stats = restore_tags_with_remap(backup_file, new_lib)
+    # Opt into filename-only so we exercise the >1-candidate ambiguity branch.
+    stats = restore_tags_with_remap(backup_file, new_lib, allow_filename_only=True)
     assert stats.total == 1
     assert stats.restored == 0
     assert stats.matched_exact == 0
@@ -473,7 +506,7 @@ def test_restore_remap_mixed_outcomes(tmp_path: Path) -> None:
         str(old_lib / "vanished.mp3"): {"artist": "V"},
     })
 
-    stats = restore_tags_with_remap(backup_file, new_lib)
+    stats = restore_tags_with_remap(backup_file, new_lib, allow_filename_only=True)
     assert stats.total == 4
     assert stats.matched_exact == 1
     assert stats.matched_filename == 1
@@ -721,3 +754,408 @@ def test_derived_field_value_respects_write_toggles() -> None:
 def test_derived_field_value_none_when_ml_field_absent() -> None:
     """Toggle on but the ML record has no value for the field → nothing to write."""
     assert _derived_field_value("MOOD", {}, TaggingConfig(write_mood=True)) is None
+
+
+# ---------------------------------------------------------------------------
+# Format-complete backup → restore fidelity (the HIGH "lossy backup" finding)
+#
+# These build minimal-but-valid containers for every supported format WITHOUT
+# any external tooling (no ffmpeg, no fixtures), so they run in CI
+# unconditionally and prove the backup is no longer materially lossy for
+# non-MP3 formats:
+#   - MP3 / AIFF / WAV: ID3 incl. GEOB/PRIV cue frames survive byte-identical.
+#   - FLAC: every Vorbis comment (ReplayGain, grouping, custom) survives.
+#   - M4A: every atom incl. base64 binary (cover / Serato freeform) survives.
+# ---------------------------------------------------------------------------
+
+import struct
+import wave as _wave
+
+from vibechek.tagger import _decode_m4a_atom, _encode_m4a_atom
+
+
+def _build_wav(path: Path) -> None:
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+        w.writeframes(b"\x00\x00" * 441)
+
+
+def _build_aiff(path: Path) -> None:
+    """Hand-built minimal AIFF (FORM/COMM/SSND) mutagen can parse + tag."""
+    nframes, sampwidth_bits = 100, 16
+    data = b"\x00\x00" * nframes
+    rate80 = b"\x40\x0e\xac\x44\x00\x00\x00\x00\x00\x00"  # 44100.0 as 80-bit float
+    comm = struct.pack(">hLh", 1, nframes, sampwidth_bits) + rate80
+    ssnd = struct.pack(">LL", 0, 0) + data
+
+    def chunk(cid: bytes, body: bytes) -> bytes:
+        c = cid + struct.pack(">L", len(body)) + body
+        return c + (b"\x00" if len(body) % 2 else b"")
+
+    form_body = b"AIFF" + chunk(b"COMM", comm) + chunk(b"SSND", ssnd)
+    path.write_bytes(b"FORM" + struct.pack(">L", len(form_body)) + form_body)
+
+
+def _build_flac(path: Path) -> None:
+    """Hand-built minimal FLAC (marker + last STREAMINFO block)."""
+    si = bytearray()
+    si += struct.pack(">H", 4096)  # min block
+    si += struct.pack(">H", 4096)  # max block
+    si += (0).to_bytes(3, "big")   # min frame
+    si += (0).to_bytes(3, "big")   # max frame
+    packed = (44100 << 44) | (0 << 41) | ((16 - 1) << 36) | 100
+    si += packed.to_bytes(8, "big")
+    si += b"\x00" * 16  # md5
+    hdr = bytes([0x80]) + len(si).to_bytes(3, "big")  # last-block, type 0
+    path.write_bytes(b"fLaC" + hdr + bytes(si))
+
+
+def _build_m4a(path: Path) -> None:
+    """Hand-built minimal M4A (ftyp + moov/mvhd) mutagen can parse + tag."""
+    def box(typ: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(payload)) + typ + payload
+
+    ftyp = box(b"ftyp", b"M4A " + struct.pack(">I", 0) + b"M4A mp42isom")
+    mvhd = struct.pack(">I", 0)
+    mvhd += struct.pack(">II", 0, 0)
+    mvhd += struct.pack(">I", 44100)
+    mvhd += struct.pack(">I", 100)
+    mvhd += struct.pack(">i", 0x00010000)
+    mvhd += struct.pack(">h", 0x0100)
+    mvhd += b"\x00" * 10
+    mvhd += struct.pack(">9i", 0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000)
+    mvhd += b"\x00" * 24
+    mvhd += struct.pack(">I", 2)
+    moov = box(b"moov", box(b"mvhd", mvhd))
+    path.write_bytes(ftyp + moov)
+
+
+def test_aiff_wav_backup_no_longer_drops_everything(tmp_path: Path) -> None:
+    """The HIGH finding: AIFF/WAV backups used to capture NOTHING. Now they
+    must capture ID3 text frames AND the Rekordbox GEOB/PRIV cue frames."""
+    from mutagen.aiff import AIFF
+    from mutagen.id3 import GEOB, PRIV, TIT2
+    from mutagen.wave import WAVE
+
+    for ext, opener, builder in (
+        (".aiff", AIFF, _build_aiff),
+        (".wav", WAVE, _build_wav),
+    ):
+        track = tmp_path / f"cued{ext}"
+        builder(track)
+        audio = opener(str(track))
+        audio.add_tags()
+        audio.tags.add(TIT2(encoding=3, text=["Cued Track"]))
+        audio.tags.add(GEOB(encoding=0, mime="application/octet-stream",
+                            filename="", desc="Serato Markers_", data=b"\x01\x02cue"))
+        audio.tags.add(PRIV(owner="Serato Markers2", data=b"\x03\x04grid"))
+        audio.save()
+
+        snap = read_all_tags(track)
+        assert snap.get("_unsupported") is None, f"{ext} still marked unsupported"
+        assert snap.get("title") == "Cued Track"
+        assert any(k.startswith("geob_") for k in snap), f"{ext} dropped GEOB: {snap}"
+        assert any(k.startswith("priv_") for k in snap), f"{ext} dropped PRIV: {snap}"
+
+
+def test_backup_restore_geob_priv_byte_identical_roundtrip(tmp_path: Path) -> None:
+    """GEOB/PRIV survive a real backup → mutate → restore byte-for-byte, with
+    exactly one frame each (no duplication from the pre-clear)."""
+    from mutagen.id3 import GEOB, PRIV
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "cued.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    audio.add_tags()
+    geob_data = b"\x00\x01\x02SeratoMarkers\xff"
+    priv_data = b"\xde\xad\xbe\xefgrid"
+    audio.tags.add(GEOB(encoding=0, mime="application/octet-stream",
+                        filename="", desc="Serato Markers_", data=geob_data))
+    audio.tags.add(PRIV(owner="Serato Markers2", data=priv_data))
+    audio.save()
+
+    backup_file = tmp_path / "backup.json"
+    backup_tags(tmp_path, backup_file)
+
+    # Mutate: wipe the cue frames so restore has real work to do.
+    audio = MP3(track)
+    audio.tags.delall("GEOB:Serato Markers_")
+    audio.tags.delall("PRIV:Serato Markers2:" + priv_data.decode("latin-1"))
+    audio.save()
+    after_wipe = MP3(track)
+    assert not [k for k in after_wipe.tags if k.startswith(("GEOB", "PRIV"))]
+
+    stats = restore_tags(backup_file)
+    assert isinstance(stats, RestoreStats)
+    assert stats.restored >= 1
+
+    restored = MP3(track)
+    geob = [restored.tags[k] for k in restored.tags if k.startswith("GEOB")]
+    priv = [restored.tags[k] for k in restored.tags if k.startswith("PRIV")]
+    assert len(geob) == 1, f"expected one GEOB, got {len(geob)}"
+    assert len(priv) == 1, f"expected one PRIV, got {len(priv)}"
+    assert geob[0].data == geob_data, "GEOB bytes not byte-identical after restore"
+    assert priv[0].data == priv_data, "PRIV bytes not byte-identical after restore"
+
+
+def test_restore_preclears_stale_geob_no_duplication(tmp_path: Path) -> None:
+    """LOW finding: restore must pre-clear existing GEOB/PRIV so a stale frame
+    on disk can't survive alongside the restored snapshot frame."""
+    from mutagen.id3 import GEOB
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "x.mp3"
+    _make_silent_mp3(track)
+    snapshot = {
+        "geob_GEOB:Serato Markers_": {
+            "encoding": 0, "mime": "x", "filename": "", "desc": "Serato Markers_",
+            "data": __import__("base64").b64encode(b"NEWcues").decode("ascii"),
+        }
+    }
+    # Put a DIFFERENT (stale) GEOB with the same description on disk first.
+    audio = MP3(track)
+    audio.add_tags()
+    audio.tags.add(GEOB(encoding=0, mime="x", filename="", desc="Serato Markers_",
+                        data=b"OLDstale"))
+    audio.save()
+
+    ok, err = write_all_tags(track, snapshot)
+    assert ok, err
+    restored = MP3(track)
+    geob = [restored.tags[k] for k in restored.tags if k.startswith("GEOB")]
+    assert len(geob) == 1
+    assert geob[0].data == b"NEWcues", "stale GEOB survived; pre-clear failed"
+
+
+def test_flac_backup_captures_all_vorbis_comments(tmp_path: Path) -> None:
+    """FLAC backup must be format-complete: ReplayGain / custom comments that
+    the old fixed-field reader dropped now round-trip."""
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "t.flac"
+    _build_flac(track)
+    audio = FLAC(track)
+    audio["TITLE"] = "Song"
+    audio["GROUPING"] = "Deep House"  # canonical → subgenre
+    audio["REPLAYGAIN_TRACK_GAIN"] = "-6.50 dB"
+    audio["LABEL"] = "Anjunadeep"
+    audio.save()
+
+    snap = read_all_tags(track)
+    assert snap["title"] == "Song"
+    assert snap["subgenre"] == "Deep House"
+    assert snap.get("txxx_replaygain_track_gain") == "-6.50 dB"
+    assert snap.get("txxx_label") == "Anjunadeep"
+
+    # Wipe + restore round-trips the extra comments back to their Vorbis keys.
+    audio = FLAC(track)
+    audio.delete()
+    audio.save()
+    ok, err = write_all_tags(track, snap)
+    assert ok, err
+    restored = FLAC(track)
+    assert restored["replaygain_track_gain"][0] == "-6.50 dB"
+    assert restored["label"][0] == "Anjunadeep"
+    assert restored["grouping"][0] == "Deep House"
+
+
+def test_m4a_backup_captures_binary_freeform_atom(tmp_path: Path) -> None:
+    """M4A backup must base64 binary atoms (Serato freeform) and restore them
+    byte-identical — the old reader dropped them entirely."""
+    from mutagen.mp4 import MP4, MP4FreeForm
+
+    track = tmp_path / "t.m4a"
+    _build_m4a(track)
+    audio = MP4(track)
+    audio["\xa9nam"] = ["Title"]
+    serato = b"\x01\x02\x03markers"
+    audio["----:com.serato.dj:markersv2"] = [MP4FreeForm(serato, dataformat=0)]
+    audio.save()
+
+    snap = read_all_tags(track)
+    assert snap["title"] == "Title"
+    assert any(k.startswith("mp4atom_----:") for k in snap), f"freeform dropped: {snap}"
+
+    audio = MP4(track)
+    audio.delete()
+    audio.save()
+    ok, err = write_all_tags(track, snap)
+    assert ok, err
+    restored = MP4(track)
+    ff = restored["----:com.serato.dj:markersv2"][0]
+    assert bytes(ff) == serato, "Serato freeform bytes not byte-identical"
+
+
+def test_encode_decode_m4a_atom_roundtrip() -> None:
+    """Pure-helper round-trip for every atom value kind."""
+    from mutagen.mp4 import MP4Cover, MP4FreeForm
+
+    cases = [
+        ["plain text"],
+        [42],
+        [MP4FreeForm(b"\x00\xffbinary", dataformat=1)],
+        [MP4Cover(b"\x89PNGcover", imageformat=MP4Cover.FORMAT_PNG)],
+        [b"\x01\x02rawbytes"],
+    ]
+    for original in cases:
+        decoded = _decode_m4a_atom(_encode_m4a_atom(original))
+        assert len(decoded) == 1
+        if isinstance(original[0], (bytes, bytearray)):
+            assert bytes(decoded[0]) == bytes(original[0])
+        else:
+            assert decoded[0] == original[0]
+
+
+@pytest.mark.parametrize("ext", [".mp3", ".aiff", ".wav", ".flac", ".m4a"])
+def test_backup_restore_fidelity_per_format(tmp_path: Path, ext: str) -> None:
+    """Parametrized backup → restore fidelity across every supported format.
+
+    Asserts: (a) the format is NOT recorded as `_unsupported`, (b) the title
+    survives a real backup → restore, (c) BackupStats counts it as fully
+    backed up (the non-MP3 formats no longer silently drop everything)."""
+    track = tmp_path / f"track{ext}"
+    if ext == ".mp3":
+        _make_silent_mp3(track)
+        from mutagen.mp3 import MP3
+        a = MP3(track); a.add_tags()
+        from mutagen.id3 import TIT2
+        a.tags.add(TIT2(encoding=3, text=["MyTitle"])); a.save()
+    elif ext in (".aiff", ".aif"):
+        _build_aiff(track)
+        from mutagen.aiff import AIFF
+        from mutagen.id3 import TIT2
+        a = AIFF(track); a.add_tags()
+        a.tags.add(TIT2(encoding=3, text=["MyTitle"])); a.save()
+    elif ext == ".wav":
+        _build_wav(track)
+        from mutagen.id3 import TIT2
+        from mutagen.wave import WAVE
+        a = WAVE(track); a.add_tags()
+        a.tags.add(TIT2(encoding=3, text=["MyTitle"])); a.save()
+    elif ext == ".flac":
+        _build_flac(track)
+        from mutagen.flac import FLAC
+        a = FLAC(track); a["TITLE"] = "MyTitle"; a.save()
+    elif ext == ".m4a":
+        _build_m4a(track)
+        from mutagen.mp4 import MP4
+        a = MP4(track); a["\xa9nam"] = ["MyTitle"]; a.save()
+
+    backup_file = tmp_path / "backup.json"
+    bstats = backup_tags(tmp_path, backup_file)
+    assert isinstance(bstats, BackupStats)
+    assert bstats.not_fully_backed_up == 0, f"{ext} counted as not fully backed up"
+
+    snap = read_all_tags(track)
+    assert snap.get("_unsupported") is None, f"{ext} marked unsupported"
+    assert snap.get("title") == "MyTitle"
+
+    rstats = restore_tags(backup_file)
+    assert rstats.restored == rstats.total >= 1
+    assert rstats.skipped_unsupported == 0
+
+
+def test_backup_stats_counts_unsupported_format(tmp_path: Path) -> None:
+    """A genuinely unreadable format (no reader) is counted in
+    `not_fully_backed_up`, and restore reports it via `skipped_unsupported`
+    rather than silently skipping or erroring."""
+    (tmp_path / "real.wav").write_bytes(b"")  # empty: read fails gracefully
+    _build_wav(tmp_path / "ok.wav")
+    # An .ogg has no reader path → _unsupported.
+    (tmp_path / "track.ogg").write_bytes(b"OggS" + b"\x00" * 40)
+
+    backup_file = tmp_path / "backup.json"
+    bstats = backup_tags(tmp_path, backup_file)
+    assert bstats.not_fully_backed_up >= 1
+
+    rstats = restore_tags(backup_file)
+    assert rstats.skipped_unsupported >= 1
+
+
+def test_backup_records_size_enables_size_match_remap(tmp_path: Path) -> None:
+    """Backups now record `_size`, so a moved library with two same-named
+    tracks is disambiguated by size (strategy 2) — no opt-in needed, and the
+    risky basename-only fallback stays off."""
+    from mutagen.id3 import TIT2
+    from mutagen.mp3 import MP3
+
+    src = tmp_path / "src"
+    src.mkdir()
+    track = src / "track01.mp3"
+    _make_silent_mp3(track)
+    a = MP3(track); a.add_tags(); a.tags.add(TIT2(encoding=3, text=["Original"])); a.save()
+    original_size = track.stat().st_size
+
+    backup_file = tmp_path / "backup.json"
+    backup_tags(src, backup_file)
+    data = json.loads(backup_file.read_text(encoding="utf-8"))
+    assert data["files"][str(track)]["_size"] == original_size
+
+    track_bytes = track.read_bytes()
+    # Move the library: delete the original so the exact-path strategy can't
+    # fire and we genuinely exercise the (name, size) strategy.
+    import shutil
+    shutil.rmtree(src)
+
+    new_lib = tmp_path / "new"
+    (new_lib / "a").mkdir(parents=True)
+    (new_lib / "b").mkdir(parents=True)
+    moved = new_lib / "a" / "track01.mp3"
+    moved.write_bytes(track_bytes)  # same size as backup
+    decoy = new_lib / "b" / "track01.mp3"
+    decoy.write_bytes(track_bytes + b"\x00" * 64)  # different size, same name
+
+    # Default (no filename-only opt-in) must still match via (name, size).
+    stats = restore_tags_with_remap(backup_file, new_lib)
+    assert stats.matched_filename_size == 1
+    assert stats.matched_filename == 0
+    assert stats.matches[0]["matched"] == str(moved)
+
+
+def test_remap_basename_only_off_by_default(tmp_path: Path) -> None:
+    """A moved library whose sizes drifted falls to basename-only — which is
+    now OFF by default so it can't silently mistag a same-named track."""
+    old_lib = tmp_path / "old"
+    old_lib.mkdir()
+    backup_path_str = str(old_lib / "Untitled.mp3")
+    new_lib = tmp_path / "new"
+    new_lib.mkdir()
+    (new_lib / "Untitled.mp3").write_text("different track", encoding="utf-8")
+
+    backup_file = tmp_path / "backup.json"
+    _write_backup(backup_file, {backup_path_str: {"artist": "Foo"}})  # no _size
+
+    off = restore_tags_with_remap(backup_file, new_lib)
+    assert off.matched_filename == 0
+    assert off.skipped_missing == 1
+    assert off.matches[0]["strategy"] == "missing"
+
+    on = restore_tags_with_remap(backup_file, new_lib, allow_filename_only=True)
+    assert on.matched_filename == 1
+
+
+def test_restore_remap_forwards_config_encoding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """restore_tags_with_remap must forward `config` to the ID3 writer so a
+    Rekordbox-5 (UTF-16) user isn't silently re-encoded on a moved-library
+    restore (the MED finding)."""
+    instances = _install_fake_mp3(monkeypatch)
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    track = lib / "song.mp3"
+    track.write_text("x", encoding="utf-8")
+
+    backup_file = tmp_path / "backup.json"
+    _write_backup(backup_file, {str(track): {"title": "Hi"}})
+
+    stats = restore_tags_with_remap(
+        backup_file, lib, config=TaggingConfig(id3_text_encoding=1)
+    )
+    assert stats.matched_exact == 1
+    assert instances and instances[0].tags
+    for frame in instances[0].tags.values():
+        assert frame.encoding == 1, "config encoding not forwarded on remap restore"

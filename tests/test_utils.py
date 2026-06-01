@@ -28,6 +28,45 @@ def test_sanitize_passes_through_clean_name() -> None:
     assert sanitize_folder_name("Deep House") == "Deep House"
 
 
+def test_sanitize_rejects_dot_traversal_names() -> None:
+    # A genre tag of ".." (or "." / leading-dot variants) must never survive as
+    # a path segment that could escape the library root.
+    assert sanitize_folder_name("..") == "Unknown"
+    assert sanitize_folder_name(".") == "Unknown"
+    assert sanitize_folder_name("  ..  ") == "Unknown"
+    assert sanitize_folder_name("...") == "Unknown"
+    # Separators collapse to "_", so an embedded traversal can't introduce a sep.
+    assert "/" not in sanitize_folder_name("../../Windows")
+    assert "\\" not in sanitize_folder_name("..\\..\\Windows")
+
+
+def test_sanitize_strips_trailing_dots_and_spaces() -> None:
+    # Windows silently drops trailing dots/spaces from folder names; normalize so
+    # our intended name matches what lands on disk.
+    assert sanitize_folder_name("House.") == "House"
+    assert sanitize_folder_name("House ") == "House"
+    assert sanitize_folder_name("House. . ") == "House"
+
+
+def test_sanitize_maps_windows_reserved_device_names() -> None:
+    # Reserved device names are uncreatable on Windows; they must be remapped to
+    # a safe, creatable name rather than passed through verbatim.
+    for reserved in ("CON", "con", "PRN", "AUX", "NUL", "COM1", "COM9", "LPT1", "LPT9"):
+        out = sanitize_folder_name(reserved)
+        assert out.lower() not in {
+            "con", "prn", "aux", "nul",
+            *(f"com{i}" for i in range(1, 10)),
+            *(f"lpt{i}" for i in range(1, 10)),
+        }
+        assert out  # never empty
+    # A reserved stem with an extension (e.g. a genre "nul.mp3") is just as
+    # reserved on Windows and must also be remapped.
+    assert sanitize_folder_name("nul.mp3").lower() != "nul.mp3"
+    # Non-reserved lookalikes are untouched.
+    assert sanitize_folder_name("Console") == "Console"
+    assert sanitize_folder_name("COM10") == "COM10"
+
+
 def test_find_audio_files_returns_audio_only(tiny_library: Path) -> None:
     files = find_audio_files(tiny_library)
     assert all(f.suffix.lower() in SUPPORTED_EXTENSIONS for f in files)

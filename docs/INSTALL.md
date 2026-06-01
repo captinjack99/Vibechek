@@ -27,7 +27,7 @@ See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop 
 1. Go to [Releases](https://github.com/papapew/Vibechek/releases).
 2. Download the archive for your OS.
 3. Extract somewhere stable (e.g. `C:\Program Files\Vibechek\` or `~/.local/bin/vibechek/`).
-4. Add the extracted folder to your `PATH` — or, on Windows, run the included `vibechek-setup.exe` and check the "Add to PATH" box.
+4. Add the extracted folder to your `PATH`. The Windows CLI ships as `vibechek-windows-x64.zip` — there's no separate setup program, so add the extracted folder to your user `PATH` by hand (System Properties → Environment Variables). *(The point-and-click desktop app is a separate NSIS `.exe` — see the two flavors above.)*
 5. Verify: `vibechek --version`.
 
 ### Alternative: pip install from source
@@ -170,7 +170,7 @@ vibechek download-models   # one-time, ~800 MB
 
 ## Troubleshooting
 
-**"vibechek: command not found"** — the install folder isn't on your PATH. Re-run the Windows installer with "Add to PATH" checked, or add the folder manually:
+**"vibechek: command not found"** — the install folder isn't on your PATH. Add the folder manually:
 - Windows: System Properties → Environment Variables → User Path
 - macOS / Linux: add `export PATH="$PATH:/path/to/vibechek"` to your shell rc
 

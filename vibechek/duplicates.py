@@ -10,7 +10,6 @@ Source: ports of `legacy/find_duplicates.py` and `legacy/move_safe_duplicates.py
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import shutil
 import subprocess
@@ -37,6 +36,19 @@ _KEEPER_FORMAT_PRIORITY = {
     ".flac": 1, ".wav": 2, ".aiff": 3, ".aif": 3, ".m4a": 4,
     ".mp3": 5, ".ogg": 6, ".aac": 7, ".wma": 8,
 }
+
+# Must match DuplicateConfig.chromaprint_similarity_threshold's default so
+# find_duplicates can tell whether the caller actually set a config threshold
+# (then it wins) or left it at the default (then the similarity_threshold
+# parameter is used instead).
+_DEFAULT_SIMILARITY_THRESHOLD = 0.95
+
+# How many leading sub-fingerprints to use as multi-probe bucket keys. The first
+# few frames cover the start of the spectral envelope and are stable across
+# re-encodes; probing several of them (rather than only the first) means a
+# transcode that perturbs one early frame still collides with its twin on
+# another. Small enough to keep buckets cheap.
+_NUM_BUCKET_PROBES = 4
 
 
 class DuplicateAction(str, Enum):
@@ -186,24 +198,63 @@ def audio_fingerprint_raw(
     return None
 
 
-def fingerprint_similarity(a: list[int], b: list[int]) -> float:
-    """Return Hamming-distance similarity in [0.0, 1.0] for two raw fingerprints.
-
-    Aligns at index 0 and compares the overlapping prefix bit-by-bit. 1.0 means
-    identical, 0.0 means every bit differs. This is the standard cheap
-    chromaprint similarity check — for longer audio with offsets you'd slide
-    one window over the other, but for full-track duplicate detection the
-    aligned form catches re-encodes well.
-    """
+def _aligned_similarity(a: list[int], b: list[int]) -> float:
+    """Bit similarity of two equal-or-prefix-aligned fingerprints (offset 0)."""
     n = min(len(a), len(b))
     if n == 0:
         return 0.0
     diff_bits = 0
-    for x, y in zip(a[:n], b[:n]):
+    for x, y in zip(a[:n], b[:n], strict=True):
         # XOR gives a 1 bit wherever the two sub-fingerprints differ.
         diff_bits += (x ^ y).bit_count()
     total_bits = n * 32
     return 1.0 - (diff_bits / total_bits)
+
+
+# How far (in sub-fingerprints) to slide one fingerprint against the other when
+# searching for the best alignment. A transcode or a few-hundred-ms encoder
+# delay shifts the whole sequence by a handful of frames; at ~125 ms/frame, ±20
+# frames covers ~2.5 s of drift, which comfortably spans real-world offsets
+# (MP3 encoder/decoder delay, leading-silence trim) without making the O(W·N)
+# scan expensive.
+_MAX_ALIGN_OFFSET = 20
+
+# Require at least this many overlapping sub-fingerprints for a slid alignment
+# to count. Without it, a 1-frame overlap could score a spurious 1.0 and create
+# false-positive duplicate groups.
+_MIN_ALIGN_OVERLAP = 8
+
+
+def fingerprint_similarity(a: list[int], b: list[int]) -> float:
+    """Return the best Hamming-distance similarity in [0.0, 1.0] over offsets.
+
+    Slides `b` against `a` by up to ``_MAX_ALIGN_OFFSET`` sub-fingerprints in
+    each direction and returns the highest bit-similarity found. 1.0 means a
+    perfectly-aligned identical overlap; 0.0 means every compared bit differs.
+
+    The previous implementation compared only at offset 0, so a transcode whose
+    fingerprint was shifted by even one frame (encoder delay, trimmed leading
+    silence) scored far below threshold and was missed. The sliding scan is the
+    standard Chromaprint alignment and recovers those legitimate duplicates.
+    """
+    if not a or not b:
+        return 0.0
+
+    # Offset 0 is always valid (used as the floor) even if shorter than the
+    # min-overlap guard, so identical full-length inputs still score correctly.
+    best = _aligned_similarity(a, b)
+
+    for offset in range(1, _MAX_ALIGN_OFFSET + 1):
+        # Slide b forward (a delayed relative to b): compare a[offset:] vs b.
+        fwd_a, fwd_b = a[offset:], b
+        if min(len(fwd_a), len(fwd_b)) >= _MIN_ALIGN_OVERLAP:
+            best = max(best, _aligned_similarity(fwd_a, fwd_b))
+        # Slide b backward (b delayed relative to a): compare a vs b[offset:].
+        bwd_a, bwd_b = a, b[offset:]
+        if min(len(bwd_a), len(bwd_b)) >= _MIN_ALIGN_OVERLAP:
+            best = max(best, _aligned_similarity(bwd_a, bwd_b))
+
+    return best
 
 
 def _file_info(filepath: Path, read_metadata: bool = True) -> FileInfo:
@@ -271,6 +322,37 @@ def _cluster_by_similarity(
     return clusters
 
 
+def _bucket_keys(raw: list[int]) -> list[str]:
+    """Return the multi-probe bucket keys for one raw fingerprint.
+
+    Files are filed under several keys (the hex of the first few sub-fingerprints)
+    so two tracks that agree on ANY probe share a bucket and get compared. This
+    replaces single-first-subfingerprint bucketing, which missed transcodes whose
+    very first frame happened to differ. Keys are prefixed with their probe index
+    so identical sub-fingerprint values at different positions don't collide.
+    """
+    if not raw:
+        return []
+    keys: list[str] = []
+    for idx in range(min(_NUM_BUCKET_PROBES, len(raw))):
+        keys.append(f"{idx}:{raw[idx]:08x}")
+    return keys
+
+
+def _dedupe_bucket(
+    bucket: list[tuple[FileInfo, list[int]]],
+) -> list[tuple[FileInfo, list[int]]]:
+    """Drop repeated files from a bucket, keyed by path (multi-probe membership)."""
+    out: list[tuple[FileInfo, list[int]]] = []
+    seen: set[str] = set()
+    for info, raw in bucket:
+        if info.path in seen:
+            continue
+        seen.add(info.path)
+        out.append((info, raw))
+    return out
+
+
 def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:
     """Pick which file to keep from a group; return (keeper, duplicates).
 
@@ -310,6 +392,7 @@ def find_duplicates(
     config: DuplicateConfig,
     on_progress: ProgressCallback | None = None,
     read_metadata: bool = True,
+    similarity_threshold: float = 0.95,
 ) -> DuplicateReport:
     """Scan `library_path` and return all detected duplicate groups.
 
@@ -317,6 +400,13 @@ def find_duplicates(
     time on large libraries when the caller doesn't need bitrate/duration info
     (e.g. MD5-only dedup with default keeper rules). The format-priority and
     size-based keeper picking still works without metadata.
+
+    `similarity_threshold` is the chromaprint match cutoff in [0, 1]: two tracks
+    are grouped as audio duplicates when their best-aligned fingerprint
+    similarity is >= this value. The default (0.95) is overridden by
+    `config.chromaprint_similarity_threshold` whenever the config carries a
+    non-default value, so the GUI/CLI threshold control still wins; an RPC caller
+    that hasn't touched the config can pass `similarity_threshold` directly.
     """
     audio_files = find_audio_files(library_path)
     report = DuplicateReport(summary=DuplicateSummary(total_files=len(audio_files)))
@@ -364,11 +454,26 @@ def find_duplicates(
             }
             remaining = [fp for fp in audio_files if str(fp) not in exact_dupe_paths]
 
-            # Bucket key: the first sub-fingerprint as hex. Truly-similar tracks
-            # almost always share the first ~32 bits (this is the start of the
-            # spectral envelope and is extremely stable across re-encodes).
-            # Bucketing first keeps the pairwise similarity step O(N) in
-            # practice instead of O(N²) over the whole library.
+            # Resolve the effective cutoff. `similarity_threshold` is the
+            # contract param; the config value wins when the caller has set a
+            # non-default config threshold (GUI/CLI path) so an explicit Settings
+            # value is never ignored. Both default to 0.95.
+            cfg_threshold = config.chromaprint_similarity_threshold
+            effective = (
+                cfg_threshold
+                if cfg_threshold != _DEFAULT_SIMILARITY_THRESHOLD
+                else similarity_threshold
+            )
+            threshold = max(0.0, min(1.0, effective))
+
+            # Multi-probe bucketing: a transcode can perturb the very first
+            # sub-fingerprint, so keying solely on it (the old behaviour) silently
+            # dropped real duplicates. Instead we probe several stable
+            # sub-fingerprints near the start of each track and file the track
+            # under each probe key. Two tracks that agree on ANY probe land in a
+            # common bucket and get compared — recall up, while the per-bucket
+            # work stays small. A track is de-duplicated within a bucket by path
+            # so multi-key membership never double-counts it.
             buckets: dict[str, list[tuple[FileInfo, list[int]]]] = defaultdict(list)
 
             for i, fp in enumerate(remaining):
@@ -385,14 +490,21 @@ def find_duplicates(
                     info.audio_fingerprint = hashlib.md5(
                         ",".join(str(x) for x in raw_fp).encode()
                     ).hexdigest()
-                    buckets[f"{raw_fp[0]:08x}"].append((info, raw_fp))
+                    for key in _bucket_keys(raw_fp):
+                        buckets[key].append((info, raw_fp))
 
-            threshold = max(0.0, min(1.0, config.chromaprint_similarity_threshold))
             # Per-bucket union-find: cluster files whose pairwise similarity
             # crosses the configured threshold. This is the threshold the user
             # sets in Settings — at 1.0 only byte-identical fingerprints group,
             # at 0.85 you get re-encodes / different bitrates of the same master.
+            # A cluster can recur across buckets (multi-probe membership), so
+            # dedupe emitted groups by their set of member paths.
+            seen_group_paths: set[frozenset[str]] = set()
             for bucket in buckets.values():
+                # Drop duplicate (info, raw) entries that multi-probe bucketing
+                # may have placed in the same bucket twice (same file matched two
+                # probe keys that collided here).
+                bucket = _dedupe_bucket(bucket)
                 if len(bucket) <= 1:
                     continue
                 clusters = _cluster_by_similarity(bucket, threshold)
@@ -400,6 +512,12 @@ def find_duplicates(
                     if len(cluster) <= 1:
                         continue
                     files = [info for info, _ in cluster]
+                    # Multi-probe bucketing can surface the same cluster from
+                    # more than one bucket; emit each unique member-set once.
+                    member_paths = frozenset(f.path for f in files)
+                    if member_paths in seen_group_paths:
+                        continue
+                    seen_group_paths.add(member_paths)
                     # Avoid double-reporting: if everyone in the cluster shares
                     # the same MD5 hash, phase 1 already grouped them. Only skip
                     # when MD5 actually ran (config.use_md5 True AND all hashes

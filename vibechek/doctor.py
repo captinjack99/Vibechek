@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import platform
 import sys
 import tempfile
@@ -62,6 +61,11 @@ class DiagnosticReport:
     gpus: list[dict[str, Any]] = field(default_factory=list)
     models_dir: str = ""
     models: list[dict[str, Any]] = field(default_factory=list)
+    # True iff the analyzer ships a populated MODEL_SHA256 pin table, i.e.
+    # downloaded model files are actually content-verified. When False the
+    # integrity check is a silent no-op (warns on size mismatch only), which
+    # users should be able to see in the diagnostic.
+    model_integrity_verified: bool = False
     log_tail: list[str] = field(default_factory=list)
     wsl: dict[str, Any] | None = None
     native_venv: dict[str, Any] | None = None
@@ -126,6 +130,25 @@ def _collect_models(models_dir: Path | None = None) -> tuple[str, list[dict[str,
                 entry["present"] = False
             out.append(entry)
     return str(target), out
+
+
+def _collect_model_integrity() -> bool:
+    """True iff the analyzer's `MODEL_SHA256` pin table is populated.
+
+    When empty, `verify_model_sha256` no-ops and downloaded model files are
+    only size-checked — so a poisoned mirror would not be caught. Surfacing
+    this in the diagnostic makes the otherwise-invisible no-op verification
+    visible to users (and to anyone triaging a "wrong model" bug report).
+
+    Lazy-imports `analyzer.MODEL_SHA256` so doctor stays importable without
+    essentia, matching `_collect_models`.
+    """
+    try:
+        from vibechek.analyzer import MODEL_SHA256
+        return any(bool(v) for v in MODEL_SHA256.values())
+    except Exception as e:  # noqa: BLE001
+        log.debug("model integrity probe failed: %s", e)
+        return False
 
 
 def _collect_log_tail(n: int = 50) -> list[str]:
@@ -246,6 +269,7 @@ def build_report(
         ],
         models_dir=models_dir_str,
         models=models,
+        model_integrity_verified=_collect_model_integrity(),
         log_tail=_collect_log_tail(log_lines),
         wsl=_collect_wsl(),
         native_venv=_collect_native_venv(),
@@ -318,6 +342,11 @@ def render_markdown(report: DiagnosticReport) -> str:
     lines.append(f"- Directory: `{report.models_dir}`")
     present = sum(1 for m in report.models if m.get("present"))
     lines.append(f"- Present: **{present} / {len(report.models)}**")
+    if report.model_integrity_verified:
+        lines.append("- Integrity: **verified** (SHA256-pinned)")
+    else:
+        lines.append("- Integrity: **unverified** "
+                     "(MODEL_SHA256 pin table empty — downloads are size-checked only)")
     for m in report.models:
         if m.get("present"):
             lines.append(f"  - `{m['name']}` — {_fmt_size(m.get('size_bytes'))}")

@@ -107,6 +107,11 @@ export function DuplicatesView() {
         path: scanPath,
         use_md5: dupCfg.use_md5,
         use_chromaprint: dupCfg.use_chromaprint,
+        // The backend reads this as `threshold` (rpc._find_duplicates). Without
+        // it, the Chromaprint similarity slider in Settings is silently dead —
+        // every scan uses the server-side default (0.95) regardless of the
+        // user's choice. Forward it so the control actually does something.
+        threshold: dupCfg.chromaprint_similarity_threshold,
       });
       setReport(r);
       finish();
@@ -117,7 +122,16 @@ export function DuplicatesView() {
     } finally {
       scanningRef.current = false;
     }
-  }, [scanPath, dupCfg.use_md5, dupCfg.use_chromaprint, begin, finish, fail, setReport]);
+  }, [
+    scanPath,
+    dupCfg.use_md5,
+    dupCfg.use_chromaprint,
+    dupCfg.chromaprint_similarity_threshold,
+    begin,
+    finish,
+    fail,
+    setReport,
+  ]);
 
   // Stage 1: build the plan + open the confirm modal.
   const handleResolve = async (action: Action) => {
@@ -277,14 +291,19 @@ export function DuplicatesView() {
               {pendingResolve.action === "trash" ? (
                 <>
                   <p className="text-xs text-white/60">
-                    Files go to the OS trash and stay recoverable until you empty it.
+                    On a regular internal drive, files go to the OS trash and
+                    stay recoverable until you empty it (Recycle Bin on Windows,
+                    Trash on macOS, <code className="font-mono">~/.local/share/Trash</code> on Linux).
                   </p>
-                  <p className="text-[11px] text-white/40">
-                    On Windows this is the Recycle Bin. On macOS, the Trash.
-                    On Linux, <code className="font-mono">~/.local/share/Trash</code>.
-                    On removable / network drives without a trash folder
-                    (FAT32 USB sticks, some network shares), files cannot be
-                    recovered — they are permanently deleted.
+                  <p className="flex items-start gap-1.5 text-xs text-accent-yellow">
+                    <AlertCircle className="w-4 h-4 flex-none mt-px" />
+                    <span>
+                      <strong>Not recoverable on removable or network drives.</strong>{" "}
+                      FAT32 USB sticks and many network shares have no trash
+                      folder, so files there are deleted permanently — they
+                      cannot be restored. If your library lives on one of
+                      these, use "Move to review folder" instead.
+                    </span>
                   </p>
                 </>
               ) : (

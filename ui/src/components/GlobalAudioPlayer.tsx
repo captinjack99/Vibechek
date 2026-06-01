@@ -111,7 +111,26 @@ export function GlobalAudioPlayer() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+
+    // Load-stall watchdog. Some files decode to nothing (0-length stream,
+    // unsupported codec the browser silently rejects, an asset-protocol path
+    // that resolves but yields no audio) WITHOUT WaveSurfer ever firing
+    // `ready` OR `error`. The bar then sticks on "Loading…" forever with no
+    // usable controls. If neither fires within 15s, surface an error so the
+    // user gets a message + the close button stays actionable.
+    const watchdog = window.setTimeout(() => {
+      // `ready` is captured stale here, so re-check WaveSurfer directly: a
+      // decoded track reports a finite, non-zero duration. If it has one,
+      // the `ready` handler is about to (or already did) run — don't clobber.
+      const decoded = (() => {
+        try { return (wsRef.current?.getDuration() ?? 0) > 0; } catch { return false; }
+      })();
+      if (decoded) return;
+      setError("Timed out loading audio (15s). The file may be unreadable or in an unsupported format.");
+    }, 15_000);
+
     // playToken is in the deps so clicking the same track again restarts it.
+    return () => window.clearTimeout(watchdog);
   }, [path, playToken]);
 
   // Stop playback + tear down audio when the bar is closed. We fully destroy

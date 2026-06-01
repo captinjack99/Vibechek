@@ -8,6 +8,7 @@ preserved (or absent) rather than left half-written.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from unittest import mock
 
@@ -120,4 +121,103 @@ def test_partial_uses_sibling_path_for_atomic_rename(tmp_path: Path) -> None:
         atomic_write_json(target, {"k": "v"})
 
     assert captured["src"].parent == target.parent
-    assert captured["src"].name == "out.json.partial"
+    # The partial name carries a per-writer pid.tid suffix so concurrent
+    # writers don't share one temp file, but it must still be a sibling of the
+    # destination (same volume) and clearly belong to it.
+    assert captured["src"].name.startswith("out.json.")
+    assert captured["src"].name.endswith(".partial")
+
+
+def test_partial_name_is_unique_per_thread(tmp_path: Path) -> None:
+    """Two threads writing the SAME destination must use DIFFERENT temp files.
+
+    A shared fixed `.partial` name lets one writer truncate the other's bytes
+    mid-flight (audit HIGH: shared-.partial race). The per-writer pid.tid
+    suffix guarantees each thread gets its own temp file.
+    """
+    target = tmp_path / "out.json"
+    seen_partials: list[str] = []
+    seen_lock = threading.Lock()
+    original_replace = Path.replace
+
+    def spy_replace(self, dst):
+        with seen_lock:
+            seen_partials.append(self.name)
+        return original_replace(self, dst)
+
+    def writer(i: int) -> None:
+        atomic_write_json(target, {"writer": i})
+
+    with mock.patch.object(Path, "replace", spy_replace):
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # Both writers ran, each through its own distinct partial file.
+    assert len(seen_partials) == 2
+    assert len(set(seen_partials)) == 2, (
+        f"writers shared a partial file: {seen_partials}"
+    )
+    # The destination is valid JSON written by exactly one of the writers —
+    # never a torn mix of both payloads.
+    final = json.loads(target.read_text(encoding="utf-8"))
+    assert final["writer"] in (0, 1)
+
+
+def test_concurrent_writers_never_corrupt_destination(tmp_path: Path) -> None:
+    """Hammer the same file from many threads; every read must parse cleanly.
+
+    With a shared temp name, a reader (or the final rename) could observe a
+    half-written file. The unique-suffix scheme keeps every intermediate state
+    consistent: the destination is only ever the atomically-renamed result of a
+    fully-written partial.
+    """
+    target = tmp_path / "state.json"
+    atomic_write_json(target, {"n": -1})  # seed so reads always find a file
+    errors: list[Exception] = []
+    stop = threading.Event()
+
+    def writer(i: int) -> None:
+        for _ in range(25):
+            try:
+                atomic_write_json(target, {"n": i, "payload": "x" * 500})
+            except PermissionError:
+                # Windows-only: os.replace() is denied while a *reader* holds an
+                # open handle on the destination. That's a platform rename
+                # quirk, not the corruption we're guarding against here — the
+                # readers below still only ever observe complete, well-formed
+                # JSON. Skip and keep hammering.
+                pass
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                json.loads(target.read_text(encoding="utf-8"))
+            except (FileNotFoundError, PermissionError):
+                # mid-rename window (POSIX: missing; Windows: briefly locked) is
+                # fine; just retry. Neither is a torn-file condition.
+                pass
+            except json.JSONDecodeError as e:
+                # THIS is the failure we're guarding against: a reader observing
+                # a half-written / torn destination. Must never happen.
+                errors.append(e)
+                return
+
+    writers = [threading.Thread(target=writer, args=(i,)) for i in range(6)]
+    readers = [threading.Thread(target=reader) for _ in range(3)]
+    for t in readers:
+        t.start()
+    for t in writers:
+        t.start()
+    for t in writers:
+        t.join()
+    stop.set()
+    for t in readers:
+        t.join()
+
+    assert not errors, f"reader saw a corrupt/torn file: {errors[:3]}"
+    # No partials left behind after the storm settles.
+    leftover = list(tmp_path.glob("state.json.*.partial"))
+    assert leftover == [], f"leaked partial files: {leftover}"

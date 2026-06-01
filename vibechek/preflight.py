@@ -105,7 +105,7 @@ def check_models(models_dir: Path | None = None) -> ModelsCheck:
 
     if not target.exists():
         # All models missing
-        for name, (subdir, weights_name, metadata_name) in MODELS.items():
+        for name, (_subdir, _weights_name, _metadata_name) in MODELS.items():
             result.per_model.append(ModelCheck(
                 name=name,
                 present=False,
@@ -115,7 +115,7 @@ def check_models(models_dir: Path | None = None) -> ModelsCheck:
             result.missing.append(name)
         return result
 
-    for name, (subdir, weights_name, metadata_name) in MODELS.items():
+    for name, (_subdir, _weights_name, _metadata_name) in MODELS.items():
         weights = target / f"{name}.pb"
         metadata = target / f"{name}.json"
 
@@ -239,7 +239,7 @@ def summary_lines(r: PreflightResult) -> list[str]:
     if r.essentia.installed:
         lines.append(f"  OK (version: {r.essentia.version or 'unknown'})")
     else:
-        lines.append(f"  NOT INSTALLED")
+        lines.append("  NOT INSTALLED")
         lines.append(f"  {r.essentia.error}")
         if "win" in r.platform.lower():
             lines.append("  Windows: essentia-tensorflow has no official wheel.")
@@ -276,8 +276,10 @@ def summary_lines(r: PreflightResult) -> list[str]:
         else:
             for d in r.wsl.distros:
                 bits = []
-                if d.vibechek_installed: bits.append("vibechek")
-                if d.essentia_installed: bits.append("essentia")
+                if d.vibechek_installed:
+                    bits.append("vibechek")
+                if d.essentia_installed:
+                    bits.append("essentia")
                 status = ", ".join(bits) if bits else "neither installed"
                 lines.append(f"  - {d.name}: {status}")
             lines.append("  Run the GUI installer or `pip install essentia-tensorflow vibechek` inside your distro.")

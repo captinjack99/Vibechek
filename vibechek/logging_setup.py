@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
-from pathlib import Path
 
 from vibechek.config import DATA_DIR
 
@@ -76,7 +75,7 @@ def tail(n: int = 200) -> list[str]:
         # Simple O(n) read of the tail — log file is bounded by rotation
         with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
-        return [l.rstrip("\n") for l in lines[-n:]]
+        return [line.rstrip("\n") for line in lines[-n:]]
     except OSError:
         return []
 

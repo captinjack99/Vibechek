@@ -84,8 +84,8 @@ def test_analyze_directory_uses_full_wsl_probe(monkeypatch, tmp_path) -> None:
     is not installed (native, in WSL, or in the managed venv)" because the
     quick probe couldn't see the distro contents.
     """
-    from vibechek import analyzer, preflight as _preflight_module
-    from vibechek import wsl
+    from vibechek import analyzer, wsl
+    from vibechek import preflight as _preflight_module
 
     probe_calls: list[bool] = []
 

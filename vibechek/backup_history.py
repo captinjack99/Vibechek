@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -28,6 +29,14 @@ log = logging.getLogger(__name__)
 
 MAX_RECORDS = 50  # Plenty of history without bloating the index
 HISTORY_FILE = CONFIG_DIR / "backup_history.json"
+
+# Serializes load-modify-save of the history index. backup_tags + forget_backup
+# can land on the RPC dispatch pool concurrently; without this, two writers
+# each load the old index and the later save clobbers the earlier's mutation
+# (lost update). The unique-temp-suffix in atomic_write_json already prevents a
+# torn file; this lock prevents the lost update. Re-entrant so `record`/`forget`
+# can call `save()` without self-deadlocking.
+_HISTORY_LOCK = threading.RLock()
 
 
 @dataclass
@@ -92,38 +101,40 @@ def record(library_path: str | Path, backup_path: str | Path, file_count: int) -
     """Remember a backup that just got created. Bumps to the top."""
     bp = str(backup_path)
     lp = str(library_path)
-    history = load()
-    # If we already have this exact backup path, replace it
-    history.records = [r for r in history.records if r.backup_path != bp]
-    size = 0
-    try:
-        size = Path(bp).stat().st_size
-    except OSError:
-        pass
-    rec = BackupRecord(
-        backup_path=bp,
-        library_path=lp,
-        file_count=file_count,
-        created_at=time.time(),
-        size_bytes=size,
-    )
-    history.records.insert(0, rec)
-    if len(history.records) > MAX_RECORDS:
-        history.records = history.records[:MAX_RECORDS]
-    save(history)
-    return rec
+    with _HISTORY_LOCK:
+        history = load()
+        # If we already have this exact backup path, replace it
+        history.records = [r for r in history.records if r.backup_path != bp]
+        size = 0
+        try:
+            size = Path(bp).stat().st_size
+        except OSError:
+            pass
+        rec = BackupRecord(
+            backup_path=bp,
+            library_path=lp,
+            file_count=file_count,
+            created_at=time.time(),
+            size_bytes=size,
+        )
+        history.records.insert(0, rec)
+        if len(history.records) > MAX_RECORDS:
+            history.records = history.records[:MAX_RECORDS]
+        save(history)
+        return rec
 
 
 def forget(backup_path: str | Path) -> bool:
     """Drop a record from the index. The backup file itself is NOT deleted."""
     bp = str(backup_path)
-    history = load()
-    before = len(history.records)
-    history.records = [r for r in history.records if r.backup_path != bp]
-    if len(history.records) < before:
-        save(history)
-        return True
-    return False
+    with _HISTORY_LOCK:
+        history = load()
+        before = len(history.records)
+        history.records = [r for r in history.records if r.backup_path != bp]
+        if len(history.records) < before:
+            save(history)
+            return True
+        return False
 
 
 def to_dict(history: BackupHistory) -> dict[str, Any]:

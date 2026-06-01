@@ -13,18 +13,13 @@ Covers:
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
 from vibechek.config import (
-    AnalysisConfig,
-    CONFIG_FILE,
     DuplicateConfig,
-    LEGACY_CONFIG_FILE,
     OrganizationConfig,
-    TaggingConfig,
     VibechekConfig,
 )
 

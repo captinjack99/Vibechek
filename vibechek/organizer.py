@@ -372,8 +372,12 @@ def route_new_tracks(
     """Copy each tagged track from `staging_dir` into a `library_root/<Genre>/` folder.
 
     Genre is read from the file's existing tag. Tracks without a genre tag are
-    skipped (with a log entry). File-name collisions are silently skipped to avoid
-    overwriting whatever is already there.
+    skipped (with a log entry). When the destination filename already exists, the
+    incoming file is copied under a uniquified name (`track_1.mp3`, ...) — the
+    same never-clobber rule `organize_from_analysis` uses — so a genuinely
+    different staging track that happens to share a basename is never silently
+    dropped. (Byte-identical re-imports still get a harmless `_1` copy; dedupe
+    handles those separately.)
     """
     staging_dir = Path(staging_dir)
     library_root = Path(library_root)
@@ -396,8 +400,11 @@ def route_new_tracks(
         dest_folder = library_root / sanitize_folder_name(genre)
         dest_file = dest_folder / fp.name
         if dest_file.exists():
+            # A different track shouldn't be lost just because the names collide.
+            # Uniquify (track_1.mp3, ...) instead of silently skipping. Still
+            # surfaced in `skipped_exists` so the UI can report "had to rename N".
             summary["skipped_exists"] += 1
-            continue
+            dest_file = _unique_destination(dest_file)
 
         if dry_run:
             summary["copied"] += 1

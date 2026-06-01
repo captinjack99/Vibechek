@@ -15,7 +15,6 @@ checking this flag.
 from __future__ import annotations
 
 import threading
-from typing import Optional
 
 
 class CancelledError(RuntimeError):
@@ -23,7 +22,7 @@ class CancelledError(RuntimeError):
 
 
 _flag = threading.Event()
-_current_kind: Optional[str] = None
+_current_kind: str | None = None
 _lock = threading.Lock()
 
 
