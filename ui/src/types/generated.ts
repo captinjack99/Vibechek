@@ -39,6 +39,7 @@ export interface AnalysisConfig {
   models_dir: string;
   use_gpu: string;
   hybrid_cpu_gpu: boolean;
+  inference_engine: string;
 }
 
 export interface DuplicateConfig {

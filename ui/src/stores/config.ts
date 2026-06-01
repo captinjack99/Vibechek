@@ -22,7 +22,13 @@ interface ConfigState {
 }
 
 const DEFAULT_CONFIG: VibechekConfig = {
-  analysis: { workers: 0, models_dir: "", use_gpu: "auto", hybrid_cpu_gpu: true },
+  analysis: {
+    workers: 0,
+    models_dir: "",
+    use_gpu: "auto",
+    hybrid_cpu_gpu: true,
+    inference_engine: "essentia_tf",
+  },
   tagging: {
     genre_confidence_threshold: 0.85,
     // Two-stage confidence floor — if the subgenre is below the strict 85%
