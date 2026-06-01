@@ -25,6 +25,10 @@ import { cleanup } from "@testing-library/react";
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => ({})),
   convertFileSrc: (src: string) => src,
+  // useUpdater() gates every plugin call behind isTauri(); in tests we're not
+  // in the Tauri shell, so it must return false (and never lazy-load the
+  // updater/process plugins).
+  isTauri: () => false,
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({

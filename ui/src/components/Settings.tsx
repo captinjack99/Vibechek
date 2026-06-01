@@ -3,7 +3,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield,
   Zap, AlertTriangle, CheckCircle2, RotateCcw, ChevronDown, ChevronRight,
-  FileText, Wrench, StopCircle, HelpCircle, Disc3, Loader2,
+  FileText, Wrench, StopCircle, HelpCircle, Disc3, Loader2, RefreshCw,
 } from "lucide-react";
 import { AnimatePresence } from "framer-motion";
 
@@ -15,6 +15,7 @@ import {
 } from "../api/rpc";
 import type { ListProfilesResult } from "../api/methods";
 import type { EngineGpuInfo, GpuDevice, PreflightResult, SystemResources, VibechekConfig } from "../types";
+import { useUpdater } from "../hooks/useUpdater";
 import { ConfirmModal } from "./ConfirmModal";
 import { LogsViewer } from "./LogsViewer";
 import { PreflightDialog } from "./PreflightDialog";
@@ -913,6 +914,8 @@ export function Settings() {
         </Hint>
       </Section>
 
+      <UpdatesSection />
+
       <Section title="About" subtitle="">
         <div className="text-xs text-white/40 font-mono break-all">
           Sidecar: {sidecarBinary ?? "?"}
@@ -947,6 +950,92 @@ export function Settings() {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+/**
+ * Software updates: a non-intrusive "Check for updates" affordance backed by
+ * tauri-plugin-updater. No-ops cleanly outside the Tauri shell (dev browser /
+ * tests) — the button simply reports "up to date".
+ */
+function UpdatesSection() {
+  const { state, supported, checkForUpdate, downloadAndInstall } = useUpdater();
+  const busy = state.phase === "checking"
+    || state.phase === "downloading"
+    || state.phase === "installing";
+
+  const checkLabel = (() => {
+    switch (state.phase) {
+      case "checking": return "Checking…";
+      case "downloading": return "Downloading…";
+      case "installing": return "Installing…";
+      default: return "Check for updates";
+    }
+  })();
+
+  return (
+    <Section
+      icon={<RefreshCw className="w-5 h-5" />}
+      title="Software updates"
+      subtitle=""
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          className="btn-ghost"
+          onClick={checkForUpdate}
+          disabled={busy}
+          title="Check GitHub Releases for a newer signed build"
+        >
+          {busy
+            ? <Loader2 className="w-4 h-4 animate-spin" />
+            : <RefreshCw className="w-4 h-4" />}
+          {checkLabel}
+        </button>
+
+        {state.phase === "available" && (
+          <button
+            className="btn-primary"
+            onClick={downloadAndInstall}
+            title="Download the update and restart Vibechek"
+          >
+            <Download className="w-4 h-4" />
+            Download &amp; install v{state.version}
+          </button>
+        )}
+      </div>
+
+      {state.phase === "up-to-date" && (
+        <div className="text-xs text-white/50 mt-1 flex items-center gap-1">
+          <CheckCircle2 className="w-3.5 h-3.5 text-accent-green flex-none" />
+          {supported
+            ? "You're on the latest version."
+            : "Updates apply to the installed desktop app only."}
+        </div>
+      )}
+
+      {state.phase === "available" && (
+        <div className="text-xs text-white/50 mt-2">
+          Version <span className="font-mono">{state.version}</span> is available.
+          {state.notes && (
+            <div className="text-[11px] text-white/40 mt-1 whitespace-pre-wrap line-clamp-4">
+              {state.notes}
+            </div>
+          )}
+        </div>
+      )}
+
+      {state.phase === "error" && state.error && (
+        <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
+          <AlertTriangle className="w-3.5 h-3.5 flex-none mt-0.5" />
+          <span>Update check failed: {state.error}</span>
+        </div>
+      )}
+
+      <Hint>
+        Vibechek checks GitHub Releases for a newer signed build and installs it
+        in place. Updates are cryptographically verified before they're applied.
+      </Hint>
+    </Section>
   );
 }
 
