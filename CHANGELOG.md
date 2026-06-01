@@ -14,6 +14,32 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
 
 ---
 
+## [0.4.0-beta.8] — 2026-06-01
+
+End-to-end engineering audit + remediation, a new flagship feature, and the
+auto-update pipeline. Full suite: 639 Python tests, ruff (now enforcing) clean,
+32→38 frontend tests, cargo check clean.
+
+### Added
+- **FLAC → CDJ export** (`vibechek cdj-export <rekordbox.xml> --out <dir>`). Lets DJs play a FLAC library on older Pioneer CDJs (CDJ-2000nexus and earlier) that don't support FLAC, **without losing cues or beat grids**: each FLAC is transcoded to a sample-identical 16-bit **AIFF**, and the Rekordbox XML is rewritten so the `TEMPO` (grid) + `POSITION_MARK` (cues) copy across with zero offset math (never MP3 — its ~26 ms encoder delay shifts the grid). Strictly additive; source files never modified. Optional `[cdj]` extra (`soundfile`) with an `ffmpeg` fallback. New `vibechek/cdj_export.py` + 20 tests.
+- **In-app auto-updater** (`tauri-plugin-updater`, opt-in). Settings → "Software updates" → check / download / install / relaunch. CI signs update artifacts + publishes `latest.json` when a signing key is configured; ships inert (unsigned) until you enroll one — see `docs/RELEASING.md`. Public-key-verified payloads.
+- **Configurable key-detection profile** + **BPM octave-error guard** (folds 70↔140 / 87↔174 and cross-checks the filename BPM).
+
+### Fixed (audit — 4 HIGH + 18 MED + 18 LOW)
+- **Tag backup was lossy** — captured only ~7 fixed fields for FLAC/M4A and **nothing** for AIFF/WAV/OGG/AAC, while advertised as "no loss." Now format-complete: FLAC reads every Vorbis comment, M4A every atom (binary atoms base64'd), and **AIFF/WAV now capture their ID3 GEOB/PRIV cue frames** (previously a silent cue-loss risk on restore). Restore reports unsupported entries instead of skipping silently.
+- **Direction classifier was silently dead** — it averaged both softmax columns → "Steady" for ~every track. Now indexes the aggressive column.
+- **UNC / network-share library paths** raised an opaque failure inside WSL → now a clear, actionable error.
+- **Concurrent index writes** (`rename_library`/`tag_library`/`forget_*`) raced a fixed `.partial` temp file → unique per-write temp name + module locks.
+- **Key accuracy**: switched to Essentia's EDM-tuned `edma` key profile (meaningful accuracy lift on electronic music).
+- **De-dup recall**: Chromaprint matching now uses sliding-offset alignment + multi-probe bucketing (catches transcodes index-0-only matching missed); the similarity-threshold setting is now actually forwarded.
+- RPC write-path inputs are validated/clamped (`id3_text_encoding`, confidence thresholds, worker counts, inverted vocal bands); `sanitize_folder_name` rejects `..`/reserved device names; multi-GPU VRAM probe pins device 0; voice/genre head class order resolved by label; WSL shim rewrites made atomic; install-distro PowerShell-injection allowlist; filename-BPM false-positive guard; ConfirmModal a11y (focus Cancel on destructive, dialog semantics, Escape); analyze-run streaming guard; asset-protocol + shell capability scoping; and many more — see `internal/AUDIT_2026-06-01.md`.
+
+### Changed
+- **CI**: `ruff check` is now enforcing (was advisory); third-party GitHub Actions pinned to commit SHAs; removed the stale `installer.iss` (NSIS-via-Tauri is the supported path).
+- **Docs**: competitor comparison claims independently verified against 2026 sources (`docs/COMPETITORS.md`); the ONNX migration plan reframed — official MTG ONNX models already exist, so it's "retire EOL TensorFlow 2.5" (security-driven) + a MAEST backbone, not self-conversion (effort ~3 weeks → ~1 week).
+
+---
+
 ## [0.4.0-beta.7] — 2026-05-29
 
 Three user-reported accuracy/UX bugs.

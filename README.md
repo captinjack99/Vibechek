@@ -2,7 +2,7 @@
 
 **Open-source ML for your DJ library.** Auto-tag genre, mood, energy, BPM, and key. Find duplicates the way your ears would. Organize 10,000 tracks in an afternoon. Keep every Rekordbox cue point intact.
 
-> **Status:** `v0.4.0-beta.7` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux). Free forever under AGPL-3.0.
+> **Status:** `v0.4.0-beta.8` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux). Free forever under AGPL-3.0.
 
 ---
 
@@ -93,6 +93,10 @@ Every ML field has an independent write toggle — genre, BPM, key, energy, mood
 ### 🎧 One global player, always in reach
 
 A single persistent player bar lives at the app root. Preview any track from anywhere, and it follows you across tabs. Two previews can never overlap, every track starts cleanly at 0:00, and there's always a visible stop control.
+
+### 💿 FLAC → CDJ export (play FLAC on old Pioneer decks)
+
+Older CDJs (CDJ-2000nexus and earlier) can't read FLAC. `vibechek cdj-export <rekordbox.xml>` transcodes your FLACs to **AIFF** — a *sample-identical* decode, so your cue points and beat grids copy across with zero drift — and rewrites a Rekordbox XML you re-import and export to USB. It never uses MP3 (encoder delay shifts the grid ~26 ms), never touches your source files, and preserves the `TEMPO`/`POSITION_MARK` data byte-for-byte. Your FLAC library plays on the club's first-gen decks with every cue intact.
 
 ### 🪟 🍎 🐧 Zero-CLI setup on every platform
 
@@ -203,7 +207,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**487 Python tests** · **44 JSON-RPC methods** · **27 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**639 Python tests** · **44 JSON-RPC methods** · **28 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
 - 32 frontend tests across keeperRules, LibraryFilters, ConfirmModal, Sidebar
