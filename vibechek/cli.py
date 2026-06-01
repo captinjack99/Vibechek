@@ -86,12 +86,17 @@ def main() -> None:
 @click.option("--hybrid/--no-hybrid", default=True, show_default=True,
               help="Run GPU + CPU workers together against a shared queue "
                    "(self-balancing). --no-hybrid uses a single device pool.")
+@click.option("--engine", type=click.Choice(["essentia_tf", "onnx"]),
+              default="essentia_tf", show_default=True,
+              help="Inference engine: essentia_tf (bundled TensorFlow, NVIDIA-only "
+                   "GPU) or onnx (TF-free ONNX Runtime, cross-vendor GPU).")
 def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
-            output: Path, models_dir: Path | None, hybrid: bool) -> None:
+            output: Path, models_dir: Path | None, hybrid: bool, engine: str) -> None:
     """Analyze every audio file under PATH with the ML models."""
     from vibechek.analyzer import analyze_directory
 
-    config = AnalysisConfig(workers=workers, use_gpu=gpu, hybrid_cpu_gpu=hybrid)
+    config = AnalysisConfig(workers=workers, use_gpu=gpu, hybrid_cpu_gpu=hybrid,
+                            inference_engine=engine)
     if models_dir:
         config.models_dir = models_dir
 
