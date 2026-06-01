@@ -510,6 +510,52 @@ export function Settings() {
           hint="Run GPU workers AND extra CPU workers together against a shared queue, so a small GPU worker-cap doesn't leave your cores idle. Whichever device finishes a track grabs the next — it self-balances. Ignored when GPU mode is off."
         />
 
+        {/* Inference engine: essentia-tensorflow (default) vs ONNX Runtime.
+            ONNX runs the SAME models through onnxruntime — cross-vendor GPU
+            (AMD/Intel/Apple via DirectML/CoreML) and NO bundled TensorFlow.
+            Selecting it provisions a separate engine (plain essentia +
+            onnxruntime) on the next analyze. Validated to parity with the TF
+            path — see docs/ONNX_MIGRATION.md. */}
+        <Field label="Inference engine">
+          <div className="flex gap-2">
+            {([
+              { id: "essentia_tf", label: "Essentia · TensorFlow" },
+              { id: "onnx", label: "ONNX Runtime" },
+            ] as const).map(({ id, label }) => (
+              <button
+                key={id}
+                onClick={() => updateAnalysis({ inference_engine: id })}
+                className={`btn ${
+                  cfg.analysis.inference_engine === id
+                    ? "bg-accent text-white"
+                    : "bg-white/5 text-white/70 hover:bg-white/10"
+                }`}
+              >
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
+          {cfg.analysis.inference_engine === "onnx" && (
+            <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
+              <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+              <span>
+                Experimental. The first analyze after switching sets up a
+                separate ONNX engine (plain Essentia + ONNX Runtime, no
+                TensorFlow) — a one-time install. Re-analyze your library so
+                every track is scored by the same engine.
+              </span>
+            </div>
+          )}
+          <Hint>
+            <strong>Essentia · TensorFlow</strong> is the default (NVIDIA-only
+            GPU).{" "}
+            <strong>ONNX Runtime</strong> runs the same models with cross-vendor
+            GPU — AMD, Intel, and Apple Silicon via DirectML/CoreML — and drops
+            the end-of-life TensorFlow runtime entirely. Validated to match the
+            default engine's output; see <code>docs/ONNX_MIGRATION.md</code>.
+          </Hint>
+        </Field>
+
         <Field label="Models directory">
           <div className="flex gap-2">
             <input

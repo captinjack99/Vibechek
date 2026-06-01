@@ -56,6 +56,17 @@ IS_SUPPORTED = IS_MAC or IS_LINUX
 VENV_DIR = Path.home() / ".vibechek" / "venv"
 
 
+def _venv_dir(engine: str = "essentia_tf") -> Path:
+    """Managed-venv path for an inference engine.
+
+    "essentia_tf" → ``~/.vibechek/venv`` (essentia-tensorflow). "onnx" →
+    ``~/.vibechek/venv-onnx`` (plain essentia + onnxruntime). The two essentia
+    builds can't coexist in one venv (both ship the ``essentia`` module), so
+    the ONNX engine gets its own.
+    """
+    return VENV_DIR.parent / "venv-onnx" if engine == "onnx" else VENV_DIR
+
+
 @dataclass
 class NativeVenvStatus:
     """What we know about the managed venv on this machine."""
@@ -80,15 +91,17 @@ def to_dict(s: NativeVenvStatus) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def probe_native_venv() -> NativeVenvStatus:
-    """Snapshot the managed venv state.
+def probe_native_venv(engine: str = "essentia_tf") -> NativeVenvStatus:
+    """Snapshot the managed venv state for the given inference engine.
 
     Fast: no subprocess calls, just disk inspection. The result is what the
-    Settings UI shows in the "Engine" row on Linux/macOS.
+    Settings UI shows in the "Engine" row on Linux/macOS. `engine="onnx"`
+    inspects ``~/.vibechek/venv-onnx`` instead of the default ``venv``.
     """
+    vd = _venv_dir(engine)
     status = NativeVenvStatus(
         supported=IS_SUPPORTED,
-        venv_dir=str(VENV_DIR),
+        venv_dir=str(vd),
     )
 
     if not IS_SUPPORTED:
@@ -98,9 +111,9 @@ def probe_native_venv() -> NativeVenvStatus:
     # — even though we don't support Windows here, leave the path lookup
     # symmetric for tests and future-proofing).
     candidate_pythons = [
-        VENV_DIR / "bin" / "python3",
-        VENV_DIR / "bin" / "python",
-        VENV_DIR / "Scripts" / "python.exe",
+        vd / "bin" / "python3",
+        vd / "bin" / "python",
+        vd / "Scripts" / "python.exe",
     ]
     py = next((p for p in candidate_pythons if p.exists()), None)
     if py is None:
@@ -109,8 +122,8 @@ def probe_native_venv() -> NativeVenvStatus:
 
     # vibechek CLI binary inside the venv
     candidate_clis = [
-        VENV_DIR / "bin" / "vibechek",
-        VENV_DIR / "Scripts" / "vibechek.exe",
+        vd / "bin" / "vibechek",
+        vd / "Scripts" / "vibechek.exe",
     ]
     cli = next((p for p in candidate_clis if p.exists()), None)
     if cli is not None:
@@ -132,8 +145,8 @@ def probe_native_venv() -> NativeVenvStatus:
     # Disk-only check for essentia (avoids the ~10s TF load that
     # `import essentia` would trigger).
     site_packages_globs = [
-        VENV_DIR / "lib" / "python3.*" / "site-packages",
-        VENV_DIR / "Lib" / "site-packages",  # Windows venv layout
+        vd / "lib" / "python3.*" / "site-packages",
+        vd / "Lib" / "site-packages",  # Windows venv layout
     ]
     for pattern in site_packages_globs:
         for sp in pattern.parent.glob(pattern.name):
@@ -191,8 +204,14 @@ def install_essentia_native(
     on_progress: ProgressCallback | None = None,
     *,
     vibechek_source: str | None = None,
+    engine: str = "essentia_tf",
 ) -> dict:
-    """Create the managed venv and install essentia-tensorflow + vibechek.
+    """Create the managed venv and install the ML stack + vibechek.
+
+    `engine="essentia_tf"` installs **essentia-tensorflow** into
+    ``~/.vibechek/venv`` (default). `engine="onnx"` installs **plain essentia +
+    onnxruntime** into ``~/.vibechek/venv-onnx`` (the TF-free engine). The two
+    essentia builds can't coexist in one venv, so the ONNX engine gets its own.
 
     Streams pip output line-by-line. Returns a dict the GUI can render.
 
@@ -202,6 +221,8 @@ def install_essentia_native(
     """
     if not IS_SUPPORTED:
         return {"ok": False, "error": f"Native install not supported on {sys.platform}"}
+
+    vd = _venv_dir(engine)
 
     host_python = _find_host_python()
     if not host_python:
@@ -234,14 +255,14 @@ def install_essentia_native(
     if on_progress:
         on_progress(0, 100, f"Using host Python: {host_python}")
 
-    VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
+    vd.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- Step 1: create venv (or skip if it exists) ----
-    if not (VENV_DIR / "bin" / "python3").exists() and not (VENV_DIR / "bin" / "python").exists():
+    if not (vd / "bin" / "python3").exists() and not (vd / "bin" / "python").exists():
         if on_progress:
-            on_progress(5, 100, f"Creating venv at {VENV_DIR}...")
+            on_progress(5, 100, f"Creating venv at {vd}...")
         rc, _stdout, stderr, cancelled = _run_subprocess_cancellable(
-            [host_python, "-m", "venv", str(VENV_DIR)],
+            [host_python, "-m", "venv", str(vd)],
             timeout=120,
         )
         if cancelled or cancellation.is_cancelled():
@@ -252,10 +273,10 @@ def install_essentia_native(
                 "error": f"venv creation exited with {rc}\n{stderr[-1000:]}",
             }
     elif on_progress:
-        on_progress(10, 100, f"Venv already exists at {VENV_DIR}, reusing")
+        on_progress(10, 100, f"Venv already exists at {vd}, reusing")
 
     venv_python = next(
-        p for p in [VENV_DIR / "bin" / "python3", VENV_DIR / "bin" / "python"]
+        p for p in [vd / "bin" / "python3", vd / "bin" / "python"]
         if p.exists()
     )
     venv_pip = [str(venv_python), "-m", "pip"]
@@ -273,11 +294,14 @@ def install_essentia_native(
     if rc != 0:
         return _fail("pip/wheel upgrade", rc, tail)
 
-    # ---- Step 3: essentia-tensorflow (the slow ~3-5 min step) ----
+    # ---- Step 3: the ML stack (the slow ~3-5 min step) ----
+    # onnx → plain essentia + onnxruntime (TF-free); else essentia-tensorflow.
+    ml_packages = ["essentia", "onnxruntime"] if engine == "onnx" else ["essentia-tensorflow"]
+    ml_label = " + ".join(ml_packages)
     if on_progress:
-        on_progress(25, 100, "Installing essentia-tensorflow (this is the slow step, ~3-5 min)...")
+        on_progress(25, 100, f"Installing {ml_label} (this is the slow step, ~3-5 min)...")
     rc, tail = _run_with_progress(
-        [*venv_pip, "install", "essentia-tensorflow"],
+        [*venv_pip, "install", *ml_packages],
         on_progress=lambda line: on_progress and on_progress(
             _parse_pip_pct(line, base=25, span=55), 100, line[:120],
         ),
@@ -286,7 +310,7 @@ def install_essentia_native(
     if cancellation.is_cancelled():
         return {"ok": False, "error": "Cancelled by user", "cancelled": True}
     if rc != 0:
-        return _fail("essentia-tensorflow install", rc, tail)
+        return _fail(f"{ml_label} install", rc, tail)
 
     # ---- Step 4: vibechek itself ----
     if on_progress:
@@ -305,7 +329,7 @@ def install_essentia_native(
     # ---- Step 5: verify ----
     if on_progress:
         on_progress(95, 100, "Verifying install...")
-    venv_vibechek = VENV_DIR / "bin" / "vibechek"
+    venv_vibechek = vd / "bin" / "vibechek"
     v_rc, v_stdout, v_stderr, v_cancel = _run_subprocess_cancellable(
         [str(venv_vibechek), "--version"], timeout=10,
     )
@@ -341,7 +365,7 @@ def install_essentia_native(
 
     return {
         "ok": True,
-        "venv_dir": str(VENV_DIR),
+        "venv_dir": str(vd),
         "venv_python": str(venv_python),
         "venv_vibechek": str(venv_vibechek),
         "vibechek_version": version_result.stdout.strip(),
@@ -544,21 +568,23 @@ def run_vibechek_in_native_venv(
     args: list[str],
     on_stderr_line: Callable[[str], None] | None = None,
     timeout: int | None = None,
+    engine: str = "essentia_tf",
 ) -> subprocess.CompletedProcess:
-    """Run `~/.vibechek/venv/bin/vibechek <args>` and return the completed process.
+    """Run `~/.vibechek/<venv>/bin/vibechek <args>` and return the completed process.
 
-    The Linux/macOS analog of `run_vibechek_in_wsl`. Same cooperative
+    The Linux/macOS analog of `run_vibechek_in_wsl`. `engine` selects the venv:
+    "essentia_tf" → ``venv``, "onnx" → ``venv-onnx``. Same cooperative
     cancellation pattern: a watchdog thread polls
     `vibechek.cancellation.is_cancelled()` and terminates the child if a
     cancel comes in.
     """
     from vibechek import cancellation
 
-    status = probe_native_venv()
+    status = probe_native_venv(engine)
     if not status.vibechek_installed or not status.venv_vibechek:
         raise FileNotFoundError(
-            f"vibechek is not installed in the managed venv at {VENV_DIR}. "
-            "Run install_essentia_native() first."
+            f"vibechek is not installed in the managed venv at {_venv_dir(engine)}. "
+            f"Run install_essentia_native(engine={engine!r}) first."
         )
 
     cmd = [status.venv_vibechek, *args]

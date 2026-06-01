@@ -155,6 +155,39 @@ MODEL_SHA256: dict[str, dict[str, str]] = {
     # ... one entry per model in MODELS ...
 }
 
+# Converted ONNX classification heads. Filenames match what
+# scripts/convert_heads_to_onnx.py produces and what onnx_backend loads.
+# essentia hosts only the .pb originals + the backbone .onnx, so the converted
+# heads live on our own mirror release (the backbone already emits genre, so
+# genre_discogs400 is optional — fetched for its class labels + as a fallback).
+_ONNX_MODELS_RELEASE = "models-onnx-v1"
+_ONNX_HEAD_STEMS: tuple[str, ...] = (
+    "genre_discogs400",
+    "danceability",
+    "voice_instrumental",
+    "mood_aggressive",
+    "mood_happy",
+    "mood_relaxed",
+    "mood_sad",
+)
+# SHA256 of each converted head file ("<stem>.onnx" / "<stem>.json"). Populated
+# when the models-onnx mirror bundle is built (scripts/build_onnx_model_bundle.py);
+# empty → verify is a no-op, same staged-rollout pattern as MODEL_SHA256.
+MODEL_SHA256_ONNX: dict[str, str] = {}
+
+
+def _onnx_head_bases() -> list[str]:
+    """Mirror base URL(s) for the converted ONNX heads (flat filenames).
+
+    Respects the VIBECHEK_MODELS_URL override (used for local mirrors / tests);
+    otherwise points at our models-onnx GitHub release.
+    """
+    if _USER_MODEL_BASE_URL:
+        return [_USER_MODEL_BASE_URL]
+    return [
+        f"https://github.com/papapew/Vibechek/releases/download/{_ONNX_MODELS_RELEASE}"
+    ]
+
 
 def verify_model_sha256(path: Path, expected: str | None) -> None:
     """Validate `path`'s SHA256 against `expected`. No-op when `expected` is None.
@@ -414,6 +447,46 @@ def download_models(
                 errors.append(f"{BACKBONE_ONNX_FILENAME}: {e}")
                 onnx_path.unlink(missing_ok=True)
         descriptors["effnet_onnx"] = {"weights": str(onnx_path)}
+
+        # ---- converted classification heads (.onnx + .json) ----
+        # essentia hosts only the .pb originals, so these come from our own
+        # models-onnx mirror. The backbone already emits genre, so
+        # genre_discogs400 and every .json are OPTIONAL (a miss is a warning);
+        # the other head .onnx are REQUIRED for the onnx engine to run.
+        head_bases = _onnx_head_bases()
+        for stem in _ONNX_HEAD_STEMS:
+            for suffix in ("onnx", "json"):
+                fname = f"{stem}.{suffix}"
+                dest = model_dir / fname
+                urls = [f"{base}/{fname}" for base in head_bases]
+                expected = MODEL_SHA256_ONNX.get(fname)
+                required = suffix == "onnx" and stem != "genre_discogs400"
+                if _needs_download(dest, urls[0], expected):
+                    try:
+                        _download_from_mirrors(
+                            urls, dest, label=fname,
+                            on_progress=lambda done, total, n=fname: report_progress(
+                                on_progress, done, max(total, done),
+                                f"{n} ({_fmt_bytes(done)}/{_fmt_bytes(total)})",
+                            ),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        (log.error if required else log.warning)(
+                            "Failed to download ONNX head %s: %s", fname, e
+                        )
+                        if required:
+                            errors.append(f"{fname}: {e}")
+                        dest.unlink(missing_ok=True)
+                        continue
+                if dest.exists():
+                    try:
+                        verify_model_sha256(dest, expected)
+                    except RuntimeError as e:
+                        log.error("SHA256 mismatch for ONNX head %s: %s", fname, e)
+                        if required:
+                            errors.append(f"{fname}: {e}")
+                        dest.unlink(missing_ok=True)
+            descriptors[f"onnx_{stem}"] = {"weights": str(model_dir / f"{stem}.onnx")}
 
     if errors:
         raise RuntimeError(
@@ -2297,6 +2370,7 @@ def _analyze_via_native_venv(
         "-o", str(local_output),
         "--gpu", config.use_gpu,
         "--models-dir", str(config.models_dir),
+        "--engine", config.inference_engine,
     ]
     if workers > 0:
         args += ["--workers", str(workers)]
@@ -2315,7 +2389,7 @@ def _analyze_via_native_venv(
         on_track=on_track,
     )
 
-    result = run_vibechek_in_native_venv(args, on_stderr_line=on_line)
+    result = run_vibechek_in_native_venv(args, on_stderr_line=on_line, engine=config.inference_engine)
 
     if result.returncode != 0:
         raise RuntimeError(
@@ -2399,6 +2473,7 @@ def _analyze_via_wsl(
         "-o", wsl_output,
         "--gpu", config.use_gpu,
         "--models-dir", wsl_models_dir,
+        "--engine", config.inference_engine,
     ]
     if workers > 0:
         args += ["--workers", str(workers)]
@@ -2408,6 +2483,11 @@ def _analyze_via_wsl(
         args += ["--limit", str(limit)]
     if not config.hybrid_cpu_gpu:
         args += ["--no-hybrid"]
+
+    # Route to the venv matching the engine: "venv-onnx" (plain essentia +
+    # onnxruntime) for the TF-free ONNX path, "venv" (essentia-tensorflow)
+    # otherwise. run_vibechek_in_wsl uses ONLY that venv's binary for onnx.
+    venv_subdir = "venv-onnx" if config.inference_engine == "onnx" else "venv"
 
     # Drop high-volume essentia / TF noise lines from the bounded tail
     # buffer so an 80-line window survives the per-worker spam and actually
@@ -2483,7 +2563,7 @@ def _analyze_via_wsl(
                 f"crash silently on multi-worker analyze."
             )
 
-    result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line)
+    result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir)
 
     if result.returncode != 0:
         stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"

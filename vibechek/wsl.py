@@ -1237,43 +1237,70 @@ echo "ROOT_DONE"
 
 # Phase 2: venv + pip. Runs as the default user so files land in their home.
 # `$DEFAULT_USER_HOME` is filled in by Python before the script is sent.
-_USER_BOOTSTRAP = r"""
-set -e
+def _user_bootstrap(engine: str = "essentia_tf") -> str:
+    """Phase-2 (pip-as-user) install script for the given inference engine.
 
-echo "[3/4] Creating ~/.vibechek venv..."
+    "essentia_tf" → ``~/.vibechek/venv`` with **essentia-tensorflow** (the
+    default; NVIDIA-only GPU). "onnx" → ``~/.vibechek/venv-onnx`` with **plain
+    essentia + onnxruntime** (the TF-free engine; cross-vendor GPU). The two
+    essentia builds can't share a venv (both ship the ``essentia`` module), so
+    the ONNX engine gets its own venv. `run_vibechek_in_wsl(venv_subdir=...)`
+    routes analyze to whichever the user picked.
+
+    `--upgrade` makes re-running "Set up" an idempotent version-drift fix:
+    every code-side bump on GitHub becomes available without deleting the venv.
+    """
+    subdir = "venv-onnx" if engine == "onnx" else "venv"
+    pip = f'"$HOME/.vibechek/{subdir}/bin/pip"'
+    if engine == "onnx":
+        ml_line = f'{pip} install --quiet essentia onnxruntime'
+        label = "plain essentia + onnxruntime (TF-free ONNX engine)"
+    else:
+        ml_line = f'{pip} install --quiet essentia-tensorflow'
+        label = "essentia-tensorflow"
+    # The ~/.local/bin symlink only tracks the DEFAULT venv; the ONNX engine is
+    # invoked by its explicit venv path (run_vibechek_in_wsl), so we don't
+    # repoint the shared symlink for it.
+    if engine == "onnx":
+        symlink_block = ""
+    else:
+        symlink_block = (
+            'mkdir -p "$HOME/.local/bin"\n'
+            f'ln -sf "$HOME/.vibechek/{subdir}/bin/vibechek" "$HOME/.local/bin/vibechek"\n'
+            'case ":$PATH:" in\n'
+            '  *":$HOME/.local/bin:"*) ;;\n'
+            '  *) echo \'export PATH="$HOME/.local/bin:$PATH"\' >> "$HOME/.bashrc" ;;\n'
+            'esac\n'
+        )
+    return f"""set -e
+
+echo "[3/4] Creating ~/.vibechek/{subdir} venv..."
 mkdir -p "$HOME/.vibechek"
-if [ ! -d "$HOME/.vibechek/venv" ]; then
-    python3 -m venv "$HOME/.vibechek/venv"
+if [ ! -d "$HOME/.vibechek/{subdir}" ]; then
+    python3 -m venv "$HOME/.vibechek/{subdir}"
 fi
 
-echo "[4/4] Installing Python packages (this is the slow part)..."
-"$HOME/.vibechek/venv/bin/pip" install --upgrade --quiet pip wheel
-"$HOME/.vibechek/venv/bin/pip" install --quiet essentia-tensorflow
-# `--upgrade` makes re-running Set up WSL an idempotent way for users to
-# fix version drift: every code-side bump that lands on GitHub becomes
-# available here without forcing them to delete ~/.vibechek/venv. Combined
-# with the analyzer's version-drift guard, this is how an out-of-date WSL
-# install gets self-repaired by the user clicking one button.
-"$HOME/.vibechek/venv/bin/pip" install --upgrade --quiet git+https://github.com/papapew/Vibechek.git
+echo "[4/4] Installing Vibechek + {label} (this is the slow part)..."
+{pip} install --upgrade --quiet pip wheel
+{ml_line}
+{pip} install --upgrade --quiet git+https://github.com/papapew/Vibechek.git
 
-# Symlink the CLI into ~/.local/bin so it's on PATH (login shells get this dir
-# automatically on most distros; we also tack it onto .bashrc just in case).
-mkdir -p "$HOME/.local/bin"
-ln -sf "$HOME/.vibechek/venv/bin/vibechek" "$HOME/.local/bin/vibechek"
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc" ;;
-esac
-
+{symlink_block}
 echo "DONE"
-"$HOME/.vibechek/venv/bin/vibechek" --version
-"$HOME/.vibechek/venv/bin/python" -c "import essentia; print('essentia OK', essentia.__version__)"
+"$HOME/.vibechek/{subdir}/bin/vibechek" --version
+"$HOME/.vibechek/{subdir}/bin/python" -c "import essentia; print('essentia OK', essentia.__version__)"
 """
+
+
+# Back-compat: the default-engine script as a module constant (referenced by
+# the existing tests + the cold-install path).
+_USER_BOOTSTRAP = _user_bootstrap("essentia_tf")
 
 
 def install_vibechek_in_wsl(
     distro: str,
     on_progress: ProgressCallback | None = None,
+    engine: str = "essentia_tf",
 ) -> dict:
     """Install vibechek + essentia + chromaprint inside `distro`.
 
@@ -1419,8 +1446,8 @@ def install_vibechek_in_wsl(
     log.info("WSL install phase 2 (pip as default user) in %s", distro)
     rc, tail, cancelled = _run_phase(
         [wsl, "-d", distro, "--"],
-        _USER_BOOTSTRAP,
-        "Phase 2: USER — installing Vibechek + Essentia (slow)",
+        _user_bootstrap(engine),
+        f"Phase 2: USER — installing Vibechek + {'plain essentia + onnxruntime' if engine == 'onnx' else 'essentia-tensorflow'} (slow)",
         run_as_root=False,
     )
     if cancelled or cancellation.is_cancelled():
@@ -2184,8 +2211,15 @@ def run_vibechek_in_wsl(
     args: list[str],
     on_stderr_line: Callable[[str], None] | None = None,
     timeout: int | None = None,
+    venv_subdir: str = "venv",
 ) -> subprocess.CompletedProcess:
     """Run `vibechek <args>` inside `distro` and return the completed process.
+
+    `venv_subdir` selects which managed venv runs the binary: "venv" (default,
+    essentia-tensorflow) or "venv-onnx" (plain essentia + onnxruntime — the
+    TF-free ONNX engine). The analyze router passes the one matching
+    `config.inference_engine`. Defaulting to "venv" keeps the TF path
+    byte-identical.
 
     stderr lines are streamed live to `on_stderr_line` if provided — useful
     for parsing CLI progress output. stdout is captured and returned.
@@ -2237,6 +2271,36 @@ def run_vibechek_in_wsl(
     #      another way)
     # The launcher exits with a clear error if none resolve, so the user sees
     # "vibechek binary not found" instead of "exit 0 + no output written".
+    # Resolve which managed venv's vibechek to run. The default "venv"
+    # (essentia-tensorflow) keeps the historical fallback chain
+    # (venv → ~/.local/bin symlink → PATH). A non-default engine venv
+    # (e.g. "venv-onnx") must use ONLY its own binary — never fall back to
+    # the TF venv, whose essentia build / onnxruntime presence differs.
+    venv_bin = f"$HOME/.vibechek/{venv_subdir}/bin/vibechek"
+    if venv_subdir == "venv":
+        bin_resolution = (
+            'VIBECHEK_BIN=""\n'
+            f'if [ -x "{venv_bin}" ]; then\n'
+            f'  VIBECHEK_BIN="{venv_bin}"\n'
+            'elif [ -x "$HOME/.local/bin/vibechek" ]; then\n'
+            '  VIBECHEK_BIN="$HOME/.local/bin/vibechek"\n'
+            'elif command -v vibechek >/dev/null 2>&1; then\n'
+            '  VIBECHEK_BIN="$(command -v vibechek)"\n'
+            'else\n'
+            '  echo "ERROR: vibechek binary not found in WSL. Re-run Settings -> Set up now." >&2\n'
+            '  exit 127\n'
+            'fi\n'
+        )
+    else:
+        bin_resolution = (
+            f'if [ -x "{venv_bin}" ]; then\n'
+            f'  VIBECHEK_BIN="{venv_bin}"\n'
+            'else\n'
+            f'  echo "ERROR: ONNX engine not set up ({venv_bin} missing). '
+            'Re-run Settings -> Set up the ONNX engine." >&2\n'
+            '  exit 127\n'
+            'fi\n'
+        )
     launcher_script = (
         "#!/usr/bin/env bash\n"
         "set -e\n"
@@ -2251,17 +2315,7 @@ def run_vibechek_in_wsl(
         # vibechek/analyzer.py:_emit_event for the line schema.
         'export VIBECHEK_STREAM_PROGRESS=1\n'
         '# Resolve vibechek binary explicitly — non-interactive bash has no PATH for it.\n'
-        'VIBECHEK_BIN=""\n'
-        'if [ -x "$HOME/.vibechek/venv/bin/vibechek" ]; then\n'
-        '  VIBECHEK_BIN="$HOME/.vibechek/venv/bin/vibechek"\n'
-        'elif [ -x "$HOME/.local/bin/vibechek" ]; then\n'
-        '  VIBECHEK_BIN="$HOME/.local/bin/vibechek"\n'
-        'elif command -v vibechek >/dev/null 2>&1; then\n'
-        '  VIBECHEK_BIN="$(command -v vibechek)"\n'
-        'else\n'
-        '  echo "ERROR: vibechek binary not found in WSL. Re-run Settings -> Set up now." >&2\n'
-        '  exit 127\n'
-        'fi\n'
+        f"{bin_resolution}"
         f"exec \"$VIBECHEK_BIN\" {' '.join(_shell_quote(a) for a in args)}\n"
     )
     launcher_path = _stage_script_for_wsl(launcher_script)
