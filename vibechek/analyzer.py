@@ -170,10 +170,27 @@ _ONNX_HEAD_STEMS: tuple[str, ...] = (
     "mood_relaxed",
     "mood_sad",
 )
-# SHA256 of each converted head file ("<stem>.onnx" / "<stem>.json"). Populated
-# when the models-onnx mirror bundle is built (scripts/build_onnx_model_bundle.py);
-# empty → verify is a no-op, same staged-rollout pattern as MODEL_SHA256.
-MODEL_SHA256_ONNX: dict[str, str] = {}
+# SHA256 of each converted head file ("<stem>.onnx" / "<stem>.json"), pinned
+# from the models-onnx-v1 bundle (scripts/build_onnx_model_bundle.py). Every
+# onnx-head download is strictly verified against these; a mismatch re-fetches
+# then raises. Re-run the bundle script + repaste this dict when the heads are
+# re-converted for a new model release.
+MODEL_SHA256_ONNX: dict[str, str] = {
+    "danceability.json": "e6da634e028c1a3ceb08233efd06f0fa25aa2f579667b80bcb3b88d568932092",
+    "danceability.onnx": "b96e2e958efb0b3fb8e3613ed2b8ebbb8fc88ed84a7046e7b46137e6f445517e",
+    "genre_discogs400.json": "680e374c8a4d9a38267b781e4786755144a59437dc4e971212de11d64053dba3",
+    "genre_discogs400.onnx": "1c20d063de1ba9a5be9cc3216d2d4be4b7a6235bd854a8bf258e50143741583a",
+    "mood_aggressive.json": "93acd1253818197611a23659858eb2b3956aa8b1dfbc8a3368c78041553f260e",
+    "mood_aggressive.onnx": "3d6c810800eb91d2dc9825cea0614e72149a76757b07424e1f15b58ae2b06ad2",
+    "mood_happy.json": "4564708c2e726aef1033286e39616d144523f8ed678e2dbe80a8f581d86d06b7",
+    "mood_happy.onnx": "b864f6d56f90de4d4197c2650a8c166fe5494b2090069a27a6c56618a65298a7",
+    "mood_relaxed.json": "c49d32ae8009003f6b91ef82fa9b04f3ef06ad0d251cbe8cb3616ff1e59c30bc",
+    "mood_relaxed.onnx": "a22a8c9a72d6bda398766545d0a95a34fc011850ae967ac3d835f4b041e23b98",
+    "mood_sad.json": "b97302cd69c0cc37a710f0ddbdb489b82ae95a0ed5abbf3f5a85a503b2d85a1c",
+    "mood_sad.onnx": "3070f6be544a32a02d442a08e892ed34869ac90d176ee734aad61bd03d56c459",
+    "voice_instrumental.json": "1ee201a221c5d74221b09017ba55154c9e3e59fa118340a95912d6d0d29b989d",
+    "voice_instrumental.onnx": "dc75fd3674273a10a8897c1e25f29f134af132fb8a45a56379d93b7f6de7ce60",
+}
 
 
 def _onnx_head_bases() -> list[str]:
