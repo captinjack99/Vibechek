@@ -1,22 +1,37 @@
 # ONNX Runtime Migration Plan
 
-Status: **Proposal / spec.** No code yet. Owner: TBD. Estimated effort: **~1 week** for one engineer with Python + ML experience (revised down — see below).
+Status: **Proposal / spec.** No code yet. Owner: TBD. Estimated effort: **~2 weeks** for one engineer with Python + ML experience (the mel-spectrogram parity item dominates — see below). **Requires a model runtime to validate; cannot be done blind.**
 
 This document is the contract a contributor should be able to pick up and execute against. If something here is ambiguous, file an issue before writing code.
 
-> **Revised 2026-06-01 (audit).** The original plan assumed we must *self-convert* the
-> `.pb` models with `tf2onnx` and re-host them. That premise was wrong: **MTG already
-> publishes official, dynamic-batch `.onnx` for the EffNet backbone + heads**, so the
-> conversion step (old §4) and the re-hosting license question (old §9) largely go away —
-> we just point `download_models()` at MTG's ONNX URLs. The migration is therefore reframed
-> from *"convert models"* to **"retire end-of-life TensorFlow 2.5"**, whose real driver is
-> **security/maintainability** (TF 2.5 is EOL with unpatched CVEs, CUDA-only, and pins old
-> Python) — cross-vendor GPU + a CPU speedup are bonuses. Also: the EffNet **genre head**
-> should be *replaced* by the ONNX-native **MAEST** head (current best open tagger), not
-> converted; route the tiny classifier heads to CPU even in GPU mode (they're GPU-neutral);
-> and triage the model licenses (several are CC BY-NC — non-commercial) if there's commercial
-> intent — that's true today regardless of ONNX. Sections below are kept for reference;
-> where they say "convert", read "download the official ONNX" instead.
+> **Revised 2026-06-01 — verified against essentia.upf.edu (supersedes the looser earlier note).**
+> The migration's *primary driver* is sound: **retire end-of-life TensorFlow 2.5** (unpatched
+> CVEs, CUDA-only, pins old Python); cross-vendor GPU + a CPU speedup are bonuses. **But the
+> "just download the official ONNX" shortcut is only partly real** — confirmed by reading the
+> model index + the EffNet metadata JSON:
+>
+> 1. **EffNet backbone** — official ONNX exists (`discogs-effnet-bsdynamic-1.onnx`, dynamic
+>    batch). **Its input is a mel-spectrogram tensor `[batch, 128, 96]`** (`serving_default_melspectrogram`),
+>    NOT raw audio — so dropping essentia means **reimplementing essentia's mel-spectrogram
+>    (`TensorflowInputMusiCNN`: 16 kHz, 128 mel bands, 96-frame patches) bit-exactly in NumPy**
+>    and validating it against the C++ output. This is the dominant risk/effort and the reason
+>    the estimate is ~2 weeks, not ~1.
+> 2. **The EffNet classifier heads** (`genre_discogs400`, `mood_*`, `voice_instrumental`,
+>    `danceability`) **have NO official ONNX — only `.pb`.** They are tiny graphs
+>    (embedding → dense → sigmoid/softmax), so a one-off `tf2onnx` conversion is trivial — but
+>    it IS a conversion step (old §4 does *not* go away for the heads). Outputs are read from
+>    the session at runtime, so no hardcoded tensor names needed.
+> 3. **MAEST** *does* ship full ONNX (`genre_discogs400-discogs-maest-*.onnx`) and is the
+>    ONNX-native, current-best replacement for the **genre** path specifically. It does NOT
+>    provide mood/voice/danceability (those stay EffNet-conditioned → still need converted
+>    heads). So MAEST is an option for genre, not a wholesale replacement.
+>
+> **Net plan:** EffNet backbone ONNX + a NumPy melspec validated against essentia + `tf2onnx`
+> for the four heads (and/or MAEST for genre). Route the tiny heads to CPU even in GPU mode
+> (GPU-neutral). Triage the CC BY-NC (non-commercial) model licenses if there's commercial
+> intent. **A parity harness run against the real models is a hard prerequisite to flipping
+> the default** — shipping an unvalidated melspec would silently misclassify every track.
+> Sections below predate this note; read §4 with these corrections.
 
 ---
 
@@ -80,15 +95,15 @@ Investigate before assuming. Check `essentia/src/algorithms/machinelearning/tens
 
 ---
 
-## 4. Models — use MTG's official ONNX (do NOT self-convert)
+## 4. Models — mixed: official ONNX for the backbone, convert the heads
 
-**Revised:** the original "convert every `.pb` with `tf2onnx`" plan is unnecessary. The MTG / Essentia model index publishes **official `.onnx` exports** (dynamic batch) for the Discogs-EffNet backbone and the classifier heads, with the pre-processing already baked into the graph. So:
+**Verified against essentia.upf.edu (2026-06-01) — supersedes the earlier "all official ONNX" claim:**
 
-1. For each model in `analyzer.MODELS`, find its **official `.onnx`** on <https://essentia.upf.edu/models.html> (each model page lists a `.onnx` alongside the `.pb`). Point `download_models()` at those URLs (and the `.json` metadata, which is unchanged).
-2. **Replace, don't convert, the genre head.** The EffNet `genre_discogs400` head is the weakest/oldest piece; swap the backbone+head to **MAEST** (`discogs-maest-*`, ONNX-native, current best open music tagger — HF `mtg-upf/discogs-maest-*`, ISMIR 2023). Gate it behind the feature flag (§6), A/B on the parity fixture (§7), and **budget time to re-tune the EffNet-calibrated thresholds** (`VOCAL_INSTRUMENTAL_MAX`, `VOCAL_FULL_MIN`, `_MOOD_INDEX`, energy-blend weights) since MAEST's score distribution differs. Ship MAEST as an opt-in "high accuracy" profile if its CPU latency is unacceptable.
-3. The handful of heads MTG does **not** publish as ONNX (if any) are the only candidates for a one-off `tf2onnx` conversion — check first; in practice the heads take EffNet embeddings and have no pre-processing, so they convert trivially if needed. Keep any such script in `scripts/convert_models_to_onnx.py`, excluded from the wheel.
+1. **EffNet backbone** — use the official **`discogs-effnet-bsdynamic-1.onnx`** (dynamic batch). Its input is **`serving_default_melspectrogram`, shape `[batch, 128, 96]`** with outputs `PartitionedCall:0` (style probs) + `PartitionedCall:1` (the 1280-d embedding we actually use). The melspectrogram is **NOT** baked into the ONNX graph — essentia computed it in C++ (`TensorflowInputMusiCNN`), so you must reimplement it in NumPy (16 kHz, 128 mel bands, 96-frame patches) and validate bit-exactly against essentia's output. This is the real work (see §3, the top note, and the timeline).
+2. **Classification heads** (`genre_discogs400`, `mood_aggressive/happy/relaxed/sad`, `voice_instrumental`, `danceability`) — **NO official ONNX exists; only `.pb`.** They are trivial graphs (1280-d embedding → dense → sigmoid/softmax), so a one-off `python -m tf2onnx.convert` (§4.1) per head is the path. Read input/output names from the resulting ONNX at runtime (`session.get_inputs()/get_outputs()`); don't hardcode. Keep the conversion script in `scripts/convert_models_to_onnx.py`, excluded from the wheel.
+3. **MAEST (optional, genre only)** — `genre_discogs400-discogs-maest-*.onnx` ships official ONNX and is the current-best open tagger for the **genre** path. It does NOT cover mood/voice/danceability (those stay EffNet-conditioned → still need the converted heads from #2). Treat MAEST as an opt-in "high accuracy" genre profile; budget time to re-tune the EffNet-calibrated thresholds (`VOCAL_INSTRUMENTAL_MAX`, `VOCAL_FULL_MIN`, `_MOOD_INDEX`, energy-blend weights) since its score distribution differs.
 
-> Because we're consuming MTG's *official* ONNX, the old "re-host our own converted weights + verify the license allows it" question is moot for hosting — but the **usage** license still matters: several Discogs models are **CC BY-NC** (non-commercial). If Vibechek ever has commercial intent, triage this separately (it's true of the current `.pb` models too).
+> **License:** several Discogs models are **CC BY-NC** (non-commercial). Hosting the converted head ONNX on our own release is fine for an OSS project, but the **usage** license matters if Vibechek ever has commercial intent — triage separately (true of today's `.pb` models too).
 
 ### 4.2 Hash + mirror update
 
@@ -186,14 +201,17 @@ The risk is silent numerical drift: ONNX rounds slightly differently than TF, an
 
 | Phase                                  | Effort   |
 | -------------------------------------- | -------- |
-| Point `download_models()` at MTG's official ONNX URLs + hashes | 0.5 day |
-| `load_models()` / `analyze_track()` ONNX path (EP chain, heads→CPU) | 2–3 days |
+| Backbone ONNX download + `tf2onnx`-convert the 6 heads + hashes | 1 day |
+| **Mel-spectrogram reimpl in NumPy, validated bit-exact vs essentia** | **3–5 days** ⚠️ dominant |
+| `load_models()` / `analyze_track()` ONNX path (EP chain, heads→CPU) | 2 days |
 | Feature flag + config plumbing         | 1 day    |
-| Parity test harness + fixture          | 2 days   |
-| (Optional) MAEST backbone A/B + threshold re-tune | 3–5 days |
+| Parity test harness + fixture (needs a real model runtime) | 2 days |
+| (Optional) MAEST genre backbone A/B + threshold re-tune | 3–5 days |
 | Cross-platform smoke testing (Win AMD/Intel, Apple Silicon, Linux) | 2 days |
 | Docs (USER_GUIDE, INSTALL, ROADMAP)    | 1 day    |
-| **Total (core, official ONNX)**        | **~1 week** |
+| **Total (core, EffNet via ONNX)**      | **~2 weeks** |
+
+The mel-spectrogram parity is the dominant item and the reason this can't be done "blind": the ONNX backbone takes a melspec tensor, essentia computed that melspec in C++, and the NumPy reimplementation must match it closely enough that genres/moods don't drift — which is only provable by running both engines on real audio.
 | **+ MAEST backbone (optional)**        | **+3–5 days** |
 
 Because we consume MTG's official ONNX (pre-processing baked in), the old "port the mel-spectrogram to NumPy and validate bit-for-bit" risk largely disappears — that was the main reason for the original 3-week estimate. Verify the official ONNX includes pre-processing per model before relying on it.
