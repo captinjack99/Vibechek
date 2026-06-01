@@ -69,7 +69,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -142,11 +142,20 @@ class CdjExportResult:
 
 
 def location_to_path(location: str) -> Path:
-    """Convert a Rekordbox ``file://localhost/...`` URI to a filesystem Path.
+    """Convert a Rekordbox ``file://localhost/...`` URI to a concrete ``Path``.
 
     Handles Windows drive-letter URIs (``file://localhost/C:/...``) and POSIX
     URIs, and percent-decodes the path. Raises :class:`CdjExportError` on a URI
     we don't understand rather than silently producing a bad path.
+
+    Returns a concrete ``Path`` so callers can ``.exists()`` / ``.stat()`` it
+    directly. We build it from the forward-slash string (NOT via ``PureWindowsPath``
+    — that converts to backslashes, which on Linux/macOS becomes a single mangled
+    ``PosixPath`` segment; that was the original cross-platform bug). On Windows a
+    drive URI yields a ``WindowsPath`` with ``.drive == "C:"``; on POSIX hosts the
+    string (and so ``.name`` and matching) is preserved verbatim, and a Windows
+    URI processed on a POSIX host simply won't resolve to a local file — the
+    correct outcome, since its audio isn't present there anyway.
     """
     parsed = urllib.parse.urlsplit(location)
     if parsed.scheme != "file":
@@ -157,7 +166,8 @@ def location_to_path(location: str) -> Path:
     # raw is like "/C:/Users/dj/x.flac" on Windows or "/Users/dj/x.flac" on POSIX.
     if len(raw) >= 3 and raw[0] == "/" and raw[2] == ":":
         # Windows drive path: strip the leading slash -> "C:/Users/dj/x.flac".
-        return Path(PureWindowsPath(raw[1:]))
+        # Keep forward slashes (do NOT route through PureWindowsPath).
+        return Path(raw[1:])
     return Path(raw)
 
 

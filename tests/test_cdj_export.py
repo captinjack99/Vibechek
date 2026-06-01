@@ -92,10 +92,14 @@ def _track_by_id(root: ET.Element, track_id: str) -> ET.Element:
 
 
 def test_windows_location_roundtrip_and_parse() -> None:
+    from pathlib import PureWindowsPath
+
     loc = "file://localhost/C:/Users/dj/My%20Music/track.flac"
     p = location_to_path(loc)
-    # Drive-letter path recovered, percent-decoded.
-    assert p.drive.upper() == "C:"
+    # Drive-letter path recovered, percent-decoded. `location_to_path` returns a
+    # concrete (host-flavour) Path, so on a POSIX CI runner `p.drive` is "" —
+    # assert the drive via PureWindowsPath(str(p)) so the check is OS-agnostic.
+    assert PureWindowsPath(str(p)).drive.upper() == "C:"
     assert p.name == "track.flac"
     assert "My Music" in str(p)
 
