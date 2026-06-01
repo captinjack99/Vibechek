@@ -241,6 +241,39 @@ The **X** on a history row removes the entry from Vibechek's index but does **no
 
 ---
 
+## Workflow 6: Play your FLAC library on old CDJs
+
+Older Pioneer CDJs (CDJ-2000nexus and earlier) can't read FLAC. Rather than re-rip
+your collection, Vibechek transcodes the FLACs to **AIFF** and rewrites a Rekordbox
+XML so your cue points and beat grids come along for the ride.
+
+Why AIFF and not MP3: an AIFF is a *sample-identical* decode of the FLAC, so the
+`TEMPO` (beat grid) and `POSITION_MARK` (cue) data copy across with **zero drift**.
+MP3 has a ~26 ms encoder delay that shifts the grid, so Vibechek never uses it. Your
+original FLAC files are never modified — the export is strictly additive.
+
+This is a CLI workflow (run `vibechek --help` to confirm it's available):
+
+1. **In Rekordbox**, export your collection: **File → Export Collection in xml format**.
+   Save it somewhere, e.g. `rekordbox.xml`.
+2. **Run the export:**
+
+   ```bash
+   vibechek cdj-export rekordbox.xml --out ~/cdj-export
+   ```
+
+   (Add `--dry-run` first to see the counts and intended files without writing
+   anything.) Vibechek writes the AIFFs plus a rewritten `rekordbox_cdj.xml` into the
+   output folder. Non-FLAC tracks pass through unchanged.
+3. **Back in Rekordbox**, import the new `rekordbox_cdj.xml` (File → Import).
+4. **Export to USB** as usual. Your FLAC library now plays on the club's first-gen
+   decks with every cue and grid intact.
+
+Requires `soundfile` (the optional `[cdj]` extra) or `ffmpeg` on your PATH — see
+[INSTALL.md](INSTALL.md).
+
+---
+
 ## Settings
 
 Top of the page:
@@ -286,10 +319,25 @@ Click **Advanced settings** to expand:
 
 At the bottom:
 
+- **Software updates** (opt-in) — check for a new version, download it, install, and
+  relaunch, all from inside the app. *Note:* update artifacts are only verified when
+  the project ships a signing key, and beta builds are unsigned, so this control is
+  inert on beta releases until signing is enabled (it's wired up and ready for the
+  stable release).
 - **Restore all settings to defaults** — wipes your config back to factory.
 - **About** — sidecar path, link to view logs.
 
 All changes auto-save 500ms after you stop typing/dragging. No "Save" button.
+
+### Experimental: ONNX inference engine
+
+There's an experimental alternative analysis engine (`AnalysisConfig.inference_engine
+= "onnx"`, opt-in) that runs the same models through ONNX Runtime instead of the
+bundled TensorFlow. Its draw is **cross-vendor GPU acceleration** — AMD, Intel, and
+Apple GPUs via DirectML/CoreML, not just NVIDIA/CUDA. It's validated to match the
+default engine's output, but it's still experimental (the converted models aren't
+hosted yet), so the default stays the essentia-tensorflow path. Most users should
+leave this alone.
 
 ---
 

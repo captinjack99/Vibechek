@@ -11,6 +11,12 @@ Two flavors:
 > `xattr -dr com.apple.quarantine /Applications/Vibechek.app` once. Signed + notarized
 > builds land with the stable release.
 
+> **In-app updates.** The desktop app can check for, download, and install updates from
+> **Settings → Software updates** once update signing is configured. Beta builds ship
+> unsigned, so the feature is inert on them — grab new betas from the
+> [Releases](https://github.com/papapew/Vibechek/releases) page until signing is enabled
+> for the stable release.
+
 See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop app.
 
 ## What you need depends on what you're doing
@@ -137,12 +143,36 @@ wsl -d Ubuntu -- bash -lc '
 
 Then set `LD_LIBRARY_PATH` to include the resulting `~/.vibechek/venv/lib/python3.*/site-packages/nvidia/*/lib` directories, or just re-run the GUI "Enable GPU" button and it'll regenerate `cuda-env.sh` for you.
 
+> **Experimental: non-NVIDIA GPUs via ONNX.** The default analysis engine
+> (essentia-tensorflow) only accelerates on NVIDIA/CUDA. An experimental, opt-in ONNX
+> Runtime engine (`AnalysisConfig.inference_engine = "onnx"`) runs the same models with
+> cross-vendor GPU support (AMD/Intel/Apple via DirectML/CoreML). It's validated to
+> match the default engine but isn't production-ready yet (the converted models aren't
+> hosted), so the essentia path stays the default. See
+> [docs/ONNX_MIGRATION.md](ONNX_MIGRATION.md).
+
 ### Skipping analyze entirely
 
 Everything else works on native Windows without Essentia: dedupe, organize,
 tag (from an existing `analysis.json`), backup, restore, route. If you have
 an analysis from a friend or a previous run, the rest of Vibechek runs
 straight from the standalone installer.
+
+## Installing soundfile (for `cdj-export`'s FLAC→AIFF transcode)
+
+`vibechek cdj-export` transcodes a FLAC library to AIFF so it plays on old CDJs (see
+the [user guide](USER_GUIDE.md#workflow-6-play-your-flac-library-on-old-cdjs)). It needs
+one of two things to read/write audio:
+
+- The optional `[cdj]` extra, which pulls in [`soundfile`](https://pypi.org/project/soundfile/):
+
+  ```bash
+  pip install "vibechek[cdj]"
+  ```
+
+- **or** [`ffmpeg`](https://ffmpeg.org/) on your `PATH` (used as a fallback).
+
+You only need this for `cdj-export`; nothing else in Vibechek depends on it.
 
 ## Installing fpcalc (for `dedupe`'s audio fingerprinting)
 

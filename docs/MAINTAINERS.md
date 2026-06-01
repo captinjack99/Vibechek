@@ -9,7 +9,7 @@ for the release mechanics see [RELEASING.md](RELEASING.md).
 A release bumps **five** files. They must all match, or the version-drift guard and CI
 will complain:
 
-1. `vibechek/__init__.py` — `__version__` (e.g. `"0.4.0-beta.7"`)
+1. `vibechek/__init__.py` — `__version__` (e.g. `"0.4.0-beta.8"`)
 2. `pyproject.toml` — PEP 440 form (`0.4.0b7`)
 3. `ui/src-tauri/Cargo.toml`
 4. `ui/src-tauri/tauri.conf.json`
@@ -56,6 +56,34 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
 - **Config is JSON, not TOML.** Since 0.3.0. A pre-0.3.0 `config.toml` is read once as a
   migration and rewritten as `config.json`. Unknown keys are dropped on load, so adding
   fields is backwards-safe.
+- **`numpy` lives in the `[dev]` extra, not core.** The analysis code imports numpy
+  *lazily* (inside the functions that need it), but the pure-logic tests (ONNX patch math,
+  direction/BPM, …) import it *directly*. Declaring it under `[dev]` keeps it out of the
+  runtime dependency surface while ensuring a clean `[dev]`-only CI install doesn't error
+  at test collection. Don't move it to core, and don't drop it from `[dev]`.
+- **ONNX backend (`vibechek/onnx_backend.py`).** The opt-in inference engine
+  (`AnalysisConfig.inference_engine = "onnx"`; default `essentia_tf`). It mirrors
+  `analyzer.load_models`'s dict + callable signatures exactly so the analyzer's downstream
+  logic is byte-unchanged, and imports `onnxruntime`/`essentia` lazily. It uses MTG's
+  official EffNet ONNX backbone (which already emits the 400-class genre output, reused
+  rather than re-run) + tf2onnx-converted heads. Two dev/CI-on-demand scripts back it:
+  `scripts/onnx_parity.py` (the parity gate — proves ONNX matches essentia-TF on a real
+  track, embedding cosine 0.99942; needs the real models + both runtimes) and
+  `scripts/convert_heads_to_onnx.py` (the one-off tf2onnx head conversion — neither is in
+  the wheel or the unit suite). **The converted head `.onnx` files still need hosting on
+  the model mirror**; until then a developer runs the convert script locally. See
+  `docs/ONNX_MIGRATION.md`.
+- **Every test must import-cleanly on a `[dev]`-only install.** CI installs *only* the
+  `[dev]` extra — no essentia, onnxruntime, or soundfile. A test that imports a heavy dep
+  at module top level breaks the *whole* collection (not just that test). Gate heavy deps
+  with `pytest.importorskip`, `@skipif`, or fakes/mocks. This bit us during beta.8 and is
+  the reason `numpy` is in `[dev]`.
+- **CDJ-export URI → path rule (`cdj_export.location_to_path`).** Rekordbox stores track
+  locations as forward-slash `file://localhost/...` URIs (Windows: `/C:/Users/...`). Build
+  the host `Path` straight from the percent-decoded forward-slash string — **never route it
+  through `PureWindowsPath`**, which converts to backslashes and collapses into a single
+  mangled `PosixPath` segment on Linux/macOS (that was the original cross-platform bug).
+  `location_to_path` strips the leading slash on a drive URI and returns a concrete `Path`.
 
 ## CI gotchas
 
