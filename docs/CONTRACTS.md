@@ -9,6 +9,10 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 (the authoritative method list), and the "Sidecar protocol" section of
 [`ui/README.md`](../ui/README.md).
 
+> **beta.8 added no new RPC methods** (the surface stays at 44). FLAC → CDJ export is a
+> CLI-only command (`vibechek cdj-export`), and the ONNX inference engine is selected via
+> the `inference_engine` config field — neither crosses the JSON-RPC boundary as a new method.
+
 ## The wire format
 
 ```
