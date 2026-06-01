@@ -159,6 +159,49 @@ If a release is already **published**, do not delete — issue a `v0.3.0-beta.2`
 
 ---
 
+## Auto-update + signing setup (one-time)
+
+Vibechek ships an in-app auto-updater (`tauri-plugin-updater`). On launch — or when the user clicks **Settings → Software updates → Check for updates** — the app fetches the update manifest from GitHub Releases, verifies the new bundle's signature against a **public key baked into the app**, and (with the user's consent) downloads, installs, and relaunches.
+
+This is a **separate keypair from the OS code-signing certs** below. The updater key signs the *update payload* so the running app can trust it; the OS certs sign the *installer* so Gatekeeper / SmartScreen trust it. You want both, but they're independent.
+
+### One-time key generation
+
+Generate the updater keypair once (do this on a trusted machine, not in CI):
+
+```bash
+# Either the standalone CLI...
+tauri signer generate -w ~/.tauri/vibechek.key
+# ...or via npx if you don't have the CLI installed globally:
+npx @tauri-apps/cli signer generate -w ~/.tauri/vibechek.key
+```
+
+This prints a **public key** and writes the **private key** to `~/.tauri/vibechek.key` (you'll also be prompted for an optional password). Then:
+
+1. **Commit the PUBLIC key** into `ui/src-tauri/tauri.conf.json` at `plugins.updater.pubkey`, replacing the placeholder `PLACEHOLDER_REPLACE_WITH_TAURI_SIGNER_PUBKEY`. The public key is safe to commit — it only lets the app *verify* updates, not sign them.
+2. **Add the PRIVATE key as a GitHub repo secret** named `TAURI_SIGNING_PRIVATE_KEY` (Settings → Secrets and variables → Actions). Paste the full contents of `~/.tauri/vibechek.key`.
+3. If you set a password during generation, **add it as `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`**. If you generated without a password, you may omit this secret (or set it empty) — the gate in the workflow treats it as optional alongside the key.
+4. **Flip `bundle.createUpdaterArtifacts` to `true`** in `ui/src-tauri/tauri.conf.json`. It ships as `false` so the current unsigned beta builds don't require a signing key (see "How the CI gate works" below); turning it on is what actually produces the signed updater bundles + `latest.json`.
+
+> ⚠️ **Losing the private key permanently breaks updates.** Every released build's updater pubkey is fixed at build time; an update payload signed with a *different* private key will fail verification on every already-installed copy. There is no recovery other than shipping a fresh installer (which users must download manually) carrying a new pubkey. Back up `~/.tauri/vibechek.key` somewhere safe and offline.
+
+### How the CI gate works
+
+**`bundle.createUpdaterArtifacts` ships as `false`** so the current **unsigned beta builds keep working** — with it `true`, `tauri build` *requires* `TAURI_SIGNING_PRIVATE_KEY` and would fail the release when no key is configured. So enabling auto-update is a deliberate flip (step 4 above): set it to `true` once you've generated the keypair, committed the pubkey, and added the secret.
+
+When `createUpdaterArtifacts: true`, the bundler emits the per-platform updater bundle (`*.nsis.zip` on Windows, `*.app.tar.gz` on macOS, the `*.AppImage` on Linux) **plus a detached `*.sig` signature** for each. The signing is gated exactly like the OS certs: the `Configure code signing (opt-in)` step in `build-tauri` exports `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to `$GITHUB_ENV` **only when the secret is non-empty**. With no key configured (and `createUpdaterArtifacts: false`), the build still succeeds — unsigned bundles, no `*.sig`, and the `release` job skips writing `latest.json`, so the in-app updater stays inert until you supply the key.
+
+The `release` job collects the `*.sig` files and synthesizes `release/latest.json` (the manifest `plugins.updater.endpoints` points at: `https://github.com/papapew/Vibechek/releases/latest/download/latest.json`), then attaches it alongside the installers. Because the endpoint resolves to `/releases/latest`, only a **published** (non-draft) release is visible to the updater — drafts won't trigger updates, which matches the existing "review the draft, then Publish" flow.
+
+### Windows / macOS *installer* signing
+
+The updater key above does not satisfy the OS. For users not to see SmartScreen / Gatekeeper warnings, you also need OS code-signing certs feeding the same opt-in step — see [Codesigning + notarization](#codesigning--notarization-one-time-ci-setup) directly below:
+
+- **Windows**: an Authenticode cert via `WINDOWS_CERTIFICATE` / `WINDOWS_CERTIFICATE_PASSWORD`. Free options for OSS exist — **[SignPath Foundation](https://signpath.org/)** offers free certificates for qualifying open-source projects, and **[Azure Trusted Signing](https://learn.microsoft.com/azure/trusted-signing/)** is a low-cost managed alternative. (Tauri 2 also supports Azure Trusted Signing directly; both ultimately produce an Authenticode signature on the `.exe`/`.msi`.)
+- **macOS**: notarization requires an **Apple Developer ID** ($99/yr) — there is no free equivalent. Wire the `APPLE_*` secrets per the macOS steps below.
+
+---
+
 ## Codesigning + notarization (one-time CI setup)
 
 Without codesigning, **macOS Gatekeeper kills the sidecar on first launch** with a generic "can't be opened because Apple cannot check it for malicious software" dialog — most users misread that as malware and uninstall. On Windows, **Defender SmartScreen** triggers similar warnings. The release workflow (`.github/workflows/release.yml`) is wired to pass certs through `tauri-action` when these repo secrets are set.

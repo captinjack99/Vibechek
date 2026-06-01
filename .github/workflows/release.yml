@@ -206,6 +206,8 @@ jobs:
           IN_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           IN_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           IN_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          IN_TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           # emit NAME VALUE -> append to $GITHUB_ENV only when VALUE is non-empty.
@@ -239,6 +241,20 @@ jobs:
           else
             echo "Windows: no WINDOWS_CERTIFICATE secret — Windows build will be UNSIGNED."
           fi
+          # Updater signing (tauri-plugin-updater). Same opt-in gate as the
+          # codesign certs above: only export the key when the secret is
+          # non-empty. Without it, tauri-action still builds the bundles +
+          # updater artifacts but does NOT produce the `.sig` signatures, so
+          # in-app auto-update verification (plugins.updater.pubkey) won't work
+          # until TAURI_SIGNING_PRIVATE_KEY is configured. The password var is
+          # only meaningful alongside the key. See docs/RELEASING.md.
+          if [ -n "${IN_TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "Updater: signing key present — updater artifacts will be SIGNED."
+            emit TAURI_SIGNING_PRIVATE_KEY          "${IN_TAURI_SIGNING_PRIVATE_KEY:-}"
+            emit TAURI_SIGNING_PRIVATE_KEY_PASSWORD "${IN_TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+          else
+            echo "Updater: no TAURI_SIGNING_PRIVATE_KEY secret — updater artifacts will be UNSIGNED (auto-update disabled until configured)."
+          fi
 
       - name: Build Tauri bundles
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
@@ -254,10 +270,18 @@ jobs:
         shell: bash
         run: |
           mkdir -p tauri-out
-          # Bundle locations vary by platform; copy whatever we find
+          # Bundle locations vary by platform; copy whatever we find.
+          # Installers + updater artifacts + their detached signatures:
+          #   - installers:  *.msi *.exe *.dmg *.AppImage *.deb *.rpm
+          #   - updater bundles (createUpdaterArtifacts): the updater target per
+          #     platform — *.nsis.zip (Windows), *.app.tar.gz (macOS),
+          #     *.AppImage (Linux, same file as the installer) — plus a *.sig
+          #     detached signature next to each (only present when
+          #     TAURI_SIGNING_PRIVATE_KEY was set in the opt-in step above).
           find ui/src-tauri/target/release/bundle -maxdepth 3 -type f \
               \( -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \
-                 -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) \
+                 -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \
+                 -o -name "*.sig" -o -name "*.nsis.zip" -o -name "*.tar.gz" \) \
               -exec cp {} tauri-out/ \; || true
           ls -la tauri-out/ || true
 
@@ -291,13 +315,82 @@ jobs:
       - name: Flatten artifact layout
         run: |
           mkdir -p release
-          # CLI archives + Tauri bundles
+          # CLI archives + Tauri bundles + updater artifacts (*.sig signatures
+          # and the per-platform updater bundles: *.nsis.zip / *.app.tar.gz).
+          # The *.sig files are what the in-app updater verifies against the
+          # pubkey in tauri.conf.json — they MUST ride along to the release.
           find artifacts -type f \
               \( -name '*.tar.gz' -o -name '*.zip' \
                  -o -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \
-                 -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
+                 -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+                 -o -name '*.sig' \) \
               -exec cp {} release/ \;
           # Don't ship the raw sidecar binaries — they're inside the Tauri bundles
+          ls -la release/
+
+      # Build the updater manifest (`latest.json`) that plugins.updater.endpoints
+      # points at. In this split build/release layout tauri-action does NOT own
+      # the release, so it can't emit latest.json itself — we synthesize it from
+      # the collected *.sig signatures and the predictable release download URLs.
+      # If no *.sig files are present (TAURI_SIGNING_PRIVATE_KEY unset), this step
+      # is a no-op and no latest.json is published — auto-update stays inert until
+      # the signing key is configured, which is the intended opt-in behavior.
+      - name: Generate updater manifest (latest.json)
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json, os, glob, sys, datetime
+
+          version = os.environ["VERSION"].lstrip("v")
+          repo = os.environ["REPO"]
+          tag = os.environ["VERSION"]
+          base = f"https://github.com/{repo}/releases/download/{tag}"
+
+          # Map each updater bundle to its Tauri target triple by file extension.
+          # The signature lives in a sibling "<bundle>.sig" file.
+          def platform_for(name: str):
+              if name.endswith(".nsis.zip"):
+                  return "windows-x86_64"
+              if name.endswith(".app.tar.gz"):
+                  return "darwin-aarch64"
+              if name.endswith(".AppImage"):
+                  return "linux-x86_64"
+              return None
+
+          platforms = {}
+          for sig in sorted(glob.glob("release/*.sig")):
+              bundle = sig[:-4]  # strip ".sig"
+              bname = os.path.basename(bundle)
+              plat = platform_for(bname)
+              if plat is None:
+                  print(f"skip (unknown updater target): {bname}", file=sys.stderr)
+                  continue
+              with open(sig, "r", encoding="utf-8") as f:
+                  signature = f.read().strip()
+              platforms[plat] = {
+                  "signature": signature,
+                  "url": f"{base}/{bname}",
+              }
+
+          if not platforms:
+              print("No *.sig updater signatures found — skipping latest.json "
+                    "(updater signing key was not configured).")
+              sys.exit(0)
+
+          manifest = {
+              "version": version,
+              "notes": f"Vibechek {tag}. See the release page for details.",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc)
+                  .strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          with open("release/latest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+          print("Wrote release/latest.json:")
+          print(json.dumps(manifest, indent=2))
+          PY
           ls -la release/
 
       - name: Create GitHub Release

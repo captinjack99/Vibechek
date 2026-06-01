@@ -1,14 +1,30 @@
 # ONNX Runtime Migration Plan
 
-Status: **Proposal / spec.** No code yet. Owner: TBD. Estimated effort: **2–3 weeks** of focused work for one engineer with Python + ML experience.
+Status: **Proposal / spec.** No code yet. Owner: TBD. Estimated effort: **~1 week** for one engineer with Python + ML experience (revised down — see below).
 
 This document is the contract a contributor should be able to pick up and execute against. If something here is ambiguous, file an issue before writing code.
+
+> **Revised 2026-06-01 (audit).** The original plan assumed we must *self-convert* the
+> `.pb` models with `tf2onnx` and re-host them. That premise was wrong: **MTG already
+> publishes official, dynamic-batch `.onnx` for the EffNet backbone + heads**, so the
+> conversion step (old §4) and the re-hosting license question (old §9) largely go away —
+> we just point `download_models()` at MTG's ONNX URLs. The migration is therefore reframed
+> from *"convert models"* to **"retire end-of-life TensorFlow 2.5"**, whose real driver is
+> **security/maintainability** (TF 2.5 is EOL with unpatched CVEs, CUDA-only, and pins old
+> Python) — cross-vendor GPU + a CPU speedup are bonuses. Also: the EffNet **genre head**
+> should be *replaced* by the ONNX-native **MAEST** head (current best open tagger), not
+> converted; route the tiny classifier heads to CPU even in GPU mode (they're GPU-neutral);
+> and triage the model licenses (several are CC BY-NC — non-commercial) if there's commercial
+> intent — that's true today regardless of ONNX. Sections below are kept for reference;
+> where they say "convert", read "download the official ONNX" instead.
 
 ---
 
 ## 1. Why ONNX
 
-Vibechek's ML pipeline (`vibechek/analyzer.py`) wraps **`essentia-tensorflow`**, which bundles TensorFlow as its inference backend. `essentia-tensorflow` ships with **CUDA-only** TF wheels: GPU acceleration is available exclusively on NVIDIA cards with a matching CUDA toolkit installed.
+**Primary driver — retire end-of-life TensorFlow.** `essentia-tensorflow` bundles **TensorFlow 2.5**, which is past end-of-life: no security patches, several known CVEs in the bundled runtime, CUDA-only, and it pins an old Python that increasingly blocks dependency upgrades across the project. That alone justifies the move — a deprecated, unpatched ML runtime shipping in a desktop app is a liability independent of any feature win.
+
+**Secondary driver — cross-vendor GPU + CPU speed.** Vibechek's ML pipeline (`vibechek/analyzer.py`) wraps **`essentia-tensorflow`**, whose **CUDA-only** TF wheels give GPU acceleration exclusively on NVIDIA cards with a matching CUDA toolkit. ONNX Runtime's CPU build also generally beats TF 2.5's CPU path.
 
 That excludes:
 - **AMD GPUs** on Windows and Linux (no ROCm support in the bundled TF build)
@@ -64,24 +80,15 @@ Investigate before assuming. Check `essentia/src/algorithms/machinelearning/tens
 
 ---
 
-## 4. Model conversion (one-time)
+## 4. Models — use MTG's official ONNX (do NOT self-convert)
 
-Every model listed in `analyzer.MODELS` needs to be converted from `.pb` (TensorFlow frozen graph) to `.onnx` exactly once, then re-uploaded to the mirror chain.
+**Revised:** the original "convert every `.pb` with `tf2onnx`" plan is unnecessary. The MTG / Essentia model index publishes **official `.onnx` exports** (dynamic batch) for the Discogs-EffNet backbone and the classifier heads, with the pre-processing already baked into the graph. So:
 
-### 4.1 Conversion command
+1. For each model in `analyzer.MODELS`, find its **official `.onnx`** on <https://essentia.upf.edu/models.html> (each model page lists a `.onnx` alongside the `.pb`). Point `download_models()` at those URLs (and the `.json` metadata, which is unchanged).
+2. **Replace, don't convert, the genre head.** The EffNet `genre_discogs400` head is the weakest/oldest piece; swap the backbone+head to **MAEST** (`discogs-maest-*`, ONNX-native, current best open music tagger — HF `mtg-upf/discogs-maest-*`, ISMIR 2023). Gate it behind the feature flag (§6), A/B on the parity fixture (§7), and **budget time to re-tune the EffNet-calibrated thresholds** (`VOCAL_INSTRUMENTAL_MAX`, `VOCAL_FULL_MIN`, `_MOOD_INDEX`, energy-blend weights) since MAEST's score distribution differs. Ship MAEST as an opt-in "high accuracy" profile if its CPU latency is unacceptable.
+3. The handful of heads MTG does **not** publish as ONNX (if any) are the only candidates for a one-off `tf2onnx` conversion — check first; in practice the heads take EffNet embeddings and have no pre-processing, so they convert trivially if needed. Keep any such script in `scripts/convert_models_to_onnx.py`, excluded from the wheel.
 
-For each model:
-
-```bash
-python -m tf2onnx.convert \
-    --graphdef path/to/model.pb \
-    --output  path/to/model.onnx \
-    --inputs  serving_default_model_Placeholder:0 \
-    --outputs PartitionedCall:0 \
-    --opset 17
-```
-
-Input/output node names vary across the heads — `analyzer.load_models()` already encodes the patterns we've seen (`("serving_default_model_Placeholder", "PartitionedCall:0")`, `("model/Placeholder", "model/Softmax")`, etc.). Use the same patterns for conversion. Inspect the original `.pb` with `tf2onnx --inputs-as-nchw` or `netron` if you're unsure.
+> Because we're consuming MTG's *official* ONNX, the old "re-host our own converted weights + verify the license allows it" question is moot for hosting — but the **usage** license still matters: several Discogs models are **CC BY-NC** (non-commercial). If Vibechek ever has commercial intent, triage this separately (it's true of the current `.pb` models too).
 
 ### 4.2 Hash + mirror update
 
@@ -179,22 +186,22 @@ The risk is silent numerical drift: ONNX rounds slightly differently than TF, an
 
 | Phase                                  | Effort   |
 | -------------------------------------- | -------- |
-| Model conversion + mirror upload       | 2 days   |
-| `load_models()` / `analyze_track()` ONNX path | 3 days   |
-| Pre-processing parity (mel spec etc.)  | 2–4 days |
+| Point `download_models()` at MTG's official ONNX URLs + hashes | 0.5 day |
+| `load_models()` / `analyze_track()` ONNX path (EP chain, heads→CPU) | 2–3 days |
 | Feature flag + config plumbing         | 1 day    |
-| Parity test harness + 100-track fixture | 2 days   |
-| Cross-platform smoke testing (Win AMD, Apple Silicon, Linux) | 3 days |
+| Parity test harness + fixture          | 2 days   |
+| (Optional) MAEST backbone A/B + threshold re-tune | 3–5 days |
+| Cross-platform smoke testing (Win AMD/Intel, Apple Silicon, Linux) | 2 days |
 | Docs (USER_GUIDE, INSTALL, ROADMAP)    | 1 day    |
-| Buffer for the inevitable surprise     | 3 days   |
-| **Total**                              | **~3 weeks** |
+| **Total (core, official ONNX)**        | **~1 week** |
+| **+ MAEST backbone (optional)**        | **+3–5 days** |
 
-The pre-processing parity item is the unknown. If essentia handles all spectrogram work inside the TF graph, it falls out of the conversion for free. If it doesn't, you're writing ~100 lines of NumPy and validating it bit-for-bit against the C++ version, which is fiddlier than it sounds.
+Because we consume MTG's official ONNX (pre-processing baked in), the old "port the mel-spectrogram to NumPy and validate bit-for-bit" risk largely disappears — that was the main reason for the original 3-week estimate. Verify the official ONNX includes pre-processing per model before relying on it.
 
 ---
 
 ## 9. Open questions
 
-- Do we package `onnxruntime` (CPU-only, ~12 MB) by default and let users `pip install onnxruntime-gpu` / `onnxruntime-directml` themselves, or do we ship platform-specific extras (`vibechek[gpu-cuda]`, `vibechek[gpu-directml]`)? Recommendation: platform extras, mirroring the current `vibechek[ml]` pattern.
-- Are the Discogs-EffNet weights' licenses compatible with re-hosting the converted `.onnx` on our GitHub Releases? Verify with MTG before publishing.
-- Does ONNX Runtime's DirectML provider actually outperform CPU for these small classification heads on integrated GPUs? Benchmark before promising it to users.
+- Do we package `onnxruntime` (CPU-only, ~12 MB) by default and let users `pip install onnxruntime-gpu` / `onnxruntime-directml` themselves, or ship platform-specific extras (`vibechek[gpu-cuda]`, `vibechek[gpu-directml]`)? Recommendation: platform extras, mirroring the current `vibechek[ml]` pattern.
+- **Route the tiny classifier heads to CPU even in GPU mode.** The audit's research found the small heads are GPU-neutral-to-negative on integrated GPUs (kernel-launch + transfer overhead dominates); only the EffNet/MAEST **backbone** is worth accelerating. So build the EP chain for the backbone session but pin the head sessions to `CPUExecutionProvider`, and do **not** market "DirectML 3–10× faster" as a blanket claim. Benchmark the backbone per EP and report real numbers.
+- **License:** several Discogs models are **CC BY-NC** (non-commercial). Hosting is moot (we use MTG's official ONNX), but if Vibechek pursues commercial distribution, the *usage* license must be cleared — track separately; it applies to today's `.pb` models too.
