@@ -1,8 +1,33 @@
 # ONNX Runtime Migration Plan
 
-Status: **Proposal / spec.** No code yet. Owner: TBD. Estimated effort: **~2 weeks** for one engineer with Python + ML experience (the mel-spectrogram parity item dominates — see below). **Requires a model runtime to validate; cannot be done blind.**
+Status: **Core viability VALIDATED (2026-06-01).** Production wiring not yet landed. Estimated remaining effort: **~1 week** (down from ~2 — the dominant melspec risk is largely retired, see results). A reusable parity harness is committed at [`scripts/onnx_parity.py`](../scripts/onnx_parity.py).
 
 This document is the contract a contributor should be able to pick up and execute against. If something here is ambiguous, file an issue before writing code.
+
+> ## ✅ Validation results (2026-06-01) — the migration works
+>
+> Ran the official ONNX EffNet backbone (`discogs-effnet-bsdynamic-1.onnx`) against
+> essentia-tensorflow's ground truth on a real track (Adele — "Chasing Pavements"), in WSL,
+> via `scripts/onnx_parity.py`. **Result: PASS.**
+>
+> | Metric | TF (essentia) | ONNX | Verdict |
+> |---|---|---|---|
+> | Mean-embedding cosine | — | **0.99942** | ✅ (≥0.995) |
+> | Genre top-class (Discogs-400) | 308 | 308 | ✅ **identical** |
+> | Voice/instrumental | [0.028, 0.972] | [0.003, 0.997] | ✅ both "Vocal" |
+>
+> **What this proves + the exact recipe to implement:**
+> - The official ONNX backbone is a faithful conversion — no self-conversion of the backbone needed.
+> - **Melspec recipe:** essentia's `TensorflowInputMusiCNN` over 512/256 frames → `[N, 96]` log-mel → window into `[k, 128, 96]` patches **at hop 64** (overlapping; matches essentia's internal patching — hop 128 still gives 0.999 but 64 is tighter) → backbone ONNX.
+> - **Genre comes free from the backbone:** ONNX `outputs[0]` is the 400-class genre sigmoid, `outputs[1]` is the 1280-d embedding. So only the **mood / voice / danceability** heads need a one-off `tf2onnx` conversion (trivial dense graphs); genre does not.
+> - Mean-over-patches pooling matches what `analyzer.py` already does.
+>
+> **The one remaining de-risking item:** the melspec above used essentia's `TensorflowInputMusiCNN`.
+> To actually *retire* TensorFlow, that melspec must come from either (a) the plain `essentia`
+> (non-`-tensorflow`) wheel if it ships that algorithm, or (b) a small NumPy reimplementation
+> **validated against `TensorflowInputMusiCNN`'s output using this same harness**. Everything
+> downstream (backbone, heads, pooling, classification) is now proven. This is mechanical, not
+> research.
 
 > **Revised 2026-06-01 — verified against essentia.upf.edu (supersedes the looser earlier note).**
 > The migration's *primary driver* is sound: **retire end-of-life TensorFlow 2.5** (unpatched
