@@ -1,6 +1,6 @@
 # Releasing Vibechek
 
-How a new release happens, end-to-end. Most of the heavy lifting is automated; the human pieces are version bumps, the tag, and the final "publish" click on GitHub.
+How a new release happens, end-to-end. It's fully automated: bump the version strings, push the tag, and GitHub Actions builds + **publishes** the release. No manual "Publish" click (that earlier flow silently created invisible untagged drafts — see the note below).
 
 ---
 
@@ -23,13 +23,23 @@ git push origin v0.3.0-beta.1
 # 3. Wait ~20-30 min. GitHub Actions:
 #    - Builds the PyInstaller CLI on Win/Mac/Linux
 #    - Builds the Tauri desktop bundle on Win/Mac/Linux
-#    - Creates a DRAFT release with all artifacts attached
+#    - PUBLISHES a release for the tag with all artifacts attached
+#      (marked "pre-release" for -beta/-rc tags; auto-generated notes)
 #
-# 4. Review the draft at https://github.com/papapew/Vibechek/releases
-#    Edit the release notes, then click "Publish release".
+# 4. The release appears at https://github.com/papapew/Vibechek/releases.
+#    Optionally edit the auto-generated notes. Nothing else to click.
 ```
 
 That's the whole process. The rest of this doc is detail you only need when something goes wrong.
+
+> **Why it auto-publishes (and used to not):** the workflow previously created the
+> release with `draft: true`. GitHub does not attach a draft release to its git tag
+> until the draft is published, so `softprops/action-gh-release` couldn't find the
+> release "by tag" and left an invisible **`untagged-*` draft** — one per version,
+> none ever visible on the Releases page. The workflow now uses `draft: false`, so
+> the release is tied to the pushed tag and appears immediately. If you ever want the
+> review-before-publish flow back, set `draft: true` AND publish each draft promptly
+> (and clean up any `untagged-*` drafts it leaves).
 
 ---
 
@@ -79,7 +89,7 @@ Downloads the sidecar binary from job 1, stages it at `ui/src-tauri/binaries/`, 
 
 ### 3. `release` (ubuntu, runs after both)
 
-Collects all artifacts, creates a **draft** release with them attached. You manually click Publish.
+Collects all artifacts and **publishes** a release for the tag with them attached (pre-release for `-beta`/`-rc` tags). No manual publish step.
 
 ---
 
@@ -124,19 +134,19 @@ Output lands in `ui/src-tauri/target/release/bundle/`.
 
 ---
 
-## After the draft release exists
+## After the release publishes
 
-GitHub auto-fills release notes from commits since the previous tag. Review and edit:
+The release is live the moment the `release` job finishes — artifacts are publicly
+downloadable and repo watchers are notified. GitHub auto-fills the notes from commits
+since the previous tag; **optionally** edit them on the Releases page:
 
 - Lead with the **headline change**, not the version number.
 - Use the four-bucket structure: **New features**, **Improvements**, **Fixes**, **Breaking changes**.
 - Link to relevant docs (USER_GUIDE.md, INSTALL.md).
 - For a beta, add a "Known caveats" section honestly.
 
-Then click **Publish release**. This:
-- Makes the artifacts publicly downloadable from `/releases/latest`
-- Updates the GitHub homepage badge
-- Sends notifications to repo watchers
+(A `-beta`/`-rc` tag is published as a **pre-release**, so it won't replace a stable
+`vX.Y.Z` as the repo's "Latest release".)
 
 ---
 
@@ -191,7 +201,7 @@ This prints a **public key** and writes the **private key** to `~/.tauri/vibeche
 
 When `createUpdaterArtifacts: true`, the bundler emits the per-platform updater bundle (`*.nsis.zip` on Windows, `*.app.tar.gz` on macOS, the `*.AppImage` on Linux) **plus a detached `*.sig` signature** for each. The signing is gated exactly like the OS certs: the `Configure code signing (opt-in)` step in `build-tauri` exports `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to `$GITHUB_ENV` **only when the secret is non-empty**. With no key configured (and `createUpdaterArtifacts: false`), the build still succeeds — unsigned bundles, no `*.sig`, and the `release` job skips writing `latest.json`, so the in-app updater stays inert until you supply the key.
 
-The `release` job collects the `*.sig` files and synthesizes `release/latest.json` (the manifest `plugins.updater.endpoints` points at: `https://github.com/papapew/Vibechek/releases/latest/download/latest.json`), then attaches it alongside the installers. Because the endpoint resolves to `/releases/latest`, only a **published** (non-draft) release is visible to the updater — drafts won't trigger updates, which matches the existing "review the draft, then Publish" flow.
+The `release` job collects the `*.sig` files and synthesizes `release/latest.json` (the manifest `plugins.updater.endpoints` points at: `https://github.com/papapew/Vibechek/releases/latest/download/latest.json`), then attaches it alongside the installers. Because the endpoint resolves to `/releases/latest`, only a **published** (non-draft) release is visible to the updater — and the workflow now publishes on tag (`draft: false`), so a tagged release feeds the updater automatically once signing is enabled. (`/releases/latest` resolves to the latest **non-pre-release**, so `-beta`/`-rc` tags won't be served to the updater as "latest" — intended.)
 
 ### Windows / macOS *installer* signing
 
