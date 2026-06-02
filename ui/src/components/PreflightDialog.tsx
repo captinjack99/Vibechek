@@ -209,7 +209,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     setBusyAction("models");
     begin("download-models");
     try {
-      await rpc("download_models", { models_dir: preflight.models.models_dir });
+      await rpc("download_models", { models_dir: preflight.models.models_dir, engine });
       finish();
       await reCheck();
     } catch (e) {

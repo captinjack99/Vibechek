@@ -437,18 +437,22 @@ def route(staging: Path, library_root: Path, dry_run: bool) -> None:
 @main.command("download-models")
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
               help="Where to put the models (defaults to user data dir).")
-def download_models_cmd(models_dir: Path | None) -> None:
+@click.option("--engine", type=click.Choice(["essentia_tf", "onnx"]),
+              default="essentia_tf", show_default=True,
+              help="Which model set: essentia_tf (.pb) or onnx (converted .onnx heads + backbone).")
+def download_models_cmd(models_dir: Path | None, engine: str) -> None:
     """Download Essentia ML models (~800MB). Run once before first analyze.
 
     Models are downloaded to a per-user directory so they survive Vibechek
-    reinstalls. Already-downloaded models are skipped.
+    reinstalls. Already-downloaded models are skipped. `--engine onnx` fetches
+    the converted ONNX model set instead of the TensorFlow `.pb` set.
     """
     from vibechek.analyzer import download_models
     from vibechek.config import MODELS_DIR
 
     target = models_dir or MODELS_DIR
     target.mkdir(parents=True, exist_ok=True)
-    console.print(f"Downloading models to [cyan]{target}[/]")
+    console.print(f"Downloading {engine} models to [cyan]{target}[/]")
 
     with _progress_bar("Downloading") as progress:
         task = progress.add_task("starting", total=None)
@@ -456,7 +460,7 @@ def download_models_cmd(models_dir: Path | None) -> None:
         def on_progress(current: int, total: int, message: str) -> None:
             progress.update(task, completed=current, total=total, description=message[:40])
 
-        descriptors = download_models(target, on_progress=on_progress)
+        descriptors = download_models(target, on_progress=on_progress, engine=engine)
 
     console.print(f"\n[green]Done.[/] {len(descriptors)} models available in [cyan]{target}[/]")
 

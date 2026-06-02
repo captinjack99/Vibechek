@@ -292,6 +292,15 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "falling back to 3 (UTF-8)", cls.__name__, coerced,
             )
             continue  # use the dataclass default (3)
+        # inference_engine steers every `if engine == "onnx"` branch; a typo or
+        # wrong-case value ("ONNX", "tf") would silently run the essentia_tf
+        # path. Snap anything unrecognized back to the default (fail-soft, loud).
+        if key == "inference_engine" and coerced not in ("essentia_tf", "onnx"):
+            log.warning(
+                "Config field %s.inference_engine has unknown value %r; "
+                "falling back to 'essentia_tf'", cls.__name__, coerced,
+            )
+            continue  # use the dataclass default ("essentia_tf")
         kwargs[key] = coerced
     return cls(**kwargs)
 
