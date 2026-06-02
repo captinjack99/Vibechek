@@ -15,9 +15,10 @@ import platform
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from vibechek.analyzer import MODELS
+from vibechek.analyzer import _ONNX_HEAD_STEMS, MODELS
 from vibechek.config import MODELS_DIR
 from vibechek.native_install import NativeVenvStatus, probe_native_venv
+from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
 from vibechek.wsl import WSLStatus, detect_wsl
 
 log = logging.getLogger(__name__)
@@ -98,42 +99,58 @@ def check_essentia() -> EssentiaCheck:
         return EssentiaCheck(installed=False, error=f"{type(e).__name__}: {e}")
 
 
-def check_models(models_dir: Path | None = None) -> ModelsCheck:
-    """Verify every required ML model file is present and non-trivial in size."""
+def _model_files_for_engine(
+    engine: str, target: Path
+) -> list[tuple[str, Path, Path | None, bool]]:
+    """(name, weights_path, metadata_path|None, required) per model for an engine.
+
+    essentia_tf → the `.pb` weights + `.json` metadata for every model in MODELS.
+    onnx → the EffNet backbone `.onnx` + each converted head `.onnx`/`.json`. The
+    genre head is OPTIONAL (the backbone emits genre directly), so a missing one
+    doesn't block readiness — matching onnx_backend's loader.
+    """
+    if engine == "onnx":
+        items: list[tuple[str, Path, Path | None, bool]] = [
+            ("effnet (onnx backbone)", target / BACKBONE_ONNX_FILENAME, None, True),
+        ]
+        for stem in _ONNX_HEAD_STEMS:
+            items.append((
+                stem,
+                target / f"{stem}.onnx",
+                target / f"{stem}.json",
+                stem != "genre_discogs400",
+            ))
+        return items
+    return [
+        (name, target / f"{name}.pb", target / f"{name}.json", True)
+        for name in MODELS
+    ]
+
+
+def check_models(models_dir: Path | None = None, engine: str = "essentia_tf") -> ModelsCheck:
+    """Verify every required ML model file for `engine` is present + non-trivial."""
     target = Path(models_dir or MODELS_DIR)
     result = ModelsCheck(models_dir=str(target))
 
-    if not target.exists():
-        # All models missing
-        for name, (_subdir, _weights_name, _metadata_name) in MODELS.items():
-            result.per_model.append(ModelCheck(
-                name=name,
-                present=False,
-                weights_path=str(target / f"{name}.pb"),
-                metadata_path=str(target / f"{name}.json"),
-            ))
-            result.missing.append(name)
-        return result
-
-    for name, (_subdir, _weights_name, _metadata_name) in MODELS.items():
-        weights = target / f"{name}.pb"
-        metadata = target / f"{name}.json"
-
-        # A 0-byte .pb is broken; treat as missing
+    for name, weights, metadata, required in _model_files_for_engine(engine, target):
+        # A 0-byte / truncated weights file is broken; treat as missing.
         weights_ok = weights.exists() and weights.stat().st_size > 1024
-        metadata_ok = metadata.exists() and metadata.stat().st_size > 0
+        metadata_ok = metadata is None or (metadata.exists() and metadata.stat().st_size > 0)
         size_mb = weights.stat().st_size / (1024 * 1024) if weights.exists() else 0.0
+        present = weights_ok and metadata_ok
 
-        check = ModelCheck(
+        result.per_model.append(ModelCheck(
             name=name,
-            present=weights_ok and metadata_ok,
+            present=present,
             weights_path=str(weights),
-            metadata_path=str(metadata),
+            metadata_path=str(metadata) if metadata is not None else "",
             size_mb=round(size_mb, 1),
-        )
-        result.per_model.append(check)
+        ))
         result.total_size_mb += size_mb
-        (result.found if check.present else result.missing).append(name)
+        if present:
+            result.found.append(name)
+        elif required:
+            result.missing.append(name)  # optional (e.g. genre head) never blocks
 
     result.total_size_mb = round(result.total_size_mb, 1)
     return result
@@ -143,15 +160,21 @@ def preflight(
     models_dir: Path | None = None,
     *,
     quick_wsl: bool = True,
+    engine: str = "essentia_tf",
 ) -> PreflightResult:
-    """Full check; ready=True iff analyze can actually run.
+    """Full check; ready=True iff analyze can actually run on `engine`.
 
     "Ready" means ONE of:
       - Native essentia is installed in the sidecar's Python AND models present
       - Windows: WSL has vibechek + essentia AND models present (models live on
         the Windows side, mounted into WSL via /mnt/c)
-      - Linux/macOS: managed venv at ~/.vibechek/venv/ has essentia AND
-        models present
+      - Linux/macOS: managed venv has essentia AND models present
+
+    `engine` selects which engine's environment to check: "essentia_tf"
+    (default) checks `~/.vibechek/venv` (essentia-tensorflow) + the `.pb`
+    models; "onnx" checks `~/.vibechek/venv-onnx` (plain essentia + onnxruntime)
+    + the `.onnx` models. This makes the ONNX path gate analyze exactly like the
+    TF path — a not-ready result drives the same install/download prompts.
 
     `quick_wsl=True` (default) skips per-distro vibechek/essentia probes so the
     call returns in under a second — appropriate for the GUI's first-render
@@ -161,10 +184,11 @@ def preflight(
     should pass `quick_wsl=False` so they don't false-fail when WSL has
     essentia but quick mode couldn't see it.
     """
+    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
     essentia = check_essentia()
-    models = check_models(models_dir)
-    wsl_status = detect_wsl(quick=quick_wsl)
-    native_venv = probe_native_venv()
+    models = check_models(models_dir, engine=engine)
+    wsl_status = detect_wsl(quick=quick_wsl, venv_subdir=venv_subdir)
+    native_venv = probe_native_venv(engine)
 
     have_native = essentia.installed
     have_wsl = wsl_status.can_run_vibechek

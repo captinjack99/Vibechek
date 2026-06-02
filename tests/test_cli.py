@@ -61,7 +61,7 @@ def test_preflight_quick_mode_skips_distro_probes(monkeypatch) -> None:
     # preflight module's namespace — that's where the call resolves.
     probe_calls: list[bool] = []
 
-    def fake_detect(quick: bool = False) -> wsl.WSLStatus:
+    def fake_detect(quick: bool = False, venv_subdir: str = "venv") -> wsl.WSLStatus:
         probe_calls.append(quick)
         return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
 
@@ -89,7 +89,7 @@ def test_analyze_directory_uses_full_wsl_probe(monkeypatch, tmp_path) -> None:
 
     probe_calls: list[bool] = []
 
-    def fake_detect(quick: bool = False) -> wsl.WSLStatus:
+    def fake_detect(quick: bool = False, venv_subdir: str = "venv") -> wsl.WSLStatus:
         probe_calls.append(quick)
         return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
 
@@ -120,7 +120,7 @@ def test_preflight_full_mode_does_distro_probes(monkeypatch) -> None:
 
     probe_calls: list[bool] = []
 
-    def fake_detect(quick: bool = False) -> wsl.WSLStatus:
+    def fake_detect(quick: bool = False, venv_subdir: str = "venv") -> wsl.WSLStatus:
         probe_calls.append(quick)
         return wsl.WSLStatus(is_windows=False, wsl_available=False, wsl_feature_enabled=False)
 

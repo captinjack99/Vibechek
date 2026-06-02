@@ -403,7 +403,8 @@ def _preflight(params: dict) -> dict:
     from vibechek.preflight import preflight, to_dict
     models_dir = Path(params["models_dir"]) if params.get("models_dir") else None
     quick = bool(params.get("quick", True))
-    return to_dict(preflight(models_dir, quick_wsl=quick))
+    engine = _valid_engine(params.get("engine"))
+    return to_dict(preflight(models_dir, quick_wsl=quick, engine=engine))
 
 
 def _wsl_status(params: dict) -> dict:
