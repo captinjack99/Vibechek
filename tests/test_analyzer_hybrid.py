@@ -90,16 +90,24 @@ def test_hybrid_pool_recycles_workers_via_maxtasks(_spawn_ctx):
 
 
 def test_throughput_summary_reports_per_device(_spawn_ctx):
-    files = [f"/tmp/s{i}.mp3" for i in range(20)]
+    # Deterministic test of the summary FORMATTER: inject known per-device
+    # tallies instead of depending on which worker wins the shared-queue race.
+    # Whether a GPU vs CPU worker actually grabs work first is timing-dependent
+    # (with sub-100ms fake tasks the faster-spawning worker can drain the whole
+    # queue before the other finishes importing) — that distribution is already
+    # covered by test_hybrid_pool_uses_both_device_classes. This test only needs
+    # to prove throughput_summary() renders both device classes.
+    files = [f"/tmp/s{i}.mp3" for i in range(4)]
     pool = analyzer._HybridPool(
         _spawn_ctx, files, model_dir="/tmp/models",
         gpu_workers=1, cpu_workers=1, maxtasks=100,
     )
     try:
-        _drain(pool, len(files))
+        pool.device_counts = {"0": 12, "-1": 8}
+        pool.device_seconds = {"0": 1.2, "-1": 1.6}
+        summary = pool.throughput_summary()
     finally:
         pool.terminate()
         pool.join()
-    summary = pool.throughput_summary()
     assert "GPU" in summary and "CPU" in summary
     assert "track" in summary
