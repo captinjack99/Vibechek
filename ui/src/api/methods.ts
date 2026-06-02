@@ -223,7 +223,7 @@ export interface FindDuplicatesRequest {
   use_chromaprint?: boolean;
   /** Chromaprint similarity threshold, 0..1. */
   threshold?: number;
-  /** "report" | "delete" | "move". */
+  /** "report" | "move" | "trash". */
   action?: string;
   review_folder?: string | null;
   /** Default true. Pass false to skip the per-file mutagen probe. */
@@ -233,7 +233,7 @@ export interface FindDuplicatesRequest {
 export interface HandleDuplicatesRequest {
   /** Full DuplicateReport object as returned by `find_duplicates`. */
   report: DuplicateReport;
-  /** "report" | "delete" | "move". */
+  /** "report" | "move" | "trash". */
   action?: string;
   review_folder?: string | null;
 }

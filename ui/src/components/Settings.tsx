@@ -212,6 +212,14 @@ export function Settings() {
   // — safe to re-run. Routes to the WSL or native installer per analyze_via.
   const handleSetupOnnx = async () => {
     const via = preflightResult?.analyze_via;
+    // Guard the fast-click race: before the (5-10s) preflight resolves, `via` is
+    // undefined and we'd otherwise fall through to the native installer — which
+    // on Windows errors "Native install not supported on win32". Ask the user to
+    // retry once the probe lands instead of routing to the wrong installer.
+    if (!via) {
+      notify("Still checking your system — try Set up ONNX engine again in a moment.", { kind: "info" });
+      return;
+    }
     setDiagBusy("onnx-setup");
     begin("install-essentia");
     try {
