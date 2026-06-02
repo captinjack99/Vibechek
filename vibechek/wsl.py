@@ -113,7 +113,7 @@ def to_dict(s: WSLStatus) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def detect_wsl(quick: bool = False) -> WSLStatus:
+def detect_wsl(quick: bool = False, venv_subdir: str = "venv") -> WSLStatus:
     """Snapshot the user's WSL setup.
 
     `quick=True` skips the per-distro vibechek/essentia probes (which boot
@@ -121,6 +121,10 @@ def detect_wsl(quick: bool = False) -> WSLStatus:
     second on typical machines. Used by `preflight()` so the GUI never
     hangs on first load. Call again with `quick=False` for full detail
     after the UI has rendered.
+
+    `venv_subdir` selects which managed venv the per-distro probe inspects —
+    "venv" (default, essentia-tensorflow) or "venv-onnx" (the TF-free ONNX
+    engine). Preflight passes the one matching the selected inference engine.
     """
     status = WSLStatus(is_windows=IS_WINDOWS, wsl_available=False, wsl_feature_enabled=False)
 
@@ -164,7 +168,7 @@ def detect_wsl(quick: bool = False) -> WSLStatus:
     linux_distros = [d for d in status.distros if d.name.lower() not in _NON_LINUX_DISTROS]
     if linux_distros:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(linux_distros)) as ex:
-            futures = {ex.submit(_probe_distro, d, wsl): d for d in linux_distros}
+            futures = {ex.submit(_probe_distro, d, wsl, venv_subdir): d for d in linux_distros}
             for fut in concurrent.futures.as_completed(futures, timeout=30):
                 d = futures[fut]
                 try:
@@ -207,14 +211,23 @@ def _parse_distro_list(stdout: str) -> list[DistroInfo]:
     return distros
 
 
-def _probe_distro(distro: DistroInfo, wsl_exe: str) -> None:
+def _probe_distro(distro: DistroInfo, wsl_exe: str, venv_subdir: str = "venv") -> None:
     """Check whether `vibechek` and `essentia` are importable inside this distro.
+
+    `venv_subdir` selects which managed venv to probe: "venv" (default,
+    essentia-tensorflow) or "venv-onnx" (the TF-free ONNX engine). For the
+    non-default venv we check ONLY that venv's binary — the shared
+    `~/.local/bin/vibechek` symlink tracks the default venv, so trusting it
+    would falsely report the ONNX engine as installed.
 
     A single bash invocation does both probes so we only pay the distro-boot
     cost once. We check known fixed paths directly (not `which`) because
     `bash -lc` on Ubuntu is non-interactive and won't add `~/.local/bin` to
     PATH — Ubuntu's default `.bashrc` returns early for non-interactive shells.
     """
+    # The ~/.local/bin symlink only tracks the default venv; don't trust it for
+    # the ONNX engine venv.
+    extra_bin = ' "$HOME_DIR/.local/bin/vibechek"' if venv_subdir == "venv" else ""
     # Disk-only check — fast and reliable. We deliberately DO NOT `import
     # essentia` because that triggers a ~10s TensorFlow load.
     #
@@ -229,9 +242,10 @@ def _probe_distro(distro: DistroInfo, wsl_exe: str) -> None:
     # `SyntaxError: invalid syntax` and the user gets a useless "Invalid
     # params: Expecting value" toast. The repair is a single-line sed, idempotent,
     # and safe — `cuda-env.sh` should never appear in a Python entry point.
-    script = r"""
+    script = rf"""
 HOME_DIR="$(printenv HOME)"
-SHIM="$HOME_DIR/.vibechek/venv/bin/vibechek"
+VENV="$HOME_DIR/.vibechek/{venv_subdir}"
+SHIM="$VENV/bin/vibechek"
 if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
     # Strip the bad line. Done at probe time so users don't have to think.
     TMP="$(mktemp)"
@@ -245,7 +259,7 @@ if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
     fi
     rm -f "$TMP"
 fi
-for p in "$SHIM" "$HOME_DIR/.local/bin/vibechek"; do
+for p in "$SHIM"{extra_bin}; do
   if [ -x "$p" ]; then
     printf 'vibechek=%s\n' "$p"
     break
@@ -255,14 +269,14 @@ done
 # prefer reading PKG-INFO over invoking `vibechek --version` because the
 # latter imports the package (slow + can fail if the install is half-broken),
 # and we need this probe to be fast + tolerant.
-for d in "$HOME_DIR/.vibechek/venv/lib/python3."*/site-packages/vibechek-*.dist-info; do
+for d in "$VENV/lib/python3."*/site-packages/vibechek-*.dist-info; do
   if [ -d "$d" ]; then
     VER="$(basename "$d" | sed -E 's/^vibechek-([^-]+)\.dist-info$/\1/')"
     printf 'vibechek_version=%s\n' "$VER"
     break
   fi
 done
-for d in "$HOME_DIR/.vibechek/venv/lib/python3."*/site-packages/essentia*.dist-info; do
+for d in "$VENV/lib/python3."*/site-packages/essentia*.dist-info; do
   if [ -d "$d" ]; then
     printf 'essentia=%s\n' "$(basename "$d" | sed -E 's/^essentia[_-][^-]+-([^-]+)\.dist-info$/\1/')"
     break
