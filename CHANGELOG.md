@@ -12,6 +12,28 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged release.
 
+### Fixed
+- **Audio track previews** ("failed to fetch") — the bundled CSP had no
+  `connect-src`, so WaveSurfer's `fetch()` of the audio was blocked; also added
+  the `http://asset.localhost` scheme Windows actually serves.
+- **ONNX engine was inert at analyze time** — the analyze RPC never received
+  `inference_engine`, so the toggle silently ran essentia_tf. Plus the model
+  *download* (button, RPC, CLI, analyze's preflight) ignored the engine and
+  fetched the `.pb` set. Both fixed + regression-tested.
+- **ONNX GPU acceleration now works** (the whole point of the migration): the
+  installer provisions `onnxruntime-gpu` + the `nvidia-*-cu12` CUDA runtime
+  wheels when an NVIDIA GPU is present, and `load_onnx_models` calls
+  `onnxruntime.preload_dlls()` so the CUDA EP initializes. **Validated: the
+  EffNet backbone runs on an RTX 4070's CUDAExecutionProvider, TF-free.** New
+  `vibechek[onnx-gpu]` extra; `vibechek download-models --engine onnx`.
+- **ONNX robustness**: genre class-labels are now required for readiness (was
+  silently dropping genre), tiny head class-label JSON no longer rejected by the
+  size gate, `inference_engine` config value validated, engine-accurate preflight
+  messaging, and the ONNX launcher no longer sources TF's `cuda-env.sh`.
+- **Release pipeline**: tag pushes now **publish** the GitHub Release (was
+  `draft: true`, which left invisible `untagged-*` drafts for every version);
+  re-runs are idempotent (pre-existing release for the tag is deleted first).
+
 ---
 
 ## [0.4.0-beta.9] — 2026-06-01

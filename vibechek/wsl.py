@@ -1267,7 +1267,25 @@ def _user_bootstrap(engine: str = "essentia_tf") -> str:
     subdir = "venv-onnx" if engine == "onnx" else "venv"
     pip = f'"$HOME/.vibechek/{subdir}/bin/pip"'
     if engine == "onnx":
-        ml_line = f'{pip} install --quiet essentia onnxruntime'
+        # GPU acceleration is the whole point of the ONNX engine. When an NVIDIA
+        # GPU is visible (nvidia-smi), install onnxruntime-gpu + the CUDA 12
+        # runtime wheels — the CUDA EP's libs, loaded at runtime via
+        # onnxruntime.preload_dlls() (see onnx_backend.load_onnx_models).
+        # Otherwise fall back to CPU onnxruntime. (AMD/ROCm is a future variant.)
+        cuda_wheels = (
+            "nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 nvidia-cublas-cu12 "
+            "nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusparse-cu12 "
+            "nvidia-cuda-nvrtc-cu12"
+        )
+        ml_line = (
+            'if command -v nvidia-smi >/dev/null 2>&1; then\n'
+            f'    echo "  NVIDIA GPU detected — installing onnxruntime-gpu + CUDA 12 runtime"\n'
+            f'    {pip} install --quiet essentia onnxruntime-gpu {cuda_wheels}\n'
+            'else\n'
+            f'    echo "  No NVIDIA GPU — installing CPU onnxruntime"\n'
+            f'    {pip} install --quiet essentia onnxruntime\n'
+            'fi'
+        )
         label = "plain essentia + onnxruntime (TF-free ONNX engine)"
     else:
         ml_line = f'{pip} install --quiet essentia-tensorflow'

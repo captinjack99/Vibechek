@@ -324,6 +324,21 @@ def load_onnx_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
             f"engine selected). See docs/ONNX_MIGRATION.md §4."
         )
 
+    # Make the GPU execution providers actually usable. onnxruntime-gpu's
+    # provider library dlopens the CUDA/cuDNN runtime (libcudnn.so.9, etc.),
+    # which lives in the installed `nvidia-*-cu12` wheels, NOT on the default
+    # loader path. `preload_dlls()` (onnxruntime >= 1.19) loads them from those
+    # wheels — without it CUDAExecutionProvider silently fails to initialize and
+    # the backbone falls back to CPU. Validated: this is what flips the RTX 4070
+    # backbone run from CPU → CUDA. No-op on CPU-only onnxruntime / GPU off.
+    if use_gpu != "off" and hasattr(ort, "preload_dlls"):
+        try:
+            ort.preload_dlls()
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "onnxruntime.preload_dlls() failed; GPU EP may fall back to CPU: %s", e
+            )
+
     providers = build_providers(use_gpu)
     log.info("ONNX backbone EPs (in order): %s", providers)
     backbone_sess = ort.InferenceSession(str(backbone_path), providers=providers or None)

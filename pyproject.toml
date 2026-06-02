@@ -47,14 +47,27 @@ ml = [
 # ONNX Runtime inference engine (experimental, TF-free). Runs the SAME models
 # through onnxruntime on PLAIN essentia (no bundled TensorFlow) — validated to
 # parity with the [ml] path (docs/ONNX_MIGRATION.md). The desktop app provisions
-# a separate ~/.vibechek/venv-onnx with these. For CLI / manual installs:
-#   pip install vibechek[onnx]                         # CPU (works everywhere)
-#   pip install vibechek[onnx] && pip install onnxruntime-gpu       # NVIDIA / AMD-ROCm
-#   pip install vibechek[onnx] && pip install onnxruntime-directml  # Windows any-vendor GPU
-# (onnxruntime-gpu / -directml REPLACE the CPU onnxruntime — install one, not both.)
+# a separate ~/.vibechek/venv-onnx and auto-picks the GPU stack when an NVIDIA
+# GPU is present. For CLI / manual installs:
+#   pip install vibechek[onnx]       # CPU (works everywhere)
+#   pip install vibechek[onnx-gpu]   # NVIDIA CUDA (validated: backbone runs on CUDA)
+# The CUDA libs ship as the nvidia-*-cu12 wheels and are loaded at runtime via
+# onnxruntime.preload_dlls() (needs onnxruntime-gpu >= 1.19) — no system CUDA
+# toolkit / LD_LIBRARY_PATH required.
 onnx = [
     "essentia>=2.1b6.dev1110; platform_system != 'Windows'",
     "onnxruntime>=1.17",
+]
+onnx-gpu = [
+    "essentia>=2.1b6.dev1110; platform_system != 'Windows'",
+    "onnxruntime-gpu>=1.19",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-curand-cu12",
+    "nvidia-cusparse-cu12",
+    "nvidia-cuda-nvrtc-cu12",
 ]
 # FLAC→CDJ export: soundfile (libsndfile) does the sample-accurate FLAC→AIFF
 # transcode. Optional and gated at import time inside vibechek/cdj_export.py —
