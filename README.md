@@ -82,7 +82,7 @@ Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to s
 
 Better yet: **hybrid analysis runs your GPU and your spare CPU cores at the same time.** A modest laptop GPU might only fit ~3 analysis workers in VRAM, which used to leave 16 CPU cores idle. Now Vibechek runs GPU workers *and* CPU workers against one shared work queue that self-balances — whichever device finishes a track grabs the next. On an RTX 4070 Laptop + i9, a 50-track run split GPU 9 / CPU 41 and used every resource at once. Toggle it in Settings.
 
-There's also an **experimental ONNX Runtime inference engine** (Settings → Analysis → **Inference engine**, opt-in) that runs the same models with **cross-vendor GPU acceleration — AMD, Intel, and Apple via DirectML/CoreML, not just NVIDIA/CUDA** — and **drops the end-of-life TensorFlow runtime entirely** (it runs on plain Essentia + ONNX Runtime). Validated to match the default engine on real tracks. Still experimental, so the default stays essentia-tensorflow; flip it in Settings and click **Set up ONNX engine** to provision it.
+There's also an **experimental ONNX Runtime inference engine** (Settings → Analysis → **Inference engine**, opt-in) that runs the same models with **cross-vendor GPU acceleration** and **drops the end-of-life TensorFlow runtime entirely** (it runs on plain Essentia + ONNX Runtime). **NVIDIA CUDA is validated** (the backbone runs on an RTX 4070, TF-free); **AMD (ROCm, native Linux) and Apple (CoreML) are wired** via ONNX Runtime's execution-provider chain. Validated to match the default engine on real tracks. Still experimental, so the default stays essentia-tensorflow; flip it in Settings and click **Set up ONNX engine** to provision it (it auto-picks the GPU stack for your hardware).
 
 ### ⏪ Undo that actually undoes
 
@@ -209,7 +209,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**674 Python tests** · **44 JSON-RPC methods** · **29 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**675 Python tests** · **44 JSON-RPC methods** · **29 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
 - 38 frontend tests across keeperRules, rpc, LibraryFilters, ConfirmModal, Sidebar, DuplicatesView

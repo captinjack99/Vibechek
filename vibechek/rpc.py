@@ -394,7 +394,8 @@ def _engine_gpu_status(params: dict) -> dict:
 
     distro = params.get("distro")
     force = bool(params.get("force", False))
-    info = probe_engine_gpu(distro, force=force)
+    engine = _valid_engine(params.get("engine"))
+    info = probe_engine_gpu(distro, force=force, engine=engine)
     return engine_gpu_info_to_dict(info)
 
 

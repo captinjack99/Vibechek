@@ -388,6 +388,13 @@ class EngineGpuInfo:
     nvidia_smi_available: bool = False
     error: str | None = None        # Error message when ok=False
     probed_at: float = 0.0          # epoch seconds
+    # For the ONNX engine: the onnxruntime ExecutionProvider that actually
+    # initialized ("CUDAExecutionProvider" / "ROCMExecutionProvider" /
+    # "CoreMLExecutionProvider" / "DmlExecutionProvider"), or None. Lets the UI
+    # say "GPU via ONNX Runtime (CUDA)" instead of TF wording. None for the TF
+    # engine (which uses tf_version / missing_cuda_libs instead).
+    provider: str | None = None
+    runtime: str | None = None      # "onnxruntime X.Y.Z" for the onnx engine
 
 
 # Process-level cache: probes take ~10s (TF import + GPU enumeration). The UI
@@ -611,7 +618,185 @@ print(json.dumps(out))
 """
 
 
-def probe_engine_gpu(distro: str | None, *, force: bool = False) -> EngineGpuInfo:
+# ONNX-engine GPU probe. Runs in venv-onnx and asks onnxruntime which GPU
+# ExecutionProvider actually INITIALIZES — the definitive test, since
+# onnxruntime drops an EP that can't allocate the device, so an EP surviving in
+# session.get_providers() means the GPU is genuinely usable. Validated on an
+# RTX 4070: CUDAExecutionProvider survives via onnxruntime-gpu + nvidia-*-cu12 +
+# preload_dlls(). Prints one JSON object on stdout.
+_ONNX_GPU_PROBE_PY = r'''
+import base64, json
+out = {"ok": False, "providers": [], "provider": None, "gpu_available": False,
+       "runtime": None, "error": None}
+try:
+    import onnxruntime as ort
+    out["runtime"] = "onnxruntime " + ort.__version__
+    if hasattr(ort, "preload_dlls"):
+        try:
+            ort.preload_dlls()
+        except Exception as e:
+            out["preload_error"] = str(e)[:200]
+    avail = list(ort.get_available_providers())
+    out["providers"] = avail
+    GPU_EPS = ["CUDAExecutionProvider", "ROCMExecutionProvider",
+               "DmlExecutionProvider", "CoreMLExecutionProvider"]
+    model = base64.b64decode("CA06NwoQCgF4EgF5IghJZGVudGl0eRIBZ1oPCgF4EgoKCAgBEgQKAggBYg8KAXkSCgoICAESBAoCCAFCBAoAEA0=")
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    for ep in GPU_EPS:
+        if ep not in avail:
+            continue
+        try:
+            sess = ort.InferenceSession(model, sess_options=so, providers=[ep, "CPUExecutionProvider"])
+            if ep in sess.get_providers():
+                out["provider"] = ep
+                out["gpu_available"] = True
+                break
+        except Exception as e:
+            out.setdefault("ep_errors", {})[ep] = str(e)[:200]
+    out["ok"] = True
+except Exception as e:
+    out["error"] = "%s: %s" % (type(e).__name__, e)
+print(json.dumps(out))
+'''
+
+_ONNX_PROVIDER_BACKEND = {
+    "CUDAExecutionProvider": ("cuda", "nvidia"),
+    "ROCMExecutionProvider": ("rocm", "amd"),
+    "DmlExecutionProvider": ("directml", "unknown"),
+    "CoreMLExecutionProvider": ("coreml", "apple"),
+}
+
+
+def _apply_onnx_json(info: EngineGpuInfo, onnx_out: dict, gpu_name: str | None) -> None:
+    """Populate an EngineGpuInfo from the onnxruntime GPU probe JSON."""
+    info.ok = bool(onnx_out.get("ok"))
+    info.provider = onnx_out.get("provider")
+    info.runtime = onnx_out.get("runtime")
+    info.gpu_available = bool(onnx_out.get("gpu_available"))
+    if onnx_out.get("error") and not info.error:
+        info.error = onnx_out["error"]
+    backend, vendor = _ONNX_PROVIDER_BACKEND.get(info.provider or "", ("unknown", "unknown"))
+    info.gpu_hardware_visible = info.gpu_available or info.nvidia_smi_available
+    if info.gpu_available:
+        info.devices.append(EngineGpuDevice(
+            name=gpu_name or (info.provider or "GPU"), backend=backend, vendor=vendor,
+        ))
+        info.gpu_count = len(info.devices)
+
+
+def _probe_wsl_onnx_gpu(distro: str) -> EngineGpuInfo:
+    """ONNX GPU probe inside `distro`'s venv-onnx (onnxruntime EPs)."""
+    info = EngineGpuInfo(engine="wsl", distro=distro)
+    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    if not wsl:
+        info.error = "wsl.exe not on PATH"
+        return info
+    script = r"""
+set +e
+HOME_DIR="$(printenv HOME)"
+DRIVER=""
+GPUNAME=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+    DRIVER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d ' \r\n')"
+    GPUNAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 | sed 's/[[:space:]]*$//' | tr -d '\r')"
+fi
+echo "NVIDIA_DRIVER=${DRIVER}"
+echo "GPU_NAME=${GPUNAME}"
+VENV_PY="$HOME_DIR/.vibechek/venv-onnx/bin/python"
+if [ ! -x "$VENV_PY" ]; then
+    echo "ONNX_JSON={\"ok\":false,\"error\":\"ONNX engine not set up (venv-onnx missing)\"}"
+    exit 0
+fi
+echo "ONNX_JSON=$("$VENV_PY" - <<'PY' 2>/dev/null
+__PROBE__
+PY
+)"
+"""
+    script = script.replace("__PROBE__", _ONNX_GPU_PROBE_PY, 1)
+    try:
+        proc = subprocess.Popen(
+            [wsl, "-d", distro, "--", "bash", "-s"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        clean = script.replace("\r\n", "\n").replace("\r", "\n")
+        stdout_bytes, stderr_bytes = proc.communicate(input=clean.encode("utf-8"), timeout=60)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        info.error = "onnx GPU probe timed out after 60s"
+        return info
+    except Exception as e:  # noqa: BLE001
+        info.error = f"onnx GPU probe failed: {type(e).__name__}: {e}"
+        return info
+    stdout = ""
+    for enc in ("utf-8", "utf-16-le", "cp1252"):
+        try:
+            stdout = stdout_bytes.decode(enc).replace("\x00", "")
+            break
+        except UnicodeDecodeError:
+            continue
+    gpu_name: str | None = None
+    onnx_out: dict = {}
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("NVIDIA_DRIVER="):
+            val = line[len("NVIDIA_DRIVER="):].strip()
+            if val:
+                info.nvidia_driver = val
+                info.nvidia_smi_available = True
+        elif line.startswith("GPU_NAME="):
+            val = line[len("GPU_NAME="):].strip()
+            if val:
+                gpu_name = val
+        elif line.startswith("ONNX_JSON="):
+            payload = line[len("ONNX_JSON="):].strip()
+            if payload:
+                try:
+                    onnx_out = json.loads(payload)
+                except json.JSONDecodeError as e:
+                    info.error = f"could not parse onnx probe JSON: {e}; raw={payload[:200]}"
+    if onnx_out:
+        _apply_onnx_json(info, onnx_out, gpu_name)
+    elif not info.error:
+        info.error = "onnx GPU probe produced no output"
+    return info
+
+
+def _probe_native_onnx_gpu() -> EngineGpuInfo:
+    """ONNX GPU probe via the native venv-onnx python (Linux/macOS)."""
+    info = EngineGpuInfo(engine="native")
+    from vibechek.native_install import probe_native_venv  # noqa: PLC0415
+    nv = probe_native_venv("onnx")
+    if not nv.supported or not nv.venv_python:
+        info.error = "ONNX engine not set up (venv-onnx missing)"
+        return info
+    try:
+        result = subprocess.run(
+            [nv.venv_python, "-c", _ONNX_GPU_PROBE_PY],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:  # noqa: BLE001
+        info.error = f"onnx GPU probe failed: {type(e).__name__}: {e}"
+        return info
+    onnx_out: dict = {}
+    for line in (result.stdout or "").splitlines():
+        s = line.strip()
+        if s.startswith("{"):
+            try:
+                onnx_out = json.loads(s)
+            except json.JSONDecodeError:
+                pass
+    if onnx_out:
+        _apply_onnx_json(info, onnx_out, None)
+    elif not info.error:
+        info.error = "onnx GPU probe produced no output"
+    return info
+
+
+def probe_engine_gpu(distro: str | None, *, force: bool = False, engine: str = "essentia_tf") -> EngineGpuInfo:
     """Ask the *actual analyze engine* what GPUs it can use.
 
     If `distro` is None or we're not on Windows, falls back to a native probe
@@ -623,7 +808,7 @@ def probe_engine_gpu(distro: str | None, *, force: bool = False) -> EngineGpuInf
 
     Results are cached for 5 minutes (per distro). Pass `force=True` to bypass.
     """
-    cache_key = f"wsl:{distro}" if distro else "native"
+    cache_key = f"{engine}:wsl:{distro}" if distro else f"{engine}:native"
     now = time.time()
     if not force:
         with _ENGINE_GPU_CACHE_LOCK:
@@ -631,7 +816,11 @@ def probe_engine_gpu(distro: str | None, *, force: bool = False) -> EngineGpuInf
         if cached is not None and (now - cached[1]) < _ENGINE_GPU_CACHE_TTL_SEC:
             return cached[0]
 
-    if not distro or not IS_WINDOWS:
+    native = not distro or not IS_WINDOWS
+    if engine == "onnx":
+        # ONNX engine: query onnxruntime's EPs in venv-onnx, not TF.
+        info = _probe_native_onnx_gpu() if native else _probe_wsl_onnx_gpu(distro)
+    elif native:
         info = _probe_native_engine_gpu()
     else:
         info = _probe_wsl_engine_gpu(distro)
@@ -1278,6 +1467,10 @@ def _user_bootstrap(engine: str = "essentia_tf") -> str:
             "nvidia-cuda-nvrtc-cu12"
         )
         ml_line = (
+            # Clean swap: onnxruntime / -gpu / -rocm all ship the same `onnxruntime`
+            # module, so re-running setup (e.g. CPU→GPU after this fix) must drop
+            # the old one first, else two distributions clobber each other.
+            f'{pip} uninstall -y onnxruntime onnxruntime-gpu onnxruntime-rocm >/dev/null 2>&1 || true\n'
             'if command -v nvidia-smi >/dev/null 2>&1; then\n'
             f'    echo "  NVIDIA GPU detected — installing onnxruntime-gpu + CUDA 12 runtime"\n'
             f'    {pip} install --quiet essentia onnxruntime-gpu {cuda_wheels}\n'

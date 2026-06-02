@@ -121,6 +121,8 @@ export interface EngineGpuInfo {
   nvidia_smi_available: boolean;
   error: string | null;
   probed_at: number;
+  provider: string | null;
+  runtime: string | null;
 }
 
 export interface WSLStatus {
@@ -177,6 +179,7 @@ export interface PreflightResult {
   wsl: WSLStatus | null;
   native_venv: NativeVenvStatus | null;
   analyze_via: string | null;
+  engine: string;
   readonly reasons_not_ready: string[];
 }
 
