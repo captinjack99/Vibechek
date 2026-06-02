@@ -2,7 +2,7 @@
 
 **Open-source ML for your DJ library.** Auto-tag genre, mood, energy, BPM, and key. Find duplicates the way your ears would. Organize 10,000 tracks in an afternoon. Keep every Rekordbox cue point intact.
 
-> **Status:** `v0.4.0-beta.8` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux). Free forever under AGPL-3.0.
+> **Status:** `v0.4.0-beta.9` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux). Free forever under AGPL-3.0.
 
 ---
 
