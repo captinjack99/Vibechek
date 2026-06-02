@@ -4,7 +4,9 @@ name: Release
 #   1. The PyInstaller CLI bundle (zip / tar.gz) per OS
 #   2. The Tauri desktop installer per OS (.msi/.exe on Windows, .dmg on macOS,
 #      .AppImage/.deb on Linux), with the CLI binary bundled as the sidecar
-# All artifacts are uploaded to a draft GitHub Release for manual publishing.
+# All artifacts are published to a GitHub Release for the pushed tag
+# (marked pre-release for -beta/-rc tags). Builds are unsigned until signing
+# is configured (docs/RELEASING.md).
 
 on:
   push:
@@ -397,7 +399,16 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: Vibechek ${{ github.ref_name }}
-          draft: true
+          # Publish immediately on tag push. (Was draft:true, which never
+          # surfaced a release: GitHub doesn't associate a DRAFT release with
+          # its git tag until it's published, so softprops gave up finding it
+          # "by tag" and left an invisible UNTAGGED draft — `untagged-*` — that
+          # piled up unseen for every version. Auto-publishing ties the release
+          # to the pushed tag and makes it appear for everyone.)
+          draft: false
+          # Pre-release suffix (-beta.N / -rc.N) → mark as pre-release so a
+          # future clean vX.Y.Z stays the "Latest" release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: release/*
           body: |
