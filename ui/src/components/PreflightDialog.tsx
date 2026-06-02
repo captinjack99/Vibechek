@@ -26,7 +26,7 @@ import {
 } from "lucide-react";
 
 import { isCancellation, rpc, useSidecarProgress } from "../hooks/useSidecar";
-import { useNotificationStore, useOperationStore } from "../stores";
+import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
 import type { InstallResult, PreflightResult, WSLStatus } from "../types";
 
 interface Props {
@@ -44,6 +44,10 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   const finish = useOperationStore((s) => s.finish);
   const fail = useOperationStore((s) => s.fail);
   const notify = useNotificationStore((s) => s.notify);
+  // The selected inference engine drives which venv/models the dialog checks +
+  // installs, so ONNX is gated and provisioned exactly like the TF path.
+  const engine = useConfigStore((s) => s.config.analysis.inference_engine);
+  const isOnnx = engine === "onnx";
 
   const [busyAction, setBusyAction] = useState<Action>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
@@ -86,7 +90,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     // detect that essentia just landed inside a distro. Ask the sidecar for a
     // full (non-quick) preflight in a single round-trip. The dialog is
     // already user-blocking; the extra 5-10s for the slow probe is fine here.
-    const next = await rpc<PreflightResult>("preflight", { quick: false });
+    const next = await rpc<PreflightResult>("preflight", { quick: false, engine });
     onRefresh(next);
     if (autoCloseIfReady && next.ready) onReady();
     return next;
@@ -193,11 +197,12 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   const handleInstallVibecheckInWsl = async (distro: string) => {
     await runWithProgress<InstallResult>("vibechek", "install_vibechek_in_wsl", {
       distro,
+      engine,
     });
   };
 
   const handleInstallEssentiaNative = async () => {
-    await runWithProgress<InstallResult>("vibechek", "install_essentia_native", {});
+    await runWithProgress<InstallResult>("vibechek", "install_essentia_native", { engine });
   };
 
   const handleDownloadModels = async () => {
@@ -255,6 +260,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             <WindowsFlow
               preflight={preflight}
               busyAction={busyAction}
+              isOnnx={isOnnx}
               onInstallWsl={handleInstallWsl}
               onInstallDistro={handleInstallDistro}
               onInstallVibechekInWsl={handleInstallVibecheckInWsl}
@@ -263,6 +269,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             <UnixEssentiaFlow
               preflight={preflight}
               busyAction={busyAction}
+              isOnnx={isOnnx}
               onInstallEssentiaNative={handleInstallEssentiaNative}
             />
           )}
@@ -270,6 +277,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
           <ModelsRow
             check={preflight.models}
             busy={busyAction === "models"}
+            isOnnx={isOnnx}
             onDownload={handleDownloadModels}
           />
 
@@ -373,6 +381,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
 interface WindowsFlowProps {
   preflight: PreflightResult;
   busyAction: Action;
+  isOnnx: boolean;
   onInstallWsl: () => void;
   onInstallDistro: () => void;
   onInstallVibechekInWsl: (distro: string) => void;
@@ -381,6 +390,7 @@ interface WindowsFlowProps {
 function WindowsFlow({
   preflight,
   busyAction,
+  isOnnx,
   onInstallWsl,
   onInstallDistro,
   onInstallVibechekInWsl,
@@ -438,13 +448,20 @@ function WindowsFlow({
         />
         <Step
           ok={false}
-          title={`Vibechek + Essentia in ${target}`}
-          sub="The Python side isn't installed in your WSL distro yet"
+          title={isOnnx ? `Vibechek + ONNX engine in ${target}` : `Vibechek + Essentia in ${target}`}
+          sub={isOnnx
+            ? "The TF-free ONNX engine isn't installed in your WSL distro yet"
+            : "The Python side isn't installed in your WSL distro yet"}
           info={
             <>
               Vibechek will run: <code>apt install python3-pip libchromaprint-tools</code>,
-              then <code>pip install essentia-tensorflow vibechek</code>. Takes 3-5 minutes.
-              No admin prompt — runs entirely inside your distro.
+              then{" "}
+              {isOnnx ? (
+                <><code>pip install essentia onnxruntime vibechek</code> into a separate{" "}
+                <code>~/.vibechek/venv-onnx</code> (plain Essentia + ONNX Runtime, no TensorFlow)</>
+              ) : (
+                <><code>pip install essentia-tensorflow vibechek</code></>
+              )}. Takes 3-5 minutes. No admin prompt — runs entirely inside your distro.
             </>
           }
           action={
@@ -477,12 +494,14 @@ function WindowsFlow({
 interface UnixFlowProps {
   preflight: PreflightResult;
   busyAction: Action;
+  isOnnx: boolean;
   onInstallEssentiaNative: () => void;
 }
 
 function UnixEssentiaFlow({
   preflight,
   busyAction,
+  isOnnx,
   onInstallEssentiaNative,
 }: UnixFlowProps) {
   const sidecarHasIt = preflight.essentia.installed;
@@ -525,10 +544,15 @@ function UnixEssentiaFlow({
       info={
         <>
           Vibechek will create a managed Python virtual environment at{" "}
-          <code>{nv?.venv_dir ?? "~/.vibechek/venv"}</code> and install{" "}
-          <code>essentia-tensorflow</code> + <code>vibechek</code> into it.
-          Takes ~3-5 minutes. No admin prompt; doesn't touch your system
-          Python.
+          <code>{nv?.venv_dir ?? (isOnnx ? "~/.vibechek/venv-onnx" : "~/.vibechek/venv")}</code>{" "}
+          and install{" "}
+          {isOnnx ? (
+            <><code>essentia</code> + <code>onnxruntime</code> (no TensorFlow)</>
+          ) : (
+            <><code>essentia-tensorflow</code></>
+          )}{" "}
+          + <code>vibechek</code> into it. Takes ~3-5 minutes. No admin prompt;
+          doesn&apos;t touch your system Python.
         </>
       }
       action={
@@ -550,21 +574,25 @@ function UnixEssentiaFlow({
 function ModelsRow({
   check,
   busy,
+  isOnnx,
   onDownload,
 }: {
   check: PreflightResult["models"];
   busy: boolean;
+  isOnnx: boolean;
   onDownload: () => void;
 }) {
   const ok = check.missing.length === 0;
   return (
     <Step
       ok={ok}
-      title="ML model files (~200 MB)"
+      title={isOnnx ? "ML model files (ONNX)" : "ML model files (~200 MB)"}
       sub={ok
         ? `${check.found.length} models, ${check.total_size_mb.toFixed(0)} MB in ${check.models_dir}`
         : `${check.missing.length} of ${check.found.length + check.missing.length} models missing`}
-      info={!ok && "Vibechek will download these from essentia.upf.edu."}
+      info={!ok && (isOnnx
+        ? "Vibechek will download the converted ONNX models from its release mirror."
+        : "Vibechek will download these from essentia.upf.edu.")}
       action={!ok && (
         <ActionButton
           icon={<Download className="w-4 h-4" />}

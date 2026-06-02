@@ -159,12 +159,12 @@ def test_preflight_ready_when_native_and_models_present(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         preflight_mod,
         "check_models",
-        lambda _d=None: ModelsCheck(models_dir="/x", found=["effnet"]),
+        lambda _d=None, engine="essentia_tf": ModelsCheck(models_dir="/x", found=["effnet"]),
     )
     monkeypatch.setattr(
         preflight_mod,
         "detect_wsl",
-        lambda quick=True: WSLStatus(False, False, False),
+        lambda quick=True, venv_subdir="venv": WSLStatus(False, False, False),
     )
 
     r = preflight()
@@ -181,12 +181,12 @@ def test_preflight_not_ready_when_no_engine(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(
         preflight_mod,
         "check_models",
-        lambda _d=None: ModelsCheck(models_dir="/x", found=["effnet"]),
+        lambda _d=None, engine="essentia_tf": ModelsCheck(models_dir="/x", found=["effnet"]),
     )
     monkeypatch.setattr(
         preflight_mod,
         "detect_wsl",
-        lambda quick=True: WSLStatus(True, True, True),  # no distros
+        lambda quick=True, venv_subdir="venv": WSLStatus(True, True, True),  # no distros
     )
 
     r = preflight()
@@ -203,9 +203,9 @@ def test_preflight_via_wsl_when_only_wsl_has_engine(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         preflight_mod,
         "check_models",
-        lambda _d=None: ModelsCheck(models_dir="/x", found=["effnet"]),
+        lambda _d=None, engine="essentia_tf": ModelsCheck(models_dir="/x", found=["effnet"]),
     )
-    monkeypatch.setattr(preflight_mod, "detect_wsl", lambda quick=True: _wsl_ready())
+    monkeypatch.setattr(preflight_mod, "detect_wsl", lambda quick=True, venv_subdir="venv": _wsl_ready())
 
     r = preflight()
     assert r.ready is True
@@ -221,9 +221,9 @@ def test_preflight_native_preferred_over_wsl(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(
         preflight_mod,
         "check_models",
-        lambda _d=None: ModelsCheck(models_dir="/x", found=["effnet"]),
+        lambda _d=None, engine="essentia_tf": ModelsCheck(models_dir="/x", found=["effnet"]),
     )
-    monkeypatch.setattr(preflight_mod, "detect_wsl", lambda quick=True: _wsl_ready())
+    monkeypatch.setattr(preflight_mod, "detect_wsl", lambda quick=True, venv_subdir="venv": _wsl_ready())
 
     r = preflight()
     assert r.analyze_via == "native"
@@ -238,12 +238,12 @@ def test_preflight_models_missing_blocks_even_with_engine(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         preflight_mod,
         "check_models",
-        lambda _d=None: ModelsCheck(models_dir="/x", missing=["effnet"]),
+        lambda _d=None, engine="essentia_tf": ModelsCheck(models_dir="/x", missing=["effnet"]),
     )
     monkeypatch.setattr(
         preflight_mod,
         "detect_wsl",
-        lambda quick=True: WSLStatus(False, False, False),
+        lambda quick=True, venv_subdir="venv": WSLStatus(False, False, False),
     )
 
     r = preflight()

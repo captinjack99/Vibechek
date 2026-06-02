@@ -560,8 +560,10 @@ export function LibraryBrowser() {
     if (preflightInFlight) return;     // already probing, don't double-fire
     setPreflightInFlight(true);
     try {
-      // Quick probe first — if it says ready, we're done immediately.
-      const quick = await rpc<PreflightResult>("preflight", {});
+      // Quick probe first — if it says ready, we're done immediately. Pass the
+      // selected engine so the probe checks the right venv (venv vs venv-onnx)
+      // + models (.pb vs .onnx); ONNX then gates analyze exactly like TF.
+      const quick = await rpc<PreflightResult>("preflight", { engine: analysisCfg.inference_engine });
       // Re-check the long-op lock: it can flip between us starting the
       // probe and the probe finishing (e.g. user kicked off a different
       // operation while we were waiting). Don't trample an active op.
@@ -573,7 +575,7 @@ export function LibraryBrowser() {
       // Not ready per quick mode. On Windows the quick mode never probes
       // distros, so "not ready" is uninformative. Do the full probe before
       // showing the dialog so the user sees the real state, not a stale one.
-      const full = await rpc<PreflightResult>("preflight", { quick: false });
+      const full = await rpc<PreflightResult>("preflight", { quick: false, engine: analysisCfg.inference_engine });
       if (useOperationStore.getState().active !== null) return;
       if (full.ready) {
         // Full probe revealed we're actually ready (quick mode missed it
