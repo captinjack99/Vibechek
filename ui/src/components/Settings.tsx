@@ -263,7 +263,7 @@ export function Settings() {
   const refreshEngineGpu = (distro: string | null, force = false) => {
     if (!isMounted.current) return;
     setEngineProbing(true);
-    rpc<EngineGpuInfo>("engine_gpu_status", { distro, force })
+    rpc<EngineGpuInfo>("engine_gpu_status", { distro, force, engine: cfg.analysis.inference_engine })
       .then((info) => {
         if (isMounted.current) setEngineGpu(info);
       })
@@ -282,6 +282,8 @@ export function Settings() {
           tf_built_with_cuda: null,
           nvidia_driver: null,
           nvidia_smi_available: false,
+          provider: null,
+          runtime: null,
           // Unwrap RpcError.message (which String(e) would render as
           // "[object Object]"); fall back to String for non-Error rejections.
           error:
@@ -1766,7 +1768,10 @@ function EngineGpuBlock({
   // install button that can never succeed for them.
   const visibleVendors = new Set(engineGpu.devices.map((d) => d.vendor || "nvidia"));
   const hasNvidiaVisible = visibleVendors.has("nvidia");
-  if (engineGpu.gpu_hardware_visible && !engineGpu.gpu_available && hasNvidiaVisible) {
+  // The "install CUDA libs" fix is the essentia-TENSORFLOW path. For the ONNX
+  // engine (engineGpu.runtime set), the GPU build is provisioned by "Set up
+  // ONNX engine", so don't show the TF fixer — fall through to the message.
+  if (engineGpu.gpu_hardware_visible && !engineGpu.gpu_available && hasNvidiaVisible && !engineGpu.runtime) {
     return (
       <EngineGpuFixableBlock
         engineGpu={engineGpu}
@@ -1786,11 +1791,24 @@ function EngineGpuBlock({
             {engineGpu.devices.map((g) => g.name).join(", ")}
           </div>
           <div className="text-white/40 font-mono">
-            {engineGpu.engine === "wsl"
-              ? `via TensorFlow inside ${engineGpu.distro}`
-              : "via native TensorFlow"}
-            {engineGpu.tf_version ? ` · TF ${engineGpu.tf_version}` : ""}
-            {engineGpu.nvidia_driver ? ` · driver ${engineGpu.nvidia_driver}` : ""}
+            {engineGpu.provider ? (
+              // ONNX engine: report the active onnxruntime ExecutionProvider.
+              <>
+                {engineGpu.engine === "wsl"
+                  ? `via ONNX Runtime inside ${engineGpu.distro}`
+                  : "via ONNX Runtime"}
+                {` · ${engineGpu.provider.replace("ExecutionProvider", "")}`}
+                {engineGpu.nvidia_driver ? ` · driver ${engineGpu.nvidia_driver}` : ""}
+              </>
+            ) : (
+              <>
+                {engineGpu.engine === "wsl"
+                  ? `via TensorFlow inside ${engineGpu.distro}`
+                  : "via native TensorFlow"}
+                {engineGpu.tf_version ? ` · TF ${engineGpu.tf_version}` : ""}
+                {engineGpu.nvidia_driver ? ` · driver ${engineGpu.nvidia_driver}` : ""}
+              </>
+            )}
           </div>
           <button className="btn-ghost text-xs mt-1" onClick={onRefresh}>
             Re-probe

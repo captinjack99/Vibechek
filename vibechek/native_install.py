@@ -294,24 +294,43 @@ def install_essentia_native(
     if rc != 0:
         return _fail("pip/wheel upgrade", rc, tail)
 
+    # Clean swap: onnxruntime / -gpu / -rocm all ship the same `onnxruntime`
+    # module, so a CPU→GPU re-setup must drop the old distribution first.
+    if engine == "onnx":
+        _run_subprocess_cancellable(
+            [*venv_pip, "uninstall", "-y", "onnxruntime", "onnxruntime-gpu", "onnxruntime-rocm"],
+            timeout=60,
+        )
+
     # ---- Step 3: the ML stack (the slow ~3-5 min step) ----
-    # onnx → plain essentia + onnxruntime (TF-free). GPU is the point of ONNX:
-    # with an NVIDIA GPU, install onnxruntime-gpu + the CUDA 12 runtime wheels
-    # (loaded at runtime via onnxruntime.preload_dlls()); else CPU onnxruntime.
+    # onnx → plain essentia + onnxruntime (TF-free). GPU is the point of ONNX,
+    # picked per platform/vendor (build_providers/onnx_backend handle the EP):
+    #   macOS        → onnxruntime (CoreML EP ships in the wheel — Apple GPU/ANE)
+    #   NVIDIA Linux → onnxruntime-gpu + CUDA 12 wheels (preload_dlls() loads them)
+    #   AMD Linux    → onnxruntime-rocm (best-effort; ROCm not viable in WSL)
+    #   else         → CPU onnxruntime
     # essentia_tf → essentia-tensorflow (CUDA via the separate Enable-GPU step).
     if engine == "onnx":
-        if shutil.which("nvidia-smi"):
+        if IS_MAC:
+            ml_packages = ["essentia", "onnxruntime"]
+        elif shutil.which("nvidia-smi"):
             ml_packages = [
                 "essentia", "onnxruntime-gpu",
                 "nvidia-cuda-runtime-cu12", "nvidia-cudnn-cu12", "nvidia-cublas-cu12",
                 "nvidia-cufft-cu12", "nvidia-curand-cu12", "nvidia-cusparse-cu12",
                 "nvidia-cuda-nvrtc-cu12",
             ]
+        elif shutil.which("rocminfo") or shutil.which("rocm-smi"):
+            ml_packages = ["essentia", "onnxruntime-rocm"]
         else:
             ml_packages = ["essentia", "onnxruntime"]
     else:
         ml_packages = ["essentia-tensorflow"]
-    ml_label = "essentia + onnxruntime-gpu" if "onnxruntime-gpu" in ml_packages else " + ".join(ml_packages)
+    ml_label = (
+        "essentia + GPU onnxruntime"
+        if any(p.startswith("onnxruntime-") for p in ml_packages)
+        else " + ".join(ml_packages)
+    )
     if on_progress:
         on_progress(25, 100, f"Installing {ml_label} (this is the slow step, ~3-5 min)...")
     rc, tail = _run_with_progress(

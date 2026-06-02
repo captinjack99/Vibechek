@@ -94,6 +94,22 @@ def test_preflight_rpc_threads_engine(monkeypatch) -> None:
     assert captured["engine"] == "onnx"
 
 
+def test_engine_gpu_status_rpc_threads_engine(monkeypatch) -> None:
+    """Regression: the GPU-status RPC must forward `engine` so the ONNX engine's
+    GPU is probed via onnxruntime in venv-onnx (not the TF venv)."""
+    import vibechek.rpc as rpc
+    import vibechek.wsl as wsl_mod
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        wsl_mod, "probe_engine_gpu",
+        lambda distro, *, force=False, engine="essentia_tf": captured.update(engine=engine),
+    )
+    monkeypatch.setattr(wsl_mod, "engine_gpu_info_to_dict", lambda _info: {})
+    rpc._engine_gpu_status({"engine": "onnx"})
+    assert captured["engine"] == "onnx"
+
+
 def test_download_models_default_engine_does_not_fetch_onnx(monkeypatch, tmp_path) -> None:
     """engine='essentia_tf' must not touch any .onnx — the TF path is unchanged."""
     fetched: list[str] = []
