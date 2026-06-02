@@ -12,6 +12,12 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged release.
 
+---
+
+## [0.4.0-beta.9] — 2026-06-01
+
+Completes the ONNX migration into a shippable, TensorFlow-free analysis engine.
+
 ### Added
 - **ONNX inference engine is now user-selectable and TensorFlow-free.** Builds on
   beta.8's validated backend into a shippable feature: a **Settings → Analysis →
@@ -27,6 +33,13 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
   engine-aware install/routing across `wsl.py` + `native_install.py`; `vibechek[onnx]`
   extra; `scripts/build_onnx_model_bundle.py`. Default stays `essentia_tf` until the
   head bundle is hosted + cross-platform GPU smoke tests land. See `docs/ONNX_MIGRATION.md`.
+- **ONNX preflight matches the TensorFlow path.** Selecting ONNX and starting an
+  analyze now runs the same readiness check + one-click setup flow as TF instead of
+  failing mid-analyze: `preflight` inspects the `venv-onnx` environment and the
+  `.onnx` models for the selected engine, so a missing ONNX engine drives the same
+  "Set up" / "Download models" prompts. `preflight` / `detect_wsl` / `check_models`
+  are engine-aware (defaults preserve the TF path byte-for-byte); the PreflightDialog
+  copy and install routing follow the selected engine.
 
 ---
 
