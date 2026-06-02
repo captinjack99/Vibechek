@@ -395,6 +395,22 @@ jobs:
           PY
           ls -la release/
 
+      - name: Remove any pre-existing release for this tag (idempotent re-runs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # softprops 422s with "already_exists / tag_name" on its finalize step
+          # when another release object already claims this tag — e.g. a re-run,
+          # or a leftover draft from the old draft:true flow. Delete EVERY
+          # release whose tag_name matches this tag first, so softprops always
+          # creates exactly one clean release. The git tag itself is untouched.
+          ids=$(gh api "repos/${{ github.repository }}/releases" --paginate \
+                  --jq ".[] | select(.tag_name == \"${{ github.ref_name }}\") | .id")
+          for id in $ids; do
+            echo "Deleting pre-existing release $id for tag ${{ github.ref_name }}"
+            gh api -X DELETE "repos/${{ github.repository }}/releases/$id"
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
