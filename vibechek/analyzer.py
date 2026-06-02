@@ -467,9 +467,11 @@ def download_models(
 
         # ---- converted classification heads (.onnx + .json) ----
         # essentia hosts only the .pb originals, so these come from our own
-        # models-onnx mirror. The backbone already emits genre, so
-        # genre_discogs400 and every .json are OPTIONAL (a miss is a warning);
-        # the other head .onnx are REQUIRED for the onnx engine to run.
+        # models-onnx mirror. The backbone already emits genre, so the
+        # genre_discogs400.onnx HEAD is optional — BUT genre_discogs400.json is
+        # REQUIRED: it carries the 400 class labels, without which the engine
+        # loads "ready" yet silently emits no genre. Non-genre head .onnx are
+        # required; their tiny .json (class labels) are best-effort.
         head_bases = _onnx_head_bases()
         for stem in _ONNX_HEAD_STEMS:
             for suffix in ("onnx", "json"):
@@ -477,7 +479,10 @@ def download_models(
                 dest = model_dir / fname
                 urls = [f"{base}/{fname}" for base in head_bases]
                 expected = MODEL_SHA256_ONNX.get(fname)
-                required = suffix == "onnx" and stem != "genre_discogs400"
+                required = (
+                    (suffix == "onnx" and stem != "genre_discogs400")
+                    or (suffix == "json" and stem == "genre_discogs400")
+                )
                 if _needs_download(dest, urls[0], expected):
                     try:
                         _download_from_mirrors(
@@ -552,7 +557,10 @@ def _needs_download(path: Path, url: str, expected_sha256: str | None = None) ->
         return True
 
     # Sanity check the local file size FIRST — fast and doesn't need network.
-    min_size = 200 if path.suffix == ".json" else 100_000
+    # .json floor is tiny: converted ONNX head class-label JSON can be ~30 bytes
+    # ({"classes":["sad","non_sad"]}); 200 wrongly rejected them. Weights (.pb /
+    # .onnx) are always >>100KB. Integrity for pinned files is the SHA check.
+    min_size = 16 if path.suffix == ".json" else 100_000
     local_size = path.stat().st_size
     if local_size < min_size:
         log.warning(
@@ -729,7 +737,7 @@ def _do_one_download(
                 )
             # Sanity check on the content — refuse anything implausibly small
             # for an Essentia model (smallest is ~514KB; smallest metadata ~1KB).
-            min_size = 200 if dest.suffix == ".json" else 100_000
+            min_size = 16 if dest.suffix == ".json" else 100_000  # tiny ONNX head class-label JSON
             if bytes_done < min_size:
                 raise RuntimeError(
                     f"unexpectedly small file ({bytes_done} bytes) — likely an error page"
@@ -1972,7 +1980,7 @@ def analyze_directory(
     # we'd false-fail every analyze-via-WSL run.
     from vibechek.preflight import preflight  # noqa: PLC0415
 
-    pf = preflight(config.models_dir, quick_wsl=False)
+    pf = preflight(config.models_dir, quick_wsl=False, engine=config.inference_engine)
     if not pf.ready:
         raise RuntimeError(
             "Cannot analyze: " + "; ".join(pf.reasons_not_ready) +

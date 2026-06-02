@@ -44,6 +44,56 @@ def test_onnx_head_bases_respects_user_override(monkeypatch) -> None:
     assert az._onnx_head_bases() == ["https://mirror.example/models"]
 
 
+def test_analyze_directory_rpc_threads_inference_engine(monkeypatch) -> None:
+    """Regression: the analyze RPC must pass the selected engine into the
+    AnalysisConfig. If it doesn't, the ONNX toggle is inert at analyze time
+    (config defaults to essentia_tf) — the bug that made ONNX silently no-op.
+    """
+    import vibechek.analyzer as analyzer_mod
+    import vibechek.rpc as rpc
+
+    captured: dict = {}
+
+    def fake_analyze(library_path, *, config, **_kw):  # noqa: ANN001
+        captured["engine"] = config.inference_engine
+        return {"summary": {}, "tracks": []}
+
+    monkeypatch.setattr(analyzer_mod, "analyze_directory", fake_analyze)
+    rpc._analyze_directory({"path": ".", "inference_engine": "onnx", "auto_save": False})
+    assert captured["engine"] == "onnx"
+
+
+def test_download_models_rpc_threads_engine(monkeypatch) -> None:
+    """Regression: the download RPC must pass `engine` through (else ONNX
+    downloads the TF .pb set and then can't find its .onnx files)."""
+    import vibechek.analyzer as analyzer_mod
+    import vibechek.rpc as rpc
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        analyzer_mod, "download_models",
+        lambda target, on_progress=None, engine="essentia_tf": captured.update(engine=engine) or {},
+    )
+    rpc._download_models({"models_dir": ".", "engine": "onnx"})
+    assert captured["engine"] == "onnx"
+
+
+def test_preflight_rpc_threads_engine(monkeypatch) -> None:
+    """Regression: the preflight RPC must forward `engine` so it checks the
+    venv-onnx + .onnx models (not the TF venv/.pb)."""
+    import vibechek.preflight as preflight_mod
+    import vibechek.rpc as rpc
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        preflight_mod, "preflight",
+        lambda md=None, *, quick_wsl=True, engine="essentia_tf": captured.update(engine=engine) or "PFR",
+    )
+    monkeypatch.setattr(preflight_mod, "to_dict", lambda _r: {})
+    rpc._preflight({"engine": "onnx"})
+    assert captured["engine"] == "onnx"
+
+
 def test_download_models_default_engine_does_not_fetch_onnx(monkeypatch, tmp_path) -> None:
     """engine='essentia_tf' must not touch any .onnx — the TF path is unchanged."""
     fetched: list[str] = []

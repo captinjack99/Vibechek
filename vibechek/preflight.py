@@ -67,6 +67,9 @@ class PreflightResult:
     #   "wsl"         — Windows + essentia inside a WSL distro
     #   "native_venv" — Linux/macOS + essentia inside ~/.vibechek/venv/
     analyze_via: str | None = None
+    # Which inference engine this result was computed for ("essentia_tf" |
+    # "onnx"). Drives engine-accurate "not ready" messaging.
+    engine: str = "essentia_tf"
 
     @property
     def reasons_not_ready(self) -> list[str]:
@@ -77,9 +80,13 @@ class PreflightResult:
             or (self.native_venv and self.native_venv.essentia_installed)
         )
         if not have_engine:
+            pkg = (
+                "the ONNX engine (plain essentia + onnxruntime)"
+                if self.engine == "onnx"
+                else "essentia-tensorflow"
+            )
             out.append(
-                "essentia-tensorflow is not installed "
-                "(native, in WSL, or in the managed venv)"
+                f"{pkg} is not installed (native, in WSL, or in the managed venv)"
             )
         if self.models.missing:
             out.append(f"{len(self.models.missing)} ML model file(s) missing")
@@ -112,14 +119,18 @@ def _model_files_for_engine(
     if engine == "onnx":
         items: list[tuple[str, Path, Path | None, bool]] = [
             ("effnet (onnx backbone)", target / BACKBONE_ONNX_FILENAME, None, True),
+            # Genre comes from the backbone, so the genre_discogs400.onnx HEAD is
+            # optional — but its 400 class LABELS (genre_discogs400.json) are
+            # REQUIRED, else the engine loads "ready" yet emits no genre.
+            ("genre_discogs400 classes", target / "genre_discogs400.json", None, True),
         ]
         for stem in _ONNX_HEAD_STEMS:
-            items.append((
-                stem,
-                target / f"{stem}.onnx",
-                target / f"{stem}.json",
-                stem != "genre_discogs400",
-            ))
+            if stem == "genre_discogs400":
+                continue  # head .onnx optional; its .json handled above
+            # Non-genre head .onnx are required; their tiny class-label .json is
+            # best-effort (not coupled here, so a missing label file doesn't
+            # block readiness).
+            items.append((stem, target / f"{stem}.onnx", None, True))
         return items
     return [
         (name, target / f"{name}.pb", target / f"{name}.json", True)
@@ -213,6 +224,7 @@ def preflight(
         wsl=wsl_status,
         native_venv=native_venv,
         analyze_via=analyze_via,
+        engine=engine,
     )
 
 

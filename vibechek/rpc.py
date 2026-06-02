@@ -333,6 +333,11 @@ def _analyze_directory(params: dict) -> dict:
         workers=_nonneg_int(params.get("workers", 0), 0),
         use_gpu=str(params.get("use_gpu", "auto")),
         hybrid_cpu_gpu=bool(params.get("hybrid_cpu_gpu", True)),
+        # Critical: route analyze to the SELECTED engine. Without this the
+        # config defaults to essentia_tf, so the ONNX toggle is inert at
+        # analyze time (and an onnx-only install fails: wrong venv). The GUI
+        # sends this from the config store; default keeps the TF path.
+        inference_engine=_valid_engine(params.get("inference_engine")),
     )
     if "models_dir" in params and params["models_dir"]:
         config.models_dir = Path(params["models_dir"])
@@ -415,7 +420,9 @@ def _wsl_status(params: dict) -> dict:
     """
     from vibechek.wsl import detect_wsl, to_dict
     quick = bool(params.get("quick", False))
-    return to_dict(detect_wsl(quick=quick))
+    engine = _valid_engine(params.get("engine"))
+    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    return to_dict(detect_wsl(quick=quick, venv_subdir=venv_subdir))
 
 
 def _install_wsl(params: dict) -> dict:
@@ -473,10 +480,11 @@ def _install_essentia_native(params: dict) -> dict:
     return install_essentia_native(on_progress=_emit_progress, engine=engine)
 
 
-def _native_venv_status(_params: dict) -> dict:
-    """Report what's installed in the managed ~/.vibechek/venv/."""
+def _native_venv_status(params: dict) -> dict:
+    """Report what's installed in the managed venv for the selected engine."""
     from vibechek.native_install import probe_native_venv, to_dict
-    return to_dict(probe_native_venv())
+    engine = _valid_engine(params.get("engine"))
+    return to_dict(probe_native_venv(engine))
 
 
 def _repair_wsl_shim(params: dict) -> dict:
@@ -753,7 +761,11 @@ def _download_models(params: dict) -> dict:
     from vibechek.config import MODELS_DIR
 
     target = Path(params["models_dir"]) if params.get("models_dir") else MODELS_DIR
-    descriptors = download_models(target, on_progress=_emit_progress)
+    # Engine-aware: "onnx" fetches the converted .onnx heads + backbone; default
+    # essentia_tf fetches the .pb set. Without this the ONNX engine downloads
+    # the wrong models and then can't find its .onnx files.
+    engine = _valid_engine(params.get("engine"))
+    descriptors = download_models(target, on_progress=_emit_progress, engine=engine)
     return {"models_dir": str(target), "models": list(descriptors.keys())}
 
 

@@ -472,6 +472,9 @@ export function LibraryBrowser() {
         workers: analysisCfg.workers,
         use_gpu: analysisCfg.use_gpu,
         hybrid_cpu_gpu: analysisCfg.hybrid_cpu_gpu,
+        // Critical: route to the SELECTED engine. Without this the sidecar
+        // defaults to essentia_tf, so the ONNX toggle is inert at analyze time.
+        inference_engine: analysisCfg.inference_engine,
         skip_paths: alreadyAnalyzed,
         // Forwarded for forward-compat / debugging; the current sidecar ignores
         // unknown params. The authoritative guard is the frontend run token.

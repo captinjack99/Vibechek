@@ -2266,10 +2266,14 @@ def run_vibechek_in_wsl(
     token_file = Path(_tempfile.gettempdir()) / f"vibechek-wsl-pid-{os.getpid()}.txt"
     wsl_token = win_to_wsl_path(str(token_file))
     use_gpu = _gpu_mode_from_args(args)
+    # cuda-env.sh holds TF's CUDA libs on LD_LIBRARY_PATH (written by
+    # install_cuda_libs_in_wsl for the essentia-tensorflow venv). Only source it
+    # for the TF engine: the onnx venv uses onnxruntime's own EP discovery, so
+    # injecting TF CUDA libs there is at best a no-op, at worst pollution.
     source_cuda_env = (
         '. "$HOME/.vibechek/cuda-env.sh" 2>/dev/null || true'
-        if use_gpu != "off"
-        else 'true  # --gpu off; skip cuda-env.sh sourcing'
+        if use_gpu != "off" and venv_subdir == "venv"
+        else 'true  # cuda-env.sh skipped (--gpu off or non-TF engine)'
     )
     # *Critical*: resolve vibechek's FULL path. Plain `exec vibechek` fails
     # silently here because we run bash non-interactively (via `setsid bash
