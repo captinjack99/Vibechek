@@ -295,9 +295,23 @@ def install_essentia_native(
         return _fail("pip/wheel upgrade", rc, tail)
 
     # ---- Step 3: the ML stack (the slow ~3-5 min step) ----
-    # onnx → plain essentia + onnxruntime (TF-free); else essentia-tensorflow.
-    ml_packages = ["essentia", "onnxruntime"] if engine == "onnx" else ["essentia-tensorflow"]
-    ml_label = " + ".join(ml_packages)
+    # onnx → plain essentia + onnxruntime (TF-free). GPU is the point of ONNX:
+    # with an NVIDIA GPU, install onnxruntime-gpu + the CUDA 12 runtime wheels
+    # (loaded at runtime via onnxruntime.preload_dlls()); else CPU onnxruntime.
+    # essentia_tf → essentia-tensorflow (CUDA via the separate Enable-GPU step).
+    if engine == "onnx":
+        if shutil.which("nvidia-smi"):
+            ml_packages = [
+                "essentia", "onnxruntime-gpu",
+                "nvidia-cuda-runtime-cu12", "nvidia-cudnn-cu12", "nvidia-cublas-cu12",
+                "nvidia-cufft-cu12", "nvidia-curand-cu12", "nvidia-cusparse-cu12",
+                "nvidia-cuda-nvrtc-cu12",
+            ]
+        else:
+            ml_packages = ["essentia", "onnxruntime"]
+    else:
+        ml_packages = ["essentia-tensorflow"]
+    ml_label = "essentia + onnxruntime-gpu" if "onnxruntime-gpu" in ml_packages else " + ".join(ml_packages)
     if on_progress:
         on_progress(25, 100, f"Installing {ml_label} (this is the slow step, ~3-5 min)...")
     rc, tail = _run_with_progress(
