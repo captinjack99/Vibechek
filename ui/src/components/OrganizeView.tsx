@@ -550,7 +550,8 @@ export function OrganizeView() {
                 })}
                 {plan.moves.length > 5 && <li>... and {plan.moves.length - 5} more</li>}
               </ul>
-              <p className="text-accent-yellow">There is no automatic undo.</p>
+              <p className="text-accent-yellow">Files move immediately. You can undo
+                this afterwards — from the result screen or "Recent operations".</p>
             </div>
           )
         }
