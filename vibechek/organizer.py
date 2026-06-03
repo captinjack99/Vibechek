@@ -28,6 +28,7 @@ from vibechek.utils import (
     ProgressCallback,
     find_audio_files,
     report_progress,
+    resolve_existing_path,
     sanitize_folder_name,
 )
 
@@ -227,7 +228,7 @@ def plan_organization(
     # First pass: count genres so we know which ones are "small"
     genre_counts: dict[str, int] = defaultdict(int)
     for track in tracks:
-        ml = track.get("ml_analysis", {})
+        ml = track.get("ml_analysis") or {}
         genre = sanitize_folder_name(ml.get("ml_genre"))
         genre_counts[genre] += 1
 
@@ -249,12 +250,16 @@ def plan_organization(
     claimed: set[Path] = set()
 
     for track in tracks:
-        source = Path(track["path"])
-        if not source.exists():
-            plan.errors.append(f"File not found: {source}")
+        # Tolerate Unicode-normalization drift (NFC/NFD) between the stored path
+        # and the on-disk name — see resolve_existing_path. Without this, every
+        # accented filename ("Tiësto", "Naté", "Années") is wrongly reported
+        # "File not found" and skipped when the path arrives NFD-normalized.
+        source = resolve_existing_path(track["path"])
+        if source is None:
+            plan.errors.append(f"File not found: {Path(track['path'])}")
             continue
 
-        ml = track.get("ml_analysis", {})
+        ml = track.get("ml_analysis") or {}
         genre = sanitize_folder_name(ml.get("ml_genre"))
         subgenre = sanitize_folder_name(ml.get("ml_subgenre"))
 

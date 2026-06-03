@@ -5,10 +5,43 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import unicodedata
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+def resolve_existing_path(path: str | Path) -> Path | None:
+    """Return an existing Path for `path`, tolerant of Unicode normalization.
+
+    A stored track path can disagree with its on-disk form purely in Unicode
+    normalization (NFC vs NFD): macOS (HFS+/APFS) exposes filenames as NFD while
+    most other sources produce NFC, so an analysis.json written on one platform
+    and applied on another can carry the "wrong" form for an accented filename
+    like "Tiësto - Adagio.flac". A raw ``Path(p).exists()`` then returns False
+    even though the file is right there, and organize/tag silently skip it as
+    "not found". (The separate cp1252-stdin mojibake that bit the packaged GUI
+    is fixed at the source in rpc.serve(); this stays as cross-platform
+    hardening.)
+
+    Try the path as given, then its NFC and NFD normal forms; return the first
+    that exists on disk, or None if the file is genuinely missing. Only the
+    fallback forms are tried (cheap) — an exact hit returns immediately and a
+    truly-absent file still yields None, so there are no false positives.
+    """
+    p = Path(path)
+    if p.exists():
+        return p
+    s = str(path)
+    for form in ("NFC", "NFD"):
+        try:
+            candidate = Path(unicodedata.normalize(form, s))
+        except (TypeError, ValueError):
+            continue
+        if candidate != p and candidate.exists():
+            return candidate
+    return None
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
     ".mp3", ".flac", ".m4a", ".wav", ".aiff", ".aif", ".ogg", ".aac", ".wma",

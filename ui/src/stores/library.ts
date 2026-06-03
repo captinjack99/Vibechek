@@ -9,6 +9,7 @@
 import { create } from "zustand";
 
 import type { TrackAnalysis } from "../types";
+import { useUIStore } from "./ui";
 
 /**
  * Identity of the analyze run currently authorized to live-merge streamed
@@ -172,6 +173,15 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     }
 
     set({ tracks: nextTracks, selectedIds: nextSelected });
+
+    // Follow the moved track in the right-rail inspector too. That selection
+    // lives in the separate UI store; without this it keeps pointing at the
+    // pre-move path, so TrackDetails finds no match and silently closes after
+    // an organize moved the open track. (selectedIds above is migrated; this
+    // completes the same guarantee for the single inspected track.)
+    const ui = useUIStore.getState();
+    const movedSel = ui.selectedTrackPath ? lookup.get(ui.selectedTrackPath) : undefined;
+    if (movedSel && movedSel !== ui.selectedTrackPath) ui.setSelectedTrack(movedSel);
   },
 
   toggleSelect: (path) => {

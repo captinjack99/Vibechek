@@ -57,6 +57,7 @@ from vibechek.utils import (
     ProgressCallback,
     find_audio_files,
     report_progress,
+    resolve_existing_path,
 )
 
 log = logging.getLogger(__name__)
@@ -648,9 +649,13 @@ def apply_ml_tags(
         cancellation.check()
         report_progress(on_progress, i + 1, stats.total, Path(track.get("path", "")).name)
 
-        filepath = Path(track["path"])
-        if not filepath.exists():
-            stats.errors.append(f"Not found: {filepath}")
+        # Tolerate NFC/NFD normalization drift between the stored path and the
+        # on-disk name (see resolve_existing_path) — otherwise accented
+        # filenames arriving NFD-normalized are wrongly skipped as "Not found"
+        # and never get tagged.
+        filepath = resolve_existing_path(track["path"])
+        if filepath is None:
+            stats.errors.append(f"Not found: {Path(track['path'])}")
             continue
 
         ml = track.get("ml_analysis", {})

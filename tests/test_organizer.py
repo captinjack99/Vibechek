@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,56 @@ def test_plan_with_explicit_base_dir_overrides_inferred(synthetic_analysis: dict
     assert plan.base_dir == custom_root
     for move in plan.moves:
         assert custom_root in move.destination.parents
+
+
+def test_plan_scan_only_tracks_route_to_unknown(tmp_path: Path) -> None:
+    """A scan-only library (no ML run) has ``ml_analysis=None`` on every track.
+
+    Organizing it must NOT crash — every track routes to Unknown/ (then
+    Other/Unknown when below min_genre_size). Regression: the planner used
+    ``track.get("ml_analysis", {})``, whose ``{}`` default only applies when
+    the key is ABSENT. scan_only records carry the key present-but-null, so the
+    call returned ``None`` and ``None.get("ml_genre")`` raised
+    ``'NoneType' object has no attribute 'get'`` — crashing the whole organize
+    flow for any library the user browsed without running ML analysis.
+    """
+    tracks = []
+    for i in range(3):
+        f = tmp_path / f"track_{i}.wav"
+        f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE")  # planner only checks .exists()
+        tracks.append({"path": str(f), "filename": f.name, "ml_analysis": None})
+    analysis = {"tracks": tracks}
+
+    config = OrganizationConfig(use_subgenres=True, min_genre_size=10)
+    plan = plan_organization(analysis, config)  # must not raise
+
+    assert len(plan.moves) == 3
+    for m in plan.moves:
+        assert m.genre == "Unknown"
+        assert "Other" in m.destination.parts and "Unknown" in m.destination.parts
+
+    # The execute path runs the same planner — dry_run must also survive.
+    stats = organize_from_analysis(analysis, config, dry_run=True)
+    assert stats.planned == 3 and stats.moved == 0
+
+
+def test_plan_resolves_nfd_normalized_paths(tmp_path: Path) -> None:
+    """An accented track path arriving NFD-normalized (e.g. a macOS-written
+    analysis.json applied on another platform) must still be found. Regression:
+    plan_organization reported every accented filename as 'File not found' and
+    dropped it from the plan."""
+    f = tmp_path / "Tiësto - Strings.flac"  # NFC on disk
+    f.write_bytes(b"RIFF\x00\x00\x00\x00WAVE")
+    nfd = unicodedata.normalize("NFD", str(f))
+    if nfd == str(f):
+        pytest.skip("platform pre-normalizes filenames")
+    tracks = [{"path": nfd, "filename": f.name,
+               "ml_analysis": {"ml_genre": "Trance"}}]
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1)
+    plan = plan_organization({"tracks": tracks}, config)
+    assert plan.errors == []  # was ["File not found: ...Tiësto..."]
+    assert len(plan.moves) == 1
+    assert plan.moves[0].genre == "Trance"
 
 
 def test_route_new_tracks_uniquifies_colliding_basenames(

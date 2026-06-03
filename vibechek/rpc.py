@@ -566,6 +566,12 @@ def _handle_duplicates(params: dict) -> dict:
 
 
 def _rebuild_report(d: dict) -> Any:
+    # `report` is reconstructed from its dict wire form; a non-dict (string,
+    # list, null) would blow up deep inside with an opaque AttributeError
+    # ('str' object has no attribute 'get'). Validate at the seam so a
+    # malformed report returns a clean INVALID_PARAMS instead.
+    if not isinstance(d, dict):
+        raise ValueError("'report' must be an object")
     from vibechek.duplicates import (
         DuplicateGroup,
         DuplicateReport,
@@ -1248,6 +1254,17 @@ def _dispatch(request: dict[str, Any]) -> None:
         # every error branch so a failed notification stays silent.
         if req_id is not None:
             _err(req_id, APP_ERROR, str(e), data={"cancelled": True})
+    except (FileNotFoundError, NotADirectoryError) as e:
+        # A missing folder / file or unmounted drive is user input, not a
+        # server fault — surface a clean param error, not an APP_ERROR carrying
+        # a scary traceback. Common in the GUI when a recent library lives on a
+        # removed USB / unmounted network share, or a saved tag-backup file was
+        # deleted. (FileNotFoundError/NotADirectoryError are OSError subclasses,
+        # so they bypass the ValueError branch below and would otherwise hit the
+        # generic Exception handler.)
+        log.info("Path not found in method %s: %s", method, e)
+        if req_id is not None:
+            _err(req_id, INVALID_PARAMS, str(e))
     except (TypeError, KeyError, ValueError) as e:
         log.exception("Invalid params to method %s", method)
         if req_id is not None:
@@ -1423,9 +1440,27 @@ def serve(stdin=None, stdout=None) -> None:
     _cleanup_stale_tempfiles()
 
     stdin = stdin or sys.stdin
+    out_stream = stdout or sys.stdout
+
+    # Force UTF-8 on the JSON-RPC channel — do NOT rely on PYTHONUTF8 reaching us.
+    # In the packaged desktop app the sidecar is launched WITHOUT a console; in
+    # that console-less/frozen configuration Python can still pick the legacy
+    # ANSI code page (cp1252 on Windows) for sys.stdin even though the Rust shell
+    # sets PYTHONUTF8=1. Non-ASCII track paths the GUI sends back over stdin
+    # (accented artist names — "Tiësto", "Ultra Naté", "Années 90") then decode
+    # as mojibake ("TiÃ«sto"), so Path.exists() fails and organize/tag report
+    # every such file "not found" and silently skip it. cli.py already forces
+    # UTF-8 on stdout/stderr but not stdin; pin both here so the channel is
+    # UTF-8 regardless of entry point. A test-supplied StringIO/queue stub has no
+    # reconfigure() (or is already text) — leave it alone.
+    for _stream in (stdin, out_stream):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     global _writer
-    _writer = _StdoutWriter(stdout or sys.stdout)
+    _writer = _StdoutWriter(out_stream)
 
     # Announce ourselves so the host knows the sidecar is alive
     _write_message({

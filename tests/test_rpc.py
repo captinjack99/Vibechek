@@ -207,6 +207,58 @@ def test_invalid_request_not_jsonrpc_2(rpc_server) -> None:
     assert response["error"]["code"] == rpc.INVALID_REQUEST
 
 
+def test_missing_path_returns_clean_invalid_params_not_apperror(rpc_server) -> None:
+    """A nonexistent / unmounted path is user input, not a server fault.
+
+    find_audio_files raises FileNotFoundError (an OSError, so it bypasses the
+    ValueError branch). Before the fix this fell through to the generic handler
+    → APP_ERROR (-32000) carrying a full traceback in `data`. The dispatch seam
+    now maps FileNotFoundError/NotADirectoryError to a clean INVALID_PARAMS with
+    no traceback. Reachable in the GUI when a recent library lives on a removed
+    USB / unmounted network share.
+    """
+    stdin, stdout = rpc_server
+    stdin.write_line({
+        "jsonrpc": "2.0", "id": "nf1", "method": "scan_directory",
+        "params": {"path": "/vibechek_no_such_dir_zzz_4f9a2"},
+    })
+    response = _wait_for_response(stdout, "nf1")
+    assert "error" in response
+    assert response["error"]["code"] == rpc.INVALID_PARAMS
+    assert "data" not in response["error"], "no scary traceback should be attached"
+    assert response["error"]["message"], "message should be non-empty"
+
+
+def test_serve_forces_utf8_on_stdio() -> None:
+    """serve() must pin the JSON-RPC channel to UTF-8, not trust the inherited
+    locale. In the packaged console-less desktop app the sidecar otherwise picks
+    cp1252 for stdin (even with PYTHONUTF8 set), so non-ASCII track paths the GUI
+    sends back ("Tiësto", "Ultra Naté") arrive mojibake'd ("TiÃ«sto") and
+    organize/tag report every accented file "not found"."""
+
+    class _RecordingStream:
+        def __init__(self) -> None:
+            self.reconfigured: dict | None = None
+            self._lines = iter(())  # EOF immediately so serve() returns
+
+        def reconfigure(self, **kw):  # type: ignore[no-untyped-def]
+            self.reconfigured = kw
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return self._lines
+
+        def write(self, _s):  # type: ignore[no-untyped-def]
+            pass
+
+        def flush(self):  # type: ignore[no-untyped-def]
+            pass
+
+    s_in, s_out = _RecordingStream(), _RecordingStream()
+    rpc.serve(stdin=s_in, stdout=s_out)
+    assert s_in.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+    assert s_out.reconfigured == {"encoding": "utf-8", "errors": "replace"}
+
+
 def test_missing_method_returns_invalid_request(rpc_server) -> None:
     stdin, stdout = rpc_server
     stdin.write_line({"jsonrpc": "2.0", "id": 12})

@@ -12,6 +12,38 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged release.
 
+### Fixed
+
+Found via a full-stack bug hunt that drove every RPC method, every CLI command,
+and the live GUI (tauri-driver + WebDriver) against a real library.
+
+- **Accented track names silently dropped from organize/tag in the desktop app.**
+  The packaged app launches the sidecar without a console, where Python picks the
+  legacy ANSI code page (cp1252) for `sys.stdin` even with `PYTHONUTF8=1` set — so
+  non-ASCII paths the GUI sends back ("Tiësto", "Ultra Naté", "Années 90") arrived
+  mojibake'd ("TiÃ«sto"), failed `Path.exists()`, and were reported "not found" and
+  skipped. `rpc.serve()` now pins stdin **and** stdout to UTF-8 regardless of the
+  inherited locale (cli.py already forced stdout/stderr, never stdin).
+- **Organize crashed on a scan-only (non-ML) library** — `plan_organization` did
+  `track.get("ml_analysis", {})`, but scan-only records carry the key set to
+  `None`, so `None.get(...)` raised. Now `... or {}`; null-ML tracks route to
+  `Unknown/` as intended.
+- **Path/file resolution is now NFC/NFD-normalization tolerant** in organize + tag
+  (`resolve_existing_path`) — a cross-platform analysis.json (macOS NFD) no longer
+  skips accented files.
+- **Nonexistent / unmounted paths** (removed USB, network share) now return a clean
+  `INVALID_PARAMS` instead of an `APP_ERROR` with a raw traceback (dispatch maps
+  `FileNotFoundError`/`NotADirectoryError`). Same for a malformed dedupe `report`.
+- **CLI `export`/`tag`/`organize` on a corrupt analysis.json** dumped a raw
+  `JSONDecodeError`; now a clean Click error. `organize` on an empty analysis
+  likewise (was a leaked `ValueError`).
+- **Library filters carried across a library switch** — `clearFilters` had no
+  caller; now cleared when opening a different library/folder.
+- **Settings GPU probe** used a stale captured inference-engine on mount (ONNX
+  users saw the wrong engine's GPU status); read at call time now.
+- **Open-track inspector** was lost when an organize moved that track
+  (`updateTrackPaths` migrated `selectedIds` but not `selectedTrackPath`).
+
 ---
 
 ## [0.4.0-beta.10] — 2026-06-02

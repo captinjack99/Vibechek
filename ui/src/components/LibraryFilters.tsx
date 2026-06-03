@@ -183,7 +183,9 @@ export function applyFilters(tracks: TrackAnalysis[], f: LibraryFilters): TrackA
 // Zustand store — filters were local state in LibraryBrowser, which meant
 // switching to another tab and back wiped the user's filter selection. The
 // store lifts them above the component tree so a tab round-trip preserves
-// state. Library load (setTracks) clears them via clearLibraryFilters.
+// state. A library SWITCH, however, clears them — LibraryBrowser's
+// handleOpenRecent/handleOpenFolder call clearFilters() so one library's
+// selections don't silently narrow the next.
 // ---------------------------------------------------------------------------
 
 interface LibraryFiltersState {

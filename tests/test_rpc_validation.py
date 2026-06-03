@@ -205,3 +205,19 @@ def test_save_config_dict_payload_ok(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(cfg_mod, "CONFIG_FILE", tmp_path / "config.json")
     out = rpc._save_config({"config": {"tagging": {"id3_text_encoding": 1}}})
     assert "saved_to" in out
+
+
+# ---------------------------------------------------------------------------
+# _rebuild_report payload-type guard (handle_duplicates)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["notadict", ["a", "list"], 42, None])
+def test_rebuild_report_rejects_non_dict(bad) -> None:
+    # A non-dict report previously crashed deep inside with an opaque
+    # AttributeError ('str' object has no attribute 'get') → APP_ERROR +
+    # traceback. The seam guard raises ValueError → INVALID_PARAMS. The guard
+    # runs BEFORE the vibechek.duplicates import, so this stays CI-clean even
+    # without the dedupe deps installed.
+    with pytest.raises(ValueError, match="must be an object"):
+        rpc._rebuild_report(bad)
