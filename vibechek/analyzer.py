@@ -161,6 +161,12 @@ MODEL_SHA256: dict[str, dict[str, str]] = {
 # heads live on our own mirror release (the backbone already emits genre, so
 # genre_discogs400 is optional — fetched for its class labels + as a fallback).
 _ONNX_MODELS_RELEASE = "models-onnx-v1"
+# ONNX models live in this dedicated subdir of the models dir, kept SEPARATE
+# from the essentia `.pb` set. The converted-head class-label JSON
+# (danceability.json, genre_discogs400.json, …) share filenames with essentia's
+# `.pb` metadata JSON but carry different content; in a shared dir each engine's
+# download clobbers the other's. The subdir makes the two engines independent.
+_ONNX_SUBDIR = "onnx"
 _ONNX_HEAD_STEMS: tuple[str, ...] = (
     "genre_discogs400",
     "danceability",
@@ -340,8 +346,11 @@ def download_models(
     # Two parts per model (weights + metadata) so the overall progress bar
     # has 2*N steps. We emit bytes-within-current-file as a fractional step
     # for smooth UX during big downloads.
-    items = list(MODELS.items())
-    total_steps = len(items) * 2
+    # The ONNX engine is TF-free and never loads the essentia `.pb` set, so skip
+    # it entirely for engine="onnx" (no ~200 MB of unused TF weights, and no
+    # essentia `.json` metadata to collide with the converted-head class labels).
+    items = [] if engine == "onnx" else list(MODELS.items())
+    total_steps = len(items) * 2 or 1
 
     def emit(step_idx: int, byte_progress: tuple[int, int] | None, label: str) -> None:
         """Translate (step, file-progress) into a 0..total_steps progress tick."""
@@ -447,7 +456,11 @@ def download_models(
     if engine == "onnx":
         from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME  # noqa: PLC0415
 
-        onnx_path = model_dir / BACKBONE_ONNX_FILENAME
+        # All ONNX files go in the dedicated subdir (see _ONNX_SUBDIR) so they
+        # never collide with the essentia `.pb` set in the parent models dir.
+        onnx_dir = model_dir / _ONNX_SUBDIR
+        onnx_dir.mkdir(parents=True, exist_ok=True)
+        onnx_path = onnx_dir / BACKBONE_ONNX_FILENAME
         onnx_urls = _candidate_urls(
             "feature-extractors/discogs-effnet", BACKBONE_ONNX_FILENAME
         )
@@ -480,7 +493,7 @@ def download_models(
         for stem in _ONNX_HEAD_STEMS:
             for suffix in ("onnx", "json"):
                 fname = f"{stem}.{suffix}"
-                dest = model_dir / fname
+                dest = onnx_dir / fname
                 urls = [f"{base}/{fname}" for base in head_bases]
                 expected = MODEL_SHA256_ONNX.get(fname)
                 required = (
@@ -515,7 +528,7 @@ def download_models(
                         if required:
                             errors.append(f"{fname}: {e}")
                         dest.unlink(missing_ok=True)
-            descriptors[f"onnx_{stem}"] = {"weights": str(model_dir / f"{stem}.onnx")}
+            descriptors[f"onnx_{stem}"] = {"weights": str(onnx_dir / f"{stem}.onnx")}
 
     if errors:
         raise RuntimeError(
@@ -793,7 +806,8 @@ def load_models(
         download_models(model_dir, engine="onnx")
         from vibechek.onnx_backend import load_onnx_models  # noqa: PLC0415
 
-        return load_onnx_models(model_dir, use_gpu=use_gpu)
+        # ONNX files live in the dedicated subdir (download_models put them there).
+        return load_onnx_models(model_dir / _ONNX_SUBDIR, use_gpu=use_gpu)
 
     apply_gpu_preference(use_gpu)
 

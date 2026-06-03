@@ -776,6 +776,99 @@ def _download_models(params: dict) -> dict:
     return {"models_dir": str(target), "models": list(descriptors.keys())}
 
 
+def _setup_onnx_engine(params: dict) -> dict:
+    """One-click, self-healing ONNX engine setup (offline-first).
+
+    Does everything needed for `inference_engine="onnx"` to work, in order, with
+    a `progress` notification at each stage so the GUI can show a live dialog:
+
+      1. Stage the BUNDLED converted heads into ``<models>/onnx`` (their own
+         subdir, so they never collide with the essentia ``.pb`` set). Cleans
+         interrupted ``.partial`` leftovers + overwrites stale heads.
+      2. Ensure the ONNX engine environment is installed — the WSL distro
+         (Windows) or the native managed venv (Linux/macOS). Installs only if
+         not already usable, so a re-click is a fast no-op.
+      3. Fetch ONLY the EffNet backbone from essentia (the heads are bundled and
+         NOT hosted upstream). The download never deletes a good cached file.
+      4. Verify readiness via the ONNX preflight.
+
+    Cancellable. Returns {ok, ready, staged, bundle_source, reasons_not_ready}.
+    """
+    from vibechek import onnx_backend  # noqa: PLC0415
+    from vibechek.analyzer import download_models  # noqa: PLC0415
+    from vibechek.config import MODELS_DIR  # noqa: PLC0415
+    from vibechek.platform import IS_WINDOWS  # noqa: PLC0415
+    from vibechek.preflight import preflight  # noqa: PLC0415
+
+    total = 4
+
+    # 1. Stage bundled heads (local, fast).
+    _emit_progress(1, total, "Staging bundled ONNX models…")
+    staged = onnx_backend.stage_bundled_onnx_heads(
+        MODELS_DIR, on_progress=lambda d, t, m: _emit_progress(1, total, m)
+    )
+
+    # 2. Ensure the ONNX engine environment (install only if not already usable).
+    _emit_progress(2, total, "Checking the ONNX engine environment…")
+    cancellation.check()
+    if IS_WINDOWS:
+        from vibechek.wsl import detect_wsl, install_vibechek_in_wsl  # noqa: PLC0415
+
+        st = detect_wsl(quick=False, venv_subdir="venv-onnx")
+        distro = _validate_distro(params.get("distro"), "") or st.usable_distro
+        if not distro and st.distros:
+            distro = st.distros[0].name
+        if not distro:
+            raise RuntimeError(
+                "No WSL distro found. Run the standard WSL setup first, then set "
+                "up the ONNX engine."
+            )
+        already = next(
+            (d for d in st.distros
+             if d.name == distro and d.vibechek_installed and d.essentia_installed),
+            None,
+        )
+        if already is None:
+            _emit_progress(2, total, f"Installing the ONNX engine in {distro} (one-time)…")
+            install_vibechek_in_wsl(
+                distro, engine="onnx",
+                on_progress=lambda d, t, m: _emit_progress(2, total, m),
+            )
+    else:
+        from vibechek.native_install import (  # noqa: PLC0415
+            install_essentia_native,
+            probe_native_venv,
+        )
+
+        nv = probe_native_venv("onnx")
+        if not (nv.essentia_installed and nv.vibechek_installed):
+            _emit_progress(2, total, "Installing the ONNX engine (one-time)…")
+            install_essentia_native(
+                engine="onnx",
+                on_progress=lambda d, t, m: _emit_progress(2, total, m),
+            )
+
+    # 3. Fetch ONLY the EffNet backbone (heads are bundled/staged).
+    _emit_progress(3, total, "Fetching the EffNet backbone…")
+    cancellation.check()
+    download_models(
+        MODELS_DIR, engine="onnx",
+        on_progress=lambda d, t, m: _emit_progress(3, total, m),
+    )
+
+    # 4. Verify the engine can actually analyze.
+    _emit_progress(4, total, "Verifying ONNX engine…")
+    pf = preflight(None, quick_wsl=False, engine="onnx")
+    return {
+        "ok": bool(pf.ready),
+        "ready": bool(pf.ready),
+        "staged": staged.get("staged", []),
+        "bundle_source": staged.get("source"),
+        "reasons_not_ready": pf.reasons_not_ready,
+        "analyze_via": pf.analyze_via,
+    }
+
+
 def _get_config(_params: dict) -> dict:
     """Load config from disk (or defaults if no file exists yet)."""
     return _config_to_jsonable(VibechekConfig.load())
@@ -1154,6 +1247,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "restore_tags": _restore_tags,
     "restore_tags_with_remap": _restore_tags_with_remap,
     "download_models": _download_models,
+    "setup_onnx_engine": _setup_onnx_engine,
     "get_config": _get_config,
     "save_config": _save_config,
     "restore_default_config": _restore_default_config,
@@ -1191,6 +1285,7 @@ _CANCELLABLE_METHODS = {
     "upgrade_vibechek_in_wsl": "install-essentia",
     "install_cuda_libs_in_wsl": "install-cuda",
     "install_essentia_native": "install-essentia",
+    "setup_onnx_engine": "install-essentia",
     "revert_journal": "revert",
 }
 

@@ -67,6 +67,75 @@ BACKBONE_ONNX_URL = (
     "discogs-effnet-bsdynamic-1.onnx"
 )
 
+
+def bundled_onnx_assets_dir() -> Path | None:
+    """Directory holding the bundled converted ONNX heads, or None if absent.
+
+    The classification heads are tiny (~5 MB total) and NOT hosted upstream
+    (essentia ships only the `.pb` originals + the 18 MB EffNet backbone), so we
+    ship them inside the app: PyInstaller bundles `vibechek/onnx_assets/` into
+    the frozen sidecar (-> `<_MEIPASS>/onnx_assets`); a source/dev install reads
+    them straight from `vibechek/onnx_assets/`. The ONNX setup flow copies these
+    into `<models>/onnx/` so the engine works with NO download of the heads (only
+    the official backbone is fetched, from essentia). Returns the first dir that
+    exists and actually contains `.onnx` files.
+    """
+    import sys  # noqa: PLC0415
+
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "onnx_assets")
+    candidates.append(Path(__file__).resolve().parent / "onnx_assets")
+    for c in candidates:
+        try:
+            if c.is_dir() and any(c.glob("*.onnx")):
+                return c
+        except OSError:
+            continue
+    return None
+
+
+# Must match analyzer._ONNX_SUBDIR (kept literal here to avoid importing the
+# heavy analyzer module just for a constant).
+_ONNX_SUBDIR = "onnx"
+
+
+def stage_bundled_onnx_heads(model_dir: Path, on_progress=None) -> dict:
+    """Copy the bundled converted heads into ``<model_dir>/onnx`` for offline use.
+
+    Self-healing: creates the subdir, removes any leftover ``.partial`` files
+    from an interrupted download, and overwrites stale/wrong head files with the
+    bundled (hash-pinned) ones. The EffNet backbone is NOT bundled — it is
+    fetched separately from essentia. Returns ``{"staged": [...], "source":
+    str|None}`` (source is None when no bundle is present, e.g. a lean dev run).
+    """
+    import shutil  # noqa: PLC0415
+
+    onnx_dir = Path(model_dir) / _ONNX_SUBDIR
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    # Clean interrupted-download leftovers so a retry starts clean.
+    for stale in onnx_dir.glob("*.partial"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+    src = bundled_onnx_assets_dir()
+    if src is None:
+        log.warning("No bundled ONNX heads found to stage (lean build?).")
+        return {"staged": [], "source": None}
+
+    files = sorted([*src.glob("*.onnx"), *src.glob("*.json")])
+    staged: list[str] = []
+    for i, f in enumerate(files):
+        shutil.copy2(f, onnx_dir / f.name)
+        staged.append(f.name)
+        if on_progress:
+            on_progress(i + 1, len(files), f"Staging {f.name}")
+    log.info("Staged %d bundled ONNX head files into %s", len(staged), onnx_dir)
+    return {"staged": staged, "source": str(src)}
+
 # Mel-spectrogram patching geometry (validated in scripts/onnx_parity.py:
 # cosine 0.99942 vs essentia-tensorflow on a real track).
 #   frameSize=512 / hopSize=256 → [N, 96] log-mel frames (per essentia MusiCNN)

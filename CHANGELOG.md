@@ -12,6 +12,27 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged release.
 
+### Added
+
+- **One-click "Set up ONNX engine"** — the ONNX engine is now self-provisioning
+  from a single button, so there is no hosting/setup gate for the user to hit.
+  A new `setup_onnx_engine` RPC does everything in order, emitting `progress` at
+  each step so the GUI shows a live dialog (bar + step message — the app visibly
+  works, never looks hung): (1) stages the bundled converted heads into
+  `<models>/onnx/`, cleaning interrupted `.partial` leftovers; (2) installs the
+  ONNX engine env (WSL or native managed venv) **only if not already usable**, so
+  a re-click is a fast no-op; (3) fetches just the EffNet backbone from essentia;
+  (4) verifies via the ONNX preflight. Self-healing and idempotent. Verified end
+  to end through the live GUI and the frozen sidecar (button → dialog → ready →
+  ONNX analyze: genre/bpm/key/mood all correct).
+- **The converted ONNX classification heads (~5 MB) now ship inside the app.**
+  The seven EffNet heads (`genre_discogs400`, `danceability`, `voice_instrumental`,
+  `mood_aggressive/happy/relaxed/sad`) have no official ONNX upstream, so they are
+  bundled in `vibechek/onnx_assets/` and embedded by PyInstaller — the ONNX engine
+  works offline with no head download (only the official backbone is fetched).
+  Heads are stored under a `models/onnx/` subdir so their metadata JSONs never
+  collide with essentia's same-named `.pb` set.
+
 ### Fixed
 
 Found via a full-stack bug hunt that drove every RPC method, every CLI command,

@@ -89,6 +89,8 @@ import type {
   ScanDirectoryRequest,
   ScanDirectoryResult,
   ScanOnlyRequest,
+  SetupOnnxEngineRequest,
+  SetupOnnxEngineResult,
   SystemResources,
   TagApplyStats,
   TagBackupStats,
@@ -319,6 +321,18 @@ export function verifyModels(): Promise<VerifyModelsResult> {
   return rpc<VerifyModelsResult>("verify_models");
 }
 
+/**
+ * One-click, self-healing ONNX engine setup. Stages the bundled converted
+ * heads, ensures the engine env (WSL/native) is installed, fetches the EffNet
+ * backbone, and verifies — emitting `progress` notifications throughout so the
+ * GUI can show a live dialog. Cancellable. Idempotent (a re-click is a no-op).
+ */
+export function setupOnnxEngine(
+  params: SetupOnnxEngineRequest = {},
+): Promise<SetupOnnxEngineResult> {
+  return rpc<SetupOnnxEngineResult>("setup_onnx_engine", params);
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -505,6 +519,7 @@ const api = {
   // models
   downloadModels,
   verifyModels,
+  setupOnnxEngine,
   // config
   getConfig,
   saveConfig,
