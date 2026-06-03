@@ -263,7 +263,12 @@ export function Settings() {
   const refreshEngineGpu = (distro: string | null, force = false) => {
     if (!isMounted.current) return;
     setEngineProbing(true);
-    rpc<EngineGpuInfo>("engine_gpu_status", { distro, force, engine: cfg.analysis.inference_engine })
+    // Read the engine at CALL time from the store, not from the captured `cfg`
+    // closure: this fn is invoked from a mount-time effect whose closure can
+    // hold the pre-disk-load default (essentia_tf). An onnx user would then get
+    // their GPU block probed for the wrong engine until a manual re-probe.
+    const probeEngine = useConfigStore.getState().config.analysis.inference_engine;
+    rpc<EngineGpuInfo>("engine_gpu_status", { distro, force, engine: probeEngine })
       .then((info) => {
         if (isMounted.current) setEngineGpu(info);
       })

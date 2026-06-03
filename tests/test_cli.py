@@ -51,6 +51,40 @@ def test_organize_dry_run(synthetic_analysis: dict, tmp_path: Path) -> None:
     assert "moves planned" in result.output
 
 
+def test_export_corrupt_json_gives_clean_error(tmp_path: Path) -> None:
+    """A corrupt/truncated analysis.json must yield a clean Click error, not a
+    raw JSONDecodeError traceback. `click.Path(exists=True)` only checks the
+    file exists — an interrupted `analyze` write leaves invalid JSON."""
+    bad = tmp_path / "junk.json"
+    bad.write_text("{ this is not valid json", encoding="utf-8")
+    result = CliRunner().invoke(main, ["export", str(bad), "--format", "csv"])
+    assert result.exit_code != 0
+    assert "not a valid analysis JSON" in result.output
+    assert not isinstance(result.exception, json.JSONDecodeError)
+
+
+def test_organize_corrupt_json_gives_clean_error(tmp_path: Path) -> None:
+    bad = tmp_path / "junk.json"
+    bad.write_text("{ this is not valid json", encoding="utf-8")
+    result = CliRunner().invoke(main, ["organize", str(bad), "--dry-run"])
+    assert result.exit_code != 0
+    assert "not a valid analysis JSON" in result.output
+    assert not isinstance(result.exception, json.JSONDecodeError)
+
+
+def test_organize_empty_analysis_gives_clean_error(tmp_path: Path) -> None:
+    """Organizing an analysis with no tracks (and no --target-root) can't infer
+    a base dir → plan_organization raises ValueError. The CLI must convert that
+    to a clean ClickException, not leak the ValueError traceback (the RPC path
+    already returns INVALID_PARAMS here)."""
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"tracks": []}), encoding="utf-8")
+    result = CliRunner().invoke(main, ["organize", str(empty), "--dry-run"])
+    assert result.exit_code != 0
+    assert "No tracks in analysis" in result.output
+    assert not isinstance(result.exception, ValueError)
+
+
 def test_preflight_quick_mode_skips_distro_probes(monkeypatch) -> None:
     """`vibechek preflight --quick` skips the slow per-distro WSL probe."""
     from vibechek import preflight as _preflight_module

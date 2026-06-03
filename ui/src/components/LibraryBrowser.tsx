@@ -194,6 +194,11 @@ export function LibraryBrowser() {
         return;
       }
       setLibraryPath(record.path);
+      // Switching libraries: drop the previous library's filter selections so
+      // they don't silently narrow (or mismatch) the new one. The filters store
+      // is intentionally cleared here — a tab round-trip preserves filters, but
+      // a library SWITCH must not. (Previously `clearFilters` had no caller.)
+      useLibraryFiltersStore.getState().clearFilters();
       setTracks(tracks);
       setNewTracksCount(null);
       setBannerDismissed(false);
@@ -420,6 +425,9 @@ export function LibraryBrowser() {
     // live-merge token before we swap the path + tracks out from under it.
     invalidateAnalyzeRun();
     setLibraryPath(selected);
+    // New folder = library switch → clear the prior library's filters (see
+    // handleOpenRecent). Otherwise stale genre/key/energy chips carry over.
+    useLibraryFiltersStore.getState().clearFilters();
     setTracks([]);
     begin("analyze");
     try {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,34 @@ from vibechek.utils import (
     SUPPORTED_EXTENSIONS,
     find_audio_files,
     report_progress,
+    resolve_existing_path,
     sanitize_folder_name,
 )
+
+
+def test_resolve_existing_path_exact(tmp_path: Path) -> None:
+    f = tmp_path / "plain.flac"
+    f.write_bytes(b"x")
+    assert resolve_existing_path(str(f)) == f
+
+
+def test_resolve_existing_path_tolerates_nfd_input(tmp_path: Path) -> None:
+    """An accented filename stored on disk as NFC must still resolve when the
+    path arrives NFD-normalized — e.g. an analysis.json written on macOS (NFD)
+    and applied on another platform. Without it, organize/tag report every
+    accented track ("Tiësto", "Naté", "Années") as not found and skip it.
+    """
+    f = tmp_path / "Tiësto - Adagio.flac"  # NFC 'ë'
+    f.write_bytes(b"x")
+    nfd = unicodedata.normalize("NFD", str(f))
+    if nfd == str(f):
+        pytest.skip("platform pre-normalizes; nothing to test")
+    resolved = resolve_existing_path(nfd)
+    assert resolved is not None and resolved.exists()
+
+
+def test_resolve_existing_path_missing_returns_none(tmp_path: Path) -> None:
+    assert resolve_existing_path(str(tmp_path / "nope_zzz.flac")) is None
 
 
 def test_sanitize_strips_invalid_chars() -> None:

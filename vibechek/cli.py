@@ -58,6 +58,23 @@ def _progress_bar(description: str) -> Progress:
     )
 
 
+def _load_analysis_json(path: Path) -> object:
+    """Read + parse an analysis JSON file for tag / organize / export.
+
+    `click.Path(exists=True)` guarantees the file is THERE, but not that it's
+    valid JSON — a truncated/interrupted `analyze` write or a wrong file would
+    raise a bare JSONDecodeError and dump a Python traceback at the user. Turn
+    that into a clean Click error instead.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise click.ClickException(
+            f"{path.name} is not a valid analysis JSON file — expected output "
+            f"from `vibechek analyze` ({e})."
+        ) from e
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="vibechek")
 def main() -> None:
@@ -146,7 +163,7 @@ def tag(analysis_json: Path, confidence: float, skip_bpm_key: bool,
     """Apply ML tags from an analysis.json to your files."""
     from vibechek.tagger import apply_ml_tags
 
-    data = json.loads(analysis_json.read_text(encoding="utf-8"))
+    data = _load_analysis_json(analysis_json)
     # --skip-bpm-key (default) maps to write_bpm/write_key=False; the inverse
     # --write-bpm-key flag turns both on (per-field toggles superseded the old
     # single skip_bpm_and_key flag).
@@ -372,7 +389,7 @@ def organize(analysis_json: Path, no_subgenres: bool, min_genre_size: int,
     """Move files into genre/subgenre folders based on analysis.json."""
     from vibechek.organizer import organize_from_analysis, plan_organization
 
-    data = json.loads(analysis_json.read_text(encoding="utf-8"))
+    data = _load_analysis_json(analysis_json)
     config = OrganizationConfig(
         use_subgenres=not no_subgenres,
         min_genre_size=min_genre_size,
@@ -380,7 +397,11 @@ def organize(analysis_json: Path, no_subgenres: bool, min_genre_size: int,
     )
 
     if dry_run:
-        plan = plan_organization(data, config)
+        try:
+            plan = plan_organization(data, config)
+        except ValueError as e:
+            # e.g. an empty analysis with no --target-root to anchor the tree.
+            raise click.ClickException(str(e)) from e
         console.print(f"\n[yellow](dry-run)[/] {len(plan.moves)} moves planned:")
         for move in plan.moves[:20]:
             rel = move.destination.relative_to(plan.base_dir)
@@ -395,7 +416,10 @@ def organize(analysis_json: Path, no_subgenres: bool, min_genre_size: int,
         def on_progress(current: int, total: int, message: str) -> None:
             progress.update(task, completed=current, total=total, description=message[:40])
 
-        stats = organize_from_analysis(data, config, on_progress=on_progress, dry_run=False)
+        try:
+            stats = organize_from_analysis(data, config, on_progress=on_progress, dry_run=False)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
 
     console.print(
         f"\n[green]Done.[/] Moved {stats.moved}/{stats.planned} • errors: {len(stats.errors)}"
@@ -694,7 +718,7 @@ def export_cmd(analysis_json: Path, fmt: str, output: Path | None) -> None:
     """
     import csv
 
-    data = json.loads(analysis_json.read_text(encoding="utf-8"))
+    data = _load_analysis_json(analysis_json)
     tracks = data.get("tracks") if isinstance(data, dict) else None
     if tracks is None:
         # Allow callers to pass a bare list of tracks too.
