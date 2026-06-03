@@ -12,6 +12,14 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged release.
 
+---
+
+## [0.4.0-beta.10] — 2026-06-02
+
+Makes the ONNX engine genuinely usable end-to-end — it runs, it's GPU-accelerated,
+and the app reflects it — plus audio-preview and release-pipeline fixes found in a
+whole-stack bug sweep.
+
 ### Fixed
 - **Audio track previews** ("failed to fetch") — the bundled CSP had no
   `connect-src`, so WaveSurfer's `fetch()` of the audio was blocked; also added
@@ -26,6 +34,12 @@ Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged
   `onnxruntime.preload_dlls()` so the CUDA EP initializes. **Validated: the
   EffNet backbone runs on an RTX 4070's CUDAExecutionProvider, TF-free.** New
   `vibechek[onnx-gpu]` extra; `vibechek download-models --engine onnx`.
+- **ONNX GPU status + cross-vendor** — Settings now shows the ONNX engine's real
+  GPU via an onnxruntime execution-provider probe in `venv-onnx` (validated:
+  "NVIDIA RTX 4070 · CUDA"). The installer auto-picks the runtime per platform:
+  NVIDIA→`onnxruntime-gpu`+CUDA (validated), Apple→CoreML (ships in the macOS
+  wheel), AMD-Linux→`onnxruntime-rocm` (best-effort). Re-running setup cleanly
+  swaps CPU↔GPU `onnxruntime`.
 - **ONNX robustness**: genre class-labels are now required for readiness (was
   silently dropping genre), tiny head class-label JSON no longer rejected by the
   size gate, `inference_engine` config value validated, engine-accurate preflight
