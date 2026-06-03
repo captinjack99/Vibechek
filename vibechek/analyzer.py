@@ -2582,10 +2582,11 @@ def _analyze_via_wsl(
             raise RuntimeError(
                 f"WSL vibechek is out of date: {distro} has "
                 f"{wsl_vibechek_version}, sidecar is {_sidecar_version}. "
-                f"Run Settings → Set up WSL again (or call the "
-                f"`repair_wsl_install` RPC) so the WSL install picks up the "
-                f"worker-cap and stall-watchdog patches. Older WSL installs "
-                f"crash silently on multi-worker analyze."
+                f"Run Settings → \"Update WSL install\" (or re-run \"Set up "
+                f"WSL\"); the RPC is `upgrade_vibechek_in_wsl`. That brings the "
+                f"WSL analyzer up to this app's version (worker-cap + "
+                f"stall-watchdog patches). Older WSL installs crash silently on "
+                f"multi-worker analyze."
             )
 
     result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir)

@@ -1450,8 +1450,10 @@ def _user_bootstrap(engine: str = "essentia_tf") -> str:
     the ONNX engine gets its own venv. `run_vibechek_in_wsl(venv_subdir=...)`
     routes analyze to whichever the user picked.
 
-    `--upgrade` makes re-running "Set up" an idempotent version-drift fix:
-    every code-side bump on GitHub becomes available without deleting the venv.
+    Re-running "Set up" is an idempotent version-drift fix: the vibechek package
+    is force-reinstalled from the GitHub head (a plain ``--upgrade`` does NOT
+    re-pull a ``git+`` install once any version is present), so every code-side
+    bump becomes available without deleting the venv.
     """
     subdir = "venv-onnx" if engine == "onnx" else "venv"
     pip = f'"$HOME/.vibechek/{subdir}/bin/pip"'
@@ -1509,6 +1511,13 @@ echo "[4/4] Installing Vibechek + {label} (this is the slow part)..."
 {pip} install --upgrade --quiet pip wheel
 {ml_line}
 {pip} install --upgrade --quiet git+https://github.com/papapew/Vibechek.git
+# `--upgrade` alone does NOT re-pull a git+ (VCS) install when a version is
+# already present — pip treats the URL requirement as satisfied without cloning
+# to compare. So re-running "Set up WSL" on a drifted install would silently
+# leave the stale package and never clear the analyzer's version-drift guard.
+# Force-reinstall just the vibechek package (its deps were handled above) so a
+# re-run always lands on the current GitHub head. Matches upgrade_vibechek_in_wsl.
+{pip} install --upgrade --force-reinstall --no-deps --quiet git+https://github.com/papapew/Vibechek.git
 
 {symlink_block}
 echo "DONE"
