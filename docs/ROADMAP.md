@@ -41,7 +41,7 @@ Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 - ✅ First-run model downloader command + GUI button
 - ✅ GitHub Actions:
   - CI: tests on Linux/macOS/Windows × Python 3.10/3.12
-  - Release: on tag, builds PyInstaller CLI + Tauri installers, drafts a GitHub Release
+  - Release: on tag, builds PyInstaller CLI + Tauri installers and publishes a GitHub Release
 - ✅ macOS `.dmg` (Apple Silicon) built by Tauri in CI
 - ✅ Code-signing plumbing is opt-in (cert secrets → signed; none → unsigned). Beta ships **unsigned**; actual Developer ID / Authenticode signing + notarization deferred (paid certs).
 
@@ -80,7 +80,7 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 - ✅ **Frontend tests** (vitest + RTL + jsdom + Tauri mocks) — 24 at Phase 3, 32 now
 - ✅ **109 backend tests** added in Phase 3 (modules: wsl, preflight, cancellation, library_state, logging_setup, RPC dispatch with concurrency check); 487 total now
 - ✅ **Generated TS types**: `scripts/generate_ts_types.py` walks 9 Python modules and emits 27 TS interfaces. `__ts_overrides__` mechanism handles wire-form ≠ storage-form cases.
-- ✅ Tagged `v0.3.0` then iterated to `v0.4.0-beta.7` (see CHANGELOG)
+- ✅ Tagged `v0.3.0` then iterated to `v0.4.0-beta.10` (see CHANGELOG)
 
 ### Phase 4 — Polish, docs, community launch _(in progress)_
 
@@ -101,7 +101,7 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 - ✅ **End-to-end audit closeout** — the beta.8 remediation cleared the remaining findings: all 4 HIGH (lossy tag backup now format-complete incl. AIFF/WAV cue frames, dead Direction classifier, opaque UNC/network-share error, racing concurrent index writes) plus the MED/LOW sweep (RPC input validation/clamping, `sanitize_folder_name` reserved-name rejection, multi-GPU device-0 pin, atomic WSL shim rewrites, …). See CHANGELOG beta.8.
 - ✅ **FLAC → CDJ export** ([`vibechek/cdj_export.py`](../vibechek/cdj_export.py)) — `vibechek cdj-export <rekordbox.xml> --out <dir>` transcodes a FLAC library to sample-identical 16-bit AIFF and rewrites the Rekordbox XML so beat grids (`TEMPO`) + cues (`POSITION_MARK`) copy across with zero offset math, letting older Pioneer CDJs play a FLAC collection. Strictly additive; never MP3 (its encoder delay shifts the grid). Optional `[cdj]` extra (soundfile) with an ffmpeg fallback.
 - ✅ **In-app auto-update wiring (opt-in)** — `tauri-plugin-updater`; Settings → "Software updates" → check / download / install / relaunch. CI signs artifacts + publishes `latest.json` when a signing key is configured; ships inert (unsigned) until one is enrolled.
-- ✅ **ONNX inference backend (opt-in, validated end-to-end)** ([`vibechek/onnx_backend.py`](../vibechek/onnx_backend.py)) — selectable via `AnalysisConfig.inference_engine = "onnx"` (default stays `essentia_tf`, byte-unchanged). Runs every neural forward pass on ONNX Runtime (MTG's official EffNet ONNX backbone + tf2onnx-converted heads) with a cross-vendor GPU EP chain (CUDA → ROCm → DirectML → CoreML → CPU); essentia stays only for DSP. Validated to match the TF path on a real track (embedding cosine 0.99942, sub-0.005 deltas) via `scripts/onnx_parity.py`.
+- ✅ **ONNX inference backend (opt-in, GPU-accelerated, validated end-to-end)** ([`vibechek/onnx_backend.py`](../vibechek/onnx_backend.py)) — selectable in Settings via `AnalysisConfig.inference_engine = "onnx"` (default stays `essentia_tf`, byte-unchanged). Runs every neural forward pass on ONNX Runtime (MTG's official EffNet ONNX backbone + tf2onnx-converted heads) with a cross-vendor GPU EP chain (CUDA → ROCm → CoreML → CPU); essentia stays only for DSP. **NVIDIA CUDA is hardware-validated** (RTX 4070, TF-free, onnxruntime-gpu + nvidia-cu12 + DLL preload); ROCm + CoreML wired but hardware-unverified. Provisioned into a separate `~/.vibechek/venv-onnx` via "Set up ONNX engine" (installer auto-picks the GPU runtime); extras `[onnx]` / `[onnx-gpu]`. Validated to match the TF path on a real track (embedding cosine 0.99942, sub-0.005 deltas) via `scripts/onnx_parity.py`.
 - ✅ **SOTA accuracy wins** — Essentia's EDM-tuned `edma` key profile; BPM octave-error guard (folds 70↔140 / 87↔174 and cross-checks the filename BPM); de-dup recall via Chromaprint sliding-offset alignment + multi-probe bucketing.
 - ✅ **Hybrid CPU+GPU analysis** — GPU + CPU workers share one work-stealing queue; per-device throughput measured. `--hybrid/--no-hybrid` + Settings toggle.
 - ✅ **GPU on Windows via WSL CUDA wheels** — one-click "Enable GPU" installs NVIDIA pip wheels into the managed venv (works on any WSL distro, no apt/keyring/root).
@@ -140,7 +140,7 @@ Logged here so they don't get forgotten:
 - **Per-file tag undo / history.** Operation-level undo (organize/dedupe) shipped in beta.5; per-file tag-write history (roll back a single field write, not just a full restore) is still open.
 - **MixedInKey/Lexicon/Beatport tag import.** "I already have data from $TOOL, use that as ground truth instead of/alongside ML."
 - **Native GPU on Windows.** ~~Currently auto-routes through WSL~~ — done: GPU works through WSL CUDA wheels today. A native path is only worth it if/when Essentia ships Windows wheels with CUDA.
-- **ONNX inference backend.** ~~Retire the EOL bundled TensorFlow 2.5 from the inference path~~ — implemented in beta.8 behind `AnalysisConfig.inference_engine = "onnx"` (default still `essentia_tf`), validated end-to-end against the TF path. Remaining before flipping the default: host the converted head `.onnx` files on the model mirror (so no local `tf2onnx` conversion is needed) and run a full-library smoke test.
+- **ONNX inference backend.** ~~Retire the EOL bundled TensorFlow 2.5 from the inference path~~ — **essentially done.** The engine shipped (selectable in Settings behind `AnalysisConfig.inference_engine = "onnx"`, default still `essentia_tf`), is GPU-accelerated (NVIDIA CUDA hardware-validated; ROCm + CoreML wired), and is validated end-to-end against the TF path. Remaining before flipping the default: host the converted head `.onnx` files on the model mirror (so no local `tf2onnx` conversion is needed), run a full-library smoke test, and validate the cross-vendor GPU paths (ROCm / CoreML) on real hardware.
 - **Cancel mid-step in WSL install.** Largely addressed in beta.3 (setsid process-group kill); further per-phase granularity could still help.
 
 ## Architectural notes

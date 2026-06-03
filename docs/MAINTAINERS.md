@@ -9,22 +9,30 @@ for the release mechanics see [RELEASING.md](RELEASING.md).
 A release bumps **five** files. They must all match, or the version-drift guard and CI
 will complain:
 
-1. `vibechek/__init__.py` — `__version__` (e.g. `"0.4.0-beta.8"`)
-2. `pyproject.toml` — PEP 440 form (`0.4.0b7`)
+1. `vibechek/__init__.py` — `__version__` (e.g. `"0.4.0-beta.10"`)
+2. `pyproject.toml` — PEP 440 form (`0.4.0b10`)
 3. `ui/src-tauri/Cargo.toml`
 4. `ui/src-tauri/tauri.conf.json`
 5. `ui/package.json`
 
 The git tag form is `vMAJOR.MINOR.PATCH-beta.N`; PEP 440 maps that to `…bN`.
 
+**Two lockfiles also carry the version** and must be bumped in the same commit or a
+clean CI checkout shows a dirty tree: `ui/src-tauri/Cargo.lock` (the `vibechek-desktop`
+package entry) and `ui/package-lock.json` (root + self-reference). See
+[RELEASING.md](RELEASING.md) for the exact fields.
+
 ## Release flow (short version)
 
 1. Bump the five manifests, update `CHANGELOG.md`, run `python scripts/update_readme_stats.py`.
 2. Commit, then `git tag vX.Y.Z-beta.N`, then `git push origin main && git push origin <tag>`.
 3. The tag push triggers [`.github/workflows/release.yml`](../.github/workflows/release.yml):
-   builds the PyInstaller CLI + the Tauri installers per OS, drafts a GitHub Release.
-4. Review the draft, then publish.
+   builds the PyInstaller CLI + the Tauri installers per OS, then **publishes** a GitHub
+   Release for the tag (`draft: false`, pre-release for `-beta`/`-rc`). No manual click.
+4. Optionally edit the auto-generated notes on the Releases page. That's it.
 
+The workflow runs an idempotent **pre-delete** step first (deletes any pre-existing
+release object for the tag) so re-runs and the old `draft: true` leftovers can't collide.
 Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md).
 
 ## Architecture landmines (the non-obvious ones)
@@ -61,18 +69,42 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
   direction/BPM, …) import it *directly*. Declaring it under `[dev]` keeps it out of the
   runtime dependency surface while ensuring a clean `[dev]`-only CI install doesn't error
   at test collection. Don't move it to core, and don't drop it from `[dev]`.
-- **ONNX backend (`vibechek/onnx_backend.py`).** The opt-in inference engine
-  (`AnalysisConfig.inference_engine = "onnx"`; default `essentia_tf`). It mirrors
-  `analyzer.load_models`'s dict + callable signatures exactly so the analyzer's downstream
-  logic is byte-unchanged, and imports `onnxruntime`/`essentia` lazily. It uses MTG's
-  official EffNet ONNX backbone (which already emits the 400-class genre output, reused
-  rather than re-run) + tf2onnx-converted heads. Two dev/CI-on-demand scripts back it:
-  `scripts/onnx_parity.py` (the parity gate — proves ONNX matches essentia-TF on a real
-  track, embedding cosine 0.99942; needs the real models + both runtimes) and
-  `scripts/convert_heads_to_onnx.py` (the one-off tf2onnx head conversion — neither is in
-  the wheel or the unit suite). **The converted head `.onnx` files still need hosting on
-  the model mirror**; until then a developer runs the convert script locally. See
-  `docs/ONNX_MIGRATION.md`.
+- **ONNX inference engine (`vibechek/onnx_backend.py`).** A complete, user-selectable
+  TF-free engine (`AnalysisConfig.inference_engine = "onnx"`; default stays `essentia_tf`).
+  Picked via the Settings toggle / `analyze --engine onnx` / the `inference_engine` config
+  field. It mirrors `analyzer.load_models`'s dict + callable signatures exactly so the
+  analyzer's downstream logic is byte-unchanged, and imports `onnxruntime`/`essentia`
+  lazily. Runs on **plain `essentia` + `onnxruntime`, zero TensorFlow**: MTG's official
+  EffNet ONNX backbone (already emits the 400-class genre output, reused rather than
+  re-run) + tf2onnx-converted heads. Validated TF-free on a real track (embedding cosine
+  0.99942). See `docs/ONNX_MIGRATION.md`.
+  - **Separate venv.** The ONNX stack installs into its own `~/.vibechek/venv-onnx`
+    (TF engine uses `~/.vibechek/venv`), each with its own essentia build. Install /
+    routing / preflight / GPU-probe are all engine-aware across `wsl.py`,
+    `native_install.py`, `analyzer.py`, `preflight.py`, and `rpc.py` (the `engine` /
+    `inference_engine` params). An onnx-only install with the wrong engine routed at
+    analyze time fails on the missing venv — the RPC plumbs the selected engine through.
+  - **GPU is real and validated** (NVIDIA **CUDA**, RTX 4070). The installer auto-picks
+    the GPU stack when `nvidia-smi` is present: `onnxruntime-gpu` + the `nvidia-*-cu12`
+    runtime wheels, loaded at runtime via `onnxruntime.preload_dlls()` (needs
+    onnxruntime ≥ 1.19) — **no system CUDA toolkit / `LD_LIBRARY_PATH`**. Apple **CoreML**
+    + AMD **ROCm** are wired but hardware-unverified. **Not DirectML** — on Windows the
+    ONNX engine runs in WSL (essentia has no Windows wheel), so the providers are
+    CUDA/ROCm/CoreML/CPU only. Extras: `vibechek[onnx]` (CPU) / `vibechek[onnx-gpu]`
+    (CUDA). The probe lives in `wsl.probe_engine_gpu`; `EngineGpuInfo.provider`/`runtime`
+    carry the live EP + onnxruntime version.
+  - **Re-setup must uninstall first.** `onnxruntime`, `onnxruntime-gpu`, and
+    `onnxruntime-rocm` all ship the **same importable `onnxruntime` module** — installing
+    a second one over the first leaves a broken mix. Both the WSL and native installers
+    `pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-rocm` before (re)installing
+    the right variant. Don't drop that step.
+  - **Dev/CI-on-demand scripts** (none in the wheel or the unit suite):
+    `scripts/onnx_parity.py` (the parity gate — proves ONNX matches essentia-TF; needs the
+    real models + both runtimes), `scripts/convert_heads_to_onnx.py` (the one-off tf2onnx
+    head conversion), and `scripts/build_onnx_model_bundle.py` (assembles the
+    `models-onnx-v1` release bundle). **The converted head `.onnx` files still need hosting
+    on the model mirror** to flip the default; until then a developer runs the convert
+    script locally.
 - **Every test must import-cleanly on a `[dev]`-only install.** CI installs *only* the
   `[dev]` extra — no essentia, onnxruntime, or soundfile. A test that imports a heavy dep
   at module top level breaks the *whole* collection (not just that test). Gate heavy deps
@@ -106,9 +138,12 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
 
 ## Debugging WSL (Windows)
 
-- `wsl_status` / `doctor` RPCs report what's installed where.
+- `wsl_status` / `doctor` RPCs report what's installed where. `wsl_status` /
+  `engine_gpu_status` / `preflight` take an `engine` param and probe the matching venv
+  (`venv` for `essentia_tf`, `venv-onnx` for `onnx`) — pass the engine the GUI is set to.
 - Per-distro probe reads `__version__` from `site-packages/vibechek-*.dist-info`.
-- To inspect by hand: `wsl -e bash -lic 'cd "$HOME"; ~/.vibechek/venv/bin/vibechek --version'`.
+- To inspect by hand: `wsl -e bash -lic 'cd "$HOME"; ~/.vibechek/venv/bin/vibechek --version'`
+  (the TF engine). For the ONNX engine swap `venv` → `venv-onnx`.
 - Distro reset wipes `~/.local/share` — the ML models live there and will need re-download.
 
 ## Where things are stored (per user, via platformdirs)

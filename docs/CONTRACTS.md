@@ -9,9 +9,35 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 (the authoritative method list), and the "Sidecar protocol" section of
 [`ui/README.md`](../ui/README.md).
 
-> **beta.8 added no new RPC methods** (the surface stays at 44). FLAC → CDJ export is a
-> CLI-only command (`vibechek cdj-export`), and the ONNX inference engine is selected via
-> the `inference_engine` config field — neither crosses the JSON-RPC boundary as a new method.
+> **The method surface stays at 44** — no new RPC *methods* through beta.10. FLAC → CDJ
+> export is a CLI-only command (`vibechek cdj-export`). The ONNX inference engine did not
+> add a method either, but it **did add params to existing methods** (the engine selection
+> crosses the wire) — see "Engine-aware params" below.
+
+## Engine-aware params (ONNX inference engine)
+
+Selecting the inference engine (`essentia_tf` default, or `onnx`) is plumbed through
+existing methods as a param — the Python side validates it via `rpc._valid_engine` and
+routes to the matching managed venv (`venv` vs `venv-onnx`):
+
+| Method | Param | Notes |
+|---|---|---|
+| `analyze_directory` | `inference_engine` | The actual analyze routing; without it the ONNX toggle is inert and an onnx-only install fails on the wrong venv. |
+| `preflight` | `engine` | Probes the engine's venv for readiness. |
+| `download_models` | `engine` | `onnx` fetches the converted-head bundle; `essentia_tf` the `.pb` set. |
+| `install_vibechek_in_wsl` | `engine` | Picks the stack/venv to install (essentia-tensorflow vs plain essentia + onnxruntime). |
+| `install_essentia_native` | `engine` | Native (Linux/macOS) counterpart. |
+| `engine_gpu_status` | `engine` | The ONNX path probes onnxruntime's live ExecutionProviders in `venv-onnx`; the TF path probes TensorFlow. |
+| `native_venv_status` | `engine` | Reports what's installed in the engine's managed venv. |
+| `wsl_status` | `engine` | Selects which venv subdir (`venv` / `venv-onnx`) the per-distro probe inspects. |
+
+The `EngineGpuInfo` result (returned by `engine_gpu_status`) gained two ONNX-specific
+fields: **`provider`** (the onnxruntime ExecutionProvider that actually initialized, e.g.
+`"CUDAExecutionProvider"`, or `null`) and **`runtime`** (e.g. `"onnxruntime 1.19.2"`).
+Both are `null` for the TF engine, which uses `tf_version` / `missing_cuda_libs` instead.
+
+Unknown/invalid engine values are coerced to the `essentia_tf` default at the boundary, so
+older UIs that omit the param keep working.
 
 ## The wire format
 

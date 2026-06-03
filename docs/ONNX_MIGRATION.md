@@ -60,6 +60,26 @@ This document is the contract a contributor should be able to pick up and execut
 
 ---
 
+> ## 📜 Sections §1–§9 below are the ORIGINAL migration *plan* (historical)
+> The engine has since SHIPPED — see the status line at the top of this file. The
+> plan sections are kept as design history and rationale, but where they disagree
+> with the implementation, **the implementation wins.** Notable points where the
+> shipped reality differs from the plan:
+> - **No DirectML.** On Windows the ONNX engine runs *inside WSL* (essentia has no
+>   Windows wheel), so the only GPU providers are **CUDA** (NVIDIA, validated),
+>   **ROCm** (AMD), and **CoreML** (Apple) — all Linux/macOS. DirectML, mentioned
+>   as a "Windows DX12" path in §1/§5, is **not used** anywhere.
+> - **Two separate venvs, not a feature flag swap.** The TF and ONNX engines live
+>   in distinct managed venvs (`~/.vibechek/venv` vs `~/.vibechek/venv-onnx`), each
+>   with its own essentia build. The engine is chosen per-analysis (`inference_engine`
+>   config / `analyze --engine` / Settings toggle), not by a single `config.py` flag
+>   replacing the install.
+> - **Default stays `essentia_tf`**, not `onnx` (the §6 "default to onnx" plan is
+>   superseded by the remaining-work list in the status block above).
+> - **Melspec is settled:** plain `essentia` ships `TensorflowInputMusiCNN`
+>   bit-identically, so the §3/§4 "reimplement the mel-spectrogram in NumPy" risk
+>   did **not** materialize.
+
 ## 1. Why ONNX
 
 **Primary driver — retire end-of-life TensorFlow.** `essentia-tensorflow` bundles **TensorFlow 2.5**, which is past end-of-life: no security patches, several known CVEs in the bundled runtime, CUDA-only, and it pins an old Python that increasingly blocks dependency upgrades across the project. That alone justifies the move — a deprecated, unpatched ML runtime shipping in a desktop app is a liability independent of any feature win.
@@ -72,6 +92,10 @@ That excludes:
 - **Apple Silicon** (M1/M2/M3/M4) — no Metal support
 - **DirectML** users on Windows who don't have CUDA installed
 
+> *(Historical note: the shipped ONNX engine does **not** use DirectML — it runs in
+> WSL on Windows, so cross-vendor GPU is CUDA / ROCm / CoreML only. See the banner
+> above.)*
+
 Today, every non-NVIDIA user falls back to CPU inference, which on a typical 1000-track library is the difference between a coffee break and a multi-hour wait. Users have flagged this more than once.
 
 **ONNX Runtime** solves this directly. Its **Execution Provider (EP)** architecture lets a single runtime dispatch to:
@@ -83,6 +107,10 @@ Today, every non-NVIDIA user falls back to CPU inference, which on a typical 100
 - `CPUExecutionProvider`      — always-on fallback
 
 One runtime, one wheel, one code path — every GPU vendor covered.
+
+> *(Historical: the shipped engine runs in WSL/native Linux/macOS — never native
+> Windows — so the actual provider set is CUDA / ROCm / CoreML / CPU. The
+> `DirectMLExecutionProvider` row never made it into the implementation.)*
 
 ---
 

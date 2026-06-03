@@ -7,12 +7,15 @@ How a new release happens, end-to-end. It's fully automated: bump the version st
 ## TL;DR — cutting a beta or release
 
 ```bash
-# 1. Bump all four version strings (must match the git tag exactly):
+# 1. Bump all five version manifests (must match the git tag exactly):
 #    - vibechek/__init__.py        __version__
 #    - pyproject.toml              project.version  (PEP 440 form: 0.3.0b1)
 #    - ui/package.json             version
 #    - ui/src-tauri/Cargo.toml     package.version
 #    - ui/src-tauri/tauri.conf.json version
+#    Also bump the two lockfiles so CI doesn't dirty them:
+#    - ui/src-tauri/Cargo.lock     (the vibechek-desktop package entry)
+#    - ui/package-lock.json        (root + package version)
 git add -A && git commit -m "chore: bump to v0.3.0-beta.1"
 
 # 2. Tag and push (the CI workflow keys on `v*` tag pushes):
@@ -45,7 +48,7 @@ That's the whole process. The rest of this doc is detail you only need when some
 
 ## Version-string rules
 
-Four files carry a version. They must all agree, and they must match the git tag (without the leading `v`):
+Five files carry a version. They must all agree, and they must match the git tag (without the leading `v`):
 
 | File | Format | Example |
 |---|---|---|
@@ -54,6 +57,13 @@ Four files carry a version. They must all agree, and they must match the git tag
 | `ui/package.json` | npm semver | `0.3.0-beta.1` |
 | `ui/src-tauri/Cargo.toml` | Cargo semver | `0.3.0-beta.1` |
 | `ui/src-tauri/tauri.conf.json` | Tauri semver | `0.3.0-beta.1` |
+
+Two **lockfiles** also embed the version and must be regenerated/bumped in the same commit, or a clean CI build will show a dirty tree:
+
+| File | What to bump |
+|---|---|
+| `ui/src-tauri/Cargo.lock` | the `vibechek-desktop` package's `version` entry |
+| `ui/package-lock.json` | the root `version` and the self-referencing `packages."".version` |
 
 The git tag itself is `v0.3.0-beta.1`. Keep these in sync — `vibechek --version` reads `__init__.py`, the desktop installer name reads `tauri.conf.json`, and pip install reads `pyproject.toml`. Drift causes "the about page says v0.3.0 but the installer says v0.2.9"-class bugs.
 
@@ -317,6 +327,6 @@ signtool verify /pa /v Vibechek_0.3.0-beta.8_x64-setup.exe
 - [ ] Tag write + restore round-trip preserves Rekordbox GEOB/PRIV frames
 - [ ] Windows: WSL auto-install flow works from a fresh Windows VM
 - [ ] Windows: "Enable GPU" install on a machine with the libs missing
-- [ ] All 192 Python tests + 24 frontend tests pass on CI
+- [ ] Full Python + frontend test suites pass on CI (see README for current counts)
 
 When all of these are green for a beta, drop the suffix and ship the stable.
