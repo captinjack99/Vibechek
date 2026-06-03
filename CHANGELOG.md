@@ -56,6 +56,11 @@ and the live GUI (tauri-driver + WebDriver) against a real library.
   the drift guard.** It now detects WSL version drift on a full probe, reports
   not-ready, and surfaces an actionable "Update WSL install" reason — closing
   the confusing "set up → Ready → analyze errors out of date" loop.
+- **Track preview hung 15s then timed out.** WaveSurfer's WebAudio backend
+  fetches the track over `asset:` (which the beta.10 CSP fix allowed) and then
+  fetches a `blob:` URL to decode — but `blob:` was missing from the CSP
+  `connect-src`, so the decode fetch was blocked and the player fired neither
+  `ready` nor `error`. Added `blob:` to `connect-src`; preview now loads + plays.
 
 ---
 
