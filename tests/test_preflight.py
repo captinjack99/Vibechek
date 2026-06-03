@@ -43,6 +43,24 @@ def _wsl_not_ready() -> WSLStatus:
     return WSLStatus(is_windows=True, wsl_available=False, wsl_feature_enabled=False)
 
 
+def _wsl_drifted(version: str) -> WSLStatus:
+    """WSL with vibechek+essentia present but pinned to a specific version."""
+    return WSLStatus(
+        is_windows=True,
+        wsl_available=True,
+        wsl_feature_enabled=True,
+        distros=[
+            DistroInfo(
+                name="Ubuntu-24.04",
+                vibechek_installed=True,
+                essentia_installed=True,
+                is_default=True,
+                vibechek_version=version,
+            )
+        ],
+    )
+
+
 def test_reasons_not_ready_essentia_missing_no_wsl() -> None:
     r = PreflightResult(
         ready=False,
@@ -102,6 +120,38 @@ def test_reasons_not_ready_empty_when_all_good() -> None:
         wsl=None,
     )
     assert r.reasons_not_ready == []
+
+
+def test_reasons_not_ready_flags_wsl_version_drift() -> None:
+    """WSL has the engine but an OLD vibechek -> the analyzer's drift guard will
+    reject it, so preflight must NOT call it ready; it surfaces an actionable
+    'Update WSL install' reason. Regression: preflight reported 'Ready to
+    analyze' while a real analyze failed with 'out of date'."""
+    r = PreflightResult(
+        ready=False,
+        essentia=EssentiaCheck(installed=False, error="ImportError (host)"),
+        models=ModelsCheck(models_dir="/x", found=["effnet"]),  # models present
+        platform="Windows-10",
+        wsl=_wsl_drifted("0.1.0"),  # far older than any current build
+        analyze_via="wsl",
+    )
+    reasons = r.reasons_not_ready
+    assert any("out of date" in x.lower() for x in reasons), reasons
+    assert any("update wsl install" in x.lower() for x in reasons), reasons
+
+
+def test_reasons_not_ready_no_drift_when_wsl_matches_sidecar() -> None:
+    import vibechek  # noqa: PLC0415
+
+    r = PreflightResult(
+        ready=True,
+        essentia=EssentiaCheck(installed=False, error="ImportError (host)"),
+        models=ModelsCheck(models_dir="/x", found=["effnet"]),
+        platform="Windows-10",
+        wsl=_wsl_drifted(vibechek.__version__),  # same version -> not outdated
+        analyze_via="wsl",
+    )
+    assert not any("out of date" in x.lower() for x in r.reasons_not_ready)
 
 
 # ---------------------------------------------------------------------------

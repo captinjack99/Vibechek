@@ -43,6 +43,19 @@ and the live GUI (tauri-driver + WebDriver) against a real library.
   users saw the wrong engine's GPU status); read at call time now.
 - **Open-track inspector** was lost when an organize moved that track
   (`updateTrackPaths` migrated `selectedIds` but not `selectedTrackPath`).
+- **Re-running "Set up WSL" did not fix WSL version drift.** The drift guard
+  tells users to re-run setup, but the full bootstrap ran `pip install --upgrade
+  git+...` for vibechek *without* `--force-reinstall` — and a VCS `--upgrade`
+  doesn't re-pull when a version is already present, so the stale package
+  survived. The bootstrap now force-reinstalls just the vibechek package (deps
+  untouched), so re-running setup reliably clears drift. Verified: WSL
+  beta.9 → beta.10 → real analyze works.
+- **Drift error named a non-existent RPC** (`repair_wsl_install`) → now
+  `upgrade_vibechek_in_wsl` / "Update WSL install".
+- **preflight reported "Ready to analyze" while a stale WSL install would fail
+  the drift guard.** It now detects WSL version drift on a full probe, reports
+  not-ready, and surfaces an actionable "Update WSL install" reason — closing
+  the confusing "set up → Ready → analyze errors out of date" loop.
 
 ---
 

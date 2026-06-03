@@ -19,11 +19,29 @@ from vibechek.wsl import (
     _detect_wsl_encoding_order,
     _parse_distro_list,
     _shell_quote,
+    _user_bootstrap,
     _wsl_run,
     to_dict,
     win_to_wsl_path,
     wsl_to_win_path,
 )
+
+
+@pytest.mark.parametrize("engine", ["essentia_tf", "onnx"])
+def test_user_bootstrap_force_reinstalls_vibechek(engine: str) -> None:
+    """Re-running 'Set up WSL' must clear version drift. A plain
+    `pip install --upgrade git+...` does NOT re-pull a VCS install once a
+    version is present, so the bootstrap must force-reinstall the package.
+    Regression: 'Set up now' left a stale beta.9 in WSL while the drift error
+    told the user to do exactly that."""
+    script = _user_bootstrap(engine)
+    assert "git+https://github.com/papapew/Vibechek.git" in script
+    assert "--force-reinstall" in script, (
+        f"{engine} bootstrap must force-reinstall vibechek to fix drift on re-run"
+    )
+    # Force-reinstall is scoped to the package (deps handled by the prior line)
+    # so a re-run doesn't drag essentia-tensorflow down again.
+    assert "--no-deps" in script
 
 # ---------------------------------------------------------------------------
 # Path translation

@@ -171,11 +171,19 @@ def test_drift_guard_raises_when_wsl_version_lags_sidecar(
         # return that would short-circuit before the WSL dispatch.
         (tmp_path / "x.flac").write_bytes(b"\x00")
         with patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]):
-            with pytest.raises(RuntimeError, match="out of date"):
+            with pytest.raises(RuntimeError, match="out of date") as exc:
                 analyzer.analyze_directory(
                     tmp_path,
                     config=AnalysisConfig(workers=1, use_gpu="off"),
                 )
+    # The remediation pointer must name an RPC that actually exists. It used to
+    # say `repair_wsl_install`, which is not in rpc.METHODS — a dead end for any
+    # caller who tried to act on it.
+    msg = str(exc.value)
+    assert "upgrade_vibechek_in_wsl" in msg
+    assert "repair_wsl_install" not in msg
+    from vibechek import rpc
+    assert "upgrade_vibechek_in_wsl" in rpc.METHODS
 
 
 def test_drift_guard_silent_when_versions_match(
