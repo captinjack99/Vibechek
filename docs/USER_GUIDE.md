@@ -329,24 +329,29 @@ At the bottom:
 
 All changes auto-save 500ms after you stop typing/dragging. No "Save" button.
 
-### Experimental: ONNX inference engine
+### ONNX inference engine
 
 **Settings → Analysis → Inference engine** picks how the ML models run:
 
 - **Essentia · TensorFlow** (default) — the bundled, NVIDIA-only path.
-- **ONNX Runtime** (experimental) — runs the *same* models through ONNX Runtime
-  on **plain Essentia with no TensorFlow at all**. Two draws: **cross-vendor GPU
-  acceleration** (AMD, Intel, and Apple GPUs via DirectML/CoreML, not just
-  NVIDIA/CUDA) and dropping the **end-of-life TensorFlow 2.5** runtime (the
+- **ONNX Runtime** — runs the *same* models through ONNX Runtime on **plain
+  Essentia with no TensorFlow at all**. Two draws: **cross-vendor GPU
+  acceleration** — NVIDIA **CUDA**, AMD **ROCm**, and Apple **CoreML**, not just
+  NVIDIA — and dropping the **end-of-life TensorFlow 2.5** runtime (the
   migration's real motivation). Validated to match the default engine's output
   on real tracks (genre/vocal/mood/BPM/key all match; embedding cosine 0.99942).
+  CUDA is verified on an RTX 4070; ROCm and CoreML are wired but
+  hardware-unverified.
 
 Because the two Essentia builds can't share an environment, ONNX runs in its own
 managed setup. To turn it on: select **ONNX Runtime**, click **Set up ONNX
 engine** (a one-time install of plain Essentia + ONNX Runtime — on Windows this
 is a second WSL venv, `~/.vibechek/venv-onnx`), then **re-analyze your library**
-so every track is scored by the same engine. Switch back any time. Most users can
-leave the default; reach for ONNX if you have a non-NVIDIA GPU or want off TF.
+so every track is scored by the same engine. The installer auto-picks the GPU
+runtime for the hardware it detects (NVIDIA → CUDA, AMD → ROCm, Apple → CoreML);
+**Settings → System** then shows what the ONNX engine actually sees — its device
+and provider, e.g. *"RTX 4070 · CUDA"*. Switch back any time. Most users can leave
+the default; reach for ONNX if you have a non-NVIDIA GPU or want off TF.
 
 ---
 

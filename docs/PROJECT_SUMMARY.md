@@ -37,10 +37,11 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 - **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 44 JSON-RPC
   methods, threadpool dispatch (8 workers) so fast reads interleave with long ops,
   cooperative cancellation, and all the real work (analyzer, tagger, duplicates,
-  organizer, journal, profiles, config, wsl, resources, …). Two beta.8 additions:
-  `cdj_export` (FLAC → AIFF transcode + Rekordbox-XML rewrite for older CDJs, CLI-only)
-  and `onnx_backend` (an opt-in ONNX Runtime inference engine that mirrors
-  `analyzer.load_models`, selected via the `inference_engine` config field).
+  organizer, journal, profiles, config, wsl, resources, …). Two additions from the
+  beta.8 → beta.10 cycle: `cdj_export` (FLAC → AIFF transcode + Rekordbox-XML rewrite
+  for older CDJs, CLI-only) and `onnx_backend` (an opt-in, GPU-accelerated ONNX Runtime
+  inference engine that mirrors `analyzer.load_models`, selected via the
+  `inference_engine` config field).
 - **Auto-generated types:** `scripts/generate_ts_types.py` mirrors Python dataclasses
   into `ui/src/types/generated.ts` so the wire stays type-safe.
 
@@ -57,7 +58,7 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 | **Undo journal** | Organize + dedupe-move write an append-only JSONL journal (one flushed line per move). Partial runs are recoverable; finished runs revert with one click. |
 | **DJ profiles** | One-click setting presets for different workflows. |
 | **FLAC → CDJ export** | `vibechek cdj-export <rekordbox.xml> --out <dir>` transcodes a FLAC library to sample-identical 16-bit **AIFF** and rewrites the Rekordbox XML so beat grids + cues copy across with zero offset math — lets older Pioneer CDJs play a FLAC collection. Strictly additive (sources never touched); never MP3 (its encoder delay shifts the grid). CLI-only; optional `[cdj]` extra (soundfile) with an ffmpeg fallback. |
-| **Inference engine (opt-in ONNX)** | Analysis runs on the bundled essentia-TensorFlow path by default (`inference_engine = "essentia_tf"`). An opt-in **ONNX Runtime** backend (`"onnx"`) runs every neural forward pass off the EOL TF 2.5 runtime with a cross-vendor GPU EP chain (CUDA → ROCm → DirectML → CoreML → CPU); validated to match the TF path end-to-end. Essentia stays for DSP either way. |
+| **Inference engine (opt-in ONNX)** | Analysis runs on the bundled essentia-TensorFlow path by default (`inference_engine = "essentia_tf"`). An opt-in, GPU-accelerated **ONNX Runtime** backend (`"onnx"`) runs every neural forward pass off the EOL TF 2.5 runtime with a cross-vendor GPU EP chain (CUDA → ROCm → CoreML → CPU); validated to match the TF path end-to-end. **NVIDIA CUDA is hardware-validated** (RTX 4070, TF-free); ROCm + CoreML are wired but hardware-unverified. Provisioned via Settings → "Set up ONNX engine" into a separate `~/.vibechek/venv-onnx` (extras `[onnx]` / `[onnx-gpu]`); on Windows it runs inside WSL like the default path. Essentia stays for DSP either way. |
 | **In-app auto-update** | Opt-in `tauri-plugin-updater`: Settings → "Software updates" → check / download / install / relaunch. CI signs artifacts + publishes `latest.json` when a signing key is configured; ships inert until one is enrolled. |
 | **Zero-CLI setup** | Windows auto-installs WSL Ubuntu (UAC) + Essentia and routes analysis through it with transparent path translation; macOS/Linux create a hermetic `~/.vibechek/venv/`. Optional one-click GPU (CUDA pip wheels). |
 
@@ -105,7 +106,7 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 ## Project stats
 
 <!-- These mirror the README stats line (auto-updated by scripts/update_readme_stats.py). -->
-- **665 Python tests**, **44 JSON-RPC methods**, **29 Python modules**
+- **675 Python tests**, **44 JSON-RPC methods**, **29 Python modules**
 - **38 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
 - Production-tested against a ~12,000-track personal DJ library
 

@@ -44,7 +44,8 @@ dependencies = [
 ml = [
     "essentia-tensorflow>=2.1b6.dev1110; platform_system != 'Windows'",
 ]
-# ONNX Runtime inference engine (experimental, TF-free). Runs the SAME models
+# ONNX Runtime inference engine (opt-in, TF-free; default stays essentia_tf).
+# Runs the SAME models
 # through onnxruntime on PLAIN essentia (no bundled TensorFlow) — validated to
 # parity with the [ml] path (docs/ONNX_MIGRATION.md). The desktop app provisions
 # a separate ~/.vibechek/venv-onnx and auto-picks the GPU stack when an NVIDIA

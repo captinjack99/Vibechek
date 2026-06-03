@@ -143,16 +143,24 @@ wsl -d Ubuntu -- bash -lc '
 
 Then set `LD_LIBRARY_PATH` to include the resulting `~/.vibechek/venv/lib/python3.*/site-packages/nvidia/*/lib` directories, or just re-run the GUI "Enable GPU" button and it'll regenerate `cuda-env.sh` for you.
 
-> **Experimental: non-NVIDIA GPUs via ONNX.** The default analysis engine
-> (essentia-tensorflow) only accelerates on NVIDIA/CUDA. An experimental, opt-in
+> **Non-NVIDIA GPUs via ONNX.** The default analysis engine
+> (essentia-tensorflow) only accelerates on NVIDIA/CUDA. The opt-in
 > **ONNX Runtime** engine (Settings → Analysis → Inference engine) runs the same
-> models with cross-vendor GPU support (AMD/Intel/Apple via DirectML/CoreML) on
-> **plain Essentia with no TensorFlow**. Validated to match the default engine.
-> Turn it on in Settings → **Set up ONNX engine** (provisions a separate
-> `~/.vibechek/venv-onnx`). For a manual CLI install: `pip install vibechek[onnx]`
-> (CPU), then optionally `pip install onnxruntime-gpu` (NVIDIA/AMD-ROCm) or
-> `onnxruntime-directml` (Windows any-vendor GPU) to replace the CPU runtime.
+> models with cross-vendor GPU support — NVIDIA **CUDA**, AMD **ROCm**, Apple
+> **CoreML** — on **plain Essentia with no TensorFlow**. Validated to match the
+> default engine (CUDA verified on an RTX 4070; ROCm/CoreML wired but
+> hardware-unverified). Turn it on in Settings → **Set up ONNX engine**: it
+> provisions a separate `~/.vibechek/venv-onnx` (a second WSL venv on Windows) and
+> auto-picks the GPU runtime for your hardware. For a manual CLI install:
+> `pip install vibechek[onnx]` (CPU) or `pip install vibechek[onnx-gpu]`
+> (NVIDIA/CUDA); on AMD Linux the setup uses `onnxruntime-rocm` and on macOS the
+> CoreML provider ships in the base `onnxruntime` wheel. Then
+> `vibechek download-models --engine onnx`.
 > See [docs/ONNX_MIGRATION.md](ONNX_MIGRATION.md).
+>
+> *(Note: on Windows there is no DirectML/Intel path — Essentia has no Windows
+> wheel, so ML always runs in WSL, where the GPU providers are CUDA / ROCm /
+> CoreML.)*
 
 ### Skipping analyze entirely
 
