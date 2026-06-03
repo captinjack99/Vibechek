@@ -61,6 +61,18 @@ and the live GUI (tauri-driver + WebDriver) against a real library.
   fetches a `blob:` URL to decode — but `blob:` was missing from the CSP
   `connect-src`, so the decode fetch was blocked and the player fired neither
   `ready` nor `error`. Added `blob:` to `connect-src`; preview now loads + plays.
+- **A failed model re-download deleted the valid cached model.** `_needs_download`
+  re-fetched a locally-present, SHA-pinned file whenever the mirror's HEAD probe
+  failed (or a same-named file on another mirror had a different size), and the
+  download-failure path then `unlink`ed the existing file — so a transient
+  outage (or the not-yet-hosted ONNX head mirror) DELETED good models. Now a
+  pinned file is verified locally by its hash (no network refetch needed), and a
+  failed download never deletes the existing file (the download streams to a
+  `.partial`). Found driving the ONNX engine, which wiped its staged heads on
+  every analyze; affects the essentia path too under a flaky mirror.
+- **Organize confirm dialog wrongly said "There is no automatic undo"** — organize
+  writes a revertible journal and offers an inline "Undo this organize" button
+  plus Recent-operations revert. Copy corrected.
 
 ---
 

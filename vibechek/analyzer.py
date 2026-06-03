@@ -377,8 +377,10 @@ def download_models(
             except Exception as e:  # noqa: BLE001
                 log.error("Failed to download %s weights: %s", name, e)
                 errors.append(f"{name}.pb: {e}")
-                # Clean up any partial file so a retry doesn't think it's done
-                weights_path.unlink(missing_ok=True)
+                # Do NOT delete weights_path on failure: the download streams to
+                # a `.partial` (cleaned by _do_one_download), so an existing
+                # weights_path is a previously-good cached file — deleting it on
+                # a transient/offline failure destroys valid local models.
                 continue
         # Content-hash check (no-op when MODEL_SHA256[name]["pb"] is unset).
         # Verifies whether we just downloaded OR are reusing a cached file —
@@ -409,7 +411,8 @@ def download_models(
             except Exception as e:  # noqa: BLE001
                 log.error("Failed to download %s metadata: %s", name, e)
                 errors.append(f"{name}.json: {e}")
-                metadata_path.unlink(missing_ok=True)
+                # Keep any existing metadata file — a failed refetch must not
+                # delete a good cached file (the `.partial` is cleaned downstream).
                 # Still record the descriptor — the .pb may be usable without metadata
         # SHA256 for metadata is best-effort: metadata mismatch is far less
         # dangerous than weights mismatch (class labels can drift across model
@@ -462,7 +465,8 @@ def download_models(
             except Exception as e:  # noqa: BLE001
                 log.error("Failed to download EffNet backbone ONNX: %s", e)
                 errors.append(f"{BACKBONE_ONNX_FILENAME}: {e}")
-                onnx_path.unlink(missing_ok=True)
+                # Keep any existing backbone — never delete a good cached file on
+                # a failed download (the `.partial` is cleaned downstream).
         descriptors["effnet_onnx"] = {"weights": str(onnx_path)}
 
         # ---- converted classification heads (.onnx + .json) ----
@@ -498,7 +502,10 @@ def download_models(
                         )
                         if required:
                             errors.append(f"{fname}: {e}")
-                        dest.unlink(missing_ok=True)
+                        # Keep an existing head: the download went to `.partial`
+                        # (cleaned downstream). Deleting `dest` on a failed
+                        # refetch was WIPING valid, locally-present ONNX heads
+                        # whenever the (not-yet-hosted) mirror 404'd.
                         continue
                 if dest.exists():
                     try:
@@ -544,9 +551,11 @@ def _needs_download(path: Path, url: str, expected_sha256: str | None = None) ->
     unconditionally. The resolution depends on whether we have an out-of-band
     integrity check:
 
-      * If a pinned SHA256 exists for this file, return True so it is
-        re-downloaded and then strictly re-verified by `verify_model_sha256` —
-        the only way to be sure an unverifiable-via-HEAD cached file is sound.
+      * If a pinned SHA256 exists for this file, verify the CACHED file against
+        it locally: keep it (return False) when it matches, refetch only on a
+        genuine mismatch. (We must NOT re-download just to re-verify — that
+        fails when the mirror is down / the ONNX heads aren't hosted yet, and
+        the download-failure path must never delete an otherwise-good file.)
       * If no SHA is pinned (the current default — `MODEL_SHA256` is empty),
         keep the size-sane cached file rather than forcing a re-download we
         can't validate anyway; this preserves offline / flaky-network reuse and
@@ -569,25 +578,35 @@ def _needs_download(path: Path, url: str, expected_sha256: str | None = None) ->
         )
         return True
 
+    # A pinned file's integrity is FULLY determined by its content hash — no
+    # network probe is needed or wanted. Verify it locally: a match means the
+    # cached file is sound, so keep it (works offline, when a mirror is down,
+    # and for the not-yet-hosted ONNX heads). Only a genuine hash mismatch
+    # refetches — and even then the download-failure path never deletes the
+    # existing file. This is what stops every ONNX analyze from needlessly
+    # re-fetching (and historically DELETING) valid, locally-present heads, and
+    # avoids false "refetch" when a same-named file on a DIFFERENT mirror (e.g.
+    # essentia's genre_discogs400.json vs our converted head's) has another size.
+    if expected_sha256:
+        try:
+            verify_model_sha256(path, expected_sha256)
+            return False
+        except RuntimeError:
+            log.warning("Cached %s fails its pinned SHA256 — refetching.", path.name)
+            return True
+
+    # Unpinned: fall back to a HEAD completeness probe (server Content-Length).
     try:
         req = urllib.request.Request(url, method="HEAD")
         with urllib.request.urlopen(req, timeout=10) as resp:
             expected = int(resp.headers.get("Content-Length") or 0)
     except Exception as e:  # noqa: BLE001
-        # HEAD failed → completeness is unknown. Re-download ONLY if we can
-        # subsequently verify it via a pinned SHA256; otherwise keep the
-        # size-sane cached file (re-downloading an unverifiable file gains
-        # nothing and breaks offline reuse).
-        if expected_sha256:
-            log.info(
-                "HEAD probe failed for %s (%s) — refetching to re-verify against "
-                "pinned SHA256 (cannot confirm cached %d-byte file otherwise).",
-                url, e, local_size,
-            )
-            return True
+        # HEAD failed for an unpinned file → completeness unknown; keep the
+        # size-sane cached file (a refetch we can't validate gains nothing and
+        # breaks offline reuse).
         log.info(
             "HEAD probe failed for %s (%s) — keeping existing %d-byte local file "
-            "(passed size sanity check; no SHA pin to verify against).",
+            "(size-sane; no SHA pin to verify against).",
             url, e, local_size,
         )
         return False
