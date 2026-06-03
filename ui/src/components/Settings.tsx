@@ -9,6 +9,7 @@ import { AnimatePresence } from "framer-motion";
 
 import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
 import { isCancellation, rpc, sidecarStatus, useSidecarProgress } from "../hooks/useSidecar";
+import { setupOnnxEngine } from "../api/rpc";
 import {
   listProfiles, loadProfile, doctor as runDoctor, verifyModels,
   upgradeVibechekInWSL,
@@ -19,6 +20,7 @@ import { useUpdater } from "../hooks/useUpdater";
 import { ConfirmModal } from "./ConfirmModal";
 import { LogsViewer } from "./LogsViewer";
 import { PreflightDialog } from "./PreflightDialog";
+import { OnnxSetupDialog, type OnnxSetupState } from "./OnnxSetupDialog";
 
 // The workers slider used to cap at sysInfo.cpu_count,
 // which silently truncated a user-set value when sysInfo loaded asynchronously
@@ -126,6 +128,7 @@ export function Settings() {
 
   // ---- Diagnostics & maintenance (doctor / verify_models / upgrade WSL) ----
   const [diagBusy, setDiagBusy] = useState<null | "doctor" | "verify" | "upgrade" | "onnx-setup">(null);
+  const [onnxSetup, setOnnxSetup] = useState<OnnxSetupState>(null);
 
   const handleCopyDiagnostic = async () => {
     setDiagBusy("doctor");
@@ -211,44 +214,33 @@ export function Settings() {
   // tensorflow can't share a venv, so the ONNX engine gets its own. Idempotent
   // — safe to re-run. Routes to the WSL or native installer per analyze_via.
   const handleSetupOnnx = async () => {
-    const via = preflightResult?.analyze_via;
-    // Guard the fast-click race: before the (5-10s) preflight resolves, `via` is
-    // undefined and we'd otherwise fall through to the native installer — which
-    // on Windows errors "Native install not supported on win32". Ask the user to
-    // retry once the probe lands instead of routing to the wrong installer.
-    if (!via) {
-      notify("Still checking your system — try Set up ONNX engine again in a moment.", { kind: "info" });
-      return;
-    }
+    // One self-healing RPC handles everything: stage the bundled converted
+    // heads, install the ONNX engine env if needed, fetch the EffNet backbone,
+    // clean stale files, and verify. It auto-detects WSL vs native + the distro,
+    // so there's no fast-click race to guard. The dialog shows live progress.
     setDiagBusy("onnx-setup");
+    setOnnxSetup({ phase: "running" });
     begin("install-essentia");
     try {
-      let res: { ok?: boolean; error?: string };
-      if (via === "wsl") {
-        const distro = preflightResult?.wsl?.usable_distro;
-        if (!distro) {
-          notify("No usable WSL distro detected — finish the standard WSL setup first.", { kind: "info" });
-          finish();
-          return;
-        }
-        res = await rpc<{ ok?: boolean; error?: string }>(
-          "install_vibechek_in_wsl", { distro, engine: "onnx" });
-      } else {
-        res = await rpc<{ ok?: boolean; error?: string }>(
-          "install_essentia_native", { engine: "onnx" });
-      }
+      const distro = preflightResult?.wsl?.usable_distro;
+      const res = await setupOnnxEngine(distro ? { distro } : {});
       finish();
-      if (res.ok) {
-        notify("ONNX engine ready", {
-          kind: "success",
-          detail: "Plain Essentia + ONNX Runtime installed (no TensorFlow). Re-analyze your library to use it.",
-        });
+      if (res.ready) {
+        setOnnxSetup({ phase: "done", staged: res.staged?.length ?? 0 });
         refreshPreflight();
       } else {
-        notify(`ONNX engine setup failed: ${res.error ?? "unknown error"}`, { kind: "info" });
+        setOnnxSetup({
+          phase: "error",
+          error: (res.reasons_not_ready ?? []).join("; ") || "Setup did not complete.",
+        });
       }
     } catch (e) {
       fail(e);
+      if (!isCancellation(e)) {
+        setOnnxSetup({ phase: "error", error: e instanceof Error ? e.message : String(e) });
+      } else {
+        setOnnxSetup(null);
+      }
     } finally {
       if (isMounted.current) setDiagBusy(null);
     }
@@ -1046,6 +1038,8 @@ export function Settings() {
       </Section>
 
       <LogsViewer open={showLogs} onClose={() => setShowLogs(false)} />
+
+      <OnnxSetupDialog state={onnxSetup} onClose={() => setOnnxSetup(null)} />
 
       <AnimatePresence>
         {showPreflightDialog && preflightResult && (

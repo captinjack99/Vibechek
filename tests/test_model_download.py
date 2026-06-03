@@ -59,11 +59,17 @@ def test_failed_download_does_not_delete_existing_models(tmp_path, monkeypatch) 
     from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME  # noqa: PLC0415
 
     md = tmp_path
-    (md / BACKBONE_ONNX_FILENAME).write_bytes(b"b" * 200_000)
+    # The ONNX engine keeps its files in the dedicated <models>/onnx/ subdir
+    # (analyzer._ONNX_SUBDIR), so seed the fixture THERE — seeding the parent
+    # root would let the assertion pass trivially without exercising the path
+    # download_models actually writes to.
+    onnx_dir = md / analyzer._ONNX_SUBDIR
+    onnx_dir.mkdir()
+    (onnx_dir / BACKBONE_ONNX_FILENAME).write_bytes(b"b" * 200_000)
     for stem in analyzer._ONNX_HEAD_STEMS:
-        (md / f"{stem}.onnx").write_bytes(b"h" * 200_000)
-        (md / f"{stem}.json").write_text('{"classes": ["a", "b"]}', encoding="utf-8")
-    before = sorted(p.name for p in md.glob("*.onnx"))
+        (onnx_dir / f"{stem}.onnx").write_bytes(b"h" * 200_000)
+        (onnx_dir / f"{stem}.json").write_text('{"classes": ["a", "b"]}', encoding="utf-8")
+    before = sorted(p.name for p in onnx_dir.glob("*.onnx"))
     assert before, "fixture should have created .onnx files"
 
     # Force the download path for every file and make every download fail.
@@ -78,8 +84,49 @@ def test_failed_download_does_not_delete_existing_models(tmp_path, monkeypatch) 
     with pytest.raises(RuntimeError):  # it still reports the failures at the end
         analyzer.download_models(md, engine="onnx")
 
-    after = sorted(p.name for p in md.glob("*.onnx"))
+    after = sorted(p.name for p in onnx_dir.glob("*.onnx"))
     assert after == before, (
         "a failed re-download DELETED existing cached models — "
         f"before={before} after={after}"
     )
+
+
+# --- One-click setup: bundled ONNX heads ship in the repo + stage cleanly. ---
+
+
+def test_bundled_onnx_assets_present_in_repo() -> None:
+    """The converted heads must ship inside the package (PyInstaller `datas`
+    plus the source tree) so `setup_onnx_engine` works offline — no mirror."""
+    from vibechek import onnx_backend  # noqa: PLC0415
+
+    src = onnx_backend.bundled_onnx_assets_dir()
+    assert src is not None, "bundled ONNX heads should ship in vibechek/onnx_assets"
+    heads = sorted(p.name for p in src.glob("*.onnx"))
+    assert heads, f"no bundled .onnx heads found in {src}"
+    # The EffNet head set we convert (backbone is fetched separately, not bundled).
+    assert "danceability.onnx" in heads
+
+
+def test_stage_bundled_onnx_heads_copies_into_onnx_subdir(tmp_path) -> None:
+    from vibechek import onnx_backend  # noqa: PLC0415
+
+    res = onnx_backend.stage_bundled_onnx_heads(tmp_path)
+    onnx_dir = tmp_path / "onnx"
+    assert onnx_dir.is_dir(), "must stage into the models/onnx/ subdir"
+    staged = sorted(p.name for p in onnx_dir.glob("*.onnx"))
+    assert staged, "no heads staged"
+    assert res["staged"], f"helper reported nothing staged: {res}"
+    # Subdir keeps converted-head JSONs away from essentia's same-named .json.
+    assert "danceability.onnx" in staged
+
+
+def test_stage_bundled_onnx_heads_cleans_partial_leftovers(tmp_path) -> None:
+    """A previously-aborted download leaves `*.partial` turds; staging must
+    sweep them so a half-written file can't be mistaken for a real model."""
+    from vibechek import onnx_backend  # noqa: PLC0415
+
+    onnx_dir = tmp_path / "onnx"
+    onnx_dir.mkdir()
+    (onnx_dir / "danceability.onnx.partial").write_bytes(b"junk")
+    onnx_backend.stage_bundled_onnx_heads(tmp_path)
+    assert not list(onnx_dir.glob("*.partial")), "stale .partial files not cleaned"

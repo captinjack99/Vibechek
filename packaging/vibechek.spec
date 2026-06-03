@@ -45,9 +45,16 @@ in `.github/workflows/release.yml`), SmartScreen warnings go away after the
 publisher reputation builds.
 """
 
+import os
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
+
+# PyInstaller resolves relative `datas` source paths against the SPEC file's
+# directory (packaging/), not the CWD — so compute the repo root explicitly.
+# SPECPATH is injected by PyInstaller and is the directory holding this spec.
+_REPO_ROOT = os.path.dirname(SPECPATH)
 
 # Mutagen ships pure-Python; no special data files. Rich bundles some color
 # themes we want to keep accessible.
@@ -61,6 +68,13 @@ hiddenimports = [
 
 datas = []
 datas += collect_data_files("rich")
+# Bundle the converted ONNX classification heads (~5 MB) so the ONNX engine
+# works without downloading the (unhosted) heads — only the official EffNet
+# backbone is fetched from essentia. onnx_backend.bundled_onnx_assets_dir()
+# reads them from <_MEIPASS>/onnx_assets at runtime; the setup flow copies them
+# into <models>/onnx/. Source path is made absolute (relative paths resolve
+# against the spec dir, not the repo root).
+datas += [(os.path.join(_REPO_ROOT, "vibechek", "onnx_assets"), "onnx_assets")]
 
 a = Analysis(
     ["entrypoint.py"],

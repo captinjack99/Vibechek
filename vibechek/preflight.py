@@ -15,7 +15,7 @@ import platform
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from vibechek.analyzer import _ONNX_HEAD_STEMS, MODELS
+from vibechek.analyzer import _ONNX_HEAD_STEMS, _ONNX_SUBDIR, MODELS
 from vibechek.config import MODELS_DIR
 from vibechek.native_install import NativeVenvStatus, probe_native_venv
 from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
@@ -127,12 +127,15 @@ def _model_files_for_engine(
     doesn't block readiness — matching onnx_backend's loader.
     """
     if engine == "onnx":
+        # ONNX models live in their own subdir (see analyzer._ONNX_SUBDIR) so
+        # they never collide with the essentia `.pb` set in the parent dir.
+        onnx_target = target / _ONNX_SUBDIR
         items: list[tuple[str, Path, Path | None, bool]] = [
-            ("effnet (onnx backbone)", target / BACKBONE_ONNX_FILENAME, None, True),
+            ("effnet (onnx backbone)", onnx_target / BACKBONE_ONNX_FILENAME, None, True),
             # Genre comes from the backbone, so the genre_discogs400.onnx HEAD is
             # optional — but its 400 class LABELS (genre_discogs400.json) are
             # REQUIRED, else the engine loads "ready" yet emits no genre.
-            ("genre_discogs400 classes", target / "genre_discogs400.json", None, True),
+            ("genre_discogs400 classes", onnx_target / "genre_discogs400.json", None, True),
         ]
         for stem in _ONNX_HEAD_STEMS:
             if stem == "genre_discogs400":
@@ -140,7 +143,7 @@ def _model_files_for_engine(
             # Non-genre head .onnx are required; their tiny class-label .json is
             # best-effort (not coupled here, so a missing label file doesn't
             # block readiness).
-            items.append((stem, target / f"{stem}.onnx", None, True))
+            items.append((stem, onnx_target / f"{stem}.onnx", None, True))
         return items
     return [
         (name, target / f"{name}.pb", target / f"{name}.json", True)

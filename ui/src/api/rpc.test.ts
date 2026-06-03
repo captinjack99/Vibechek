@@ -59,6 +59,7 @@ const PYTHON_METHODS = [
   "restore_tags",
   "restore_tags_with_remap",
   "download_models",
+  "setup_onnx_engine",
   "get_config",
   "save_config",
   "restore_default_config",

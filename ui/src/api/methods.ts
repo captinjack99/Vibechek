@@ -82,6 +82,7 @@ export const RPC_METHODS = [
   "restore_tags_with_remap",
   // models
   "download_models",
+  "setup_onnx_engine",
   "verify_models",
   // config
   "get_config",
@@ -350,6 +351,25 @@ export interface DownloadModelsRequest {
 export interface DownloadModelsResult {
   models_dir: string;
   models: string[];
+}
+
+/** Optional WSL distro override for `setup_onnx_engine` (Windows only). */
+export interface SetupOnnxEngineRequest {
+  distro?: string;
+}
+
+/** Result of the one-click, self-healing ONNX engine setup. */
+export interface SetupOnnxEngineResult {
+  ok: boolean;
+  ready: boolean;
+  /** Bundled head files copied into <models>/onnx (e.g. "danceability.onnx"). */
+  staged: string[];
+  /** Where the bundled heads were staged from (a _MEIPASS dir when frozen). */
+  bundle_source: string | null;
+  /** Preflight reasons the engine still isn't ready (empty when ready). */
+  reasons_not_ready: string[];
+  /** "wsl" | "native" — how analyze will route once ready. */
+  analyze_via: string;
 }
 
 // --- config ---
