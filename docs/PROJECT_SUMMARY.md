@@ -8,7 +8,7 @@ preserving Rekordbox cue points and beat grids. It runs entirely on your machine
 no account, no telemetry, no upload. Free forever under **AGPL-3.0**.
 
 - **Repo:** https://github.com/papapew/Vibechek
-- **Current version:** `v0.4.0-beta.9` (public beta)
+- **Current version:** `v0.4.0-beta.10` (public beta)
 - **Platforms:** Windows, macOS, Linux (desktop app + CLI)
 
 > This is the living project summary. For release history see [CHANGELOG.md](../CHANGELOG.md).
