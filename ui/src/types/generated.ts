@@ -40,6 +40,8 @@ export interface AnalysisConfig {
   use_gpu: string;
   hybrid_cpu_gpu: boolean;
   inference_engine: string;
+  genre_source_policy: string;
+  genre_ml_override_confidence: number;
 }
 
 export interface DuplicateConfig {

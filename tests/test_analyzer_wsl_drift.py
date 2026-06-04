@@ -154,36 +154,57 @@ def _stub_preflight(version: str | None) -> MagicMock:
     return pf
 
 
-def test_drift_guard_raises_when_wsl_version_lags_sidecar(
+def test_drift_auto_updates_wsl_in_place_then_analyzes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The user's 2026-05-18 case: WSL has 0.1.0-dev, sidecar has 0.4.0-beta.2."""
-    # Pretend the sidecar identifies as beta.2 — pin the constant so the test
-    # doesn't break the next time the real __version__ bumps.
-    # Patch the source-of-truth on the `vibechek` package, since
-    # _analyze_via_wsl does `from vibechek import __version__` at call time.
+    """When the WSL install lags the sidecar, analyze AUTO-UPDATES it in place
+    (engine-aware) and then proceeds — instead of aborting and making the user
+    re-run setup. (Old behavior raised "out of date".)"""
     import vibechek as _vibechek  # noqa: PLC0415
-    monkeypatch.setattr(_vibechek, "__version__", "0.4.0-beta.2", raising=False)
+    monkeypatch.setattr(_vibechek, "__version__", "0.5.0-beta", raising=False)
 
-    with patch("vibechek.preflight.preflight", return_value=_stub_preflight("0.1.0-dev")):
+    (tmp_path / "x.flac").write_bytes(b"\x00")
+    output = tmp_path / "out.json"
+    output.write_text('{"tracks": [], "status": "complete", "summary": {}}', encoding="utf-8")
+    fake_run = MagicMock(returncode=0, stdout="", stderr="")
+    fake_upgrade = MagicMock(return_value={"ok": True})
+
+    with patch("vibechek.preflight.preflight", return_value=_stub_preflight("0.1.0-dev")), \
+         patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]), \
+         patch("vibechek.wsl.upgrade_vibechek_in_wsl", fake_upgrade), \
+         patch("vibechek.wsl.run_vibechek_in_wsl", return_value=fake_run), \
+         patch("vibechek.wsl.win_to_wsl_path", side_effect=lambda s: s), \
+         patch("vibechek.wsl.wsl_to_win_path", side_effect=lambda s: s):
         from vibechek.config import AnalysisConfig
-        # Provide one fake audio file so we get past the empty-library early
-        # return that would short-circuit before the WSL dispatch.
-        (tmp_path / "x.flac").write_bytes(b"\x00")
-        with patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]):
-            with pytest.raises(RuntimeError, match="out of date") as exc:
-                analyzer.analyze_directory(
-                    tmp_path,
-                    config=AnalysisConfig(workers=1, use_gpu="off"),
-                )
-    # The remediation pointer must name an RPC that actually exists. It used to
-    # say `repair_wsl_install`, which is not in rpc.METHODS — a dead end for any
-    # caller who tried to act on it.
-    msg = str(exc.value)
-    assert "upgrade_vibechek_in_wsl" in msg
-    assert "repair_wsl_install" not in msg
-    from vibechek import rpc
-    assert "upgrade_vibechek_in_wsl" in rpc.METHODS
+        # Must NOT raise — the drift is auto-healed, not surfaced as an error.
+        report = analyzer.analyze_directory(
+            tmp_path,
+            config=AnalysisConfig(workers=1, use_gpu="off", inference_engine="essentia_tf"),
+            output_path=output,
+        )
+
+    # Auto-update fired exactly once, engine-aware, then analyze proceeded.
+    assert fake_upgrade.call_count == 1
+    assert fake_upgrade.call_args.kwargs.get("engine") == "essentia_tf"
+    assert report.get("status") == "complete"
+
+
+def test_drift_auto_update_failure_surfaces_clean_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the in-place update itself fails, surface a clear repair error."""
+    import vibechek as _vibechek  # noqa: PLC0415
+    monkeypatch.setattr(_vibechek, "__version__", "0.5.0-beta", raising=False)
+    (tmp_path / "x.flac").write_bytes(b"\x00")
+    with patch("vibechek.preflight.preflight", return_value=_stub_preflight("0.1.0-dev")), \
+         patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]), \
+         patch("vibechek.wsl.upgrade_vibechek_in_wsl",
+               return_value={"ok": False, "error": "pip failed"}):
+        from vibechek.config import AnalysisConfig
+        with pytest.raises(RuntimeError, match="update.*failed|out of date"):
+            analyzer.analyze_directory(
+                tmp_path, config=AnalysisConfig(workers=1, use_gpu="off"),
+            )
 
 
 def test_drift_guard_silent_when_versions_match(

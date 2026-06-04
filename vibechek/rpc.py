@@ -338,6 +338,9 @@ def _analyze_directory(params: dict) -> dict:
         # analyze time (and an onnx-only install fails: wrong venv). The GUI
         # sends this from the config store; default keeps the TF path.
         inference_engine=_valid_engine(params.get("inference_engine")),
+        # Existing-tag vs ML genre reconciliation policy (see AnalysisConfig).
+        # Validated so a bad value can't silently disable reconciliation.
+        genre_source_policy=_valid_genre_policy(params.get("genre_source_policy")),
     )
     if "models_dir" in params and params["models_dir"]:
         config.models_dir = Path(params["models_dir"])
@@ -440,6 +443,11 @@ def _install_wsl(params: dict) -> dict:
 def _valid_engine(value: Any, default: str = "essentia_tf") -> str:
     """Whitelist the inference-engine name before it steers install/venv logic."""
     return value if value in ("essentia_tf", "onnx") else default
+
+
+def _valid_genre_policy(value: Any, default: str = "prefer_tag") -> str:
+    """Whitelist the existing-tag-vs-ML genre reconciliation policy."""
+    return value if value in ("prefer_tag", "prefer_ml", "tag_only", "ml_only") else default
 
 
 def _install_vibechek_in_wsl(params: dict) -> dict:

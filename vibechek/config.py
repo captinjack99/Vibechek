@@ -69,6 +69,20 @@ class AnalysisConfig:
     # the DSP (decode, melspec, BPM, key) under either engine.
     inference_engine: str = "essentia_tf"  # "essentia_tf" | "onnx"
 
+    # ----- Existing-tag vs ML reconciliation (genre/BPM/key) ----------------
+    # Many libraries already carry curated genre tags (e.g. Beatport downloads)
+    # that are far more accurate than an audio-only guess — BUT some tags are
+    # generic junk ("Dance/Pop", "Electronic") or plain wrong, so we must not
+    # trust them blindly. `genre_source_policy` controls reconciliation:
+    #   "prefer_tag" (default): use a SPECIFIC existing genre tag; fall back to
+    #       ML when the tag is missing or a generic bucket; let ML override only
+    #       when it both disagrees AND clears `genre_ml_override_confidence`.
+    #   "prefer_ml": use ML; fall back to a specific tag only when ML is weak.
+    #   "tag_only": always keep a specific existing tag (never let ML override).
+    #   "ml_only": ignore existing tags entirely (pure audio — legacy behavior).
+    genre_source_policy: str = "prefer_tag"
+    genre_ml_override_confidence: float = 0.90
+
 
 @dataclass
 class TaggingConfig:
