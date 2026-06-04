@@ -2342,7 +2342,10 @@ def analyze_directory(
                     except OSError as e:
                         log.warning("Partial checkpoint write failed (continuing): %s", e)
 
-    report = _build_report(results, total, in_progress=False)
+    report = _build_report(
+        results, total, in_progress=False,
+        genre_policy=(config.genre_source_policy, config.genre_ml_override_confidence),
+    )
     if output_path:
         # Atomic write — a kill/power-loss/disk-full mid-write must not
         # truncate the report (which can represent 30+ min of GPU time).
@@ -2472,6 +2475,7 @@ def _analyze_via_native_venv(
         "--gpu", config.use_gpu,
         "--models-dir", str(config.models_dir),
         "--engine", config.inference_engine,
+        "--genre-policy", config.genre_source_policy,
     ]
     if workers > 0:
         args += ["--workers", str(workers)]
@@ -2575,6 +2579,7 @@ def _analyze_via_wsl(
         "--gpu", config.use_gpu,
         "--models-dir", wsl_models_dir,
         "--engine", config.inference_engine,
+        "--genre-policy", config.genre_source_policy,
     ]
     if workers > 0:
         args += ["--workers", str(workers)]
@@ -2651,19 +2656,36 @@ def _analyze_via_wsl(
     # analyze on a flaky detection.
     if wsl_vibechek_version is not None:
         from vibechek import __version__ as _sidecar_version  # noqa: PLC0415
-        # Block ONLY when the WSL install is strictly older — a newer WSL venv
-        # (user upgraded it ahead of the desktop app) is fine and must not be
-        # rejected.
+        # Auto-update IN PLACE when the WSL install is strictly older than the
+        # sidecar. The WSL analyzer must always match the app so new flags +
+        # safety patches (worker-cap, stall-watchdog, genre reconciliation, …)
+        # Just Work — we update transparently instead of either aborting on an
+        # unknown flag or silently degrading. A NEWER WSL venv (user upgraded
+        # ahead of the app) is left alone. Fast path: vibechek package only,
+        # targeting the engine's venv; clear error only if the update fails.
         if _wsl_install_is_outdated(wsl_vibechek_version, _sidecar_version):
-            raise RuntimeError(
-                f"WSL vibechek is out of date: {distro} has "
-                f"{wsl_vibechek_version}, sidecar is {_sidecar_version}. "
-                f"Run Settings → \"Update WSL install\" (or re-run \"Set up "
-                f"WSL\"); the RPC is `upgrade_vibechek_in_wsl`. That brings the "
-                f"WSL analyzer up to this app's version (worker-cap + "
-                f"stall-watchdog patches). Older WSL installs crash silently on "
-                f"multi-worker analyze."
+            from vibechek.wsl import upgrade_vibechek_in_wsl  # noqa: PLC0415
+            log.info(
+                "WSL vibechek %s < sidecar %s — auto-updating in place (engine=%s)",
+                wsl_vibechek_version, _sidecar_version, config.inference_engine,
             )
+            report_progress(
+                on_progress, 0, 0,
+                f"Updating the analysis engine in {distro} to "
+                f"{_sidecar_version} (one-time)…",
+            )
+            up = upgrade_vibechek_in_wsl(
+                distro, on_progress=on_progress, engine=config.inference_engine,
+            )
+            if up.get("cancelled"):
+                raise cancellation.CancelledError("Analysis cancelled by user")
+            if not up.get("ok"):
+                raise RuntimeError(
+                    f"WSL vibechek was out of date ({wsl_vibechek_version} < "
+                    f"{_sidecar_version}) and the automatic in-place update "
+                    f"failed: {up.get('error', 'unknown error')}. Re-run "
+                    f"Settings → \"Set up WSL\" to repair it."
+                )
 
     result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir)
 
@@ -2738,7 +2760,55 @@ def _write_partial(output_path: Path, results: list[dict[str, Any]], total: int,
     )
 
 
-def _build_report(results: list[dict[str, Any]], total: int, in_progress: bool) -> dict[str, Any]:
+def _reconcile_record_genre(
+    r: dict[str, Any], policy: str, override_conf: float,
+) -> None:
+    """Reconcile one record's ML genre with its existing tag, in place.
+
+    Keeps the pure-audio read in `ml_genre_audio`/`ml_subgenre_audio` and sets
+    `ml_genre`/`ml_subgenre` to the effective (reconciled) value plus
+    `ml_genre_source` ("tag"|"ml"|"ml_override") and `ml_genre_conflict`.
+    Idempotent: always re-derives from the stashed audio values, so re-running
+    with a different policy is correct. See genres.reconcile_genre +
+    AnalysisConfig.genre_source_policy.
+    """
+    ml = r.get("ml_analysis")
+    if not ml:
+        return
+    audio_genre = ml.get("ml_genre_audio", ml.get("ml_genre"))
+    audio_sub = ml.get("ml_subgenre_audio", ml.get("ml_subgenre"))
+    if not audio_genre:
+        return
+    from vibechek.genres import reconcile_genre  # noqa: PLC0415
+
+    tag = (r.get("existing_tags") or {}).get("genre")
+    rec = reconcile_genre(
+        audio_genre, audio_sub or "",
+        ml.get("ml_genre_raw_confidence") or ml.get("ml_genre_confidence") or 0.0,
+        tag, policy, override_conf,
+    )
+    ml["ml_genre_audio"] = audio_genre
+    ml["ml_subgenre_audio"] = audio_sub
+    ml["ml_genre"] = rec.genre
+    ml["ml_subgenre"] = rec.subgenre
+    ml["ml_genre_source"] = rec.source
+    ml["ml_genre_conflict"] = rec.conflict
+    if rec.source != "ml":
+        ml["ml_genre_confidence"] = round(rec.confidence, 3)
+
+
+def _build_report(
+    results: list[dict[str, Any]], total: int, in_progress: bool,
+    genre_policy: tuple[str, float] = ("prefer_tag", 0.90),
+) -> dict[str, Any]:
+    # Reconcile ML genre against existing tags on the FINAL report only (partial
+    # checkpoints stay raw-ML — they're transient). _reconcile_record_genre is
+    # idempotent, so the final pass produces the configured result regardless.
+    if not in_progress:
+        pol, override = genre_policy
+        for r in results:
+            _reconcile_record_genre(r, pol, override)
+
     genres: dict[str, int] = defaultdict(int)
     energies: dict[int, int] = defaultdict(int)
     timeslots: dict[str, int] = defaultdict(int)

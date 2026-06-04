@@ -509,6 +509,8 @@ export function LibraryBrowser() {
         // Critical: route to the SELECTED engine. Without this the sidecar
         // defaults to essentia_tf, so the ONNX toggle is inert at analyze time.
         inference_engine: analysisCfg.inference_engine,
+        // How to reconcile an existing genre tag with the ML read.
+        genre_source_policy: analysisCfg.genre_source_policy,
         skip_paths: alreadyAnalyzed,
         // Forwarded for forward-compat / debugging; the current sidecar ignores
         // unknown params. The authoritative guard is the frontend run token.

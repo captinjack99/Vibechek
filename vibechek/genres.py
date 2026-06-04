@@ -247,13 +247,112 @@ def get_best_genre(
     )
 
 
+# ---------------------------------------------------------------------------
+# Existing-tag vs ML reconciliation
+# ---------------------------------------------------------------------------
+
+# Generic / low-quality genre tags that must NOT be trusted over the audio model
+# — these are the "notoriously bad" Beatport broad buckets and catch-alls. A tag
+# in this set is treated as "no usable tag" so ML decides.
+_GENERIC_GENRE_TAGS: frozenset[str] = frozenset({
+    "", "unknown", "other", "others", "misc", "miscellaneous", "various",
+    "electronic", "electronica", "dance", "dance/electronic", "dance / electronic",
+    "dance/pop", "dance / pop", "dance/electronica", "dance / electronica",
+    "edm", "club", "club/dance", "pop", "music", "untagged", "no genre",
+})
+
+
+def is_specific_genre(tag: str | None) -> bool:
+    """True if `tag` is a usable, specific genre (not a generic bucket / junk)."""
+    if not tag:
+        return False
+    return tag.strip().lower() not in _GENERIC_GENRE_TAGS
+
+
+def split_tag_genre(tag: str) -> tuple[str, str]:
+    """Split an existing genre tag into (parent_genre, subgenre) using the
+    hierarchy. 'Tech House' -> ('House', 'Tech House'); an unknown modern genre
+    -> (tag, tag) so we still surface the specific label."""
+    t = (tag or "").strip()
+    canon = DJ_GENRE_MAP.get(t, t)
+    if canon in SUBGENRE_TO_PARENT:
+        parent = SUBGENRE_TO_PARENT[canon]
+        return DJ_GENRE_MAP.get(parent, parent), canon
+    return canon, canon
+
+
+def _genre_conflicts(tag: str, ml_genre: str, ml_subgenre: str) -> bool:
+    """True if the existing tag and the ML read are NOT the same genre family."""
+    tag_parent, tag_sub = split_tag_genre(tag)
+    if tag_sub in (ml_subgenre, ml_genre) or tag_parent in (ml_genre, ml_subgenre):
+        return False
+    return True
+
+
+@dataclass
+class ReconciledGenre:
+    genre: str
+    subgenre: str
+    confidence: float
+    source: str          # "tag" | "ml" | "ml_override"
+    conflict: bool       # tag and ML disagreed (informational / for review)
+
+
+def reconcile_genre(
+    ml_genre: str,
+    ml_subgenre: str,
+    ml_raw_confidence: float,
+    existing_tag: str | None,
+    policy: str = "prefer_tag",
+    ml_override_confidence: float = 0.90,
+) -> ReconciledGenre:
+    """Reconcile an existing genre tag with the ML read per `policy`.
+
+    Trusts SPECIFIC existing tags by default (they're usually curated/Beatport),
+    ignores generic junk tags, and lets a confident, disagreeing ML read
+    override. Pure + fully unit-testable; see AnalysisConfig.genre_source_policy.
+    """
+    tag = (existing_tag or "").strip()
+    specific = is_specific_genre(tag)
+
+    # No usable tag, or pure-ML mode → ML.
+    if policy == "ml_only" or not specific:
+        return ReconciledGenre(ml_genre, ml_subgenre, ml_raw_confidence, "ml", False)
+
+    tag_parent, tag_sub = split_tag_genre(tag)
+    conflict = _genre_conflicts(tag, ml_genre, ml_subgenre)
+
+    if policy == "tag_only":
+        return ReconciledGenre(tag_parent, tag_sub, 1.0, "tag", conflict)
+
+    if policy == "prefer_ml":
+        # ML wins unless it's weak, then defer to the specific tag.
+        if ml_raw_confidence is not None and ml_raw_confidence < 0.5:
+            return ReconciledGenre(tag_parent, tag_sub, 0.99, "tag", conflict)
+        return ReconciledGenre(ml_genre, ml_subgenre, ml_raw_confidence, "ml", conflict)
+
+    # "prefer_tag" (default): trust the specific tag; ML overrides ONLY when it
+    # both disagrees and is very confident (the tag is probably wrong).
+    if (
+        conflict
+        and ml_raw_confidence is not None
+        and ml_raw_confidence >= ml_override_confidence
+    ):
+        return ReconciledGenre(ml_genre, ml_subgenre, ml_raw_confidence, "ml_override", True)
+    return ReconciledGenre(tag_parent, tag_sub, 0.99, "tag", conflict)
+
+
 __all__ = [
     "GENRE_HIERARCHY",
     "SUBGENRE_TO_PARENT",
     "DJ_GENRE_MAP",
     "GenrePrediction",
     "GenreResult",
+    "ReconciledGenre",
     "UNKNOWN",
     "parse_discogs_genre",
     "get_best_genre",
+    "is_specific_genre",
+    "split_tag_genre",
+    "reconcile_genre",
 ]

@@ -649,6 +649,31 @@ export function Settings() {
           </Hint>
         </Field>
 
+        <Field label="Genre source (existing tag vs ML)">
+          <select
+            className="input"
+            value={cfg.analysis.genre_source_policy}
+            onChange={(e) =>
+              updateAnalysis({
+                genre_source_policy: e.target.value as
+                  | "prefer_tag" | "prefer_ml" | "tag_only" | "ml_only",
+              })
+            }
+          >
+            <option value="prefer_tag">Prefer existing tag (recommended)</option>
+            <option value="prefer_ml">Prefer ML analysis</option>
+            <option value="tag_only">Existing tag only (never override)</option>
+            <option value="ml_only">ML only (ignore existing tags)</option>
+          </select>
+          <Hint>
+            Many libraries (e.g. Beatport downloads) already carry accurate genre
+            tags. <strong>Prefer existing tag</strong> trusts a <em>specific</em>{" "}
+            existing genre and uses ML only to fill gaps or override when it's very
+            confident and disagrees — generic junk tags ("Dance/Pop", "Electronic")
+            are ignored in favor of ML. <strong>ML only</strong> is pure audio.
+          </Hint>
+        </Field>
+
         <Field label="Models directory">
           <div className="flex gap-2">
             <input

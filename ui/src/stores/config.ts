@@ -28,6 +28,8 @@ const DEFAULT_CONFIG: VibechekConfig = {
     use_gpu: "auto",
     hybrid_cpu_gpu: true,
     inference_engine: "essentia_tf",
+    genre_source_policy: "prefer_tag",
+    genre_ml_override_confidence: 0.9,
   },
   tagging: {
     genre_confidence_threshold: 0.85,

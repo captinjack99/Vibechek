@@ -132,13 +132,20 @@ def main() -> None:
               default="essentia_tf", show_default=True,
               help="Inference engine: essentia_tf (bundled TensorFlow, NVIDIA-only "
                    "GPU) or onnx (TF-free ONNX Runtime, cross-vendor GPU).")
+@click.option("--genre-policy",
+              type=click.Choice(["prefer_tag", "prefer_ml", "tag_only", "ml_only"]),
+              default="prefer_tag", show_default=True,
+              help="Reconcile an existing genre tag with the ML read: prefer_tag "
+                   "(trust a specific existing tag, ML fills gaps + can override if "
+                   "very confident), prefer_ml, tag_only, or ml_only (pure audio).")
 def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
-            output: Path, models_dir: Path | None, hybrid: bool, engine: str) -> None:
+            output: Path, models_dir: Path | None, hybrid: bool, engine: str,
+            genre_policy: str) -> None:
     """Analyze every audio file under PATH with the ML models."""
     from vibechek.analyzer import analyze_directory
 
     config = AnalysisConfig(workers=workers, use_gpu=gpu, hybrid_cpu_gpu=hybrid,
-                            inference_engine=engine)
+                            inference_engine=engine, genre_source_policy=genre_policy)
     if models_dir:
         config.models_dir = models_dir
 

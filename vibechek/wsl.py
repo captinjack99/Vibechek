@@ -1705,11 +1705,19 @@ def install_vibechek_in_wsl(
 # but stuck on an older code revision, so we just bump the package and skip
 # the 5-10 minute essentia re-download. The full bootstrap remains the
 # correct entry for cold installs.
-_VIBECHEK_UPGRADE = r"""
+def _vibechek_upgrade_script(venv_subdir: str = "venv") -> str:
+    """Fast vibechek-package-only upgrade script for `~/.vibechek/<venv_subdir>`.
+
+    `venv_subdir` is "venv" (essentia-tensorflow engine) or "venv-onnx" (the
+    TF-free ONNX engine) so the auto-update targets whichever venv the analyze
+    will actually use.
+    """
+    return f"""
 set -e
 
-if [ ! -x "$HOME/.vibechek/venv/bin/pip" ]; then
-    echo "ERROR: $HOME/.vibechek/venv is missing — run the full WSL setup first" >&2
+VENV="$HOME/.vibechek/{venv_subdir}"
+if [ ! -x "$VENV/bin/pip" ]; then
+    echo "ERROR: $VENV is missing — run the full WSL setup first" >&2
     exit 2
 fi
 
@@ -1718,19 +1726,24 @@ echo "[1/1] Upgrading vibechek package (essentia + apt unchanged)..."
 # resolver sees the existing version as satisfying ">=" requirements. --no-deps
 # keeps us from touching essentia/numpy/tensorflow, which is the whole point
 # of the fast path.
-"$HOME/.vibechek/venv/bin/pip" install --upgrade --force-reinstall --no-deps --quiet \
+"$VENV/bin/pip" install --upgrade --force-reinstall --no-deps --quiet \
     git+https://github.com/papapew/Vibechek.git
 
 echo "DONE"
-"$HOME/.vibechek/venv/bin/vibechek" --version
+"$VENV/bin/vibechek" --version
 """
 
 
 def upgrade_vibechek_in_wsl(
     distro: str,
     on_progress: ProgressCallback | None = None,
+    engine: str = "essentia_tf",
 ) -> dict:
     """Re-install vibechek inside `distro` from GitHub, skipping apt + essentia.
+
+    `engine` selects the venv to upgrade: "essentia_tf" → ~/.vibechek/venv,
+    "onnx" → ~/.vibechek/venv-onnx (so auto-update targets the venv the analyze
+    actually uses).
 
     This is the fast repair path for version drift: when the sidecar is on
     v0.4.0-beta.3 but the WSL install is stuck on v0.4.0-beta.1, the user can
@@ -1762,7 +1775,8 @@ def upgrade_vibechek_in_wsl(
         f"vibechek-wsl-upgrade-pid-{os.getpid()}.txt"
     )
     wsl_token = win_to_wsl_path(str(token_file))
-    inner_script = _stage_script_for_wsl(_VIBECHEK_UPGRADE)
+    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    inner_script = _stage_script_for_wsl(_vibechek_upgrade_script(venv_subdir))
     inner_wsl = win_to_wsl_path(str(inner_script))
     launcher = (
         "#!/usr/bin/env bash\n"
