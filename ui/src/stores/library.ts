@@ -10,6 +10,7 @@ import { create } from "zustand";
 
 import type { TrackAnalysis } from "../types";
 import { useUIStore } from "./ui";
+import { usePlayerStore } from "./player";
 
 /**
  * Identity of the analyze run currently authorized to live-merge streamed
@@ -182,6 +183,16 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const ui = useUIStore.getState();
     const movedSel = ui.selectedTrackPath ? lookup.get(ui.selectedTrackPath) : undefined;
     if (movedSel && movedSel !== ui.selectedTrackPath) ui.setSelectedTrack(movedSel);
+
+    // Follow the moved track in the global audio player too. The player keeps
+    // its own `path` (set by play()), and nothing else touches it on a move —
+    // so after an organize relocates the loaded track, Play/Restart would call
+    // WaveSurfer.load() against the now-nonexistent source and error/time out.
+    // Rewrite it to the new location, preserving title + playToken so the bar's
+    // identity (and the isCurrent check) stays in sync.
+    const player = usePlayerStore.getState();
+    const movedPlay = player.path ? lookup.get(player.path) : undefined;
+    if (movedPlay && movedPlay !== player.path) usePlayerStore.setState({ path: movedPlay });
   },
 
   toggleSelect: (path) => {

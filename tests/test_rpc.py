@@ -799,6 +799,20 @@ def test_new_rpc_methods_are_not_cancellable(rpc_server) -> None:
     assert "count_new_tracks" not in rpc._CANCELLABLE_METHODS
 
 
+def test_handle_duplicates_is_cancellable(rpc_server) -> None:
+    """handle_duplicates physically moves/trashes files and its loops call
+    cancellation.check(). Those checks are inert unless the dispatcher begins a
+    cancellation kind for the method — so the Cancel button on a destructive
+    bulk move/trash only works if handle_duplicates is registered cancellable
+    with a kind distinct from find_duplicates' 'dedupe' (so the busy/lock
+    messaging is accurate).
+    """
+    assert "handle_duplicates" in rpc._CANCELLABLE_METHODS
+    assert rpc._CANCELLABLE_METHODS["handle_duplicates"] != rpc._CANCELLABLE_METHODS[
+        "find_duplicates"
+    ]
+
+
 def test_long_op_lock_rejects_concurrent_cancellable_ops(rpc_server) -> None:
     """Two cancellable ops at once must NOT both grab the
     cancellation singleton. The second must get a clean 'busy' error
@@ -835,3 +849,330 @@ def test_long_op_lock_rejects_concurrent_cancellable_ops(rpc_server) -> None:
         assert "result" in resp1
     finally:
         rpc.METHODS["download_models"] = orig_handler
+
+
+# ---------------------------------------------------------------------------
+# Non-dict params → clean INVALID_PARAMS (not a traceback APP_ERROR)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_params", [["not", "a", "dict"], "hello", 42, 3.14, True])
+def test_non_dict_params_returns_invalid_params_not_apperror(rpc_server, bad_params) -> None:
+    """A request whose `params` is a non-object (array/string/number) used to
+    reach `params.get(...)` → AttributeError, which is NOT in the
+    (TypeError, KeyError, ValueError) branch, so it fell through to APP_ERROR
+    (-32000) carrying a full traceback (and absolute filesystem paths). The
+    dispatch seam now rejects a non-dict params with a clean INVALID_PARAMS and
+    no traceback, before any handler or cancellation state is touched.
+    """
+    stdin, stdout = rpc_server
+    stdin.write_line({
+        "jsonrpc": "2.0", "id": "npd1", "method": "find_duplicates",
+        "params": bad_params,
+    })
+    resp = _wait_for_response(stdout, "npd1")
+    assert "error" in resp
+    assert resp["error"]["code"] == rpc.INVALID_PARAMS
+    assert "data" not in resp["error"], "no scary traceback should be attached"
+
+
+def test_non_dict_params_does_not_toggle_cancellation(rpc_server) -> None:
+    """The params-shape rejection must run BEFORE the cancellable begin()/end()
+    block, so a malformed cancellable request never leaves the cancellation
+    singleton in a 'busy' state that would block real ops.
+    """
+    from vibechek import cancellation
+
+    stdin, stdout = rpc_server
+    # analyze_directory is cancellable; send it a non-dict params.
+    stdin.write_line({
+        "jsonrpc": "2.0", "id": "npd2", "method": "analyze_directory",
+        "params": "oops",
+    })
+    resp = _wait_for_response(stdout, "npd2")
+    assert resp["error"]["code"] == rpc.INVALID_PARAMS
+    # The singleton must be clear — no op was begun for the rejected request.
+    assert cancellation.current_kind() is None
+
+
+# ---------------------------------------------------------------------------
+# Notifications (no id) must never receive a reply, even in early-return branches
+# ---------------------------------------------------------------------------
+
+
+def _collect_frames(stdout, settle: float = 0.4) -> list[dict]:
+    deadline = time.time() + settle
+    frames: list[dict] = []
+    while time.time() < deadline:
+        for line in stdout.read_lines():
+            try:
+                frames.append(json.loads(line))
+            except ValueError:
+                continue
+        time.sleep(0.02)
+    return frames
+
+
+def test_notification_unknown_method_gets_no_reply(rpc_server) -> None:
+    """Per JSON-RPC 2.0 the server MUST NOT respond to a notification (no id),
+    even for an unknown method. The METHOD_NOT_FOUND early return now guards on
+    req_id is not None.
+    """
+    stdin, stdout = rpc_server
+    before = len(stdout.read_lines())
+    stdin.write_line({"jsonrpc": "2.0", "method": "this_method_does_not_exist"})
+    frames = _collect_frames(stdout)
+    # No error frame of any kind should have been emitted for the notification.
+    errs = [f for f in frames if "error" in f]
+    assert errs == [], f"notification got illegal reply(s): {errs}"
+    # And specifically no {"id": null, "error": ...} frame.
+    assert not any(f.get("id") is None and "error" in f for f in frames)
+    _ = before
+
+
+def test_notification_missing_method_gets_no_reply(rpc_server) -> None:
+    """A notification lacking 'method' must also stay silent (the INVALID_REQUEST
+    early return now guards req_id)."""
+    stdin, stdout = rpc_server
+    stdin.write_line({"jsonrpc": "2.0"})
+    frames = _collect_frames(stdout)
+    errs = [f for f in frames if "error" in f]
+    assert errs == [], f"notification got illegal reply(s): {errs}"
+
+
+def test_request_unknown_method_still_replies(rpc_server) -> None:
+    """Sanity: a real request (with id) to an unknown method still gets the
+    METHOD_NOT_FOUND error — the notification guard must not silence real
+    requests."""
+    stdin, stdout = rpc_server
+    stdin.write_line({"jsonrpc": "2.0", "id": "rq1", "method": "nope_method"})
+    resp = _wait_for_response(stdout, "rq1")
+    assert resp["error"]["code"] == rpc.METHOD_NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# _restore_tags forwards the user's tagging config (id3 encoding)
+# ---------------------------------------------------------------------------
+
+
+def test_restore_tags_forwards_config_encoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plain restore_tags RPC must forward the user's tagging config (so
+    id3_text_encoding is honoured), mirroring _restore_tags_with_remap. Before
+    the fix it called restore_tags with no config → fresh UTF-8 default → empty
+    text frames for Rekordbox-5/UTF-16 users.
+    """
+    import vibechek.tagger as tagger_mod
+    from vibechek.config import TaggingConfig, VibechekConfig
+
+    captured: dict = {}
+
+    def fake_restore_tags(backup_path, on_progress=None, config=None):
+        captured["config"] = config
+        from vibechek.tagger import RestoreStats
+        return RestoreStats()
+
+    # A config with a non-default ID3 encoding (UTF-16 = 1, Rekordbox 5).
+    cfg = VibechekConfig()
+    cfg.tagging = TaggingConfig(id3_text_encoding=1)
+
+    monkeypatch.setattr(tagger_mod, "restore_tags", fake_restore_tags)
+    monkeypatch.setattr(VibechekConfig, "load", classmethod(lambda cls: cfg))
+
+    rpc._restore_tags({"backup_path": "/tmp/whatever.json"})
+
+    assert captured["config"] is not None, "config must be forwarded, not None"
+    assert captured["config"].id3_text_encoding == 1
+
+
+# ---------------------------------------------------------------------------
+# verify_models is engine-aware (ONNX install no longer reported as 16 missing)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_models_onnx_checks_onnx_dir_not_pb(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """For an ONNX-engine install verify_models must check the staged heads in
+    <models>/onnx (.onnx + .json), NOT the flat .pb/.json set. Before the fix it
+    hardcoded the .pb set, so a healthy ONNX-only install reported every model
+    'missing' AND never integrity-checked the .onnx files actually loaded.
+    """
+    import vibechek.analyzer as analyzer_mod
+    from vibechek import config as cfg_mod
+    from vibechek.config import VibechekConfig
+    from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
+
+    # Point MODELS_DIR at a tmp tree with ONLY the onnx subdir populated.
+    monkeypatch.setattr(cfg_mod, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(rpc, "VibechekConfig", VibechekConfig)
+
+    cfg = VibechekConfig()
+    cfg.analysis.inference_engine = "onnx"
+    monkeypatch.setattr(VibechekConfig, "load", classmethod(lambda cls: cfg))
+
+    onnx_dir = tmp_path / "onnx"
+    onnx_dir.mkdir()
+    # Stage one head .onnx with a KNOWN-GOOD pinned hash, plus the backbone.
+    stem = "danceability"
+    good = analyzer_mod.MODEL_SHA256_ONNX[f"{stem}.onnx"]
+    # Find content whose sha256 equals the pin? We can't — instead write a file
+    # whose hash we DON'T control and assert the mismatch is reported as ok=False
+    # (not 'missing'), proving the ONNX branch ran. Also write the backbone so it
+    # shows up as ok=None (no pin) rather than missing.
+    (onnx_dir / f"{stem}.onnx").write_bytes(b"not the real weights")
+    (onnx_dir / BACKBONE_ONNX_FILENAME).write_bytes(b"fake backbone")
+
+    out = rpc._verify_models({})
+    assert out["engine"] == "onnx"
+    names = {r["name"] for r in out["results"]}
+    # ONNX filenames, NOT the essentia .pb model keys.
+    assert f"{stem}.onnx" in names
+    assert BACKBONE_ONNX_FILENAME in names
+    assert "effnet" not in names  # the .pb model key must NOT appear
+
+    by_name = {r["name"]: r for r in out["results"]}
+    # The staged head with a pin but wrong content → ok=False with a digest,
+    # NOT reason='missing' (proves it was actually hashed, not absent).
+    dance = by_name[f"{stem}.onnx"]
+    assert dance["ok"] is False
+    assert dance.get("reason") != "missing"
+    assert dance["expected"] == good
+    # The backbone has no pin → ok=None (informational), not a scary failure.
+    assert by_name[BACKBONE_ONNX_FILENAME]["ok"] is None
+
+
+def test_verify_models_param_engine_overrides_config(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """An explicit `engine` param overrides config.inference_engine."""
+    from vibechek import config as cfg_mod
+    from vibechek.config import VibechekConfig
+
+    monkeypatch.setattr(cfg_mod, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(rpc, "VibechekConfig", VibechekConfig)
+    cfg = VibechekConfig()
+    cfg.analysis.inference_engine = "essentia_tf"
+    monkeypatch.setattr(VibechekConfig, "load", classmethod(lambda cls: cfg))
+
+    out = rpc._verify_models({"engine": "onnx"})
+    assert out["engine"] == "onnx"
+
+
+# ---------------------------------------------------------------------------
+# _setup_onnx_engine surfaces the installer's failure reason (no swallow)
+# ---------------------------------------------------------------------------
+
+
+def test_setup_onnx_engine_forwards_install_failure_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the engine-install step fails (the installer RETURNS {ok:False,
+    error:...} rather than raising), setup_onnx_engine must short-circuit and
+    forward that specific reason in `error`, instead of running on to the
+    preflight and replacing it with the generic 'not installed' string.
+    """
+    import vibechek.onnx_backend as onnx_mod
+
+    # Stage step is local/fast — stub it to a benign result.
+    monkeypatch.setattr(
+        onnx_mod, "stage_bundled_onnx_heads",
+        lambda models_dir, on_progress=None: {"staged": ["danceability.onnx"], "source": "bundled"},
+    )
+
+    # Force the native (non-Windows) branch so we don't depend on WSL, and make
+    # the venv probe report "not installed" so the install path runs.
+    import vibechek.platform as platform_mod
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", False, raising=False)
+
+    import vibechek.native_install as native_mod
+
+    class _Probe:
+        essentia_installed = False
+        vibechek_installed = False
+
+    monkeypatch.setattr(native_mod, "probe_native_venv", lambda engine: _Probe())
+    monkeypatch.setattr(
+        native_mod, "install_essentia_native",
+        lambda engine=None, on_progress=None: {
+            "ok": False, "error": "No space left on device", "cancelled": False,
+        },
+    )
+
+    # Preflight must NOT raise; return an unready report.
+    import vibechek.preflight as pf_mod
+
+    class _PF:
+        ready = False
+        reasons_not_ready = ["the ONNX engine is not installed"]
+        analyze_via = "native"
+
+    monkeypatch.setattr(pf_mod, "preflight", lambda *a, **k: _PF())
+
+    out = rpc._setup_onnx_engine({})
+    assert out["ok"] is False
+    assert out["ready"] is False
+    assert out["error"] == "No space left on device"
+    # download_models step must have been SKIPPED (short-circuit), so the
+    # specific reason survives rather than being replaced by preflight's generic
+    # string only.
+    assert "No space left on device" in str(out["error"])
+
+
+# ---------------------------------------------------------------------------
+# backup_before_write: the apply RPC must actually snapshot the apply set first.
+# ---------------------------------------------------------------------------
+
+
+def _silent_mp3(path) -> None:
+    frame = bytes([0xFF, 0xFB, 0x90, 0xC0]) + bytes(413)
+    path.write_bytes(frame * 40)
+
+
+def test_apply_ml_tags_backup_before_write_creates_backup(tmp_path) -> None:
+    """With backup_before_write on (default), _apply_ml_tags snapshots the exact
+    files being tagged to a backup BEFORE mutating them, and reports its path.
+    (Regression: the toggle was dead — default-on gave a false sense of safety.)"""
+    track = tmp_path / "song.mp3"
+    _silent_mp3(track)
+    params = {
+        "analysis": {"tracks": [{"path": str(track), "ml_analysis": {
+            "ml_genre": "House", "ml_subgenre": "Deep House",
+            "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+        }}]},
+        "backup_before_write": True,
+    }
+    result = rpc._apply_ml_tags(params)
+    bp = result.get("backup_path")
+    assert bp, "apply must report the pre-apply backup path"
+    from pathlib import Path as _P
+    assert _P(bp).exists(), "the backup file must actually exist on disk"
+
+
+def test_apply_ml_tags_no_backup_when_disabled(tmp_path) -> None:
+    track = tmp_path / "song.mp3"
+    _silent_mp3(track)
+    params = {
+        "analysis": {"tracks": [{"path": str(track), "ml_analysis": {
+            "ml_genre": "House", "ml_subgenre": "Deep House",
+            "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+        }}]},
+        "backup_before_write": False,
+    }
+    result = rpc._apply_ml_tags(params)
+    assert "backup_path" not in result
+
+
+def test_organize_cancel_returns_partial_stats_with_journal(monkeypatch, tmp_path) -> None:
+    """A cancelled organize must surface its partial stats + journal_path tagged
+    cancelled=True (so the GUI can still offer Undo), not become an APP_ERROR
+    that strands the half-moved files with no undo path."""
+    from vibechek import cancellation
+    from vibechek.organizer import OrganizeStats
+
+    partial = OrganizeStats(planned=10, moved=3)
+    partial.journal_path = str(tmp_path / "organize.jsonl")
+
+    def fake_org(*_a, **_k):
+        e = cancellation.CancelledError("cancelled by user")
+        e.partial_stats = partial  # type: ignore[attr-defined]
+        raise e
+
+    monkeypatch.setattr("vibechek.organizer.organize_from_analysis", fake_org)
+    res = rpc._organize({"analysis": {"tracks": []}, "target_root": str(tmp_path)})
+    assert res["cancelled"] is True
+    assert res["moved"] == 3
+    assert res["journal_path"].endswith("organize.jsonl")

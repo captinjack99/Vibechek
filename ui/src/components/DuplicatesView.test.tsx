@@ -15,8 +15,13 @@ import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 
 import { DuplicatesView } from "./DuplicatesView";
-import { useConfigStore, useLibraryStore } from "../stores";
-import type { DuplicateReport } from "../types";
+import {
+  useConfigStore,
+  useLibraryStore,
+  useNotificationStore,
+  useOperationStore,
+} from "../stores";
+import type { DuplicateReport, FileInfo } from "../types";
 
 const emptyReport: DuplicateReport = {
   summary: {
@@ -59,6 +64,114 @@ describe("<DuplicatesView /> — find_duplicates payload", () => {
           params: expect.objectContaining({ threshold: 0.81 }),
         }),
       );
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression for "Move to review folder always reports 'Moved 0 duplicates'".
+//
+// `handle_duplicates` always returns BOTH `moved` and `deleted` (init 0),
+// incrementing only the action's key. The toast used `summary.deleted ??
+// summary.moved`, which for a MOVE returns the number 0 (`??` only falls
+// through on null/undefined) — so every move read "Moved 0 duplicates". The
+// fix selects the count by action: move -> moved, trash -> deleted.
+// ---------------------------------------------------------------------------
+
+function fileInfo(path: string, sizeMb = 5): FileInfo {
+  return {
+    path,
+    filename: path.split(/[\\/]/).pop() ?? path,
+    size_bytes: Math.round(sizeMb * 1024 * 1024),
+    size_mb: sizeMb,
+    file_hash: "h",
+    audio_fingerprint: null,
+    codec: "mp3",
+    bitrate_kbps: 320,
+    duration_s: 200,
+    modified_time: 0,
+  };
+}
+
+/** A report with one exact-duplicate group (1 keeper + 1 dupe) so an action
+ *  has something to act on (filesToAct > 0 enables the buttons). */
+function reportWithOneGroup(): DuplicateReport {
+  const keep = fileInfo("D:/Music/a.mp3");
+  const dup = fileInfo("D:/Music/a (1).mp3");
+  return {
+    summary: {
+      total_files: 2,
+      exact_duplicate_groups: 1,
+      exact_duplicate_files: 1,
+      audio_duplicate_groups: 0,
+      audio_duplicate_files: 0,
+      total_duplicates: 1,
+      space_recoverable_mb: 5,
+    },
+    exact_duplicates: [
+      { method: "md5", key: "g1", keep, duplicates: [dup], recoverable_mb: 5 },
+    ],
+    audio_duplicates: [],
+  };
+}
+
+describe("<DuplicatesView /> — resolve result toast", () => {
+  beforeEach(() => {
+    useLibraryStore.setState({ libraryPath: "D:/Music" });
+    useConfigStore.getState().updateDuplicates({ review_folder: "D:/Review" });
+  });
+
+  it("reports the real moved count for a move action (not 0)", async () => {
+    const user = userEvent.setup();
+    // handle_duplicates returns {moved: N, deleted: 0}; the follow-up rescan
+    // (find_duplicates) returns an empty report.
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        if (args.method === "handle_duplicates") {
+          return { moved: 7, deleted: 0, errors: 0, journal_path: "D:/j.jsonl" };
+        }
+        return emptyReport; // find_duplicates rescan
+      },
+    );
+    // Seed a report so the action buttons render + enable.
+    useOperationStore.setState({ duplicateReport: reportWithOneGroup() });
+
+    render(<DuplicatesView />);
+
+    await user.click(screen.getByRole("button", { name: /move to review folder/i }));
+    // Confirm the modal.
+    await user.click(await screen.findByRole("button", { name: /yes, move files/i }));
+
+    await waitFor(() => {
+      const msgs = useNotificationStore.getState().items.map((n) => n.message);
+      expect(msgs).toContain("Moved 7 duplicates");
+    });
+    // And specifically NOT the old buggy "Moved 0 duplicates".
+    expect(
+      useNotificationStore.getState().items.map((n) => n.message),
+    ).not.toContain("Moved 0 duplicates");
+  });
+
+  it("reports the real trashed count for a trash action", async () => {
+    const user = userEvent.setup();
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        if (args.method === "handle_duplicates") {
+          return { moved: 0, deleted: 4, errors: 0 };
+        }
+        return emptyReport;
+      },
+    );
+    useOperationStore.setState({ duplicateReport: reportWithOneGroup() });
+
+    render(<DuplicatesView />);
+
+    await user.click(screen.getByRole("button", { name: /send to trash/i }));
+    await user.click(await screen.findByRole("button", { name: /yes, send to trash/i }));
+
+    await waitFor(() => {
+      const msgs = useNotificationStore.getState().items.map((n) => n.message);
+      expect(msgs).toContain("Trashed 4 duplicates");
     });
   });
 });

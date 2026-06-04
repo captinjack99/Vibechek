@@ -169,6 +169,13 @@ def _read_journal(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 # Truncated last line from a crash mid-write — safe to skip.
                 log.debug("Skipping malformed journal line %d in %s", i, path)
                 continue
+            if not isinstance(obj, dict):
+                # Valid JSON that isn't an object (a stray array/scalar from a
+                # partial or hand-mangled write). `"kind" in obj` / `obj.get(...)`
+                # below assume a dict — skip rather than raise, matching the
+                # documented "skip malformed lines" contract.
+                log.debug("Skipping non-object journal line %d in %s", i, path)
+                continue
             if i == 0 and "kind" in obj:
                 header = obj
             elif obj.get("action") in ("move", "trash"):
@@ -229,6 +236,15 @@ def revert_journal(
         raise FileNotFoundError(f"Journal not found: {path}")
 
     _header, entries = _read_journal(path)
+    # Reject a file that isn't a Vibechek operation journal at all (wrong file,
+    # corrupt JSON, mangled header). Every real journal — even an empty or
+    # fully-reverted one — carries a valid header written by start_journal, so
+    # this only false-rejects genuine non-journals, not legitimately-empty runs.
+    if _header.get("kind") not in (KIND_ORGANIZE, KIND_DEDUPE_MOVE, KIND_DEDUPE_TRASH):
+        raise ValueError(
+            f"{path} is not a Vibechek operation journal — "
+            f"run `vibechek journals` to list valid ones."
+        )
     moves = [e for e in entries if e.get("action") == "move"]
     trashed = [e for e in entries if e.get("action") == "trash"]
 

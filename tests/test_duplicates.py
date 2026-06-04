@@ -26,6 +26,50 @@ def test_file_md5_matches_known_string(tmp_path: Path) -> None:
     assert file_md5(f) == "5eb63bbbe01eeed093cb22bb8f5acdc3"
 
 
+def _fi(path: str, size_mb: float = 5.0) -> FileInfo:
+    return FileInfo(path=path, filename=Path(path).name,
+                    size_bytes=int(size_mb * 1_000_000), size_mb=size_mb)
+
+
+def test_merge_overlapping_clusters_unions_shared_files() -> None:
+    """A~B in one bucket and B~C in another must collapse to ONE group {A,B,C},
+    not two overlapping groups (which let a file be keeper AND duplicate)."""
+    from vibechek.duplicates import _merge_overlapping_clusters
+
+    a, b, c, d = _fi("/m/a.mp3"), _fi("/m/b.mp3"), _fi("/m/c.mp3"), _fi("/m/d.mp3")
+    merged = _merge_overlapping_clusters([[a, b], [b, c]])
+    assert len(merged) == 1
+    assert {f.path for f in merged[0]} == {"/m/a.mp3", "/m/b.mp3", "/m/c.mp3"}
+    # Disjoint clusters stay separate.
+    merged2 = _merge_overlapping_clusters([[a, b], [c, d]])
+    assert len(merged2) == 2
+
+
+def test_handle_duplicates_never_moves_a_keeper_of_another_group(tmp_path: Path) -> None:
+    """Defense-in-depth: even if a report has overlapping groups where a file is
+    the KEEPER of one group and a DUPLICATE in another, handle_duplicates must
+    NOT move/trash that keeper (the data-loss bug)."""
+    from vibechek.duplicates import DuplicateGroup, DuplicateReport
+
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        (tmp_path / name).write_bytes(b"x" * 1000)
+    a, b, c = (_fi(str(tmp_path / n)) for n in ("a.mp3", "b.mp3", "c.mp3"))
+    report = DuplicateReport()
+    # b is a DUPLICATE in group 1 but the KEEPER of group 2.
+    report.audio_duplicates = [
+        DuplicateGroup(method="chromaprint", key="g1", keep=a, duplicates=[b], recoverable_mb=0.0),
+        DuplicateGroup(method="chromaprint", key="g2", keep=b, duplicates=[c], recoverable_mb=0.0),
+    ]
+    review = tmp_path / "review"
+    cfg = DuplicateConfig(action="move", review_folder=str(review),
+                          use_md5=False, use_chromaprint=True)
+    summary = handle_duplicates(report, cfg)
+    assert (tmp_path / "a.mp3").exists(), "keeper a must stay"
+    assert (tmp_path / "b.mp3").exists(), "b is a keeper of group 2 — must NOT be moved"
+    assert not (tmp_path / "c.mp3").exists(), "c (a real dupe, not any keeper) should move"
+    assert summary["moved"] == 1 and summary["errors"] == 0
+
+
 def test_choose_keeper_prefers_flac_over_mp3() -> None:
     files = [
         FileInfo(path="/a/track.mp3", filename="track.mp3", size_bytes=5_000_000, size_mb=5.0),

@@ -174,6 +174,61 @@ def _make_silent_mp3(path: Path) -> None:
     path.write_bytes(frame * 40)
 
 
+def _confident_house_analysis(track: Path) -> dict:
+    return {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "House", "ml_subgenre": "Deep House",
+        "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+    }}]}
+
+
+def test_write_subgenre_as_main_genre_true_writes_subgenre_to_main(tmp_path: Path) -> None:
+    """Default: the subgenre IS the main genre (TCON), and TIT1 mirrors it."""
+    from mutagen.mp3 import MP3
+    track = tmp_path / "t.mp3"
+    _make_silent_mp3(track)
+    apply_ml_tags(_confident_house_analysis(track),
+                  TaggingConfig(write_subgenre_as_main_genre=True))
+    tags = MP3(track).tags
+    assert str(tags.get("TCON")) == "Deep House"
+    assert str(tags.get("TIT1")) == "Deep House"
+
+
+def test_write_subgenre_as_main_genre_false_keeps_parent_main_subgenre_preserved(tmp_path: Path) -> None:
+    """Toggle OFF: main genre (TCON) becomes the PARENT family ('House'), but the
+    precise subgenre is NOT lost — it's still recorded in the TIT1 subgenre frame.
+    (Regression: this Settings toggle was previously dead — flipping it did nothing.)"""
+    from mutagen.mp3 import MP3
+    track = tmp_path / "t.mp3"
+    _make_silent_mp3(track)
+    apply_ml_tags(_confident_house_analysis(track),
+                  TaggingConfig(write_subgenre_as_main_genre=False))
+    tags = MP3(track).tags
+    assert str(tags.get("TCON")) == "House", "main genre should be the parent family"
+    assert str(tags.get("TIT1")) == "Deep House", "subgenre must still be preserved"
+
+
+def test_backup_tag_files_snapshots_only_given_files(tmp_path: Path) -> None:
+    """backup_tag_files snapshots exactly the listed files (not a dir scan), in a
+    format restore can read."""
+    import json as _json
+
+    from mutagen.id3 import TCON
+    from mutagen.mp3 import MP3
+
+    from vibechek.tagger import backup_tag_files
+    a, b, ignored = tmp_path / "a.mp3", tmp_path / "b.mp3", tmp_path / "ignore.mp3"
+    for p in (a, b, ignored):
+        _make_silent_mp3(p)
+    m = MP3(a); m.add_tags(); m.tags.add(TCON(encoding=3, text=["Techno"])); m.save()
+    out = tmp_path / "bk.json"
+    stats = backup_tag_files([a, b], out)
+    assert stats.backed_up == 2
+    data = _json.loads(out.read_text(encoding="utf-8"))
+    assert set(Path(p).name for p in data["files"]) == {"a.mp3", "b.mp3"}
+    assert "ignore.mp3" not in " ".join(data["files"])
+    assert data["files"][str(a)]["genre"] == "Techno"
+
+
 def test_apply_ml_tags_preserves_rekordbox_geob_priv(tmp_path: Path) -> None:
     """A genre tag write must NOT strip GEOB/PRIV frames — losing those would
     silently destroy a DJ's Serato/Rekordbox cue points and beat grids."""
@@ -1159,3 +1214,290 @@ def test_restore_remap_forwards_config_encoding(
     assert instances and instances[0].tags
     for frame in instances[0].tags.values():
         assert frame.encoding == 1, "config encoding not forwarded on remap restore"
+
+
+# ---------------------------------------------------------------------------
+# Multi-valued tags must survive backup → restore (HIGH "silent truncation")
+#
+# A FLAC/M4A with two ARTIST and two GENRE values used to be collapsed to the
+# FIRST value in the backup JSON, so the extra values were lost for good even
+# on a "successful" restore. These prove every value survives the round-trip.
+# ---------------------------------------------------------------------------
+
+
+def test_flac_multivalue_artist_genre_survive_roundtrip(tmp_path: Path) -> None:
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "collab.flac"
+    _build_flac(track)
+    audio = FLAC(track)
+    audio["ARTIST"] = ["Artist A", "Artist B"]
+    audio["GENRE"] = ["House", "Techno"]
+    audio.save()
+
+    snap = read_all_tags(track)
+    # Scalar canonical key still present for display/apply consumers.
+    assert snap["artist"] == "Artist A"
+    # ...but the full list is preserved somewhere lossless.
+    assert snap.get("txxx_artist") == ["Artist A", "Artist B"]
+    assert snap.get("txxx_genre") == ["House", "Techno"]
+
+    # Wipe + restore: every value must come back, not just the first.
+    audio = FLAC(track)
+    audio.delete()
+    audio.save()
+    ok, err = write_all_tags(track, snap)
+    assert ok, err
+    restored = FLAC(track)
+    assert list(restored["artist"]) == ["Artist A", "Artist B"]
+    assert list(restored["genre"]) == ["House", "Techno"]
+
+
+def test_flac_singlevalue_comment_stays_scalar(tmp_path: Path) -> None:
+    """Single-valued Vorbis comments keep the historical scalar snapshot shape
+    (so existing snapshots/consumers are unaffected)."""
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "single.flac"
+    _build_flac(track)
+    audio = FLAC(track)
+    audio["REPLAYGAIN_TRACK_GAIN"] = "-6.50 dB"
+    audio.save()
+
+    snap = read_all_tags(track)
+    assert snap.get("txxx_replaygain_track_gain") == "-6.50 dB"
+
+
+def test_m4a_multivalue_artist_genre_survive_roundtrip(tmp_path: Path) -> None:
+    from mutagen.mp4 import MP4
+
+    track = tmp_path / "collab.m4a"
+    _build_m4a(track)
+    audio = MP4(track)
+    audio["\xa9ART"] = ["Artist A", "Artist B"]
+    audio["\xa9gen"] = ["House", "Techno"]
+    audio.save()
+
+    snap = read_all_tags(track)
+    assert snap["artist"] == "Artist A"  # scalar display key
+
+    audio = MP4(track)
+    audio.delete()
+    audio.save()
+    ok, err = write_all_tags(track, snap)
+    assert ok, err
+    restored = MP4(track)
+    assert restored["\xa9ART"] == ["Artist A", "Artist B"]
+    assert restored["\xa9gen"] == ["House", "Techno"]
+
+
+# ---------------------------------------------------------------------------
+# TXXX descriptions are CASE-SENSITIVE and must round-trip verbatim (HIGH)
+#
+# `replaygain_track_gain` / `EnergyLevel` were being rewritten as
+# `REPLAYGAIN_TRACK_GAIN` / `ENERGYLEVEL` on restore, silently renaming the
+# frame so case-sensitive readers (foobar2000 ReplayGain, Mixed In Key) stop
+# matching it.
+# ---------------------------------------------------------------------------
+
+
+def test_txxx_description_roundtrips_verbatim_mp3(tmp_path: Path) -> None:
+    from mutagen.id3 import TXXX
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "rg.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    audio.add_tags()
+    audio.tags.add(TXXX(encoding=3, desc="replaygain_track_gain", text=["-6.5 dB"]))
+    audio.tags.add(TXXX(encoding=3, desc="EnergyLevel", text=["7"]))
+    audio.save()
+
+    snap = read_all_tags(track)
+    # Wipe TXXX then restore.
+    audio = MP3(track)
+    for k in [k for k in audio.tags if k.startswith("TXXX")]:
+        del audio.tags[k]
+    audio.save()
+    ok, err = write_all_tags(track, snap)
+    assert ok, err
+
+    restored = MP3(track)
+    descs = sorted(restored.tags[k].desc for k in restored.tags if k.startswith("TXXX"))
+    assert descs == ["EnergyLevel", "replaygain_track_gain"], (
+        f"TXXX descriptions not preserved verbatim: {descs}"
+    )
+
+
+def test_txxx_description_roundtrips_verbatim_aiff_wav(tmp_path: Path) -> None:
+    """The same TXXX-rename bug affects AIFF/WAV via the shared ID3 writer."""
+    from mutagen.aiff import AIFF
+    from mutagen.id3 import TXXX
+    from mutagen.wave import WAVE
+
+    for ext, opener, builder in (
+        (".aiff", AIFF, _build_aiff),
+        (".wav", WAVE, _build_wav),
+    ):
+        track = tmp_path / f"rg{ext}"
+        builder(track)
+        audio = opener(str(track))
+        audio.add_tags()
+        audio.tags.add(TXXX(encoding=3, desc="MixedInKey", text=["9A"]))
+        audio.save()
+
+        snap = read_all_tags(track)
+        audio = opener(str(track))
+        for k in [k for k in audio.tags if k.startswith("TXXX")]:
+            del audio.tags[k]
+        audio.save()
+        ok, err = write_all_tags(track, snap)
+        assert ok, err
+
+        restored = opener(str(track))
+        descs = [restored.tags[k].desc for k in restored.tags if k.startswith("TXXX")]
+        assert descs == ["MixedInKey"], f"{ext} renamed TXXX desc: {descs}"
+
+
+def test_txxx_legacy_string_snapshot_still_restores(tmp_path: Path) -> None:
+    """An OLD snapshot whose txxx_ value is a bare string (pre-dict format)
+    must still restore without crashing — the desc falls back to the key
+    suffix verbatim (no case-folding)."""
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "legacy.mp3"
+    _make_silent_mp3(track)
+    # Simulate a legacy snapshot: bare-string txxx_ value.
+    snap = {"txxx_energylevel": "7"}
+    ok, err = write_all_tags(track, snap)
+    assert ok, err
+    restored = MP3(track)
+    descs = [restored.tags[k].desc for k in restored.tags if k.startswith("TXXX")]
+    assert descs == ["energylevel"]
+
+
+# ---------------------------------------------------------------------------
+# apply_ml_tags must tag AIFF/WAV/M4A (MEDIUM: those used to error
+# "unsupported format" despite being analyzed and tag-capable)
+# ---------------------------------------------------------------------------
+
+
+def _apply_analysis(track: Path) -> dict:
+    return {
+        "tracks": [{
+            "path": str(track),
+            "ml_analysis": {
+                "ml_genre": "House",
+                "ml_subgenre": "Deep House",
+                "ml_genre_confidence": 0.95,
+                "ml_genre_raw_confidence": 0.95,
+                "ml_bpm": 124.6,
+                "ml_key": "9A",
+                "ml_energy": "High",
+            },
+        }],
+    }
+
+
+def test_apply_ml_tags_writes_wav(tmp_path: Path) -> None:
+    from mutagen.wave import WAVE
+
+    track = tmp_path / "t.wav"
+    _build_wav(track)
+    cfg = TaggingConfig(write_bpm=True, write_key=True)
+    stats = apply_ml_tags(_apply_analysis(track), cfg)
+    assert stats.other_tags_applied == 1
+    assert stats.errors == []
+    audio = WAVE(track)
+    assert str(audio.tags.get("TCON")) == "Deep House"
+    assert str(audio.tags.get("TBPM")) == "125"
+    assert any(k == "TXXX:ENERGY" for k in audio.tags)
+
+
+def test_apply_ml_tags_writes_aiff(tmp_path: Path) -> None:
+    from mutagen.aiff import AIFF
+
+    track = tmp_path / "t.aiff"
+    _build_aiff(track)
+    stats = apply_ml_tags(_apply_analysis(track), TaggingConfig())
+    assert stats.other_tags_applied == 1
+    assert stats.errors == []
+    audio = AIFF(track)
+    assert str(audio.tags.get("TCON")) == "Deep House"
+
+
+def test_apply_ml_tags_writes_m4a(tmp_path: Path) -> None:
+    from mutagen.mp4 import MP4
+
+    track = tmp_path / "t.m4a"
+    _build_m4a(track)
+    cfg = TaggingConfig(write_bpm=True)
+    stats = apply_ml_tags(_apply_analysis(track), cfg)
+    assert stats.other_tags_applied == 1
+    assert stats.errors == []
+    audio = MP4(track)
+    assert audio.get("\xa9gen") == ["Deep House"]
+    assert audio.get("tmpo") == [125]
+    energy = audio.get("----:com.apple.iTunes:ENERGY")
+    assert energy and bytes(energy[0]) == b"High"
+
+
+def test_apply_ml_tags_still_errors_truly_unsupported(tmp_path: Path) -> None:
+    """ogg/aac/wma have no apply writer — they must still report the
+    'unsupported format' error rather than silently claiming success."""
+    track = tmp_path / "t.ogg"
+    track.write_bytes(b"OggS" + b"\x00" * 40)
+    stats = apply_ml_tags(_apply_analysis(track), TaggingConfig())
+    assert stats.other_tags_applied == 0
+    assert any("unsupported format .ogg" in e for e in stats.errors)
+
+
+# ---------------------------------------------------------------------------
+# apply_ml_tags must tolerate malformed (non-dict / path-less) track entries
+# instead of crashing the whole apply with AttributeError/KeyError (MEDIUM).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_ml_tags_skips_non_dict_track_entry() -> None:
+    stats = apply_ml_tags(
+        {"tracks": ["a stray string", 123, ["nested"]]},
+        TaggingConfig(),
+        dry_run=True,
+    )
+    assert stats.total == 3
+    # No crash; each malformed entry is recorded as a skip error.
+    assert len(stats.errors) == 3
+    assert all("malformed" in e for e in stats.errors)
+
+
+def test_apply_ml_tags_skips_track_missing_path() -> None:
+    stats = apply_ml_tags(
+        {"tracks": [{"ml_analysis": {"ml_genre": "House"}}]},
+        TaggingConfig(),
+        dry_run=True,
+    )
+    assert stats.total == 1
+    assert any("no 'path'" in e for e in stats.errors)
+
+
+def test_apply_ml_tags_mixed_valid_and_malformed(tmp_path: Path) -> None:
+    """A valid track alongside malformed entries still gets tagged; the bad
+    entries are skipped, not fatal."""
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "good.flac"
+    _build_flac(track)
+    FLAC(track).save()
+    analysis = {
+        "tracks": [
+            "garbage",
+            {"path": str(track), "ml_analysis": {
+                "ml_genre": "House", "ml_subgenre": "Deep House",
+                "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+            }},
+        ],
+    }
+    stats = apply_ml_tags(analysis, TaggingConfig())
+    assert stats.total == 2
+    assert stats.other_tags_applied == 1
+    assert FLAC(track)["genre"][0] == "Deep House"

@@ -179,7 +179,13 @@ def _read_id3_tags(id3: ID3 | None) -> dict[str, Any]:
     for key in id3:
         if key.startswith("TXXX:"):
             desc = key.split(":", 1)[1]
-            out[f"txxx_{desc.lower()}"] = str(id3[key])
+            # TXXX descriptions are CASE-SENSITIVE per ID3 (ReplayGain frames,
+            # Mixed In Key `EnergyLevel`, Serato fields). The lowercased key is
+            # only for lookup/dedup; preserve the real `desc` verbatim so a
+            # restore rebuilds the frame byte-identically instead of forcing it
+            # to UPPER-case (which renames the frame and breaks case-sensitive
+            # readers).
+            out[f"txxx_{desc.lower()}"] = {"desc": desc, "text": str(id3[key])}
         elif key.startswith("GEOB:"):
             frame = id3[key]
             out[f"geob_{key}"] = {
@@ -211,21 +217,39 @@ def _read_flac_tags(filepath: Path) -> dict[str, Any]:
     out: dict[str, Any] = {}
     handled: set[str] = set()
     for vorbis_key, field_name in canonical.items():
-        val = _first(audio.tags.get(vorbis_key))
+        values = audio.tags.get(vorbis_key)
+        val = _first(values)
         if val is not None:
+            # Keep a SCALAR canonical key for display / apply consumers...
             out[field_name] = val
             handled.add(vorbis_key)
+            # ...but if the field is multi-valued (collaborations, multi-genre,
+            # classical performers), also stash the FULL list under the generic
+            # `txxx_<key>` entry so restore is lossless instead of dropping the
+            # 2nd+ values. `_write_flac_tags` writes the list back to the same
+            # Vorbis key, overriding the scalar.
+            if isinstance(values, list) and len(values) > 1:
+                out[f"txxx_{vorbis_key}"] = list(values)
     # Format-complete: capture EVERY remaining Vorbis comment (ReplayGain,
     # label/catalog, comment, Serato fields, custom energy/mood/etc.) as a
-    # `txxx_<key>` entry so restore puts it back verbatim. The old code only
-    # snapshotted a fixed field set and dropped everything else.
+    # `txxx_<key>` entry so restore puts it back verbatim. Store the FULL value
+    # list (not just value[0]) so multi-valued comments survive. The old code
+    # only snapshotted a fixed field set and collapsed everything to the first.
     for vorbis_key in audio.tags.keys():
         lk = vorbis_key.lower()
         if lk in handled:
             continue
-        val = _first(audio.tags.get(vorbis_key))
-        if val is not None:
-            out[f"txxx_{lk}"] = val
+        values = audio.tags.get(vorbis_key)
+        if not values:
+            continue
+        # Single-valued comment stays a scalar (the historical snapshot shape);
+        # only multi-valued comments are stored as a list, so a backup's 2nd+
+        # values are no longer dropped while existing scalar snapshots/round-
+        # trips are unchanged.
+        if isinstance(values, list) and len(values) > 1:
+            out[f"txxx_{lk}"] = list(values)
+        else:
+            out[f"txxx_{lk}"] = _first(values)
     return out
 
 
@@ -242,10 +266,18 @@ def _read_m4a_tags(filepath: Path) -> dict[str, Any]:
     out: dict[str, Any] = {}
     handled: set[str] = set()
     for atom, field_name in canonical.items():
-        val = _first(audio.tags.get(atom))
+        values = audio.tags.get(atom)
+        val = _first(values)
         if val is not None:
+            # Scalar canonical key for display / apply...
             out[field_name] = val
             handled.add(atom)
+            # ...plus the FULL list under the generic atom key when the atom is
+            # multi-valued (multiple ©ART / ©gen), so a restore brings every
+            # value back instead of only the first. `_write_m4a_tags` writes the
+            # generic atom after the scalar, overriding it with the full list.
+            if isinstance(values, list) and len(values) > 1:
+                out[f"mp4atom_{atom}"] = _encode_m4a_atom(values)
     if "tmpo" in audio.tags:
         out["bpm"] = str(audio.tags["tmpo"][0])
         handled.add("tmpo")
@@ -388,8 +420,18 @@ def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
 
     for key, val in tags.items():
         if key.startswith("txxx_"):
-            tag_name = key[5:].upper()
-            id3.add(TXXX(encoding=enc, desc=tag_name, text=str(val)))
+            # New snapshots store {"desc": <verbatim>, "text": ...} so the
+            # original case-sensitive TXXX description round-trips exactly.
+            # Old snapshots stored a bare string under a lowercased key — for
+            # those, fall back to the key suffix verbatim (no case-folding)
+            # rather than the historical .upper(), which renamed frames.
+            if isinstance(val, dict):
+                desc = val.get("desc", key[5:])
+                text = val.get("text", "")
+            else:
+                desc = key[5:]
+                text = val
+            id3.add(TXXX(encoding=enc, desc=desc, text=str(text)))
         elif key.startswith("geob_"):
             id3.add(GEOB(
                 encoding=val["encoding"],
@@ -416,7 +458,14 @@ def _write_flac_tags(filepath: Path, tags: dict[str, Any]) -> None:
             audio[vorbis_key] = str(tags[field_name])
     for key, val in tags.items():
         if key.startswith("txxx_"):
-            audio[key[5:]] = str(val)
+            # Preserve multi-valued Vorbis comments: a list snapshot is written
+            # back as a list (every value), a scalar as a single string. This
+            # also overrides any scalar canonical field written above (e.g. a
+            # multi-artist ARTIST) so restore is lossless.
+            if isinstance(val, list):
+                audio[key[5:]] = [str(v) for v in val]
+            else:
+                audio[key[5:]] = str(val)
     audio.save()
 
 
@@ -486,12 +535,42 @@ def backup_tags(
     on_progress: ProgressCallback | None = None,
 ) -> BackupStats:
     """Snapshot every supported audio file under `library_path` to a JSON file."""
-    files = find_audio_files(library_path)
+    return _snapshot_tags_to_file(
+        find_audio_files(library_path), str(library_path), output_path, on_progress
+    )
+
+
+def backup_tag_files(
+    paths: list[str] | list[Path],
+    output_path: Path,
+    on_progress: ProgressCallback | None = None,
+) -> BackupStats:
+    """Snapshot a SPECIFIC list of audio files (not a directory scan).
+
+    Used by the "backup before write" safety net in the apply-tags flow: it
+    snapshots exactly the files about to be mutated (the apply set carries only
+    track paths, not a library root), so the backup scope matches the change and
+    no broad tree walk happens. Same on-disk format as `backup_tags`, so the
+    normal restore paths read it.
+    """
+    files = [Path(p) for p in paths if Path(p).exists()]
+    source = str(files[0].parent) if files else ""
+    return _snapshot_tags_to_file(files, source, output_path, on_progress)
+
+
+def _snapshot_tags_to_file(
+    files: list[Path],
+    source_directory: str,
+    output_path: Path,
+    on_progress: ProgressCallback | None = None,
+) -> BackupStats:
+    """Read every file's tags and atomically write the backup JSON. Shared core
+    of `backup_tags` (directory scan) and `backup_tag_files` (explicit list)."""
     stats = BackupStats(total=len(files))
 
     backup = {
         "version": BACKUP_VERSION,
-        "source_directory": str(library_path),
+        "source_directory": source_directory,
         "total_files": stats.total,
         "files": {},
     }
@@ -642,20 +721,44 @@ def apply_ml_tags(
     """
     from vibechek import cancellation
 
-    tracks = analysis_data.get("tracks", [])
+    # Tolerate a wrong-shape payload (a bare list of tracks, or junk) without an
+    # AttributeError: a dict uses its "tracks", a list IS the track list, and
+    # anything else yields no tracks. The per-entry loop below skips non-dict
+    # rows. (The CLI also pre-validates for a clean error message.)
+    if isinstance(analysis_data, dict):
+        tracks = analysis_data.get("tracks", [])
+    elif isinstance(analysis_data, list):
+        tracks = analysis_data
+    else:
+        tracks = []
+    if not isinstance(tracks, list):
+        tracks = []
     stats = ApplyStats(total=len(tracks))
 
     for i, track in enumerate(tracks):
         cancellation.check()
-        report_progress(on_progress, i + 1, stats.total, Path(track.get("path", "")).name)
+
+        # A hand-edited / wrong-shape analysis.json can carry non-dict elements
+        # (a bare string/number) or dicts missing `path`. Skip them rather than
+        # crashing the whole apply with an AttributeError/KeyError — matches the
+        # guard the `export` command already applies to the same files.
+        if not isinstance(track, dict):
+            stats.errors.append(f"Skipped malformed track entry (not an object): {track!r}")
+            continue
+        track_path = track.get("path")
+        if not track_path:
+            stats.errors.append("Skipped track entry with no 'path'")
+            continue
+
+        report_progress(on_progress, i + 1, stats.total, Path(track_path).name)
 
         # Tolerate NFC/NFD normalization drift between the stored path and the
         # on-disk name (see resolve_existing_path) — otherwise accented
         # filenames arriving NFD-normalized are wrongly skipped as "Not found"
         # and never get tagged.
-        filepath = resolve_existing_path(track["path"])
+        filepath = resolve_existing_path(track_path)
         if filepath is None:
-            stats.errors.append(f"Not found: {Path(track['path'])}")
+            stats.errors.append(f"Not found: {Path(track_path)}")
             continue
 
         ml = track.get("ml_analysis", {})
@@ -719,8 +822,19 @@ def apply_ml_tags(
         # "House" rather than "Deep House" — the user can still browse the
         # parent bucket while tracks the model couldn't subgenre-classify
         # don't pollute it.
+        # `subgenre_to_write` is what lands in the SUBGENRE frame (TIT1 /
+        # CONTENTGROUP / ©grp); `genre_to_write` is the MAIN genre frame (TCON /
+        # GENRE / ©gen). When `write_subgenre_as_main_genre` is False the user
+        # wants the parent family in the sortable main-genre field (e.g. "House")
+        # while the precise subgenre is still recorded in its own frame — so the
+        # subgenre is never lost, it just doesn't become the Rekordbox sort key.
+        subgenre_to_write = ""
         if apply_subgenre:
-            genre_to_write = subgenre
+            subgenre_to_write = subgenre
+            if config.write_subgenre_as_main_genre:
+                genre_to_write = subgenre
+            else:
+                genre_to_write = parent_genre or subgenre
             stats.genre_applied += 1
         elif apply_parent_only:
             genre_to_write = parent_genre
@@ -741,12 +855,21 @@ def apply_ml_tags(
         ext = filepath.suffix.lower()
         try:
             if ext == ".mp3":
-                _apply_mp3(filepath, ml, apply_genre, genre_to_write, config)
+                _apply_mp3(filepath, ml, apply_genre, genre_to_write, config, subgenre_to_write)
                 stats.other_tags_applied += 1
             elif ext == ".flac":
-                _apply_flac(filepath, ml, apply_genre, genre_to_write, config)
+                _apply_flac(filepath, ml, apply_genre, genre_to_write, config, subgenre_to_write)
+                stats.other_tags_applied += 1
+            elif ext in (".aiff", ".aif", ".wav"):
+                # AIFF/WAV carry the same ID3v2 frames as MP3 and the analyzer
+                # decodes them — tag them instead of erroring 'unsupported'.
+                _apply_aiff_wav(filepath, ml, apply_genre, genre_to_write, config, subgenre_to_write)
+                stats.other_tags_applied += 1
+            elif ext == ".m4a":
+                _apply_m4a(filepath, ml, apply_genre, genre_to_write, config, subgenre_to_write)
                 stats.other_tags_applied += 1
             else:
+                # Genuinely tag-less formats (ogg/aac/wma) have no apply writer.
                 stats.errors.append(f"{filepath.name}: unsupported format {ext}")
         except Exception as e:  # noqa: BLE001
             stats.errors.append(f"{filepath.name}: {e}")
@@ -797,57 +920,137 @@ def _derived_field_value(tag_name: str, ml: dict[str, Any], config: TaggingConfi
     return val if val is not None else None
 
 
-def _apply_mp3(
-    filepath: Path,
+def _apply_id3_frames(
+    id3: ID3,
     ml: dict[str, Any],
     apply_genre: bool,
     genre_value: str,
     config: TaggingConfig,
+    subgenre_value: str = "",
 ) -> None:
-    audio = MP3(filepath)
-    if audio.tags is None:
-        audio.add_tags()
+    """Write ML-derived frames into an ID3 block.
 
+    Shared by MP3 *and* AIFF/WAV — all three embed the same ID3v2 frames, so
+    the frame construction (TCON/TIT1/TBPM/TKEY/TXXX) lives in one place and
+    can't drift between formats. Honors `preserve_rekordbox_frames` by
+    snapshotting GEOB/PRIV before the writes and re-adding any that a write
+    didn't already replace.
+
+    `genre_value` is the MAIN genre (TCON); `subgenre_value` is the SUBGENRE
+    (TIT1). They differ only when `write_subgenre_as_main_genre` is off (parent
+    in TCON, precise subgenre still preserved in TIT1).
+    """
     enc = config.id3_text_encoding
 
     # Snapshot binary frames to restore after destructive writes
     preserved: list[tuple[str, Any]] = []
     if config.preserve_rekordbox_frames:
         preserved = [
-            (k, audio.tags[k])
-            for k in list(audio.tags.keys())
+            (k, id3[k])
+            for k in list(id3.keys())
             if k.startswith("GEOB:") or k.startswith("PRIV:")
         ]
 
     if apply_genre:
-        audio.tags.delall("TCON")
-        audio.tags.add(TCON(encoding=enc, text=[genre_value]))
-        # Only write TIT1 (subgenre frame) when the value we're writing is
-        # genuinely a subgenre — i.e. when stage-1 (strict subgenre conf)
-        # passed. When we fall back to the parent genre under stage 2 we
-        # leave TIT1 untouched so we don't mislabel an unclear track with
-        # a confident-looking subgenre tag.
-        ml_subgenre = ml.get("ml_subgenre", "") or ""
-        if genre_value == ml_subgenre:
-            audio.tags.delall("TIT1")
-            audio.tags.add(TIT1(encoding=enc, text=[genre_value]))
+        id3.delall("TCON")
+        id3.add(TCON(encoding=enc, text=[genre_value]))
+        # Write TIT1 (subgenre frame) whenever we have a genuine subgenre to
+        # record. Under stage-2 parent-only fallback subgenre_value is "" so
+        # TIT1 is left untouched — we don't mislabel an unclear track.
+        if subgenre_value:
+            id3.delall("TIT1")
+            id3.add(TIT1(encoding=enc, text=[subgenre_value]))
 
     if config.write_bpm and ml.get("ml_bpm"):
-        audio.tags.delall("TBPM")
-        audio.tags.add(TBPM(encoding=enc, text=[str(int(round(ml["ml_bpm"])))]))
+        id3.delall("TBPM")
+        id3.add(TBPM(encoding=enc, text=[str(int(round(ml["ml_bpm"])))]))
     if config.write_key and ml.get("ml_key"):
-        audio.tags.delall("TKEY")
-        audio.tags.add(TKEY(encoding=enc, text=[ml["ml_key"]]))
+        id3.delall("TKEY")
+        id3.add(TKEY(encoding=enc, text=[ml["ml_key"]]))
 
     for tag_name in ("ENERGY", "MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
         val = _derived_field_value(tag_name, ml, config)
         if val is not None:
-            audio.tags.delall(f"TXXX:{tag_name}")
-            audio.tags.add(TXXX(encoding=enc, desc=tag_name, text=[str(val)]))
+            id3.delall(f"TXXX:{tag_name}")
+            id3.add(TXXX(encoding=enc, desc=tag_name, text=[str(val)]))
 
     for key, frame in preserved:
-        if key not in audio.tags:
-            audio.tags.add(frame)
+        if key not in id3:
+            id3.add(frame)
+
+
+def _apply_mp3(
+    filepath: Path,
+    ml: dict[str, Any],
+    apply_genre: bool,
+    genre_value: str,
+    config: TaggingConfig,
+    subgenre_value: str = "",
+) -> None:
+    audio = MP3(filepath)
+    if audio.tags is None:
+        audio.add_tags()
+    _apply_id3_frames(audio.tags, ml, apply_genre, genre_value, config, subgenre_value)
+    audio.save()
+
+
+def _apply_aiff_wav(
+    filepath: Path,
+    ml: dict[str, Any],
+    apply_genre: bool,
+    genre_value: str,
+    config: TaggingConfig,
+    subgenre_value: str = "",
+) -> None:
+    """Apply ML tags to AIFF/WAV — both carry the same ID3v2 frames as MP3.
+
+    AIFF is the standard lossless format for Rekordbox/Serato, so a confident
+    analysis must be able to tag it (it used to error 'unsupported format').
+    """
+    ext = filepath.suffix.lower()
+    audio = AIFF(filepath) if ext in (".aiff", ".aif") else WAVE(filepath)
+    if audio.tags is None:
+        audio.add_tags()
+    _apply_id3_frames(audio.tags, ml, apply_genre, genre_value, config, subgenre_value)
+    audio.save()
+
+
+def _apply_m4a(
+    filepath: Path,
+    ml: dict[str, Any],
+    apply_genre: bool,
+    genre_value: str,
+    config: TaggingConfig,
+    subgenre_value: str = "",
+) -> None:
+    """Apply ML tags to an M4A/MP4 container.
+
+    Genre → ``©gen``, subgenre → ``©grp`` (grouping, the M4A analog of TIT1),
+    BPM → ``tmpo`` (int atom), and each derived field → a freeform
+    ``----:com.apple.iTunes:<NAME>`` atom (the iTunes convention DJ tools read).
+    """
+    audio = MP4(filepath)
+    if audio.tags is None:
+        audio.add_tags()
+
+    if apply_genre:
+        audio["\xa9gen"] = [genre_value]
+        if subgenre_value:
+            audio["\xa9grp"] = [subgenre_value]
+
+    if config.write_bpm and ml.get("ml_bpm"):
+        audio["tmpo"] = [int(round(ml["ml_bpm"]))]
+    if config.write_key and ml.get("ml_key"):
+        audio["----:com.apple.iTunes:initialkey"] = [
+            MP4FreeForm(str(ml["ml_key"]).encode("utf-8"))
+        ]
+
+    for tag_name in ("ENERGY", "MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
+        val = _derived_field_value(tag_name, ml, config)
+        if val is not None:
+            audio[f"----:com.apple.iTunes:{tag_name}"] = [
+                MP4FreeForm(str(val).encode("utf-8"))
+            ]
 
     audio.save()
 
@@ -858,16 +1061,16 @@ def _apply_flac(
     apply_genre: bool,
     genre_value: str,
     config: TaggingConfig,
+    subgenre_value: str = "",
 ) -> None:
     audio = FLAC(filepath)
     if apply_genre:
         audio["GENRE"] = genre_value
-        # CONTENTGROUP is the FLAC analog of MP3's TIT1 (subgenre) — only
-        # populate it when the value we're writing is genuinely a subgenre.
-        # Stage-2 parent-only fallback should NOT pollute CONTENTGROUP.
-        ml_subgenre = ml.get("ml_subgenre", "") or ""
-        if genre_value == ml_subgenre:
-            audio["CONTENTGROUP"] = genre_value
+        # CONTENTGROUP is the FLAC analog of MP3's TIT1 (subgenre) — populate it
+        # whenever we have a genuine subgenre. Stage-2 parent-only fallback
+        # passes subgenre_value="" so it does NOT pollute CONTENTGROUP.
+        if subgenre_value:
+            audio["CONTENTGROUP"] = subgenre_value
 
     if config.write_bpm and ml.get("ml_bpm"):
         audio["BPM"] = str(int(round(ml["ml_bpm"])))

@@ -77,7 +77,11 @@ class PreflightResult:
         have_engine = (
             self.essentia.installed
             or (self.wsl and self.wsl.can_run_vibechek)
-            or (self.native_venv and self.native_venv.essentia_installed)
+            or (
+                self.native_venv
+                and self.native_venv.essentia_installed
+                and self.native_venv.vibechek_installed
+            )
         )
         if not have_engine:
             pkg = (

@@ -18,7 +18,60 @@ _Nothing yet._
 
 First release on the simplified `0.x` versioning — the `-beta.N` iteration counter
 is retired (the `0.x` line already signals pre-1.0/beta status). Ships the bundled,
-one-click ONNX engine setup, plus the full-stack bug-hunt fixes from the beta.10 cycle.
+one-click ONNX engine setup, the full-stack bug-hunt fixes from the beta.10 cycle,
+**and a second, deeper bug hunt (16-domain code/RPC/CLI audit + live-GUI driving)
+that found and fixed 46 more issues** — see "Fixed (second bug hunt)" below.
+
+### Added
+
+- **`backup_before_write` now actually backs up.** The Tags-settings toggle
+  (default on) reached the config but nothing acted on it — applying ML tags
+  did NOT snapshot first, so the safety was illusory. The apply flow now
+  snapshots the exact files being tagged (to a timestamped backup recorded in
+  history) before mutating them, and reports the backup path.
+- **`write_subgenre_as_main_genre` now takes effect.** When off, the parent
+  family (e.g. "House") goes in the sortable main-genre frame while the precise
+  subgenre ("Deep House") is preserved in its own subgenre frame. (Was a dead
+  toggle that did nothing.)
+- **Tag apply now supports AIFF / WAV / M4A** (previously errored "unsupported
+  format" despite those formats being analyzed and tag-capable).
+
+### Fixed (second bug hunt)
+
+- **Dedupe could delete a file it marked as a "keeper."** Overlapping
+  audio-duplicate groups (multi-probe bucketing with no global merge) let one
+  file be a keeper in one group and a duplicate in another; the move/trash then
+  removed the kept copy. Now clusters are merged globally (union-find) and
+  `handle_duplicates` never acts on any group's keeper. Also fixes inflated
+  duplicate counts and spurious "file not found" double-processing.
+- **Tag backup was lossy / non-identity.** Multi-valued FLAC/M4A artist, genre,
+  and composer were truncated to the first value (permanent loss on a
+  backup→restore round-trip), and ID3 `TXXX` descriptions were upper-cased on
+  restore (renaming ReplayGain / EnergyLevel / MixedInKey frames). Both now
+  round-trip verbatim.
+- **Cancel during the dedupe move/trash batch was inert** — a destructive
+  operation couldn't be stopped. Now cancellable. And a **cancelled organize**
+  now returns its partial stats + undo journal (so "Undo" still works) instead
+  of erroring out and stranding half-moved files.
+- **CDJ export** never down-sampled >48 kHz FLAC (the AIFF wouldn't play on the
+  target CDJ) and left a stale SampleRate in the rewritten Rekordbox XML — both
+  fixed; resampled tracks are reported.
+- **`revert` / `journals` crashed on one malformed journal line**, and `revert`
+  silently "succeeded" (reverted 0, exit 0) when pointed at a non-journal file —
+  now skipped / validated with clean errors.
+- **Audio preview**: a rapid track switch showed the previous track's abort
+  error on the new track; large valid files hit a false 15s timeout; the player
+  kept a stale path after an organize moved the loaded track — all fixed.
+- **~30 more**: clean JSON-RPC errors for non-dict params + no replies to
+  notifications; engine-aware `verify_models`; non-empty preflight reasons;
+  ONNX crash on ultra-short audio; energy-0 timeslot; organizer `Unknown/`
+  subfolder + route dry-run undercount; one bad `library_state` record no longer
+  wipes the recent list; clearing an optional path no longer persists `.`; many
+  CLI tracebacks (tag/organize/restore-tags/export/dedupe on corrupt or
+  wrong-shape input) turned into clean errors; and frontend fixes
+  (filters/search/errors-only reset on library switch, select-all on filtered
+  lists, dedupe "moved N" count, the ONNX setup dialog gaining a Cancel, the
+  risky-install-path warning now surfaced). Every fix has a regression test.
 
 ### Added
 

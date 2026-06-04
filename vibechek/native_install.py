@@ -153,8 +153,10 @@ def probe_native_venv(engine: str = "essentia_tf") -> NativeVenvStatus:
             # `essentia-tensorflow` installs both `essentia/` and a dist-info
             for d in sp.glob("essentia*.dist-info"):
                 status.essentia_installed = True
-                # Parse version from dir name: "essentia_tensorflow-2.1b6.dev1110.dist-info"
-                m = re.match(r"essentia[_-][^-]+-([^-]+)\.dist-info$", d.name)
+                # Parse version from dir name. Handle both the essentia_tf venv
+                # ("essentia_tensorflow-2.1b6.dev1110.dist-info") and the ONNX
+                # venv, which installs plain essentia ("essentia-2.1b6....").
+                m = re.match(r"^essentia(?:[_-][^-]+)?-([^-]+)\.dist-info$", d.name)
                 if m:
                     status.essentia_version = m.group(1)
                 break

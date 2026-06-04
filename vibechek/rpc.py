@@ -640,12 +640,25 @@ def _organize(params: dict) -> dict:
         target_root=Path(params["target_root"]) if params.get("target_root") else None,
     )
     analysis_data = _load_analysis_payload(params)
-    stats = organize_from_analysis(
-        analysis_data,
-        config,
-        on_progress=_emit_progress,
-        dry_run=bool(params.get("dry_run", False)),
-    )
+    try:
+        stats = organize_from_analysis(
+            analysis_data,
+            config,
+            on_progress=_emit_progress,
+            dry_run=bool(params.get("dry_run", False)),
+        )
+    except cancellation.CancelledError as e:
+        # A cancelled organize has usually already moved SOME files and written a
+        # revert journal. Surface those partial stats (incl. journal_path) as a
+        # normal result tagged cancelled=True, so the GUI can still offer "Undo
+        # this organize" — instead of an APP_ERROR that drops the journal path
+        # and strands the half-moved files with no one-click undo.
+        partial = getattr(e, "partial_stats", None)
+        if partial is not None:
+            result = asdict(partial)
+            result["cancelled"] = True
+            return result
+        raise
     return asdict(stats)
 
 
@@ -706,12 +719,54 @@ def _apply_ml_tags(params: dict) -> dict:
         id3_text_encoding=_valid_id3_encoding(params.get("id3_text_encoding", 3), 3),
     )
     analysis_data = _load_analysis_payload(params)
+    dry = bool(params.get("dry_run", False))
+
+    # "Backup before write" safety net (default ON). Snapshot the EXACT files
+    # about to be tagged BEFORE mutating them, so a bad apply is recoverable via
+    # restore-tags. Previously this toggle was dead — the value reached the
+    # config but nothing acted on it, so users had a false sense of safety.
+    backup_path = None
+    if config.backup_before_write and not dry:
+        backup_path = _auto_backup_before_apply(analysis_data)
+
     stats = apply_ml_tags(
         analysis_data, config,
         on_progress=_emit_progress,
-        dry_run=bool(params.get("dry_run", False)),
+        dry_run=dry,
     )
-    return asdict(stats)
+    result = asdict(stats)
+    if backup_path is not None:
+        result["backup_path"] = str(backup_path)
+    return result
+
+
+def _auto_backup_before_apply(analysis_data: dict) -> Path | None:
+    """Snapshot the tags of every file in the apply set to a timestamped backup
+    under the data dir, and record it in the user's backup history. Returns the
+    backup path, or None when there is nothing to back up. Raises if the backup
+    file itself can't be written — we must NOT proceed to mutate tags when the
+    requested safety backup failed."""
+    from datetime import datetime  # noqa: PLC0415
+
+    from vibechek import backup_history  # noqa: PLC0415
+    from vibechek.config import DATA_DIR  # noqa: PLC0415
+    from vibechek.tagger import backup_tag_files  # noqa: PLC0415
+
+    tracks = analysis_data.get("tracks") or []
+    paths = [t.get("path") for t in tracks if isinstance(t, dict) and t.get("path")]
+    if not paths:
+        return None
+    backups_dir = DATA_DIR / "backups"
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output = backups_dir / f"pre-apply-{stamp}.json"
+    stats = backup_tag_files(paths, output, on_progress=_emit_progress)
+    try:
+        common = os.path.commonpath([str(p) for p in paths])
+        backup_history.record(common, output, stats.backed_up)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not record pre-apply backup in history: %s", e)
+    return output
 
 
 def _backup_tags(params: dict) -> dict:
@@ -734,7 +789,17 @@ def _backup_tags(params: dict) -> dict:
 def _restore_tags(params: dict) -> dict:
     from vibechek.tagger import restore_tags
 
-    stats = restore_tags(Path(params["backup_path"]), on_progress=_emit_progress)
+    # Forward the user's tagging config so the plain restore path honours
+    # id3_text_encoding too (mirrors _restore_tags_with_remap). Without it
+    # restore_tags falls back to a fresh TaggingConfig() (UTF-8) and silently
+    # re-encodes every MP3 text frame as UTF-8 — empty in Rekordbox 5 / UTF-16
+    # setups — on the standard "Restore tags" button.
+    cfg = VibechekConfig.load().tagging
+    stats = restore_tags(
+        Path(params["backup_path"]),
+        on_progress=_emit_progress,
+        config=cfg,
+    )
     return asdict(stats)
 
 
@@ -830,10 +895,27 @@ def _setup_onnx_engine(params: dict) -> dict:
         )
         if already is None:
             _emit_progress(2, total, f"Installing the ONNX engine in {distro} (one-time)…")
-            install_vibechek_in_wsl(
+            res = install_vibechek_in_wsl(
                 distro, engine="onnx",
                 on_progress=lambda d, t, m: _emit_progress(2, total, m),
             )
+            # install_vibechek_in_wsl RETURNS {ok: False, error: ...} on failure
+            # (it does not raise). Without checking it we'd continue to the
+            # download + preflight and replace the installer's specific, actionable
+            # reason (network/disk/pip) with the generic preflight string. Capture
+            # and short-circuit so the GUI can show the real cause.
+            if isinstance(res, dict) and not res.get("ok"):
+                pf = preflight(None, quick_wsl=True, engine="onnx")
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "error": res.get("error"),
+                    "cancelled": bool(res.get("cancelled")),
+                    "staged": staged.get("staged", []),
+                    "bundle_source": staged.get("source"),
+                    "reasons_not_ready": pf.reasons_not_ready,
+                    "analyze_via": pf.analyze_via,
+                }
     else:
         from vibechek.native_install import (  # noqa: PLC0415
             install_essentia_native,
@@ -843,10 +925,24 @@ def _setup_onnx_engine(params: dict) -> dict:
         nv = probe_native_venv("onnx")
         if not (nv.essentia_installed and nv.vibechek_installed):
             _emit_progress(2, total, "Installing the ONNX engine (one-time)…")
-            install_essentia_native(
+            res = install_essentia_native(
                 engine="onnx",
                 on_progress=lambda d, t, m: _emit_progress(2, total, m),
             )
+            # install_essentia_native also RETURNS {ok: False, error: ...} on
+            # failure rather than raising — same short-circuit as the WSL branch.
+            if isinstance(res, dict) and not res.get("ok"):
+                pf = preflight(None, quick_wsl=False, engine="onnx")
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "error": res.get("error"),
+                    "cancelled": bool(res.get("cancelled")),
+                    "staged": staged.get("staged", []),
+                    "bundle_source": staged.get("source"),
+                    "reasons_not_ready": pf.reasons_not_ready,
+                    "analyze_via": pf.analyze_via,
+                }
 
     # 3. Fetch ONLY the EffNet backbone (heads are bundled/staged).
     _emit_progress(3, total, "Fetching the EffNet backbone…")
@@ -862,6 +958,11 @@ def _setup_onnx_engine(params: dict) -> dict:
     return {
         "ok": bool(pf.ready),
         "ready": bool(pf.ready),
+        # `error` is part of the schema on every path: None on success, the
+        # installer's specific reason on an install-step failure (set in the
+        # short-circuit returns above). The frontend prefers res.error when set.
+        "error": None,
+        "cancelled": False,
         "staged": staged.get("staged", []),
         "bundle_source": staged.get("source"),
         "reasons_not_ready": pf.reasons_not_ready,
@@ -970,20 +1071,84 @@ def _doctor(_params: dict) -> dict:
     return {"markdown": render_markdown(build_report())}
 
 
-def _verify_models(_params: dict) -> dict:
-    """Verify every downloaded model's SHA256 against the pinned table.
-
-    Returns {"results": [{name, suffix, ok, expected, computed}, ...]}.
-    `ok=True` for files matching MODEL_SHA256[name][suffix], `ok=None` for
-    files we have no pin for yet (the table is populated on the release
-    build), `ok=False` for actual mismatches.
-    """
+def _sha256_file(path: Path) -> str:
+    """Stream a file's SHA256 in 1 MiB chunks (avoid slurping 100+ MB weights)."""
     import hashlib as _hashlib
 
-    from vibechek.analyzer import MODEL_SHA256, MODELS
+    h = _hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_models(params: dict) -> dict:
+    """Verify the downloaded model files' SHA256 against the pinned table.
+
+    Engine-aware: the ONNX engine stages its heads + backbone under
+    ``<models>/onnx`` and never downloads the essentia ``.pb`` set, so verifying
+    the flat ``.pb``/``.json`` files for an ONNX-only install would report every
+    file "missing" (a false alarm) while never integrity-checking the ``.onnx``
+    files the analyze pipeline actually loads. We pick the file set from the
+    active engine (``params['engine']`` if given, else config.inference_engine).
+
+    Returns {"results": [{name, suffix, ok, expected, computed}, ...], "engine": ...}.
+    `ok=True` for files matching the pinned digest, `ok=None` for files we have
+    no pin for yet (the essentia table is populated on the release build),
+    `ok=False` for actual mismatches or missing required files.
+    """
     from vibechek.config import MODELS_DIR
 
+    engine = _valid_engine(
+        params.get("engine"), default=VibechekConfig.load().analysis.inference_engine
+    )
+
     results: list[dict] = []
+
+    if engine == "onnx":
+        from vibechek.analyzer import (
+            _ONNX_HEAD_STEMS,
+            _ONNX_SUBDIR,
+            MODEL_SHA256_ONNX,
+        )
+        from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
+
+        onnx_dir = MODELS_DIR / _ONNX_SUBDIR
+        # Backbone (.onnx) + each converted head (.onnx + class-label .json).
+        filenames = [BACKBONE_ONNX_FILENAME]
+        for stem in _ONNX_HEAD_STEMS:
+            filenames.append(f"{stem}.onnx")
+            filenames.append(f"{stem}.json")
+
+        for fname in filenames:
+            path = onnx_dir / fname
+            expected = MODEL_SHA256_ONNX.get(fname)
+            if not path.exists():
+                results.append({
+                    "name": fname, "suffix": "onnx", "ok": False,
+                    "reason": "missing",
+                })
+                continue
+            computed = _sha256_file(path)
+            if expected is None:
+                # Backbone has no pin (fetched from essentia upstream); report
+                # informational ok=None rather than a scary failure.
+                results.append({
+                    "name": fname, "suffix": "onnx", "ok": None,
+                    "computed": computed,
+                    "reason": "no pin (upstream backbone / unpinned head)",
+                })
+            else:
+                results.append({
+                    "name": fname, "suffix": "onnx",
+                    "ok": computed.lower() == expected.lower(),
+                    "expected": expected, "computed": computed,
+                })
+        return {"results": results, "engine": engine}
+
+    # essentia_tf: the flat .pb / .json set in the models dir.
+    from vibechek.analyzer import MODEL_SHA256, MODELS
+
     for name in MODELS:
         for suffix in ("pb", "json"):
             path = MODELS_DIR / f"{name}.{suffix}"
@@ -993,11 +1158,7 @@ def _verify_models(_params: dict) -> dict:
                     "reason": "missing",
                 })
                 continue
-            h = _hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-            computed = h.hexdigest()
+            computed = _sha256_file(path)
             expected = MODEL_SHA256.get(name, {}).get(suffix)
             if expected is None:
                 results.append({
@@ -1011,7 +1172,7 @@ def _verify_models(_params: dict) -> dict:
                     "ok": computed.lower() == expected.lower(),
                     "expected": expected, "computed": computed,
                 })
-    return {"results": results}
+    return {"results": results, "engine": engine}
 
 
 def _list_profiles(_params: dict) -> dict:
@@ -1274,6 +1435,13 @@ _CANCELLABLE_METHODS = {
     "analyze_directory": "analyze",
     "scan_only": "analyze",
     "find_duplicates": "dedupe",
+    # handle_duplicates physically MOVES/TRASHES files and its loops call
+    # cancellation.check() (vibechek.duplicates). Those checks only go live when
+    # the dispatcher has begun a cancellation kind for the method — otherwise the
+    # Cancel button is inert and a destructive batch can't be stopped. Use a kind
+    # distinct from find_duplicates' 'dedupe' so the busy-rejection messaging is
+    # accurate and the move/trash op is gated by _LONG_OP_LOCK.
+    "handle_duplicates": "dedupe-handle",
     "organize": "organize",
     "apply_ml_tags": "tag",
     "backup_tags": "backup",
@@ -1310,12 +1478,30 @@ def _dispatch(request: dict[str, Any]) -> None:
     params = request.get("params") or {}
 
     if not method:
-        _err(req_id, INVALID_REQUEST, "Missing 'method'")
+        # Per JSON-RPC 2.0 the server must NOT reply to a notification (no id),
+        # even on error. The handler-exception branches already guard this; the
+        # early returns must too, or an id-less malformed request gets an illegal
+        # {"id": null, ...} error frame.
+        if req_id is not None:
+            _err(req_id, INVALID_REQUEST, "Missing 'method'")
         return
 
     handler = METHODS.get(method)
     if handler is None:
-        _err(req_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+        if req_id is not None:
+            _err(req_id, METHOD_NOT_FOUND, f"Method not found: {method}")
+        return
+
+    # Validate params SHAPE once, before toggling any cancellation state. Every
+    # handler immediately does `params.get(...)`; a non-object params (JSON
+    # array/string/number) raises AttributeError, which is NOT in the
+    # (TypeError, KeyError, ValueError) branch below and would otherwise leak a
+    # full traceback as APP_ERROR (-32000) instead of a clean INVALID_PARAMS.
+    # Running this before the begin()/end() block keeps cancellation state from
+    # being touched for a rejected request.
+    if not isinstance(params, dict):
+        if req_id is not None:
+            _err(req_id, INVALID_PARAMS, "'params' must be an object")
         return
 
     kind = _CANCELLABLE_METHODS.get(method)
@@ -1328,13 +1514,16 @@ def _dispatch(request: dict[str, Any]) -> None:
         with _LONG_OP_LOCK:
             existing = cancellation.current_kind()
             if existing is not None:
-                _err(
-                    req_id,
-                    INVALID_REQUEST,
-                    f"Another long-running operation ({existing!r}) is already "
-                    f"in progress. Cancel it before starting {kind!r}.",
-                    data={"busy": True, "running": existing},
-                )
+                # Same notification guard as the rest of _dispatch — never reply
+                # to an id-less request, even with a busy error.
+                if req_id is not None:
+                    _err(
+                        req_id,
+                        INVALID_REQUEST,
+                        f"Another long-running operation ({existing!r}) is already "
+                        f"in progress. Cancel it before starting {kind!r}.",
+                        data={"busy": True, "running": existing},
+                    )
                 return
             cancellation.begin(kind)
             # Fresh op → fresh throttle clock, so its first progress tick isn't

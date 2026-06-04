@@ -178,6 +178,26 @@ def test_make_patches_shape_and_padding() -> None:
     assert np.all(padded[0, 50:] == 0.0)  # tail zero-padded
 
 
+def test_make_patches_empty_mel_yields_single_zero_patch() -> None:
+    """An empty/near-empty decode (ultra-short audio) must still yield one patch.
+
+    Regression: `_make_patches` read `mel.shape[1]` to size the pad, which raised
+    `IndexError: tuple index out of range` on a 1-D `(0,)` mel array. ORT then
+    surfaced an opaque 'EffNet embedding failed: tuple index out of range' for the
+    track instead of analyzing it like the essentia path does.
+    """
+    # 1-D empty array — no zero mel frames at all (audio < ~32 ms).
+    empty_1d = ob._make_patches(np.array([], dtype=np.float32))
+    assert empty_1d.shape == (1, 128, 96)
+    assert empty_1d.dtype == np.float32
+    assert np.all(empty_1d == 0.0)
+
+    # 2-D but zero rows — same contract.
+    empty_2d = ob._make_patches(np.zeros((0, 96), dtype=np.float32))
+    assert empty_2d.shape == (1, 128, 96)
+    assert np.all(empty_2d == 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Engine flag default
 # ---------------------------------------------------------------------------

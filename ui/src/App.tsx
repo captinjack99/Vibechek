@@ -15,7 +15,7 @@ import { Onboarding } from "./components/Onboarding";
 import { OperationsHistory } from "./components/OperationsHistory";
 import { GlobalAudioPlayer } from "./components/GlobalAudioPlayer";
 
-import { useUIStore, useOperationStore, useConfigStore, useLibraryStore } from "./stores";
+import { useUIStore, useOperationStore, useConfigStore, useLibraryStore, useNotificationStore } from "./stores";
 import { useSidecarProgress, useSidecarEvent } from "./hooks/useSidecar";
 import { useConfigPersistence } from "./hooks/useConfigPersistence";
 import type { TrackAnalysis } from "./types";
@@ -24,6 +24,18 @@ interface TrackAnalyzedPayload {
   current: number;
   total: number;
   track: TrackAnalysis;
+}
+
+/**
+ * Payload of the sidecar's `notify` notification — emitted at startup for
+ * known-problematic install locations (Google Drive "My Drive", OneDrive,
+ * iCloud, Dropbox, very long / space-heavy paths) that can make the
+ * PyInstaller bootloader hang or behave erratically.
+ */
+interface NotifyPayload {
+  level?: string;
+  message: string;
+  detail?: string;
 }
 
 /**
@@ -80,6 +92,20 @@ export default function App() {
     if (!analyzeRun) return;
     if (!isUnderLibrary(path, analyzeRun.root)) return;
     mergeAnalyzedTrack(payload.track);
+  });
+
+  // Surface the sidecar's startup install-path warning. The sidecar emits a
+  // `notify` notification (re-broadcast by the Rust shell as `sidecar:notify`)
+  // when it detects a risky install location — without a listener this was the
+  // single mechanism warning users about hang-prone paths, and it was silently
+  // dropped. The notification store has no "warning" kind, so map level →
+  // "info" (still distinct from the sticky red operation-error toast).
+  useSidecarEvent<NotifyPayload>("notify", (payload) => {
+    if (!payload?.message) return;
+    useNotificationStore.getState().notify(payload.message, {
+      kind: "info",
+      detail: payload.detail,
+    });
   });
 
   // Load config from disk on startup, then auto-save (debounced) on change.

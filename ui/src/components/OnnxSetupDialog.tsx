@@ -8,7 +8,7 @@
  * clear success / error state at the end.
  */
 import { useState } from "react";
-import { Loader2, CheckCircle2, AlertCircle, X, Cpu } from "lucide-react";
+import { Loader2, CheckCircle2, AlertCircle, X, Cpu, StopCircle } from "lucide-react";
 
 import { useSidecarProgress } from "../hooks/useSidecar";
 
@@ -21,9 +21,14 @@ export type OnnxSetupState =
 export function OnnxSetupDialog({
   state,
   onClose,
+  onCancel,
 }: {
   state: OnnxSetupState;
   onClose: () => void;
+  // Abort an in-flight setup. setup_onnx_engine is a Cancellable backend op
+  // (it calls cancellation.check() during the network fetch/install), so a
+  // user on a slow/flaky mirror isn't trapped behind a non-dismissable modal.
+  onCancel?: () => void;
 }) {
   const [progress, setProgress] = useState({ current: 0, total: 4, message: "Starting…" });
 
@@ -66,6 +71,16 @@ export function OnnxSetupDialog({
               engine and fetches the EffNet backbone, so it can take a few minutes — the app isn't hung. You can
               keep using other tabs.
             </p>
+            {onCancel && (
+              <button
+                onClick={onCancel}
+                className="flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-2 text-sm font-medium text-white hover:bg-white/20"
+                title="Stop the ONNX engine setup"
+              >
+                <StopCircle className="h-4 w-4" />
+                Cancel
+              </button>
+            )}
           </div>
         )}
 

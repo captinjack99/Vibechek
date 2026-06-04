@@ -340,3 +340,241 @@ def test_export_skips_missing_source(tmp_path: Path) -> None:
     assert result.flac_converted == 0
     assert result.passthrough == 1
     assert result.track_errors and "not found" in result.track_errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# >48 kHz hi-res down-sample (CDJ-2000nexus tops out at 48 kHz)
+# ---------------------------------------------------------------------------
+
+
+@needs_soundfile
+def test_ffmpeg_fallback_downsamples_above_48k(tmp_path: Path, monkeypatch) -> None:
+    """Regression: the ffmpeg fallback MUST down-sample a >48 kHz FLAC.
+
+    The ffmpeg path is only reached when soundfile is unavailable, so it cannot
+    rely on soundfile to discover the source rate. We force that path by
+    monkeypatching _soundfile_module to None (ffmpeg must be on PATH for this
+    test). Before the fix the AIFF stayed at 96 kHz — unplayable on the CDJs the
+    whole feature targets.
+    """
+    import shutil
+
+    import numpy as np
+    import soundfile as sf
+
+    import vibechek.cdj_export as cdj
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not on PATH — required to exercise the fallback path")
+
+    sr = 96000
+    sine = (0.5 * np.sin(2 * np.pi * 440 * np.arange(sr) / sr)).astype("float32")
+    flac = tmp_path / "hires.flac"
+    sf.write(str(flac), sine, sr, format="FLAC")
+
+    # Force the ffmpeg fallback exactly as a soundfile-less install would hit it.
+    monkeypatch.setattr(cdj, "_soundfile_module", lambda: None)
+
+    aiff = tmp_path / "out" / "hires.aiff"
+    transcode_to_aiff(flac, aiff)
+
+    assert aiff.exists()
+    # Read the produced rate WITHOUT soundfile-dependence in the assert by
+    # re-enabling soundfile only for inspection (the transcode already ran).
+    out_rate = sf.info(str(aiff)).samplerate
+    assert out_rate <= 48000, f"ffmpeg fallback left a >48 kHz AIFF ({out_rate} Hz)"
+    assert out_rate == 44100
+
+
+@needs_soundfile
+def test_ffmpeg_fallback_keeps_44k_unchanged(tmp_path: Path, monkeypatch) -> None:
+    """A <=48 kHz source must NOT be resampled by the ffmpeg fallback."""
+    import shutil
+
+    import numpy as np
+    import soundfile as sf
+
+    import vibechek.cdj_export as cdj
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not on PATH — required to exercise the fallback path")
+
+    sr = 44100
+    n = 12345
+    sine = (0.5 * np.sin(2 * np.pi * 440 * np.arange(n) / sr)).astype("float32")
+    flac = tmp_path / "cd.flac"
+    sf.write(str(flac), sine, sr, format="FLAC")
+
+    monkeypatch.setattr(cdj, "_soundfile_module", lambda: None)
+
+    aiff = tmp_path / "out" / "cd.aiff"
+    transcode_to_aiff(flac, aiff)
+
+    info = sf.info(str(aiff))
+    assert info.samplerate == 44100
+    # No rate change -> ffmpeg preserves the exact frame count (grid stays valid).
+    assert info.frames == n
+
+
+def test_ffmpeg_cmd_forces_44k_when_rate_unknown(tmp_path: Path, monkeypatch) -> None:
+    """If the source rate can't be probed, ffmpeg is invoked with -ar 44100.
+
+    Forcing 44.1 kHz when the rate is unknown is always CDJ-safe (a no-op for
+    already-<=48 kHz tracks) and prevents shipping an unplayable hi-res AIFF.
+    Exercises the command construction without needing a real audio file.
+    """
+    import vibechek.cdj_export as cdj
+
+    captured: dict[str, list[str]] = {}
+
+    class _FakeProc:
+        returncode = 0
+        stderr = ""
+
+    def _fake_run(cmd, *args, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    # Rate cannot be determined -> the fix must still add -ar 44100.
+    monkeypatch.setattr(cdj, "_probe_samplerate", lambda src: None)
+    monkeypatch.setattr(cdj.subprocess, "run", _fake_run)
+
+    cdj._transcode_ffmpeg(tmp_path / "x.flac", tmp_path / "x.aiff")
+
+    cmd = captured["cmd"]
+    assert "-ar" in cmd
+    assert cmd[cmd.index("-ar") + 1] == "44100"
+
+
+# ---------------------------------------------------------------------------
+# Down-sampled tracks: SampleRate/BitRate must be corrected in the XML
+# ---------------------------------------------------------------------------
+
+
+def _build_hires_rekordbox_xml(flac_location: str) -> str:
+    """A Rekordbox collection XML with a single 96 kHz FLAC TRACK."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<DJ_PLAYLISTS Version="1.0.0">
+  <PRODUCT Name="rekordbox" Version="6.7.7" Company="AlphaTheta"/>
+  <COLLECTION Entries="1">
+    <TRACK TrackID="1" Name="HiRes" Kind="FLAC" Size="80000000"
+           TotalTime="312" SampleRate="96000" BitRate="4608"
+           Location="{flac_location}">
+      <TEMPO Inizio="0.025" Bpm="124.00" Metro="4/4" Battito="1"/>
+      <POSITION_MARK Name="" Type="0" Start="0.025" Num="-1"/>
+    </TRACK>
+  </COLLECTION>
+  <PLAYLISTS>
+    <NODE Type="0" Name="ROOT" Count="0"/>
+  </PLAYLISTS>
+</DJ_PLAYLISTS>
+"""
+
+
+@needs_soundfile
+def test_rewrite_corrects_stale_samplerate_for_downsampled_track(tmp_path: Path) -> None:
+    """Regression: a down-sampled track's XML SampleRate/BitRate must be updated.
+
+    Before the fix the TRACK kept SampleRate="96000" even though the on-disk AIFF
+    is 44.1 kHz, so Rekordbox advertised a rate the file no longer had.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    src_flac = tmp_path / "hires.flac"
+    src_flac.write_bytes(b"flac placeholder - rewrite only reads the AIFF rate")
+
+    # A real 44.1 kHz AIFF stands in for the down-sampled output.
+    aiff = tmp_path / "out" / "hires.aiff"
+    aiff.parent.mkdir()
+    sf.write(str(aiff), np.zeros(4410, dtype="int16"), 44100, format="AIFF", subtype="PCM_16")
+
+    xml = _build_hires_rekordbox_xml(path_to_location(src_flac))
+    xml_path = tmp_path / "rb.xml"
+    xml_path.write_text(xml, encoding="utf-8")
+    tree = parse_rekordbox_xml(xml_path)
+
+    new_tree = rewrite_for_cdj(tree, {str(src_flac): aiff}, tmp_path / "out")
+    out_flac = _track_by_id(new_tree.getroot(), "1")
+
+    assert out_flac.get("Kind") == AIFF_KIND
+    # SampleRate corrected to the AIFF's real rate; stale BitRate cleared.
+    assert out_flac.get("SampleRate") == "44100"
+    assert out_flac.get("BitRate") == "0"
+
+
+@needs_soundfile
+def test_rewrite_leaves_samplerate_when_not_resampled(tmp_path: Path) -> None:
+    """A non-resampled (<=48 kHz) track keeps its declared SampleRate/BitRate."""
+    import numpy as np
+    import soundfile as sf
+
+    src_flac = tmp_path / "song.flac"
+    src_flac.write_bytes(b"x")
+    aiff = tmp_path / "out" / "song.aiff"
+    aiff.parent.mkdir()
+    # AIFF rate matches the TRACK's declared 44100 -> nothing to correct.
+    sf.write(str(aiff), np.zeros(4410, dtype="int16"), 44100, format="AIFF", subtype="PCM_16")
+
+    xml = _build_rekordbox_xml(path_to_location(src_flac), path_to_location(tmp_path / "b.mp3"))
+    xml_path = tmp_path / "rb.xml"
+    xml_path.write_text(xml, encoding="utf-8")
+    tree = parse_rekordbox_xml(xml_path)
+
+    new_tree = rewrite_for_cdj(tree, {str(src_flac): aiff}, tmp_path / "out")
+    out_flac = _track_by_id(new_tree.getroot(), "1")
+    assert out_flac.get("SampleRate") == "44100"
+    assert out_flac.get("BitRate") == "1411"  # untouched
+
+
+@needs_soundfile
+def test_export_records_resampled_hires_track(tmp_path: Path) -> None:
+    """End-to-end: a 96 kHz FLAC is reported in result.resampled and its XML rate fixed."""
+    import numpy as np
+    import soundfile as sf
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    flac = lib / "hires.flac"
+    sr = 96000
+    sf.write(str(flac), np.zeros(sr // 2, dtype="float32"), sr, format="FLAC")
+
+    xml = _build_hires_rekordbox_xml(path_to_location(flac))
+    xml_path = tmp_path / "rb.xml"
+    xml_path.write_text(xml, encoding="utf-8")
+
+    out_dir = tmp_path / "export"
+    result = export_for_cdj(xml_path, out_dir)
+
+    assert result.flac_converted == 1
+    assert result.errors == 0
+    # The hi-res source is flagged as down-sampled (irreversible quality drop).
+    assert result.resampled == [str(flac)]
+
+    # The on-disk AIFF really is <=48 kHz ...
+    aiff = next(out_dir.glob("*.aiff"))
+    assert sf.info(str(aiff)).samplerate <= 48000
+    # ... and the rewritten XML no longer advertises 96000.
+    tree = parse_rekordbox_xml(result.output_xml)
+    out_flac = _track_by_id(tree.getroot(), "1")
+    assert out_flac.get("SampleRate") == "44100"
+
+
+@needs_soundfile
+def test_export_does_not_flag_44k_track_as_resampled(tmp_path: Path) -> None:
+    """A normal 44.1 kHz FLAC must NOT appear in result.resampled."""
+    import numpy as np
+    import soundfile as sf
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    flac = lib / "deep.flac"
+    sf.write(str(flac), np.zeros(8000, dtype="float32"), 44100, format="FLAC")
+
+    xml = _build_rekordbox_xml(path_to_location(flac), path_to_location(lib / "x.mp3"))
+    xml_path = tmp_path / "rb.xml"
+    xml_path.write_text(xml, encoding="utf-8")
+
+    result = export_for_cdj(xml_path, tmp_path / "export")
+    assert result.flac_converted == 1
+    assert result.resampled == []

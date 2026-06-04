@@ -75,6 +75,31 @@ def _load_analysis_json(path: Path) -> object:
         ) from e
 
 
+def _load_analysis_with_tracks(path: Path) -> dict:
+    """Load analysis JSON and normalize to a dict with a `tracks` list.
+
+    Accepts the standard ``{"tracks": [...]}`` object OR a bare ``[...]`` list
+    of track objects. Any other top-level shape (a string, a number, a dict
+    whose `tracks` isn't a list) raises a clean Click error instead of letting
+    `apply_ml_tags`/`plan_organization` blow up with an AttributeError traceback
+    on a hand-edited or wrong-format file.
+    """
+    data = _load_analysis_json(path)
+    if isinstance(data, list):
+        return {"tracks": data}
+    if isinstance(data, dict):
+        if not isinstance(data.get("tracks", []), list):
+            raise click.ClickException(
+                f"{path.name}: the 'tracks' field must be a list — this doesn't "
+                f"look like output from `vibechek analyze`."
+            )
+        return data
+    raise click.ClickException(
+        f"{path.name} is not a valid analysis file — expected an object with a "
+        f"'tracks' list (or a list of tracks) from `vibechek analyze`."
+    )
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="vibechek")
 def main() -> None:
@@ -137,10 +162,20 @@ def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
             raise click.Abort() from e
 
     summary = report["summary"]
-    console.print(
-        f"\n[green]Done.[/] Analyzed {summary['analyzed']}/{summary['total_files']} "
-        f"({summary['errors']} errors) → [cyan]{output}[/]"
-    )
+    if summary["total_files"] == 0:
+        # Zero matching audio files (empty dir, or --skip/--limit filtered
+        # everything out). Don't print a green "Done." that names an output
+        # file — make the "did nothing" outcome visible instead of looking
+        # like a successful refresh.
+        console.print(
+            f"\n[yellow]No audio files found under[/] [cyan]{path}[/] "
+            f"— nothing analyzed, [cyan]{output}[/] not refreshed."
+        )
+    else:
+        console.print(
+            f"\n[green]Done.[/] Analyzed {summary['analyzed']}/{summary['total_files']} "
+            f"({summary['errors']} errors) → [cyan]{output}[/]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +198,7 @@ def tag(analysis_json: Path, confidence: float, skip_bpm_key: bool,
     """Apply ML tags from an analysis.json to your files."""
     from vibechek.tagger import apply_ml_tags
 
-    data = _load_analysis_json(analysis_json)
+    data = _load_analysis_with_tracks(analysis_json)
     # --skip-bpm-key (default) maps to write_bpm/write_key=False; the inverse
     # --write-bpm-key flag turns both on (per-field toggles superseded the old
     # single skip_bpm_and_key flag).
@@ -232,7 +267,13 @@ def restore_tags_cmd(backup_file: Path) -> None:
         def on_progress(current: int, total: int, message: str) -> None:
             progress.update(task, completed=current, total=total, description=message[:40])
 
-        stats = restore_tags(backup_file, on_progress=on_progress)
+        try:
+            stats = restore_tags(backup_file, on_progress=on_progress)
+        except (ValueError, FileNotFoundError) as e:
+            # _load_backup_files raises a friendly ValueError/FileNotFoundError
+            # for empty / corrupt / wrong-shape backups. Render it as a clean
+            # Click error rather than leaking the raw traceback.
+            raise click.ClickException(str(e)) from e
 
     console.print(
         f"\n[green]Done.[/] Restored {stats.restored}/{stats.total} • "
@@ -289,7 +330,13 @@ def revert(journal_file: Path) -> None:
         def on_progress(current: int, total: int, message: str) -> None:
             progress.update(task, completed=current, total=total, description=message[:40])
 
-        summary = revert_journal(journal_file, on_progress=on_progress)
+        try:
+            summary = revert_journal(journal_file, on_progress=on_progress)
+        except (ValueError, FileNotFoundError) as e:
+            # revert_journal rejects a non-journal / corrupt file with a clean
+            # message — surface it as a Click error instead of a raw traceback,
+            # and never silently "succeed" (Reverted 0) on the wrong file.
+            raise click.ClickException(str(e)) from e
 
     console.print(
         f"\n[green]Done.[/] Reverted {summary['reverted']} • "
@@ -330,6 +377,14 @@ def dedupe(path: Path, output: Path, no_chromaprint: bool, no_md5: bool,
 
     if move_to and trash:
         raise click.UsageError("--move-to and --trash are mutually exclusive")
+    if no_md5 and no_chromaprint:
+        # With both detection methods off, find_duplicates does no work and
+        # returns an empty report — indistinguishable from a clean library.
+        # Reject up front rather than report a misleading "0 groups".
+        raise click.UsageError(
+            "--no-md5 and --no-chromaprint cannot both be set — "
+            "no detection method would run."
+        )
     if trash:
         action = DuplicateAction.TRASH
     elif move_to:
@@ -389,7 +444,7 @@ def organize(analysis_json: Path, no_subgenres: bool, min_genre_size: int,
     """Move files into genre/subgenre folders based on analysis.json."""
     from vibechek.organizer import organize_from_analysis, plan_organization
 
-    data = _load_analysis_json(analysis_json)
+    data = _load_analysis_with_tracks(analysis_json)
     config = OrganizationConfig(
         use_subgenres=not no_subgenres,
         min_genre_size=min_genre_size,
@@ -745,7 +800,10 @@ def export_cmd(analysis_json: Path, fmt: str, output: Path | None) -> None:
         # Minimal — just paths. We deliberately *don't* prefix with `#EXTM3U`
         # yet because some DJ apps (rekordbox) get confused by m3u8 without
         # full EXTINF lines. Document as basic for now.
-        lines = [t.get("path", "") for t in tracks if t.get("path")]
+        # Mirror the CSV branch's guard: a hand-edited / wrong-shape file can
+        # have non-dict entries; the isinstance check short-circuits before
+        # .get so a bare string/int doesn't raise AttributeError.
+        lines = [t.get("path", "") for t in tracks if isinstance(t, dict) and t.get("path")]
         output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     console.print(f"[green]Exported {len(tracks)} tracks[/] → [cyan]{output}[/] ({fmt})")

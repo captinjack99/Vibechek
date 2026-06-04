@@ -35,6 +35,11 @@ export function GlobalAudioPlayer() {
 
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
+  // Load-stall watchdog timer id. Held in a ref so the `ready`/`error` handlers
+  // can disarm it the instant a terminal event fires — relying only on the
+  // effect-cleanup (which runs on the *next* load) leaves a stale timer armed
+  // that fires a false "Timed out" error over a track that already decoded.
+  const watchdogRef = useRef<number | null>(null);
 
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -46,6 +51,16 @@ export function GlobalAudioPlayer() {
   // (i.e. when something is first played). We keep it alive for the app's
   // lifetime and just .load() new URLs into it.
   const visible = path !== null;
+
+  // Cancel the load-stall watchdog. Called from both terminal events (ready /
+  // error) and from the load effect's cleanup, so a fired-or-superseded timer
+  // can never set a stale "Timed out" error over an already-decoded track.
+  const disarmWatchdog = () => {
+    if (watchdogRef.current !== null) {
+      window.clearTimeout(watchdogRef.current);
+      watchdogRef.current = null;
+    }
+  };
 
   useEffect(() => {
     // Only build the instance once the container exists (bar is visible).
@@ -67,6 +82,12 @@ export function GlobalAudioPlayer() {
     wsRef.current = ws;
 
     ws.on("ready", () => {
+      // A track that successfully decoded is, by definition, not in an error
+      // state. Clearing here lets a late success recover the UI from a spurious
+      // error set by a *previous* track's aborted load (rapid preview switch)
+      // or by the stall watchdog firing just before a slow file finished.
+      disarmWatchdog();
+      setError(null);
       setReady(true);
       setDuration(ws.getDuration());
       // Always start a freshly-loaded track from 0:00. Reusing one WaveSurfer
@@ -82,7 +103,16 @@ export function GlobalAudioPlayer() {
     ws.on("play", () => setPlaying(true));
     ws.on("pause", () => setPlaying(false));
     ws.on("finish", () => setPlaying(false));
-    ws.on("error", (e: Error) => setError(e?.message || "Could not load audio"));
+    ws.on("error", (e: Error) => {
+      // Aborting the previous load is *expected* when the user switches
+      // previews faster than a file decodes: WaveSurfer aborts the in-flight
+      // fetch, which rejects with an AbortError it re-emits here. Surfacing it
+      // would stamp the previous track's abort onto the NEW (good) track and
+      // lock the controls. Treat benign aborts as a no-op.
+      if (e?.name === "AbortError" || /abort/i.test(e?.message ?? "")) return;
+      disarmWatchdog();
+      setError(e?.message || "Could not load audio");
+    });
 
     return () => {
       // App teardown only — the bar normally stays mounted.
@@ -118,7 +148,9 @@ export function GlobalAudioPlayer() {
     // `ready` OR `error`. The bar then sticks on "Loading…" forever with no
     // usable controls. If neither fires within 15s, surface an error so the
     // user gets a message + the close button stays actionable.
-    const watchdog = window.setTimeout(() => {
+    disarmWatchdog(); // belt + suspenders: never run two watchdogs at once
+    watchdogRef.current = window.setTimeout(() => {
+      watchdogRef.current = null;
       // `ready` is captured stale here, so re-check WaveSurfer directly: a
       // decoded track reports a finite, non-zero duration. If it has one,
       // the `ready` handler is about to (or already did) run — don't clobber.
@@ -130,13 +162,14 @@ export function GlobalAudioPlayer() {
     }, 15_000);
 
     // playToken is in the deps so clicking the same track again restarts it.
-    return () => window.clearTimeout(watchdog);
+    return () => disarmWatchdog();
   }, [path, playToken]);
 
   // Stop playback + tear down audio when the bar is closed. We fully destroy
   // the instance so a stale WebAudio source can't linger; it's recreated on
   // the next play().
   const handleClose = () => {
+    disarmWatchdog();
     const ws = wsRef.current;
     if (ws) {
       try { ws.stop(); } catch { /* ignore */ }

@@ -213,7 +213,14 @@ def plan_organization(
       2. `config.target_root`.
       3. Parent of the first track's path in the analysis.
     """
-    tracks = analysis_data.get("tracks", [])
+    raw_tracks = (
+        analysis_data.get("tracks", []) if isinstance(analysis_data, dict)
+        else (analysis_data if isinstance(analysis_data, list) else [])
+    )
+    # Drop wrong-shape rows (a hand-edited / wrong-format analysis.json can carry
+    # bare strings/numbers or dicts with no "path"). Without this a single bad
+    # row crashes the whole plan with a TypeError/KeyError (e.g. tracks[0]["path"]).
+    tracks = [t for t in raw_tracks if isinstance(t, dict) and t.get("path")]
 
     if base_dir is None:
         if config.target_root is not None:
@@ -266,7 +273,11 @@ def plan_organization(
         if genre in small_genres:
             dest_folder = base_dir / "Other" / genre
             reason = f"rare genre (<{config.min_genre_size} tracks) → Other/"
-        elif config.use_subgenres and subgenre and subgenre != genre:
+        elif config.use_subgenres and subgenre and subgenre not in (genre, "Unknown"):
+            # `sanitize_folder_name(None/"" )` returns the literal "Unknown"
+            # sentinel, so a track with a real genre but no subgenre must NOT be
+            # routed to <Genre>/Unknown/ — it falls through to the flat
+            # <Genre>/ branch below.
             dest_folder = base_dir / genre / subgenre
             reason = "ML genre + subgenre"
         else:
@@ -359,6 +370,18 @@ def organize_from_analysis(
                 stats.moved += 1
             except OSError as e:
                 stats.errors.append(f"{move.source.name}: {e}")
+    except cancellation.CancelledError as exc:
+        # A mid-batch Cancel unwinds through here. The `finally` below flushes
+        # the journal containing the moves already done; we must surface the
+        # journal path (and the partial counts the loop accumulated) so the
+        # caller can still offer "Undo this organize" for the files that DID
+        # move. Without this, journal_path was only assigned after the
+        # try/finally — the exception skipped it and the GUI got no undo
+        # affordance for a partial organize. Attach the partial stats to the
+        # exception so the RPC layer can return it as a partial result.
+        stats.journal_path = str(jrnl.path) if jrnl.entries > 0 else None
+        exc.partial_stats = stats  # type: ignore[attr-defined]
+        raise
     finally:
         jrnl.close()
 
@@ -391,6 +414,15 @@ def route_new_tracks(
 
     from vibechek import cancellation
 
+    # Destinations already claimed by an earlier copy in THIS batch. Mirrors
+    # plan_organization so the dry-run preview matches the real run: two
+    # DIFFERENT staging files sharing a basename + genre both land in the same
+    # folder. In dry_run mode no copy is written, so the second file's dest
+    # still wouldn't exist on disk at check time — without `claimed`, the
+    # preview would report 0 renames while the real (sequential-copy) run
+    # renames the second to `_1` and counts it in skipped_exists.
+    claimed: set[Path] = set()
+
     for i, fp in enumerate(files):
         # Honor Cancel mid-copy (the trash/move loops in duplicates do too).
         cancellation.check()
@@ -404,12 +436,13 @@ def route_new_tracks(
 
         dest_folder = library_root / sanitize_folder_name(genre)
         dest_file = dest_folder / fp.name
-        if dest_file.exists():
+        if dest_file in claimed or dest_file.exists():
             # A different track shouldn't be lost just because the names collide.
             # Uniquify (track_1.mp3, ...) instead of silently skipping. Still
             # surfaced in `skipped_exists` so the UI can report "had to rename N".
             summary["skipped_exists"] += 1
-            dest_file = _unique_destination(dest_file)
+            dest_file = _unique_destination(dest_file, claimed)
+        claimed.add(dest_file)
 
         if dry_run:
             summary["copied"] += 1

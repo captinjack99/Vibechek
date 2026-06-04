@@ -199,6 +199,14 @@ export function LibraryBrowser() {
       // is intentionally cleared here — a tab round-trip preserves filters, but
       // a library SWITCH must not. (Previously `clearFilters` had no caller.)
       useLibraryFiltersStore.getState().clearFilters();
+      // Same invariant for the two filter-likes that DON'T live in the filters
+      // store: the free-text search box and the "show errors only" toggle.
+      // Without these resets the prior library's search query keeps narrowing
+      // the new list, and the errors-only filter can strand a clean library in
+      // an empty, unrecoverable view (the toggle button only renders when the
+      // new library has errors of its own).
+      setSearchFilter("");
+      setShowErrorsOnly(false);
       setTracks(tracks);
       setNewTracksCount(null);
       setBannerDismissed(false);
@@ -417,6 +425,20 @@ export function LibraryBrowser() {
     return result;
   }, [tracks, searchFilter, filters, showErrorsOnly]);
 
+  // "All selected" for the master checkbox must reflect what the user actually
+  // SEES (the filtered set), not raw `selectedIds.size === filtered.length`.
+  // `selectedIds` can hold paths NOT in the current filtered set (select rows,
+  // then change the search/filters so a *different* set of equal size shows) —
+  // a pure size comparison then renders "checked" while none of the visible
+  // rows are selected, and clicking it clears the invisible selection instead
+  // of selecting the visible rows.
+  const allVisibleSelected = useMemo(
+    () =>
+      filtered.length > 0 &&
+      filtered.every((t) => selectedIds.has(t.path)),
+    [filtered, selectedIds],
+  );
+
   const handleOpenFolder = async () => {
     const selected = await openDialog({ directory: true, multiple: false });
     if (typeof selected !== "string") return;
@@ -428,6 +450,10 @@ export function LibraryBrowser() {
     // New folder = library switch → clear the prior library's filters (see
     // handleOpenRecent). Otherwise stale genre/key/energy chips carry over.
     useLibraryFiltersStore.getState().clearFilters();
+    // Also clear the free-text search box and the errors-only toggle, which
+    // live outside the filters store (see handleOpenRecent for the rationale).
+    setSearchFilter("");
+    setShowErrorsOnly(false);
     setTracks([]);
     begin("analyze");
     try {
@@ -837,15 +863,17 @@ export function LibraryBrowser() {
           onClick={() =>
             // Select/clear the FILTERED set, not the whole library — otherwise
             // "select all" under an active filter silently selects (and
-            // bulk-tags) tracks the user can't see, and the checkbox state
-            // never reconciles with `filtered.length`.
-            selectedIds.size === filtered.length && filtered.length > 0
+            // bulk-tags) tracks the user can't see. We key off whether every
+            // VISIBLE row is selected (`allVisibleSelected`) rather than raw
+            // size equality, which can be true while none of the visible rows
+            // are actually selected (an equal-size out-of-view selection).
+            allVisibleSelected
               ? clearSelection()
               : selectPaths(filtered.map((t) => t.path))
           }
-          title={selectedIds.size === filtered.length ? "Clear selection" : "Select all"}
+          title={allVisibleSelected ? "Clear selection" : "Select all"}
         >
-          {selectedIds.size > 0 && selectedIds.size === filtered.length ? (
+          {allVisibleSelected ? (
             <CheckSquare className="w-5 h-5" />
           ) : (
             <Square className="w-5 h-5" />
@@ -934,8 +962,10 @@ export function LibraryBrowser() {
         )}
       </div>
 
-      {/* Filter chips (only render when there are analyzed tracks to filter) */}
-      {(analyzedCount > 0 || errorCount > 0) && (
+      {/* Filter chips (only render when there are analyzed tracks to filter).
+          Also render when the errors-only toggle is active so the "clear"
+          affordance is never lost even if errorCount is 0 for the current set. */}
+      {(analyzedCount > 0 || errorCount > 0 || showErrorsOnly) && (
         <div className="px-4 py-2 border-b border-white/5 flex items-center gap-3 flex-wrap">
           {analyzedCount > 0 && !showErrorsOnly && (
             <FilterChips tracks={tracks} filters={filters} setFilters={setFilters} />
@@ -957,7 +987,7 @@ export function LibraryBrowser() {
               Find compatible
             </button>
           )}
-          {errorCount > 0 && (
+          {(errorCount > 0 || showErrorsOnly) && (
             <button
               onClick={() => setShowErrorsOnly((v) => !v)}
               className={cx(

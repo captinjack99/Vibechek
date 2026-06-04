@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from vibechek import preflight as preflight_mod
+from vibechek.native_install import NativeVenvStatus
 from vibechek.preflight import (
     EssentiaCheck,
     ModelsCheck,
@@ -152,6 +153,102 @@ def test_reasons_not_ready_no_drift_when_wsl_matches_sidecar() -> None:
         analyze_via="wsl",
     )
     assert not any("out of date" in x.lower() for x in r.reasons_not_ready)
+
+
+def test_reasons_not_ready_managed_venv_essentia_without_vibechek() -> None:
+    """Managed venv has essentia but NOT vibechek -> NOT a usable engine.
+
+    Regression: `reasons_not_ready` counted the managed venv as a present engine
+    on `essentia_installed` alone, while `preflight()` requires essentia AND
+    vibechek. That mismatch produced ready=False with an EMPTY reasons list (and
+    the analyzer's 'Cannot analyze: .' message) when the vibechek install step
+    failed after essentia was already in. The two have_engine definitions must
+    agree: the managed venv only counts when both are installed.
+    """
+    r = PreflightResult(
+        ready=False,
+        essentia=EssentiaCheck(installed=False, error="ImportError (host)"),
+        models=ModelsCheck(models_dir="/x", missing=[]),  # models present
+        platform="Linux-5.0",
+        wsl=None,
+        native_venv=NativeVenvStatus(
+            supported=True,
+            venv_dir="/home/u/.vibechek/venv",
+            essentia_installed=True,
+            vibechek_installed=False,
+        ),
+    )
+    reasons = r.reasons_not_ready
+    assert reasons, "ready=False must always surface at least one reason"
+    assert any("not installed" in x.lower() for x in reasons), reasons
+
+
+def test_reasons_not_ready_managed_venv_fully_installed_is_clean() -> None:
+    """Managed venv with BOTH essentia and vibechek counts as a present engine."""
+    r = PreflightResult(
+        ready=True,
+        essentia=EssentiaCheck(installed=False, error="ImportError (host)"),
+        models=ModelsCheck(models_dir="/x", found=["effnet"]),
+        platform="Linux-5.0",
+        wsl=None,
+        native_venv=NativeVenvStatus(
+            supported=True,
+            venv_dir="/home/u/.vibechek/venv",
+            essentia_installed=True,
+            vibechek_installed=True,
+        ),
+        analyze_via="native_venv",
+    )
+    assert not any("not installed" in x.lower() for x in r.reasons_not_ready)
+
+
+# ---------------------------------------------------------------------------
+# probe_native_venv — essentia version parse (essentia_tf + plain/onnx venvs)
+# ---------------------------------------------------------------------------
+
+
+def _make_essentia_venv(venv_dir: Path, dist_info_name: str) -> None:
+    """Lay out a minimal venv with an essentia*.dist-info dir.
+
+    Uses the `Lib/site-packages` layout (the one probe_native_venv's
+    site-packages glob actually traverses) so the test runs on the Windows dev
+    box and CI alike.
+    """
+    (venv_dir / "bin").mkdir(parents=True, exist_ok=True)
+    (venv_dir / "bin" / "python3").write_text("#!/bin/sh\n")
+    sp = venv_dir / "Lib" / "site-packages"
+    sp.mkdir(parents=True, exist_ok=True)
+    (sp / dist_info_name).mkdir()
+
+
+@pytest.mark.parametrize(
+    ("dist_info", "expected"),
+    [
+        ("essentia_tensorflow-2.1b6.dev1110.dist-info", "2.1b6.dev1110"),
+        # Regression: plain essentia (ONNX venv) has only ONE hyphen-token, so
+        # the old `essentia[_-][^-]+-(...)` regex never matched and the version
+        # was lost (Settings showed "Installed at ... ()").
+        ("essentia-2.1b6.dev1110.dist-info", "2.1b6.dev1110"),
+    ],
+)
+def test_probe_native_venv_parses_essentia_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dist_info: str,
+    expected: str,
+) -> None:
+    from vibechek import native_install as ni
+
+    venv_dir = tmp_path / "venv"
+    _make_essentia_venv(venv_dir, dist_info)
+
+    # Force the module to treat this platform as supported and point at our venv.
+    monkeypatch.setattr(ni, "IS_SUPPORTED", True)
+    monkeypatch.setattr(ni, "_venv_dir", lambda engine="essentia_tf": venv_dir)
+
+    status = ni.probe_native_venv()
+    assert status.essentia_installed is True
+    assert status.essentia_version == expected
 
 
 # ---------------------------------------------------------------------------

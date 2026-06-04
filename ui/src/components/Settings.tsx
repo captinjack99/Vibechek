@@ -231,7 +231,11 @@ export function Settings() {
       } else {
         setOnnxSetup({
           phase: "error",
-          error: (res.reasons_not_ready ?? []).join("; ") || "Setup did not complete.",
+          // Prefer the real install/fetch failure reason the sidecar reports;
+          // fall back to the preflight reasons, then a generic message.
+          error: res.error
+            || (res.reasons_not_ready ?? []).join("; ")
+            || "Setup did not complete.",
         });
       }
     } catch (e) {
@@ -243,6 +247,19 @@ export function Settings() {
       }
     } finally {
       if (isMounted.current) setDiagBusy(null);
+    }
+  };
+
+  // Abort an in-flight ONNX setup. setup_onnx_engine is Cancellable on the
+  // sidecar (it calls cancellation.check() during the network fetch/install),
+  // so this actually stops the op. The in-flight setupOnnxEngine() promise then
+  // rejects with a cancellation error, which handleSetupOnnx's catch maps to
+  // isCancellation -> setOnnxSetup(null), closing the modal cleanly.
+  const handleCancelOnnxSetup = async () => {
+    try {
+      await rpc("cancel_operation");
+    } catch {
+      /* user-cancel — sidecar handles its own logging */
     }
   };
 
@@ -370,6 +387,25 @@ export function Settings() {
     refreshPreflight();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Re-probe the engine GPU whenever the user switches inference engines.
+  // The probe is engine-specific server-side (ONNX populates provider/runtime
+  // and can see AMD/Intel/Apple GPUs; TF populates tf_version and is
+  // NVIDIA-only), so without this the whole GPU panel — the System>GPU stat,
+  // EngineGpuBlock, the acceleration hint, the "On" enabled/disabled state, and
+  // the TF CUDA-wheels fixer — keeps rendering the PREVIOUS engine's truth until
+  // a manual Re-probe or app restart. Seed the ref with the current engine so
+  // the mount-time probe (in refreshPreflight) isn't duplicated on first run.
+  const lastProbedEngine = useRef(cfg.analysis.inference_engine);
+  useEffect(() => {
+    if (lastProbedEngine.current === cfg.analysis.inference_engine) return;
+    lastProbedEngine.current = cfg.analysis.inference_engine;
+    const distro = preflightResult?.wsl?.usable_distro ?? null;
+    // force=true so the engine-keyed server cache for the NEW engine is fetched
+    // rather than returning the prior engine's cached probe.
+    refreshEngineGpu(distro, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.analysis.inference_engine]);
 
   const handleDownloadModels = async () => {
     begin("download-models");
@@ -1039,7 +1075,11 @@ export function Settings() {
 
       <LogsViewer open={showLogs} onClose={() => setShowLogs(false)} />
 
-      <OnnxSetupDialog state={onnxSetup} onClose={() => setOnnxSetup(null)} />
+      <OnnxSetupDialog
+        state={onnxSetup}
+        onClose={() => setOnnxSetup(null)}
+        onCancel={handleCancelOnnxSetup}
+      />
 
       <AnimatePresence>
         {showPreflightDialog && preflightResult && (

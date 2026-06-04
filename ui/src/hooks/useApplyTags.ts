@@ -101,6 +101,12 @@ export function useApplyTags(): UseApplyTagsReturn {
           vocal_full_min: taggingCfg.vocal_full_min,
           preserve_rekordbox_frames: taggingCfg.preserve_rekordbox_frames,
           id3_text_encoding: taggingCfg.id3_text_encoding,
+          // These two Settings toggles were previously dead end-to-end: the
+          // handler reads them with `params.get(name, True)` (vibechek/rpc.py),
+          // but useApplyTags never sent them — so flipping either OFF silently
+          // had no effect. Forward them so the persisted choice reaches the RPC.
+          write_subgenre_as_main_genre: taggingCfg.write_subgenre_as_main_genre,
+          backup_before_write: taggingCfg.backup_before_write,
         });
         finish();
         return {
