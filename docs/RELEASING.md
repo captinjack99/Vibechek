@@ -8,20 +8,20 @@ How a new release happens, end-to-end. It's fully automated: bump the version st
 
 ```bash
 # 1. Bump all five version manifests (must match the git tag exactly):
-#    - vibechek/__init__.py        __version__
-#    - pyproject.toml              project.version  (PEP 440 form: 0.3.0b1)
+#    - vibechek/__init__.py        __version__              (e.g. 0.5.0-beta)
+#    - pyproject.toml              project.version          (PEP 440 form: 0.5.0b0)
 #    - ui/package.json             version
 #    - ui/src-tauri/Cargo.toml     package.version
 #    - ui/src-tauri/tauri.conf.json version
 #    Also bump the two lockfiles so CI doesn't dirty them:
 #    - ui/src-tauri/Cargo.lock     (the vibechek-desktop package entry)
 #    - ui/package-lock.json        (root + package version)
-git add -A && git commit -m "chore: bump to v0.3.0-beta.1"
+git add -A && git commit -m "chore: bump to v0.5.0-beta"
 
 # 2. Tag and push (the CI workflow keys on `v*` tag pushes):
-git tag v0.3.0-beta.1
+git tag v0.5.0-beta
 git push origin main
-git push origin v0.3.0-beta.1
+git push origin v0.5.0-beta
 
 # 3. Wait ~20-30 min. GitHub Actions:
 #    - Builds the PyInstaller CLI on Win/Mac/Linux
@@ -52,11 +52,16 @@ Five files carry a version. They must all agree, and they must match the git tag
 
 | File | Format | Example |
 |---|---|---|
-| `vibechek/__init__.py` | Free-form semver | `0.3.0-beta.1` |
-| `pyproject.toml` | **PEP 440** (no hyphen for pre-release) | `0.3.0b1` |
-| `ui/package.json` | npm semver | `0.3.0-beta.1` |
-| `ui/src-tauri/Cargo.toml` | Cargo semver | `0.3.0-beta.1` |
-| `ui/src-tauri/tauri.conf.json` | Tauri semver | `0.3.0-beta.1` |
+| `vibechek/__init__.py` | Free-form semver | `0.5.0-beta` |
+| `pyproject.toml` | **PEP 440** (no hyphen for pre-release) | `0.5.0b0` |
+| `ui/package.json` | npm semver | `0.5.0-beta` |
+| `ui/src-tauri/Cargo.toml` | Cargo semver | `0.5.0-beta` |
+| `ui/src-tauri/tauri.conf.json` | Tauri semver | `0.5.0-beta` |
+
+> **Versioning scheme (since `0.5.0-beta`):** we dropped the `-beta.N` iteration
+> counter. The `0.x` line already signals pre-1.0 / beta status, so each release
+> just bumps `MINOR` (`0.5.0-beta` → `0.6.0-beta` → …). PEP 440 maps the bare
+> `-beta` suffix to `b0`. (Earlier releases used `-beta.N` → `bN`.)
 
 Two **lockfiles** also embed the version and must be regenerated/bumped in the same commit, or a clean CI build will show a dirty tree:
 

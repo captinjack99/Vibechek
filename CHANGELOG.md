@@ -10,7 +10,15 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 ## [Unreleased]
 
-Targeted for `v0.4.0`. Items move out of this section once they ship in a tagged release.
+_Nothing yet._
+
+---
+
+## [0.5.0-beta] — 2026-06-04
+
+First release on the simplified `0.x` versioning — the `-beta.N` iteration counter
+is retired (the `0.x` line already signals pre-1.0/beta status). Ships the bundled,
+one-click ONNX engine setup, plus the full-stack bug-hunt fixes from the beta.10 cycle.
 
 ### Added
 
