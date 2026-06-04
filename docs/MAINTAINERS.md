@@ -9,13 +9,15 @@ for the release mechanics see [RELEASING.md](RELEASING.md).
 A release bumps **five** files. They must all match, or the version-drift guard and CI
 will complain:
 
-1. `vibechek/__init__.py` — `__version__` (e.g. `"0.4.0-beta.10"`)
-2. `pyproject.toml` — PEP 440 form (`0.4.0b10`)
+1. `vibechek/__init__.py` — `__version__` (e.g. `"0.5.0-beta"`)
+2. `pyproject.toml` — PEP 440 form (`0.5.0b0`)
 3. `ui/src-tauri/Cargo.toml`
 4. `ui/src-tauri/tauri.conf.json`
 5. `ui/package.json`
 
-The git tag form is `vMAJOR.MINOR.PATCH-beta.N`; PEP 440 maps that to `…bN`.
+The git tag form is `vMAJOR.MINOR.PATCH-beta` (e.g. `v0.5.0-beta`); PEP 440 maps the
+`-beta` suffix to `b0`. (We dropped the old `-beta.N` iteration counter — the `0.x`
+line already signals pre-1.0/beta status, so versions just bump `MINOR`.)
 
 **Two lockfiles also carry the version** and must be bumped in the same commit or a
 clean CI checkout shows a dirty tree: `ui/src-tauri/Cargo.lock` (the `vibechek-desktop`
