@@ -70,6 +70,71 @@ def test_handle_duplicates_never_moves_a_keeper_of_another_group(tmp_path: Path)
     assert summary["moved"] == 1 and summary["errors"] == 0
 
 
+def _fiv(name: str, dur: float | None, size_mb: float = 5.0) -> FileInfo:
+    return FileInfo(path=f"/m/{name}", filename=name,
+                    size_bytes=int(size_mb * 1_000_000), size_mb=size_mb, duration_s=dur)
+
+
+# ---- Variant awareness: keep distinct versions, collapse only same-version ----
+
+
+def test_version_key_distinguishes_real_versions() -> None:
+    from vibechek.filename import version_key
+    assert version_key("Song (Original Mix)") == version_key("Song")          # original == base
+    assert version_key("Song (Extended Mix)") != version_key("Song (Radio Edit)")
+    assert version_key("Song (Extended Mix)") != version_key("Song")          # extended != base
+    assert version_key("Song (Imanbek Remix)") != version_key("Song")         # remix != original
+    assert version_key("Song (Imanbek Remix)") != version_key("Song (CamelPhat Remix)")
+    assert version_key("Song (Imanbek Remix)") == version_key("X - Song (Imanbek Remix)")
+
+
+def test_variant_keeps_extended_and_radio_separate() -> None:
+    """Extended Mix + Radio Edit of one song = two versions a DJ keeps."""
+    from vibechek.duplicates import _split_into_versions
+    groups = _split_into_versions(
+        [_fiv("Song (Extended Mix).flac", 360), _fiv("Song (Radio Edit).flac", 180)], 0.12)
+    assert len(groups) == 2
+
+
+def test_variant_flac_original_mp3_extended_both_kept() -> None:
+    """The user's exact case: FLAC original + MP3 extended = different versions."""
+    from vibechek.duplicates import _split_into_versions
+    groups = _split_into_versions(
+        [_fiv("Song.flac", 200, 40), _fiv("Song (Extended Mix).mp3", 360, 12)], 0.12)
+    assert len(groups) == 2
+
+
+def test_variant_collapses_flac_mp3_of_same_version() -> None:
+    """FLAC + MP3 of the SAME version is a true duplicate → keep the FLAC."""
+    from vibechek.duplicates import _resolve_encodings, _split_into_versions
+    flac = _fiv("Song (Extended Mix).flac", 360, 40)
+    mp3 = _fiv("Song (Extended Mix).mp3", 360, 12)
+    groups = _split_into_versions([flac, mp3], 0.12)
+    assert len(groups) == 1
+    (keeper, dupes), = _resolve_encodings(groups[0], DuplicateConfig())
+    assert keeper.filename.endswith(".flac")
+    assert [d.filename for d in dupes] == ["Song (Extended Mix).mp3"]
+
+
+def test_keep_all_formats_keeps_one_per_format() -> None:
+    """keep_all_formats: a controller-friendly MP3 is kept alongside the FLAC."""
+    from vibechek.duplicates import _resolve_encodings
+    flac = _fiv("Song (Extended Mix).flac", 360, 40)
+    mp3 = _fiv("Song (Extended Mix).mp3", 360, 12)
+    pairs = _resolve_encodings([flac, mp3], DuplicateConfig(keep_all_formats=True))
+    assert len(pairs) == 2
+    assert all(len(dupes) == 0 for _, dupes in pairs)  # nothing removed
+
+
+def test_mislabeled_extended_radio_split_by_duration() -> None:
+    """Two files with the same (empty) version key but very different durations
+    are still treated as different versions (a mislabeled extended/radio pair)."""
+    from vibechek.duplicates import _split_into_versions
+    groups = _split_into_versions(
+        [_fiv("Song.flac", 360), _fiv("Song.mp3", 180)], 0.12)
+    assert len(groups) == 2
+
+
 def test_choose_keeper_prefers_flac_over_mp3() -> None:
     files = [
         FileInfo(path="/a/track.mp3", filename="track.mp3", size_bytes=5_000_000, size_mb=5.0),

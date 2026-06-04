@@ -533,6 +533,10 @@ def _find_duplicates(params: dict) -> dict:
         chromaprint_similarity_threshold=threshold,
         action=params.get("action", "report"),
         review_folder=Path(params["review_folder"]) if params.get("review_folder") else None,
+        # Variant awareness (see DuplicateConfig). Safe defaults: keep distinct
+        # versions, collapse to the single best encoding within a version.
+        keep_distinct_versions=bool(params.get("keep_distinct_versions", True)),
+        keep_all_formats=bool(params.get("keep_all_formats", False)),
     )
     # Default True for safety — the GUI's auto-keeper rules need bitrate/duration.
     # The GUI can pass read_metadata=false for MD5-only dedup with default rules,

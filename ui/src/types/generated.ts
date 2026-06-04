@@ -48,6 +48,9 @@ export interface DuplicateConfig {
   chromaprint_similarity_threshold: number;
   action: string;
   review_folder: string | null;
+  keep_distinct_versions: boolean;
+  keep_all_formats: boolean;
+  version_duration_tolerance: number;
 }
 
 export interface OrganizationConfig {

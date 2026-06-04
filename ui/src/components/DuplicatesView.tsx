@@ -112,6 +112,10 @@ export function DuplicatesView() {
         // every scan uses the server-side default (0.95) regardless of the
         // user's choice. Forward it so the control actually does something.
         threshold: dupCfg.chromaprint_similarity_threshold,
+        // Variant awareness: keep Extended/Radio/Remix as distinct versions
+        // (only collapse redundant encodings) unless the user turned it off.
+        keep_distinct_versions: dupCfg.keep_distinct_versions,
+        keep_all_formats: dupCfg.keep_all_formats,
       });
       setReport(r);
       finish();
@@ -127,6 +131,8 @@ export function DuplicatesView() {
     dupCfg.use_md5,
     dupCfg.use_chromaprint,
     dupCfg.chromaprint_similarity_threshold,
+    dupCfg.keep_distinct_versions,
+    dupCfg.keep_all_formats,
     begin,
     finish,
     fail,

@@ -36,6 +36,63 @@ _MIX_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+# --- Version / edition detection (for variant-aware dedupe) ---------------
+#
+# A "version" identity has TWO axes that both matter to a DJ:
+#   * remix identity — Original vs "<Artist> Remix" (a remix is a distinct work)
+#   * length/edit    — Extended vs Radio Edit vs standard (different set tools)
+# version_key() combines them as "<remix>|<length>" so two files are the SAME
+# version (true duplicate candidates, differing only by format/bitrate) only
+# when BOTH axes match. "Original Mix" and a bare title collapse to the same
+# standard length. This is what lets dedupe keep an Extended + a Radio Edit, or
+# a FLAC-original + an MP3-extended, while still collapsing a FLAC + MP3 of the
+# exact same version.
+_REMIX_PARENS_RE = re.compile(
+    r"[\(\[]\s*(?P<who>[^)\]]+?)\s+(?:remix|rmx|bootleg|flip|refix|rework)\s*[\)\]]",
+    re.IGNORECASE,
+)
+_REMIX_DASH_RE = re.compile(
+    r"-\s*(?P<who>[^-\(\[\]]+?)\s+(?:remix|rmx|bootleg|flip|refix|rework)\b",
+    re.IGNORECASE,
+)
+_LENGTH_TYPES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bextended\b", re.IGNORECASE), "extended"),
+    (re.compile(r"\bradio\b", re.IGNORECASE), "radio"),
+    (re.compile(r"\bclub\s*mix\b", re.IGNORECASE), "club"),
+    (re.compile(r"\bdub\b", re.IGNORECASE), "dub"),
+    (re.compile(r"\bvip\b", re.IGNORECASE), "vip"),
+    (re.compile(r"\binstrumental\b", re.IGNORECASE), "instrumental"),
+    (re.compile(r"\bac[ae]pella\b", re.IGNORECASE), "acapella"),
+]
+
+
+def _norm_remixer(who: str) -> str:
+    """Normalize a remixer name to a stable comparison token."""
+    who = re.sub(r"\b(feat\.?|ft\.?|presents|pres\.?)\b.*", "", who, flags=re.IGNORECASE)
+    return re.sub(r"[^a-z0-9]+", "", who.lower())
+
+
+def version_key(text: str) -> str:
+    """Canonical version identity ``"<remix>|<length>"`` for an title/filename.
+
+    Same key => same version (only format/bitrate may differ => true duplicate).
+    Different key => a distinct version a DJ may legitimately keep. Pure.
+    """
+    t = text or ""
+    remix = ""
+    m = _REMIX_PARENS_RE.search(t) or _REMIX_DASH_RE.search(t)
+    if m:
+        norm = _norm_remixer(m.group("who"))
+        if norm:
+            remix = f"remix:{norm}"
+    length = ""
+    for pat, tok in _LENGTH_TYPES:
+        if pat.search(t):
+            length = tok
+            break
+    return f"{remix}|{length}"
+
+
 def _extract_bpm(stem: str) -> int | None:
     """Best-effort BPM from a filename stem (extension already stripped).
 
@@ -105,4 +162,4 @@ def extract_from_filename(filename: str) -> dict[str, Any]:
     return info
 
 
-__all__ = ["extract_from_filename"]
+__all__ = ["extract_from_filename", "version_key"]

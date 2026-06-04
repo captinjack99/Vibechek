@@ -365,8 +365,15 @@ def revert(journal_file: Path) -> None:
 @click.option("--move-to", type=click.Path(path_type=Path), default=None,
               help="Move duplicates to this folder for review.")
 @click.option("--trash", is_flag=True, help="Send duplicates to OS trash (needs send2trash).")
+@click.option("--across-versions", is_flag=True,
+              help="Also dedupe ACROSS versions (collapse Extended/Radio/Remix into one). "
+                   "Default keeps distinct versions and only collapses redundant encodings.")
+@click.option("--keep-all-formats", is_flag=True,
+              help="Within a version, keep the best file of EACH format (e.g. a FLAC AND an MP3) "
+                   "instead of just the single best.")
 def dedupe(path: Path, output: Path, no_chromaprint: bool, no_md5: bool,
-           move_to: Path | None, trash: bool) -> None:
+           move_to: Path | None, trash: bool, across_versions: bool,
+           keep_all_formats: bool) -> None:
     """Find duplicate tracks via MD5 + Chromaprint."""
     from vibechek.duplicates import (
         DuplicateAction,
@@ -397,6 +404,8 @@ def dedupe(path: Path, output: Path, no_chromaprint: bool, no_md5: bool,
         use_chromaprint=not no_chromaprint,
         action=action.value,
         review_folder=move_to,
+        keep_distinct_versions=not across_versions,
+        keep_all_formats=keep_all_formats,
     )
 
     with _progress_bar("Scanning") as progress:
