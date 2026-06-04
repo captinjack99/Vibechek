@@ -402,6 +402,79 @@ def _merge_overlapping_clusters(
     return [c for c in components.values() if len(c) > 1]
 
 
+def _split_into_versions(
+    files: list[FileInfo], duration_tol: float,
+) -> list[list[FileInfo]]:
+    """Split an acoustic 'song' cluster into same-VERSION sub-groups.
+
+    Two files are the same version (and thus true duplicate candidates) only
+    when they share a parsed version key (Original vs Extended vs Radio vs a
+    specific Remix — see filename.version_key) AND have similar durations. This
+    is what keeps an Extended Mix and a Radio Edit, or an Original and a Remix,
+    from being collapsed into each other.
+    """
+    from vibechek.filename import version_key  # noqa: PLC0415
+
+    by_key: dict[str, list[FileInfo]] = defaultdict(list)
+    for f in files:
+        by_key[version_key(f.filename or Path(f.path).name)].append(f)
+    out: list[list[FileInfo]] = []
+    for group in by_key.values():
+        out.extend(_split_by_duration(group, duration_tol))
+    return out
+
+
+def _split_by_duration(
+    group: list[FileInfo], tol: float,
+) -> list[list[FileInfo]]:
+    """Greedy single-link split of a same-version-key group by track duration.
+
+    Catches mislabeled pairs (e.g. an extended + a radio edit that BOTH lack a
+    length tag in the filename): if their durations differ by more than `tol`
+    they're treated as different versions. Files with unknown duration don't
+    force a split (they attach to the first sub-group)."""
+    if len(group) <= 1:
+        return [group]
+    clusters: list[list[FileInfo]] = []
+    for f in group:
+        placed = False
+        for c in clusters:
+            head = next((x for x in c if x.duration_s), None)
+            if f.duration_s is None or head is None or head.duration_s is None:
+                c.append(f)
+                placed = True
+                break
+            hi = max(f.duration_s, head.duration_s)
+            if hi <= 0 or abs(f.duration_s - head.duration_s) / hi <= tol:
+                c.append(f)
+                placed = True
+                break
+        if not placed:
+            clusters.append([f])
+    return clusters
+
+
+def _resolve_encodings(
+    vfiles: list[FileInfo], config: DuplicateConfig,
+) -> list[tuple[FileInfo, list[FileInfo]]]:
+    """Given files that ARE the same version, decide the (keeper, dupes) pairs.
+
+    Default: collapse every encoding to the single best file. With
+    `keep_all_formats`, keep the best file of EACH format (FLAC + MP3 + …) so a
+    DJ who wants a lossless master and a controller-friendly MP3 keeps both.
+    Returns one (keeper, dupes) tuple per kept file; dupes empty => nothing to
+    remove for that keeper.
+    """
+    if len(vfiles) <= 1:
+        return [(vfiles[0], [])] if vfiles else []
+    if config.keep_all_formats:
+        by_fmt: dict[str, list[FileInfo]] = defaultdict(list)
+        for f in vfiles:
+            by_fmt[Path(f.path).suffix.lower()].append(f)
+        return [choose_keeper(g) for g in by_fmt.values()]
+    return [choose_keeper(vfiles)]
+
+
 def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:
     """Pick which file to keep from a group; return (keeper, duplicates).
 
@@ -572,16 +645,29 @@ def find_duplicates(
                     and len(set(hashes)) <= 1
                 ):
                     continue
-                keeper, dupes = choose_keeper(files)
-                # Group key: the keeper's fingerprint hash. Stable + unique.
-                group_key = keeper.audio_fingerprint or ""
-                report.audio_duplicates.append(DuplicateGroup(
-                    method="chromaprint",
-                    key=group_key,
-                    keep=keeper,
-                    duplicates=dupes,
-                    recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
-                ))
+                # Variant awareness: an acoustic cluster ("song") can contain
+                # DIFFERENT versions (Extended vs Radio, Original vs Remix) a DJ
+                # wants to keep. Split into same-version sub-groups and only
+                # collapse redundant encodings WITHIN a version — unless the user
+                # opted into cross-version dedupe (keep_distinct_versions=False).
+                if config.keep_distinct_versions:
+                    version_groups = _split_into_versions(
+                        files, config.version_duration_tolerance
+                    )
+                else:
+                    version_groups = [files]
+
+                for vfiles in version_groups:
+                    for keeper, dupes in _resolve_encodings(vfiles, config):
+                        if not dupes:
+                            continue
+                        report.audio_duplicates.append(DuplicateGroup(
+                            method="chromaprint",
+                            key=keeper.audio_fingerprint or "",
+                            keep=keeper,
+                            duplicates=dupes,
+                            recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
+                        ))
 
     report.update_summary()
     return report

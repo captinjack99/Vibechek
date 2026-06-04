@@ -62,6 +62,9 @@ const DEFAULT_CONFIG: VibechekConfig = {
     chromaprint_similarity_threshold: 0.95,
     action: "report",
     review_folder: null,
+    keep_distinct_versions: true,
+    keep_all_formats: false,
+    version_duration_tolerance: 0.12,
   },
   organization: {
     use_subgenres: true,

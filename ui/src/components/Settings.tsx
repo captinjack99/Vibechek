@@ -843,6 +843,18 @@ export function Settings() {
           onChange={(v) => updateDuplicates({ use_chromaprint: v })}
           hint="Requires `fpcalc` on PATH; falls back gracefully if missing."
         />
+        <Toggle
+          label="Keep distinct versions (Extended / Radio / Remix)"
+          checked={cfg.duplicates.keep_distinct_versions}
+          onChange={(v) => updateDuplicates({ keep_distinct_versions: v })}
+          hint="On (recommended): different versions of a song are never auto-removed — only redundant encodings of the SAME version collapse. Off: dedupe across versions too (keep one file per song)."
+        />
+        <Toggle
+          label="Keep one file per format (FLAC + MP3)"
+          checked={cfg.duplicates.keep_all_formats}
+          onChange={(v) => updateDuplicates({ keep_all_formats: v })}
+          hint="Within a version, keep the best of each format instead of only the single best — e.g. a FLAC master AND an MP3 for a controller that can't read FLAC."
+        />
         <Field label="Action">
           <select
             className="input"

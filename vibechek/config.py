@@ -127,6 +127,27 @@ class DuplicateConfig:
     action: str = "report"  # "report" | "move" | "trash"
     review_folder: Path | None = None  # Where to move dupes if action == "move"
 
+    # ----- Variant awareness ------------------------------------------------
+    # A DJ's library legitimately holds different *versions* of one song
+    # (Extended vs Radio Edit, Original vs a Remix). Acoustic similarity alone
+    # would lump them together and the keeper logic would delete one. These
+    # control how aggressive de-duplication is across versions/formats.
+    #
+    # keep_distinct_versions: when True (default, SAFE), files that are clearly
+    #   different versions (different remix, or Extended vs Radio length) are
+    #   NEVER auto-removed — only redundant *encodings of the same version*
+    #   collapse. Set False to dedupe ACROSS versions too (aggressive: keep one
+    #   file per acoustic song regardless of version — the legacy behavior).
+    # keep_all_formats: when True, keep the best file of EACH format within a
+    #   version (e.g. a FLAC *and* an MP3 for a controller that can't read FLAC)
+    #   instead of collapsing to the single best encoding.
+    # version_duration_tolerance: two files with the SAME parsed version key are
+    #   still treated as different versions if their durations differ by more
+    #   than this fraction (catches mislabeled extended/radio pairs).
+    keep_distinct_versions: bool = True
+    keep_all_formats: bool = False
+    version_duration_tolerance: float = 0.12
+
 
 @dataclass
 class OrganizationConfig:
