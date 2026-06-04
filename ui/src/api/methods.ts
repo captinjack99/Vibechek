@@ -370,6 +370,10 @@ export interface SetupOnnxEngineResult {
   reasons_not_ready: string[];
   /** "wsl" | "native" — how analyze will route once ready. */
   analyze_via: string;
+  /** The real failure reason when a setup step (install/fetch) failed, else null. */
+  error?: string | null;
+  /** True when the setup was cancelled mid-run. */
+  cancelled?: boolean;
 }
 
 // --- config ---

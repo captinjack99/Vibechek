@@ -123,3 +123,116 @@ def test_report_progress_swallows_callback_errors() -> None:
 def test_report_progress_no_callback() -> None:
     # Calling with None should be a no-op
     report_progress(None, 1, 10, "msg")
+
+
+# ---------------------------------------------------------------------------
+# library_state.load_state — defensive per-row parsing
+# ---------------------------------------------------------------------------
+
+
+def _write_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, records: list) -> Path:
+    """Point library_state.STATE_FILE at a temp index containing `records`."""
+    import json as _json
+
+    from vibechek import library_state
+
+    f = tmp_path / "library_state.json"
+    f.write_text(_json.dumps({"recent": records}), encoding="utf-8")
+    monkeypatch.setattr(library_state, "STATE_FILE", f)
+    return f
+
+
+def test_load_state_keeps_valid_records_when_one_has_unknown_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single forward-compat record (extra key written by a newer build then
+    downgraded) must NOT wipe the whole recent list — drop the unknown key and
+    keep every record. Without the fix load_state() returned 0 records.
+    """
+    from vibechek import library_state
+
+    records = [
+        {"path": f"D:/lib{i}", "analysis_path": f"a{i}.json"} for i in range(3)
+    ]
+    records.append({"path": "D:/X", "analysis_path": "a.json", "color": "blue"})
+    _write_state(tmp_path, monkeypatch, records)
+
+    state = library_state.load_state()
+    assert [r.path for r in state.recent] == ["D:/lib0", "D:/lib1", "D:/lib2", "D:/X"]
+    # The unknown key is dropped, not preserved on the record.
+    assert not hasattr(state.recent[-1], "color")
+
+
+def test_load_state_skips_only_the_record_missing_a_required_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record missing a required field (e.g. from an interrupted migration)
+    is skipped on its own; every other valid record survives.
+    """
+    from vibechek import library_state
+
+    records = [
+        {"path": f"D:/lib{i}", "analysis_path": f"a{i}.json"} for i in range(9)
+    ]
+    records.append({"path": "D:/X"})  # missing required analysis_path
+    _write_state(tmp_path, monkeypatch, records)
+
+    state = library_state.load_state()
+    assert len(state.recent) == 9
+    assert all(r.analysis_path for r in state.recent)
+
+
+def test_load_state_skips_non_dict_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stray valid-JSON-but-non-object row (array/scalar) is skipped rather
+    than crashing the load.
+    """
+    from vibechek import library_state
+
+    records = [
+        ["stray", "array"],
+        42,
+        {"path": "D:/Y", "analysis_path": "y.json"},
+    ]
+    _write_state(tmp_path, monkeypatch, records)
+
+    state = library_state.load_state()
+    assert [r.path for r in state.recent] == ["D:/Y"]
+
+
+def test_load_state_coerces_tags_string_to_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`tags` stored as a bare string (hand-edited/old file) must become a
+    list[str] so the UI doesn't iterate it character-by-character.
+    """
+    from vibechek import library_state
+
+    records = [{"path": "D:/Y", "analysis_path": "y.json", "tags": "Brunch"}]
+    _write_state(tmp_path, monkeypatch, records)
+
+    state = library_state.load_state()
+    assert state.recent[0].tags == ["Brunch"]
+
+
+def test_load_state_missing_file_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibechek import library_state
+
+    monkeypatch.setattr(
+        library_state, "STATE_FILE", tmp_path / "does_not_exist.json"
+    )
+    assert library_state.load_state().recent == []
+
+
+def test_load_state_corrupt_json_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibechek import library_state
+
+    f = tmp_path / "library_state.json"
+    f.write_text("not json {", encoding="utf-8")
+    monkeypatch.setattr(library_state, "STATE_FILE", f)
+    assert library_state.load_state().recent == []

@@ -117,6 +117,9 @@ class CdjExportResult:
         output_xml: path to the written ``rekordbox_cdj.xml`` (None on dry run).
         out_dir: the output directory.
         track_errors: per-track error detail.
+        resampled: source locations whose audio was down-sampled to a CDJ-safe
+            rate (>48 kHz hi-res). This is an irreversible quality reduction the
+            user should be told about; the CLI surfaces it as a warning.
     """
 
     flac_converted: int = 0
@@ -127,6 +130,7 @@ class CdjExportResult:
     output_xml: Path | None = None
     out_dir: Path | None = None
     track_errors: list[TrackError] = field(default_factory=list)
+    resampled: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -293,19 +297,67 @@ def _resample_float(data, src_rate: int, dst_rate: int):
     return np.stack(cols, axis=1).astype(arr.dtype)
 
 
+def _probe_samplerate(src: Path) -> int | None:
+    """Best-effort source sample rate WITHOUT soundfile (the ffmpeg path's case).
+
+    The ffmpeg fallback is only ever reached when ``soundfile`` is unavailable,
+    so we must not rely on it here. Try ``ffprobe`` (ships alongside ffmpeg),
+    then fall back to mutagen's ``FLAC.info.sample_rate``. Returns None if the
+    rate genuinely can't be determined, letting the caller choose a CDJ-safe
+    default rather than guessing.
+    """
+    # ffprobe is bundled with ffmpeg and reads the rate straight from the header.
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate",
+                "-of",
+                "default=nw=1:nk=1",
+                str(src),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        if proc.returncode == 0 and out.isdigit():
+            return int(out)
+    except OSError:
+        pass
+    # Fallback: read the FLAC header with mutagen (a core dependency).
+    try:
+        from mutagen.flac import FLAC  # noqa: PLC0415
+
+        rate = FLAC(str(src)).info.sample_rate
+        if rate:
+            return int(rate)
+    except Exception:  # noqa: BLE001 -- mutagen failure is non-fatal; fall through
+        pass
+    return None
+
+
 def _transcode_ffmpeg(src: Path, dst: Path) -> None:
     """Fallback: ``ffmpeg -i src -c:a pcm_s16le dst``.
 
     pcm_s16le in an AIFF container gives a 16-bit AIFF. ffmpeg keeps the source
     sample rate (and thus frame count) unless we ask otherwise; for >48 kHz
     sources we add ``-ar 44100`` to keep the CDJ happy.
+
+    The source rate is probed via ffprobe/mutagen (NOT soundfile — it is
+    guaranteed absent on this path). If the rate can't be determined we still
+    force ``-ar 44100``: it is always CDJ-safe and only a no-op resample for
+    tracks that are already <=48 kHz, which is far safer than shipping an
+    unplayable hi-res AIFF.
     """
-    sr = None
-    sf = _soundfile_module()
-    if sf is not None:
-        sr = sf.info(str(src)).samplerate
+    sr = _probe_samplerate(src)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
-    if sr is not None and sr > MAX_CDJ_SAMPLERATE:
+    if sr is None or sr > MAX_CDJ_SAMPLERATE:
         cmd += ["-ar", "44100"]
     cmd += ["-c:a", "pcm_s16le", str(dst)]
     try:
@@ -396,6 +448,12 @@ def rewrite_for_cdj(
     valid byte-for-byte. No cue/grid offset math is needed -- that equivalence
     is the entire reason we target AIFF rather than a lossy/padded format.
 
+    For tracks that were down-sampled (>48 kHz hi-res reduced to 44.1 kHz) the
+    on-disk AIFF rate no longer matches the TRACK's declared ``SampleRate``; we
+    rewrite ``SampleRate`` to the AIFF's real rate and clear the now-stale
+    ``BitRate`` (Rekordbox recomputes it for lossless on import) so the XML does
+    not advertise a rate the file no longer has.
+
     The input ``tree`` is not mutated; a copy is returned.
     """
     out_dir = Path(out_dir)
@@ -436,7 +494,43 @@ def rewrite_for_cdj(
             # Size is informational for Rekordbox; if the AIFF isn't there
             # (dry-run planning path) keep whatever was there.
             pass
+        # If the AIFF's real rate differs from the TRACK's declared SampleRate
+        # (a down-sampled >48 kHz hi-res track), correct the metadata so the XML
+        # doesn't advertise a rate the file no longer has. Clear the stale
+        # BitRate too — Rekordbox recomputes it for lossless on import.
+        real_rate = _aiff_samplerate(Path(dst))
+        if real_rate is not None:
+            declared = track.get("SampleRate")
+            if declared is None or declared.strip() != str(real_rate):
+                track.set("SampleRate", str(real_rate))
+                if track.get("BitRate") is not None:
+                    track.set("BitRate", "0")
     return new_tree
+
+
+def _aiff_samplerate(path: Path) -> int | None:
+    """Read an AIFF's sample rate, or None if it can't be determined / absent.
+
+    Used to detect a down-sample so :func:`rewrite_for_cdj` can correct the
+    XML's ``SampleRate``. Prefers ``soundfile`` when present, then falls back to
+    mutagen's ``AIFF.info.sample_rate`` (soundfile is absent on the ffmpeg path).
+    A missing file (e.g. dry-run planning) yields None, leaving metadata as-is.
+    """
+    sf = _soundfile_module()
+    if sf is not None:
+        try:
+            return int(sf.info(str(path)).samplerate)
+        except Exception:  # noqa: BLE001 -- fall through to mutagen
+            pass
+    try:
+        from mutagen.aiff import AIFF  # noqa: PLC0415
+
+        rate = AIFF(str(path)).info.sample_rate
+        if rate:
+            return int(rate)
+    except Exception:  # noqa: BLE001 -- best-effort; None means "leave metadata"
+        pass
+    return None
 
 
 def _norm_key(path: Path) -> str:
@@ -550,6 +644,13 @@ def export_for_cdj(
             src_to_dst[str(src)] = dst
             result.flac_converted += 1
             result.flac_planned += 1
+            # Record an irreversible down-sample so the caller/CLI can warn the
+            # user (the AIFF's real rate differs from the source hi-res rate).
+            aiff_rate = _aiff_samplerate(dst)
+            if aiff_rate is not None and aiff_rate <= MAX_CDJ_SAMPLERATE:
+                src_rate = _probe_samplerate(src)
+                if src_rate is not None and src_rate > MAX_CDJ_SAMPLERATE:
+                    result.resampled.append(str(src))
         except CdjExportError as e:
             # A missing transcoder is fatal for the whole run -- re-raise so the
             # user gets one clear message instead of N identical per-track errors.

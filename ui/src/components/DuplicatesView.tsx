@@ -179,7 +179,12 @@ export function DuplicatesView() {
       );
       finish();
       const word = action === "trash" ? "Trashed" : "Moved";
-      const count = summary.deleted ?? summary.moved ?? 0;
+      // Select the count by ACTION, not `deleted ?? moved`. The backend always
+      // returns BOTH keys (initialised to 0), incrementing only the one for the
+      // chosen action — so for a move, `deleted` is the number 0 and `??` (which
+      // only falls through on null/undefined) returns 0 instead of `moved`,
+      // making every move report "Moved 0 duplicates".
+      const count = action === "trash" ? (summary.deleted ?? 0) : (summary.moved ?? 0);
       const errors = summary.errors ?? 0;
       // Move-to-review is revertible via Recent operations; trash isn't
       // (it's in the OS recycle bin). Surface the right hint either way.

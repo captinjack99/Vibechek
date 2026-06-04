@@ -19,7 +19,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -93,11 +93,39 @@ def load_state() -> LibraryState:
         return LibraryState()
     try:
         raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        recent = [LibraryRecord(**r) for r in raw.get("recent", [])]
-        return LibraryState(recent=recent)
-    except (OSError, json.JSONDecodeError, TypeError) as e:
+    except (OSError, json.JSONDecodeError) as e:
         log.warning("Could not load library state: %s — starting fresh", e)
         return LibraryState()
+
+    # Parse each record defensively, mirroring config._subset: a single bad
+    # row (an unexpected forward-compat key from a newer build, a missing
+    # required field from a partial write/hand-edit) must NOT nuke the whole
+    # list. Without this, one bad row strands every other valid analysis JSON
+    # on disk — the user sees "no recent libraries" though the 32MB reports
+    # are intact (see save_state's note). Skip-and-log instead.
+    raw_recent = raw.get("recent", []) if isinstance(raw, dict) else []
+    if not isinstance(raw_recent, list):
+        raw_recent = []
+    valid = {f.name for f in fields(LibraryRecord)}
+    recent: list[LibraryRecord] = []
+    for r in raw_recent:
+        if not isinstance(r, dict):
+            log.warning("Skipping non-object library record %r", r)
+            continue
+        try:
+            rec = LibraryRecord(**{k: v for k, v in r.items() if k in valid})
+        except TypeError as e:
+            log.warning("Skipping bad library record %r: %s", r, e)
+            continue
+        # `tags` is metadata the UI iterates; a hand-edited/old state file may
+        # store it as a bare string ("Brunch") which would mis-iterate as
+        # characters downstream. Coerce to a clean list[str].
+        if isinstance(rec.tags, str):
+            rec.tags = [rec.tags] if rec.tags else []
+        elif not isinstance(rec.tags, list):
+            rec.tags = []
+        recent.append(rec)
+    return LibraryState(recent=recent)
 
 
 def save_state(state: LibraryState) -> None:

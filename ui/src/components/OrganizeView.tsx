@@ -305,6 +305,7 @@ export function OrganizeView() {
     try {
       const stats = await rpc<{
         planned: number; moved: number; errors: string[]; journal_path: string | null;
+        cancelled?: boolean;
       }>(
         "organize",
         { ...buildParams(), dry_run: false },
@@ -344,10 +345,15 @@ export function OrganizeView() {
       setPlan(null);
       setPlanParams(null);
 
-      // Brief notification too, in case the user navigated away mid-op
-      notify(`Moved ${stats.moved} of ${stats.planned} files`, {
-        kind: stats.errors.length > 0 ? "info" : "success",
-      });
+      // Brief notification too, in case the user navigated away mid-op. A
+      // cancelled run still moved some files and left an undo journal — say so
+      // rather than claiming a clean success.
+      notify(
+        stats.cancelled
+          ? `Organize cancelled — moved ${stats.moved} of ${stats.planned} before stopping. Undo is available.`
+          : `Moved ${stats.moved} of ${stats.planned} files`,
+        { kind: stats.cancelled || stats.errors.length > 0 ? "info" : "success" },
+      );
     } catch (e) {
       fail(e);
     }

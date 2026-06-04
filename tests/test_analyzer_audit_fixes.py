@@ -176,3 +176,75 @@ def test_class_index_substring_match() -> None:
 def test_class_index_falls_back_when_missing() -> None:
     assert analyzer._class_index(None, "voice", fallback=1) == 1
     assert analyzer._class_index(["a", "b"], "voice", fallback=1) == 1
+
+
+# ---------------------------------------------------------------------------
+# Timeslot energy-0 coalesce (MED): energy 0 is a real value, not "missing"
+# ---------------------------------------------------------------------------
+
+
+def test_timeslot_energy_zero_is_not_treated_as_missing() -> None:
+    """`_pick_timeslot` must honour a genuine energy of 0 (calmest tracks).
+
+    The old call site used `result.ml_energy or 3`, so an energy-0 track was
+    silently bumped to medium energy (3) and got the wrong timeslot.
+    """
+    # Generic energy-0 track: lowest energy → "Opener", not "Warm-Up".
+    assert analyzer._pick_timeslot("Unknown", None, 0, 120.0) == "Opener"
+    # The old `0 or 3` coalesce would have yielded "Warm-Up" — prove they differ.
+    assert analyzer._pick_timeslot("Unknown", None, 3, 120.0) == "Warm-Up"
+    assert analyzer._pick_timeslot("Unknown", None, 0, 120.0) != analyzer._pick_timeslot(
+        "Unknown", None, 0 or 3, 120.0
+    )
+
+
+def test_timeslot_ambient_energy_zero_is_opener_not_afterhours() -> None:
+    """An Ambient/Downtempo energy-0 track opens a set ("Opener"); the old
+    `0 or 3` coalesce pushed energy to 3 → "Afterhours"."""
+    assert analyzer._pick_timeslot("Ambient", "Dark Ambient", 0, 90.0) == "Opener"
+    # Energy 3 (what the old bug fabricated) on the same genre → "Afterhours".
+    assert analyzer._pick_timeslot("Ambient", "Dark Ambient", 3, 90.0) == "Afterhours"
+
+
+# ---------------------------------------------------------------------------
+# Timeslot subgenre special-cases (LOW): match Hard Techno/Deep House etc. on
+# the SUBGENRE, since ml_genre carries the DJ-friendly PARENT genre.
+# ---------------------------------------------------------------------------
+
+
+def test_timeslot_hard_techno_subgenre_forces_peak() -> None:
+    """A Hard Techno track surfaces as parent genre "Techno" + subgenre
+    "Hard Techno". The Peak special-case must fire off the subgenre — matching
+    the parent ("Techno") never would, so it used to fall through to "Warm-Up".
+    """
+    assert analyzer._pick_timeslot("Techno", "Hard Techno", 3, 130.0) == "Peak"
+    # Plain (non-hard) Techno at the same energy stays "Warm-Up".
+    assert analyzer._pick_timeslot("Techno", "Minimal Techno", 3, 130.0) == "Warm-Up"
+
+
+def test_timeslot_gabber_hardstyle_subgenres_force_peak() -> None:
+    """Gabber/Hardstyle arrive as subgenres under the "Hardcore" parent."""
+    assert analyzer._pick_timeslot("Hardcore", "Gabber", 2, 180.0) == "Peak"
+    assert analyzer._pick_timeslot("Hardcore", "Hardstyle", 2, 150.0) == "Peak"
+    # The producible parent "Hardcore" itself is still peak material.
+    assert analyzer._pick_timeslot("Hardcore", None, 2, 180.0) == "Peak"
+
+
+def test_timeslot_trip_hop_subgenre_is_chill() -> None:
+    """Trip Hop arrives as a subgenre under the "Downtempo" parent and should
+    take the chill (Opener/Afterhours) branch."""
+    assert analyzer._pick_timeslot("Downtempo", "Trip Hop", 1, 90.0) == "Opener"
+    assert analyzer._pick_timeslot("Downtempo", "Trip Hop", 4, 90.0) == "Afterhours"
+
+
+def test_timeslot_old_parent_match_was_dead() -> None:
+    """Proof the fix matters: matching the hard styles against the parent genre
+    (the old code) never fired, because get_best_genre yields the parent."""
+    get_best_genre = pytest.importorskip("vibechek.genres").get_best_genre
+    # A Hard Techno Discogs label resolves to parent "Techno", subgenre "Hard Techno".
+    res = get_best_genre([0.9], ["Electronic---Hard Techno"])
+    assert res.genre == "Techno"
+    assert res.subgenre == "Hard Techno"
+    # Matching the parent against the old ("Hard Techno",) tuple is a no-op,
+    # but matching the subgenre forces Peak.
+    assert analyzer._pick_timeslot(res.genre, res.subgenre, 3, 130.0) == "Peak"

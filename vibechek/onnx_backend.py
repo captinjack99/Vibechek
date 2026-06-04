@@ -229,6 +229,13 @@ def _make_patches(mel: np.ndarray, patch_frames: int = PATCH_FRAMES, hop: int = 
     """
     import numpy as np  # noqa: PLC0415
 
+    # An empty/effectively-empty decode (audio shorter than one 512-sample frame
+    # at 16 kHz) yields zero mel frames — a 1-D `(0,)` array with no `shape[1]`.
+    # Honour the "every track yields at least one patch" contract by returning a
+    # single zero patch instead of crashing on `mel.shape[1]` (matches essentia).
+    if mel.ndim < 2 or mel.shape[0] == 0:
+        return np.zeros((1, patch_frames, 96), dtype=np.float32)
+
     n_frames = int(mel.shape[0])
     idx = _patch_indices(n_frames, patch_frames, hop)
     if n_frames < patch_frames:

@@ -64,15 +64,22 @@ def test_load_state_corrupted_json_returns_empty(_isolated_state_dirs: Path) -> 
     assert state.recent == []
 
 
-def test_load_state_unknown_field_returns_empty(_isolated_state_dirs: Path) -> None:
-    """Schema drift — a record with a TypeError-causing field shouldn't crash."""
+def test_load_state_unknown_field_is_dropped_record_kept(_isolated_state_dirs: Path) -> None:
+    """Forward-compat / schema drift: a record carrying an UNKNOWN field (e.g.
+    written by a newer version) must NOT discard the whole recent list — the
+    record is kept with the unknown field ignored. (Regression: a single such
+    record used to wipe every recent library.)"""
     library_state.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     library_state.STATE_FILE.write_text(
-        json.dumps({"recent": [{"path": "/x", "analysis_path": "/y", "bogus_field": 1}]}),
+        json.dumps({"recent": [
+            {"path": "/x", "analysis_path": "/y", "bogus_field": 1},
+            {"path": "/a", "analysis_path": "/b"},
+        ]}),
         encoding="utf-8",
     )
     state = library_state.load_state()
-    assert state.recent == []  # TypeError → fallback
+    assert [r.path for r in state.recent] == ["/x", "/a"]  # both kept
+    assert not hasattr(state.recent[0], "bogus_field")     # unknown field dropped
 
 
 def test_save_state_creates_parent_dir(_isolated_state_dirs: Path, tmp_path: Path) -> None:

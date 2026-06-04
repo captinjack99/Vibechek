@@ -353,6 +353,55 @@ def _dedupe_bucket(
     return out
 
 
+def _merge_overlapping_clusters(
+    clusters: list[list[FileInfo]],
+) -> list[list[FileInfo]]:
+    """Merge clusters that share ANY file into connected components (union-find).
+
+    Multi-probe bucketing files one track under several keys, so the same file
+    can land in two different per-bucket clusters (e.g. A~B in one bucket, B~C
+    in another). Emitting those as separate groups let a single file be the
+    KEEPER of one group and a DUPLICATE of another — and `handle_duplicates`
+    would then move/trash a file the UI showed as kept (data loss). Collapsing
+    overlapping clusters into one component per file makes `choose_keeper` run
+    once per real duplicate set, so a path is either a keeper or a dupe, never
+    both. Deduplicates FileInfo by path within each component.
+    """
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:  # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        parent[find(a)] = find(b)
+
+    info_by_path: dict[str, FileInfo] = {}
+    for cluster in clusters:
+        paths = [f.path for f in cluster]
+        for f in cluster:
+            info_by_path.setdefault(f.path, f)
+            find(f.path)
+        for other in paths[1:]:
+            union(paths[0], other)
+
+    components: dict[str, list[FileInfo]] = {}
+    seen_in_component: dict[str, set[str]] = {}
+    for path, info in info_by_path.items():
+        root = find(path)
+        bucket = components.setdefault(root, [])
+        seen = seen_in_component.setdefault(root, set())
+        if path not in seen:
+            seen.add(path)
+            bucket.append(info)
+    return [c for c in components.values() if len(c) > 1]
+
+
 def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:
     """Pick which file to keep from a group; return (keeper, duplicates).
 
@@ -493,53 +542,46 @@ def find_duplicates(
                     for key in _bucket_keys(raw_fp):
                         buckets[key].append((info, raw_fp))
 
-            # Per-bucket union-find: cluster files whose pairwise similarity
-            # crosses the configured threshold. This is the threshold the user
-            # sets in Settings — at 1.0 only byte-identical fingerprints group,
-            # at 0.85 you get re-encodes / different bitrates of the same master.
-            # A cluster can recur across buckets (multi-probe membership), so
-            # dedupe emitted groups by their set of member paths.
-            seen_group_paths: set[frozenset[str]] = set()
+            # Per-bucket similarity clustering, THEN a global union-find merge.
+            # The threshold is what the user sets in Settings — at 1.0 only
+            # byte-identical fingerprints group, at 0.85 you get re-encodes /
+            # different bitrates of the same master. Multi-probe bucketing files
+            # one track under several keys, so the same file can appear in two
+            # buckets' clusters; we collect every cluster, then merge any that
+            # share a file into one component (see _merge_overlapping_clusters)
+            # so a path is a keeper OR a dupe, never both across groups.
+            raw_clusters: list[list[FileInfo]] = []
             for bucket in buckets.values():
-                # Drop duplicate (info, raw) entries that multi-probe bucketing
-                # may have placed in the same bucket twice (same file matched two
-                # probe keys that collided here).
                 bucket = _dedupe_bucket(bucket)
                 if len(bucket) <= 1:
                     continue
-                clusters = _cluster_by_similarity(bucket, threshold)
-                for cluster in clusters:
-                    if len(cluster) <= 1:
-                        continue
-                    files = [info for info, _ in cluster]
-                    # Multi-probe bucketing can surface the same cluster from
-                    # more than one bucket; emit each unique member-set once.
-                    member_paths = frozenset(f.path for f in files)
-                    if member_paths in seen_group_paths:
-                        continue
-                    seen_group_paths.add(member_paths)
-                    # Avoid double-reporting: if everyone in the cluster shares
-                    # the same MD5 hash, phase 1 already grouped them. Only skip
-                    # when MD5 actually ran (config.use_md5 True AND all hashes
-                    # known) — otherwise we wrongly drop legitimate similarity
-                    # clusters.
-                    hashes = [f.file_hash for f in files if f.file_hash]
-                    if (
-                        config.use_md5
-                        and len(hashes) == len(files)
-                        and len(set(hashes)) <= 1
-                    ):
-                        continue
-                    keeper, dupes = choose_keeper(files)
-                    # Group key: the keeper's fingerprint hash. Stable + unique.
-                    group_key = keeper.audio_fingerprint or ""
-                    report.audio_duplicates.append(DuplicateGroup(
-                        method="chromaprint",
-                        key=group_key,
-                        keep=keeper,
-                        duplicates=dupes,
-                        recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
-                    ))
+                for cluster in _cluster_by_similarity(bucket, threshold):
+                    if len(cluster) > 1:
+                        raw_clusters.append([info for info, _ in cluster])
+
+            for files in _merge_overlapping_clusters(raw_clusters):
+                # Avoid double-reporting: if everyone in the component shares
+                # the same MD5 hash, phase 1 already grouped them. Only skip
+                # when MD5 actually ran (config.use_md5 True AND all hashes
+                # known) — otherwise we wrongly drop legitimate similarity
+                # clusters.
+                hashes = [f.file_hash for f in files if f.file_hash]
+                if (
+                    config.use_md5
+                    and len(hashes) == len(files)
+                    and len(set(hashes)) <= 1
+                ):
+                    continue
+                keeper, dupes = choose_keeper(files)
+                # Group key: the keeper's fingerprint hash. Stable + unique.
+                group_key = keeper.audio_fingerprint or ""
+                report.audio_duplicates.append(DuplicateGroup(
+                    method="chromaprint",
+                    key=group_key,
+                    keep=keeper,
+                    duplicates=dupes,
+                    recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
+                ))
 
     report.update_summary()
     return report
@@ -567,11 +609,24 @@ def handle_duplicates(
     from vibechek import cancellation
 
     action = DuplicateAction(config.action)
-    all_dupes = [
-        d
+    # Defense-in-depth against overlapping groups: NEVER act on a file that is
+    # the designated keeper of ANY group, and act on each duplicate path at most
+    # once. Grouping is now globally merged (see _merge_overlapping_clusters) so
+    # this should be a no-op, but a stale/hand-edited report or a future grouping
+    # regression must not move/trash a kept file or double-process a path.
+    keeper_paths = {
+        g.keep.path
         for g in (*report.exact_duplicates, *report.audio_duplicates)
-        for d in g.duplicates
-    ]
+        if g.keep
+    }
+    all_dupes = []
+    _seen_dupe_paths: set[str] = set()
+    for g in (*report.exact_duplicates, *report.audio_duplicates):
+        for d in g.duplicates:
+            if d.path in keeper_paths or d.path in _seen_dupe_paths:
+                continue
+            _seen_dupe_paths.add(d.path)
+            all_dupes.append(d)
     error_messages: list[str] = []
     summary: dict = {
         "moved": 0,

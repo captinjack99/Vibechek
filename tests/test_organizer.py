@@ -164,3 +164,155 @@ def test_route_new_tracks_uniquifies_colliding_basenames(
     house_files = sorted(p.name for p in (library / "House").iterdir())
     assert house_files == ["track.mp3", "track_1.mp3"]
     assert (library / "House" / "track_1.mp3").read_bytes() == b"DIFFERENT staging track content"
+
+
+def test_plan_genre_only_track_routes_flat_not_unknown_subfolder(tmp_path: Path) -> None:
+    """A track with a real genre but NO subgenre must land in flat <Genre>/,
+    not <Genre>/Unknown/.
+
+    Regression: ``sanitize_folder_name(None/"")`` returns the literal sentinel
+    "Unknown", which is truthy and ``!= genre`` (e.g. "House"), so the
+    subgenre branch wrongly routed genre-only tracks to House/Unknown/ with
+    reason "ML genre + subgenre". use_subgenres defaults to True, so this was
+    the default path for every track whose ml_subgenre was null/missing/empty.
+    """
+    library = tmp_path / "library"
+    library.mkdir()
+    cases = [
+        ("missing.mp3", {"ml_genre": "House"}),               # no ml_subgenre key
+        ("null.mp3", {"ml_genre": "House", "ml_subgenre": None}),
+        ("empty.mp3", {"ml_genre": "House", "ml_subgenre": ""}),
+    ]
+    tracks = []
+    for name, ml in cases:
+        f = library / name
+        f.write_bytes(b"")
+        tracks.append({"path": str(f), "filename": name, "ml_analysis": ml})
+
+    config = OrganizationConfig(use_subgenres=True, min_genre_size=1)
+    plan = plan_organization({"tracks": tracks}, config, base_dir=library)
+
+    assert len(plan.moves) == 3
+    for m in plan.moves:
+        rel = m.destination.relative_to(library)
+        # Flat House/<file> — exactly two parts, NOT House/Unknown/<file>.
+        assert rel.parts[0] == "House"
+        assert "Unknown" not in rel.parts, f"{m.destination} wrongly used Unknown/ subfolder"
+        assert len(rel.parts) == 2
+        assert m.reason == "ML genre"
+
+    # A track WITH a real subgenre still gets the subgenre folder.
+    g = library / "withsub.mp3"
+    g.write_bytes(b"")
+    plan2 = plan_organization(
+        {"tracks": [{"path": str(g), "filename": g.name,
+                     "ml_analysis": {"ml_genre": "House", "ml_subgenre": "Deep House"}}]},
+        config, base_dir=library,
+    )
+    rel = plan2.moves[0].destination.relative_to(library)
+    assert rel.parts[:2] == ("House", "Deep House")
+
+
+def test_route_dry_run_matches_real_run_for_colliding_basenames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """route_new_tracks dry-run must report the SAME rename count as the real
+    run when two different staging files share a basename + genre.
+
+    Regression: dry_run never wrote the copies, so the second file's dest
+    didn't exist on disk at check time and skipped_exists stayed 0 — the
+    preview claimed no renames while the real run renamed one file to _1.
+    Fixed by tracking an in-batch ``claimed`` set like plan_organization.
+    """
+    from vibechek import organizer
+
+    staging = tmp_path / "staging"
+    library_dry = tmp_path / "lib_dry"
+    library_real = tmp_path / "lib_real"
+    staging.mkdir()
+
+    # Two DIFFERENT staging files sharing the same basename, both genre House.
+    sub_a = staging / "a"
+    sub_b = staging / "b"
+    sub_a.mkdir()
+    sub_b.mkdir()
+    (sub_a / "track.mp3").write_bytes(b"content A")
+    (sub_b / "track.mp3").write_bytes(b"content B")
+
+    monkeypatch.setattr(organizer, "_read_genre_tag", lambda _fp: "House")
+
+    dry = route_new_tracks(staging, library_dry, dry_run=True)
+    real = route_new_tracks(staging, library_real, dry_run=False)
+
+    # The preview must agree with reality.
+    assert dry["copied"] == real["copied"] == 2
+    assert dry["skipped_exists"] == real["skipped_exists"] == 1
+
+    # And the real run actually wrote both under unique names.
+    real_files = sorted(p.name for p in (library_real / "House").iterdir())
+    assert real_files == ["track.mp3", "track_1.mp3"]
+
+
+def test_organize_cancel_midbatch_preserves_journal_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling an organize mid-batch must still expose the undo-journal path
+    (and partial stats) so the GUI can offer "Undo this organize" for the
+    files that already moved.
+
+    Regression: journal_path was only assigned AFTER the try/finally block, so
+    a CancelledError skipped it — the caller got no stats and no undo
+    affordance even though real files had moved. Fixed by capturing the journal
+    path on cancellation and attaching the partial stats to the exception.
+    """
+    from vibechek import cancellation, journal
+
+    library = tmp_path / "library"
+    library.mkdir()
+    tracks = []
+    for i in range(6):
+        f = library / f"t{i}.mp3"
+        f.write_bytes(b"")
+        tracks.append({
+            "path": str(f), "filename": f.name,
+            "ml_analysis": {"ml_genre": "House"},
+        })
+    analysis = {"tracks": tracks}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1)
+
+    # Make journals land in a temp dir so we never touch the user's data dir.
+    monkeypatch.setattr(journal, "JOURNALS_DIR", tmp_path / "journals")
+
+    # Trip the cancel flag after 2 moves have been recorded by intercepting
+    # cancellation.check() (called at the top of each loop iteration).
+    real_check = cancellation.check
+    calls = {"n": 0}
+
+    def fake_check() -> None:
+        calls["n"] += 1
+        # check() runs before each move; allow the first 2 moves, cancel on
+        # the 3rd iteration's check.
+        if calls["n"] == 3:
+            raise cancellation.CancelledError("test cancel")
+        real_check()
+
+    monkeypatch.setattr(cancellation, "check", fake_check)
+
+    with pytest.raises(cancellation.CancelledError) as excinfo:
+        organize_from_analysis(analysis, config, dry_run=False)
+
+    # The exception carries partial stats with a usable journal path.
+    partial = getattr(excinfo.value, "partial_stats", None)
+    assert partial is not None
+    assert partial.moved == 2
+    assert partial.journal_path is not None
+    jp = Path(partial.journal_path)
+    assert jp.exists()
+
+    # The journal records exactly the 2 moves that happened, so a revert is
+    # possible for the partial organize.
+    _header, entries = journal._read_journal(jp)
+    moves = [e for e in entries if e.get("action") == "move"]
+    assert len(moves) == 2
+    # And those two files physically moved into House/.
+    assert sorted(p.name for p in (library / "House").iterdir()) == ["t0.mp3", "t1.mp3"]

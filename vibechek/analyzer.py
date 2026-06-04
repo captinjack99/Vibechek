@@ -1066,11 +1066,31 @@ def _snap_bpm_octave(
     return round(bpm, 1)
 
 
-def _pick_timeslot(genre: str | None, energy: int, bpm: float | None) -> str:
-    """Map (genre, energy, BPM) → DJ set timeslot label."""
-    if genre in ("Ambient", "Downtempo", "Chillout", "Trip Hop"):
+def _pick_timeslot(
+    genre: str | None,
+    subgenre: str | None,
+    energy: int,
+    bpm: float | None,
+) -> str:
+    """Map (genre, subgenre, energy, BPM) → DJ set timeslot label.
+
+    Note: ``genre`` is the DJ-friendly PARENT genre (e.g. "Techno", "House")
+    while ``subgenre`` carries the finer Discogs style (e.g. "Hard Techno",
+    "Deep House"). The peak/chill special-cases below therefore have to match
+    the SUBGENRE for styles like Hard Techno — matching them against the parent
+    ``genre`` never fires (the parent arrives as "Techno"/"House").
+    """
+    # Chill / downtempo material opens or closes a set. "Ambient"/"Downtempo"
+    # are producible parent genres; "Trip Hop" arrives as the subgenre under
+    # the "Downtempo" parent. ("Chillout" is not a producible genre at all and
+    # was dead here.)
+    if genre in ("Ambient", "Downtempo") or subgenre in ("Trip Hop",):
         return "Opener" if energy <= 2 else "Afterhours"
-    if genre in ("Hardcore", "Gabber", "Hardstyle", "Hard Techno"):
+    # Peak-time material. "Hardcore" is a producible parent; "Gabber"/
+    # "Hardstyle" arrive as subgenres under it and "Hard Techno" as a subgenre
+    # under the "Techno" parent — so the hard styles must be matched on the
+    # subgenre, not the parent genre.
+    if genre in ("Hardcore",) or subgenre in ("Gabber", "Hardstyle", "Hard Techno"):
         return "Peak"
 
     if energy <= 1:
@@ -1231,18 +1251,41 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 
         result.ml_mood_scores = {k: round(v, 3) for k, v in mood_scores.items()}
     else:
-        # Genre-based fallback when mood models failed
+        # Genre-based fallback when mood models failed.
+        # `ml_genre` is the DJ-friendly PARENT genre; the finer Discogs styles
+        # (Hard Techno, Deep House, …) live in `ml_subgenre`. Match parent
+        # buckets against `genre` and subgenre-level styles against `subgenre`
+        # so the special-cases actually fire ("Hard Techno"/"Deep House" never
+        # arrive as the parent genre).
         genre = result.ml_genre or ""
-        if genre in ("Techno", "Hard Techno", "Industrial", "EBM", "Hardcore", "Gabber"):
+        subgenre = result.ml_subgenre or ""
+        if (
+            genre in ("Techno", "Industrial", "Hardcore")
+            or subgenre in ("Hard Techno", "EBM", "Gabber")
+        ):
             result.ml_energy, result.ml_mood = 4, "Dark"
-        elif genre in ("Deep House", "Ambient", "Downtempo", "Chillout"):
+        elif (
+            genre in ("Ambient", "Downtempo")
+            or subgenre in ("Deep House",)
+        ):
             result.ml_energy, result.ml_mood = 2, "Neutral"
-        elif genre in ("Trance", "Psytrance", "Happy Hardcore", "Eurodance"):
+        elif (
+            genre in ("Trance",)
+            or subgenre in ("Psy-Trance", "Happy Hardcore", "Eurodance")
+        ):
             result.ml_energy, result.ml_mood = 4, "Bright"
         else:
             result.ml_energy, result.ml_mood = 3, "Neutral"
 
-    result.ml_timeslot = _pick_timeslot(result.ml_genre, result.ml_energy or 3, result.ml_bpm)
+    # Use an explicit None check, not `or 3`: energy 0 is a legitimate computed
+    # value (calmest tracks). `0 or 3` would silently treat those as medium
+    # energy and assign the wrong timeslot.
+    result.ml_timeslot = _pick_timeslot(
+        result.ml_genre,
+        result.ml_subgenre,
+        result.ml_energy if result.ml_energy is not None else 3,
+        result.ml_bpm,
+    )
 
     # ---------- Direction (energy curve over the track) ----------
     # Reuse the aggressive prediction computed in the mood loop above instead
