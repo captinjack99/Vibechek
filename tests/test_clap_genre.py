@@ -49,6 +49,20 @@ def test_knn_predict_weighted_vote_majority() -> None:
     assert g == "House"
 
 
+def test_knn_predict_distance_weighting_favours_close_neighbour() -> None:
+    """A single very-close neighbour must outvote many loose ones of another
+    class — the distance-weighted (1/cos-distance) behaviour, not a flat count."""
+    rows = [[1.0, 0.0, 0.0]]                       # near-identical "Tech House"
+    rows += [[0.55, 0.84, 0.0]] * 9               # 9 loose "Trance" (~0.55 cos)
+    emb = np.array(rows, dtype=np.float32)
+    ref = clap_genre.ClapReference(
+        emb=emb / np.linalg.norm(emb, axis=1, keepdims=True),
+        labels=np.array(["Tech House"] + ["Trance"] * 9, dtype=object), meta={})
+    g, conf = clap_genre.knn_predict(np.array([0.999, 0.04, 0.0], dtype=np.float32), ref, k=10)
+    assert g == "Tech House"  # the 0.99 match dominates despite being outnumbered 9:1
+    assert conf > 0.5
+
+
 def test_knn_predict_empty_or_zero_is_unknown() -> None:
     ref = clap_genre.ClapReference(emb=np.zeros((0, 4), dtype=np.float32),
                                    labels=np.array([], dtype=object), meta={})
