@@ -24,6 +24,8 @@ GENRE_HIERARCHY: dict[str, list[str]] = {
         "Acid House", "Tribal House", "Garage House", "Euro House",
         "Italo House", "Ghetto House", "Tropical House", "Hard House",
         "Hip-House", "Minimal", "Speed Garage", "UK Garage",
+        # Modern Beatport house subgenres (recognized by the CLAP/web genre sources)
+        "Bass House", "Funky House", "Future House", "Afro House", "Organic House",
     ],
     "Techno": ["Deep Techno", "Dub Techno", "Hard Techno", "Minimal Techno", "Schranz"],
     "Trance": [
@@ -35,11 +37,17 @@ GENRE_HIERARCHY: dict[str, list[str]] = {
         "Happy Hardcore", "Gabber", "Hardstyle", "Speedcore", "Jumpstyle", "Makina",
     ],
     "Breaks": ["Breakbeat", "Progressive Breaks", "Big Beat", "Breakcore"],
-    "Dubstep": ["Bassline", "Grime"],
+    "Dubstep": ["Bassline", "Grime", "Melodic Dubstep", "Riddim"],
     "Disco": ["Nu-Disco", "Euro-Disco", "Italo-Disco", "Disco Polo"],
     "Ambient": ["Dark Ambient", "Drone", "New Age"],
     "Downtempo": ["Trip Hop", "Chillwave"],
     "Industrial": ["EBM", "Power Electronics", "Rhythmic Noise", "Noise", "Neofolk"],
+    # Modern Beatport top-level genres that don't nest under the above.
+    "Melodic House & Techno": [],
+    "Indie Dance": [],
+    "Big Room": ["Future Rave"],
+    "Midtempo Bass": [],
+    "Electronica": [],
 }
 
 # Reverse lookup: subgenre → parent
@@ -58,6 +66,12 @@ DJ_GENRE_MAP: dict[str, str] = {
     "Acid House": "Acid House", "Euro House": "Euro House", "Italo House": "Italo House",
     "Ghetto House": "Ghetto House", "Tropical House": "Tropical House", "Hard House": "Hard House",
     "Hip-House": "Hip-House", "Speed Garage": "Speed Garage", "Minimal": "Minimal",
+    # Modern Beatport house + crossover subgenres (CLAP/web genre vocabulary)
+    "Bass House": "Bass House", "Funky House": "Funky House", "Future House": "Future House",
+    "Afro House": "Afro House", "Organic House": "Organic House",
+    "Melodic House & Techno": "Melodic House & Techno", "Indie Dance": "Indie Dance",
+    "Big Room": "Big Room", "Future Rave": "Future Rave", "Midtempo Bass": "Midtempo Bass",
+    "Melodic Dubstep": "Melodic Dubstep", "Riddim": "Riddim", "Electronica": "Electronica",
     # Techno
     "Techno": "Techno", "Minimal Techno": "Minimal Techno",
     "Deep Techno": "Deep Techno", "Hard Techno": "Hard Techno", "Dub Techno": "Dub Techno",
@@ -305,15 +319,42 @@ def reconcile_genre(
     existing_tag: str | None,
     policy: str = "prefer_tag",
     ml_override_confidence: float = 0.90,
+    web_genre: str | None = None,
+    web_grounded: bool = False,
 ) -> ReconciledGenre:
     """Reconcile an existing genre tag with the ML read per `policy`.
 
     Trusts SPECIFIC existing tags by default (they're usually curated/Beatport),
     ignores generic junk tags, and lets a confident, disagreeing ML read
     override. Pure + fully unit-testable; see AnalysisConfig.genre_source_policy.
+
+    `web_genre` (optional) is a genre resolved by the online web-synthesis
+    classifier — a stronger signal than the audio model. When present + usable it
+    SUPERSEDES the audio read as the "ML-side" source: with a specific tag it only
+    overrides when the lookup was `web_grounded` (cited an explicit source) AND
+    disagrees on family (catches stale-tag taxonomy drift, zero-regression);
+    otherwise the tiered blend is tag › web › audio.
     """
     tag = (existing_tag or "").strip()
     specific = is_specific_genre(tag)
+
+    web = (web_genre or "").strip()
+    web_usable = bool(web) and web.lower() not in _GENERIC_GENRE_TAGS and web.lower() != "unknown"
+    if web_usable:
+        w_parent, w_sub = split_tag_genre(web)
+        if policy == "ml_only" or not specific:
+            return ReconciledGenre(w_parent, w_sub, 0.9, "web", False)
+        tag_parent, tag_sub = split_tag_genre(tag)
+        conflict = _genre_conflicts(tag, w_parent, w_sub)
+        if policy == "tag_only":
+            return ReconciledGenre(tag_parent, tag_sub, 1.0, "tag", conflict)
+        if policy == "prefer_ml":
+            return ReconciledGenre(w_parent, w_sub, 0.9, "web", conflict)
+        # prefer_tag: trust the specific tag; the grounded web read overrides ONLY
+        # when it disagrees on family (the tag is probably stale/wrong).
+        if web_grounded and conflict:
+            return ReconciledGenre(w_parent, w_sub, 0.9, "web_override", True)
+        return ReconciledGenre(tag_parent, tag_sub, 0.99, "tag", conflict)
 
     # No usable tag, or pure-ML mode → ML.
     if policy == "ml_only" or not specific:

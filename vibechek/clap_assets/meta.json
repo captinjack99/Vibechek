@@ -1,0 +1,19 @@
+{
+  "model": "HTSAT-base",
+  "checkpoint": "music_audioset_epoch_15_esc_90.14.pt",
+  "dim": 512,
+  "n": 2035,
+  "knn_k": 15,
+  "metric": "cosine",
+  "segments": {
+    "count": 3,
+    "seconds": 20,
+    "fracs": [
+      0.25,
+      0.5,
+      0.75
+    ],
+    "sr": 48000
+  },
+  "teacher": "web-synthesis resolver"
+}

@@ -91,6 +91,8 @@ import type {
   ScanOnlyRequest,
   SetupOnnxEngineRequest,
   SetupOnnxEngineResult,
+  SetupGenreEngineRequest,
+  SetupGenreEngineResult,
   SystemResources,
   TagApplyStats,
   TagBackupStats,
@@ -333,6 +335,27 @@ export function setupOnnxEngine(
   return rpc<SetupOnnxEngineResult>("setup_onnx_engine", params);
 }
 
+/**
+ * One-click setup for the pure-audio CLAP genre student: installs torch +
+ * laion-clap into the analysis venv and downloads the ~2.2 GB checkpoint.
+ * Cancellable; emits `progress`.
+ */
+export function setupClapEngine(
+  params: SetupGenreEngineRequest = {},
+): Promise<SetupGenreEngineResult> {
+  return rpc<SetupGenreEngineResult>("setup_clap_engine", params);
+}
+
+/**
+ * One-click setup for the online web-synthesis genre resolver: installs ddgs +
+ * a local Ollama and pulls the model. Cancellable; emits `progress`.
+ */
+export function setupGenreResolver(
+  params: SetupGenreEngineRequest = {},
+): Promise<SetupGenreEngineResult> {
+  return rpc<SetupGenreEngineResult>("setup_genre_resolver", params);
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -520,6 +543,8 @@ const api = {
   downloadModels,
   verifyModels,
   setupOnnxEngine,
+  setupClapEngine,
+  setupGenreResolver,
   // config
   getConfig,
   saveConfig,

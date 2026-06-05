@@ -341,6 +341,10 @@ def _analyze_directory(params: dict) -> dict:
         # Existing-tag vs ML genre reconciliation policy (see AnalysisConfig).
         # Validated so a bad value can't silently disable reconciliation.
         genre_source_policy=_valid_genre_policy(params.get("genre_source_policy")),
+        # Genre classifier (discogs|clap) + optional online web-synthesis lookup.
+        genre_classifier=_valid_genre_classifier(params.get("genre_classifier")),
+        genre_web_lookup=bool(params.get("genre_web_lookup", False)),
+        genre_llm_backend=_valid_llm_backend(params.get("genre_llm_backend")),
     )
     if "models_dir" in params and params["models_dir"]:
         config.models_dir = Path(params["models_dir"])
@@ -448,6 +452,16 @@ def _valid_engine(value: Any, default: str = "essentia_tf") -> str:
 def _valid_genre_policy(value: Any, default: str = "prefer_tag") -> str:
     """Whitelist the existing-tag-vs-ML genre reconciliation policy."""
     return value if value in ("prefer_tag", "prefer_ml", "tag_only", "ml_only") else default
+
+
+def _valid_genre_classifier(value: Any, default: str = "discogs") -> str:
+    """Whitelist the audio genre classifier (steers which model the worker loads)."""
+    return value if value in ("discogs", "clap") else default
+
+
+def _valid_llm_backend(value: Any, default: str = "ollama") -> str:
+    """Whitelist the genre web-lookup LLM backend."""
+    return value if value in ("ollama",) else default
 
 
 def _install_vibechek_in_wsl(params: dict) -> dict:
@@ -982,6 +996,68 @@ def _setup_onnx_engine(params: dict) -> dict:
     }
 
 
+def _active_engine(params: dict) -> str:
+    """The inference engine whose venv the opt-in genre setup should target."""
+    try:
+        return _valid_engine(VibechekConfig.load().analysis.inference_engine)
+    except Exception:  # noqa: BLE001
+        return _valid_engine(params.get("inference_engine"))
+
+
+def _setup_genre_engine(params: dict, *, kind: str) -> dict:
+    """Shared one-click setup for the opt-in genre engines.
+
+    `kind` is "clap" (pure-audio CLAP+kNN student: torch+laion-clap + 2.2 GB
+    checkpoint) or "resolver" (online web-synthesis: ddgs + Ollama + 4.7 GB
+    model). Both install into the ACTIVE analysis venv so one worker can run them
+    alongside essentia/onnx. Cancellable; emits `progress`. Windows → WSL; native
+    Linux/macOS is not yet wired for these heavy opt-in engines.
+    """
+    from vibechek.platform import IS_WINDOWS  # noqa: PLC0415
+
+    engine = _active_engine(params)
+    label = "CLAP genre engine" if kind == "clap" else "online genre resolver"
+    if not IS_WINDOWS:
+        return {"ok": False, "ready": False,
+                "error": f"{label} setup is currently available on Windows/WSL only."}
+
+    from vibechek.wsl import (  # noqa: PLC0415
+        detect_wsl,
+        setup_clap_in_wsl,
+        setup_resolver_in_wsl,
+    )
+
+    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    st = detect_wsl(quick=False, venv_subdir=venv_subdir)
+    distro = _validate_distro(params.get("distro"), "") or st.usable_distro
+    if not distro and st.distros:
+        distro = st.distros[0].name
+    if not distro:
+        return {"ok": False, "ready": False,
+                "error": "No WSL distro found. Run the standard WSL setup first."}
+
+    fn = setup_clap_in_wsl if kind == "clap" else setup_resolver_in_wsl
+    res = fn(distro, on_progress=_emit_progress, engine=engine)
+    ok = bool(res.get("ok"))
+    return {
+        "ok": ok, "ready": ok,
+        "error": res.get("error"),
+        "cancelled": bool(res.get("cancelled")),
+        "distro": distro,
+        "tail": res.get("tail"),
+    }
+
+
+def _setup_clap_engine(params: dict) -> dict:
+    """One-click setup for the pure-audio CLAP genre student (opt-in, ~2.2 GB)."""
+    return _setup_genre_engine(params, kind="clap")
+
+
+def _setup_genre_resolver(params: dict) -> dict:
+    """One-click setup for the online web-synthesis genre resolver (opt-in)."""
+    return _setup_genre_engine(params, kind="resolver")
+
+
 def _get_config(_params: dict) -> dict:
     """Load config from disk (or defaults if no file exists yet)."""
     return _config_to_jsonable(VibechekConfig.load())
@@ -1421,6 +1497,8 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "restore_tags_with_remap": _restore_tags_with_remap,
     "download_models": _download_models,
     "setup_onnx_engine": _setup_onnx_engine,
+    "setup_clap_engine": _setup_clap_engine,
+    "setup_genre_resolver": _setup_genre_resolver,
     "get_config": _get_config,
     "save_config": _save_config,
     "restore_default_config": _restore_default_config,
@@ -1466,6 +1544,8 @@ _CANCELLABLE_METHODS = {
     "install_cuda_libs_in_wsl": "install-cuda",
     "install_essentia_native": "install-essentia",
     "setup_onnx_engine": "install-essentia",
+    "setup_clap_engine": "install-essentia",
+    "setup_genre_resolver": "install-essentia",
     "revert_journal": "revert",
 }
 

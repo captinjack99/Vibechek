@@ -77,6 +77,19 @@ onnx-gpu = [
 cdj = [
     "soundfile>=0.12",
 ]
+# Pure-audio CLAP genre student (opt-in, heavy). The 2.2 GB checkpoint is NOT a
+# pip dep — the in-app CLAP setup downloads it. Install with: pip install vibechek[clap]
+clap = [
+    "laion-clap>=1.1.6",
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "soundfile>=0.12",
+]
+# Online web-synthesis genre resolver (opt-in). ddgs is the only pip dep; the
+# local LLM (Ollama) is installed by the in-app resolver setup.
+resolver = [
+    "ddgs>=6.0",
+]
 # Dev / tests
 dev = [
     "pytest>=8.0",

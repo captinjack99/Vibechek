@@ -781,10 +781,30 @@ def _do_one_download(
             raise
 
 
+def _maybe_load_clap(loaded: dict[str, Any], genre_classifier: str, use_gpu: str) -> None:
+    """When the CLAP genre classifier is selected, load the encoder + bundled kNN
+    reference into the models dict (alongside the essentia/onnx models, so one
+    worker does BPM/key AND the CLAP genre). Best-effort: if CLAP isn't installed
+    we log and fall back to the engine's Discogs genre rather than failing analyze.
+    """
+    if genre_classifier != "clap":
+        return
+    try:
+        from vibechek import clap_genre  # noqa: PLC0415
+
+        loaded["clap_model"] = clap_genre.load_clap_model(use_gpu=use_gpu)
+        loaded["clap_reference"] = clap_genre.load_reference()
+        log.info("CLAP genre classifier loaded (%d reference vectors)",
+                 loaded["clap_reference"].emb.shape[0])
+    except Exception as e:  # noqa: BLE001 — never break analyze on a missing opt-in model
+        log.warning("CLAP genre classifier unavailable, using Discogs genre: %s", e)
+
+
 def load_models(
     model_dir: Path,
     use_gpu: str = "auto",
     engine: str = "essentia_tf",
+    genre_classifier: str = "discogs",
 ) -> dict[str, Any]:
     """Instantiate the model callables for the analysis pipeline.
 
@@ -794,6 +814,10 @@ def load_models(
         which returns callables with the IDENTICAL signatures so every downstream
         caller (`analyze_audio_features` and its vocal/mood/genre logic) is
         byte-unchanged. Only this function knows which engine is in play.
+
+    `genre_classifier` ("discogs" default | "clap") selects the GENRE source: the
+    engine's Discogs-EffNet head, or the pure-audio CLAP+kNN student loaded
+    alongside it (BPM/key/mood still come from the engine either way).
 
     `use_gpu` is forwarded to apply_gpu_preference BEFORE the essentia/tensorflow
     import — this is the only point where CUDA_VISIBLE_DEVICES can still affect
@@ -807,7 +831,9 @@ def load_models(
         from vibechek.onnx_backend import load_onnx_models  # noqa: PLC0415
 
         # ONNX files live in the dedicated subdir (download_models put them there).
-        return load_onnx_models(model_dir / _ONNX_SUBDIR, use_gpu=use_gpu)
+        loaded = load_onnx_models(model_dir / _ONNX_SUBDIR, use_gpu=use_gpu)
+        _maybe_load_clap(loaded, genre_classifier, use_gpu)
+        return loaded
 
     apply_gpu_preference(use_gpu)
 
@@ -890,6 +916,7 @@ def load_models(
                 if classes:
                     loaded[f"{name}_classes"] = classes
 
+    _maybe_load_clap(loaded, genre_classifier, use_gpu)
     return loaded
 
 
@@ -1146,7 +1173,29 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         return result
 
     # ---------- Genre ----------
-    if "genre" in models and "genre_classes" in models:
+    # Pure-audio CLAP student (opt-in): a CLAP embedding matched by kNN against
+    # the bundled reference library. ~2x the Discogs head on pure audio, and
+    # unlike a tag it works on untagged tracks. Falls back to Discogs on failure.
+    clap_done = False
+    if "clap_model" in models and "clap_reference" in models:
+        try:
+            from vibechek import clap_genre  # noqa: PLC0415
+            from vibechek.genres import split_tag_genre  # noqa: PLC0415
+
+            audio_48k = MonoLoader(filename=str(filepath), sampleRate=48000, resampleQuality=4)()
+            emb = clap_genre.embed_audio(models["clap_model"], audio_48k)
+            g, conf = clap_genre.knn_predict(emb, models["clap_reference"])
+            if g and g != "Unknown":
+                parent, sub = split_tag_genre(g)
+                result.ml_genre = parent
+                result.ml_subgenre = sub
+                result.ml_genre_confidence = round(float(conf), 3)
+                result.ml_genre_raw_confidence = round(float(conf), 3)
+                clap_done = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("CLAP genre failed for %s (falling back to Discogs): %s", filepath.name, e)
+
+    if not clap_done and "genre" in models and "genre_classes" in models:
         try:
             preds = models["genre"](embeddings)
             avg = np.mean(preds, axis=0)
@@ -1426,7 +1475,8 @@ def analyze_track(filepath: Path, models: dict[str, Any] | None = None) -> Track
 _WORKER_MODELS: dict[str, Any] | None = None
 
 
-def _worker_init(model_dir: str, use_gpu: str, engine: str = "essentia_tf") -> None:
+def _worker_init(model_dir: str, use_gpu: str, engine: str = "essentia_tf",
+                 genre_classifier: str = "discogs") -> None:
     """multiprocessing.Pool initializer. If load_models raises, multiprocessing
     silently restarts the worker in an infinite loop — masking real errors
     like OOM, missing essentia install, or corrupted model files behind a
@@ -1450,7 +1500,8 @@ def _worker_init(model_dir: str, use_gpu: str, engine: str = "essentia_tf") -> N
     """
     global _WORKER_MODELS
     try:
-        _WORKER_MODELS = load_models(Path(model_dir), use_gpu=use_gpu, engine=engine)
+        _WORKER_MODELS = load_models(Path(model_dir), use_gpu=use_gpu, engine=engine,
+                                     genre_classifier=genre_classifier)
     except Exception as e:  # noqa: BLE001
         import sys as _sys
         import traceback as _tb
@@ -1648,7 +1699,7 @@ def _probe_free_vram_mb() -> int | None:
 _HYBRID_SENTINEL = None  # not used as a queue item; termination is via done_event
 
 
-def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks, engine="essentia_tf"):  # type: ignore[no-untyped-def]
+def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks, engine="essentia_tf", genre_classifier="discogs"):  # type: ignore[no-untyped-def]
     """One worker process: load models for `device`, then pull+analyze tracks.
 
     `device` is "0" for the GPU or "-1" for CPU-only (set as
@@ -1671,7 +1722,8 @@ def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks, en
     use_gpu = "off" if device == "-1" else "on"
     if not fake:
         try:
-            models = load_models(Path(model_dir), use_gpu=use_gpu, engine=engine)
+            models = load_models(Path(model_dir), use_gpu=use_gpu, engine=engine,
+                                 genre_classifier=genre_classifier)
         except Exception as e:  # noqa: BLE001
             import sys as _sys
             import traceback as _tb
@@ -1733,10 +1785,11 @@ class _HybridPool:
     the caller doesn't rely on ordering.
     """
 
-    def __init__(self, ctx, file_strs, model_dir, gpu_workers, cpu_workers, maxtasks, engine="essentia_tf"):  # type: ignore[no-untyped-def]
+    def __init__(self, ctx, file_strs, model_dir, gpu_workers, cpu_workers, maxtasks, engine="essentia_tf", genre_classifier="discogs"):  # type: ignore[no-untyped-def]
         self._ctx = ctx
         self._model_dir = str(model_dir)
         self._maxtasks = maxtasks
+        self._genre_classifier = genre_classifier
         self._engine = engine
         self.total = len(file_strs)
         self._results_out = 0
@@ -1761,7 +1814,8 @@ class _HybridPool:
         p = self._ctx.Process(
             target=_hybrid_worker_loop,
             args=(self._in_q, self._out_q, self._done_event,
-                  self._model_dir, device, self._maxtasks, self._engine),
+                  self._model_dir, device, self._maxtasks, self._engine,
+                  self._genre_classifier),
             daemon=True,
         )
         p._vibechek_device = device  # type: ignore[attr-defined]
@@ -1870,6 +1924,7 @@ def _run_hybrid_pool(
     pool = _HybridPool(
         spawn_ctx, file_strs, str(config.models_dir),
         gpu_workers, cpu_workers, maxtasks=200, engine=config.inference_engine,
+        genre_classifier=config.genre_classifier,
     )
     STALL_TIMEOUT = 300  # 5 min between any two results = dead pool
 
@@ -2220,7 +2275,8 @@ def analyze_directory(
                     message="Loading ML models...")
         report_progress(on_progress, 0, total, "Loading ML models...")
         models = load_models(
-            config.models_dir, use_gpu=config.use_gpu, engine=config.inference_engine
+            config.models_dir, use_gpu=config.use_gpu, engine=config.inference_engine,
+            genre_classifier=config.genre_classifier,
         )
         for i, filepath in enumerate(files):
             cancellation.check()  # Raises CancelledError if user clicked Cancel
@@ -2278,7 +2334,8 @@ def analyze_directory(
         with spawn_ctx.Pool(
             processes=workers,
             initializer=_worker_init,
-            initargs=(str(config.models_dir), config.use_gpu, config.inference_engine),
+            initargs=(str(config.models_dir), config.use_gpu, config.inference_engine,
+                      config.genre_classifier),
             maxtasksperchild=200,
         ) as pool:
             # Stall watchdog: if no result arrives in STALL_TIMEOUT seconds, the
@@ -2345,6 +2402,7 @@ def analyze_directory(
     report = _build_report(
         results, total, in_progress=False,
         genre_policy=(config.genre_source_policy, config.genre_ml_override_confidence),
+        web_cfg={"enabled": config.genre_web_lookup, "backend": config.genre_llm_backend},
     )
     if output_path:
         # Atomic write — a kill/power-loss/disk-full mid-write must not
@@ -2476,6 +2534,9 @@ def _analyze_via_native_venv(
         "--models-dir", str(config.models_dir),
         "--engine", config.inference_engine,
         "--genre-policy", config.genre_source_policy,
+        "--genre-classifier", config.genre_classifier,
+        "--genre-llm-backend", config.genre_llm_backend,
+        "--genre-web-lookup" if config.genre_web_lookup else "--no-genre-web-lookup",
     ]
     if workers > 0:
         args += ["--workers", str(workers)]
@@ -2580,6 +2641,9 @@ def _analyze_via_wsl(
         "--models-dir", wsl_models_dir,
         "--engine", config.inference_engine,
         "--genre-policy", config.genre_source_policy,
+        "--genre-classifier", config.genre_classifier,
+        "--genre-llm-backend", config.genre_llm_backend,
+        "--genre-web-lookup" if config.genre_web_lookup else "--no-genre-web-lookup",
     ]
     if workers > 0:
         args += ["--workers", str(workers)]
@@ -2760,17 +2824,28 @@ def _write_partial(output_path: Path, results: list[dict[str, Any]], total: int,
     )
 
 
+def _record_artist_title(r: dict[str, Any]) -> tuple[str, str]:
+    """Best artist/title for a record (tag first, then filename-parsed)."""
+    et = r.get("existing_tags") or {}
+    artist = (et.get("artist") or r.get("filename_artist") or "").strip()
+    title = (et.get("title") or r.get("filename_title") or "").strip()
+    return artist, title
+
+
 def _reconcile_record_genre(
     r: dict[str, Any], policy: str, override_conf: float,
+    web_cfg: dict[str, Any] | None = None,
+    web_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> None:
     """Reconcile one record's ML genre with its existing tag, in place.
 
     Keeps the pure-audio read in `ml_genre_audio`/`ml_subgenre_audio` and sets
     `ml_genre`/`ml_subgenre` to the effective (reconciled) value plus
-    `ml_genre_source` ("tag"|"ml"|"ml_override") and `ml_genre_conflict`.
-    Idempotent: always re-derives from the stashed audio values, so re-running
-    with a different policy is correct. See genres.reconcile_genre +
-    AnalysisConfig.genre_source_policy.
+    `ml_genre_source` ("tag"|"ml"|"ml_override"|"web"|"web_override") and
+    `ml_genre_conflict`. When `web_cfg` is enabled, the online web-synthesis
+    resolver supplies a grounded genre (cached per artist+title). Idempotent:
+    always re-derives from the stashed audio values. See genres.reconcile_genre +
+    AnalysisConfig.genre_source_policy / genre_web_lookup.
     """
     ml = r.get("ml_analysis")
     if not ml:
@@ -2782,13 +2857,39 @@ def _reconcile_record_genre(
     from vibechek.genres import reconcile_genre  # noqa: PLC0415
 
     tag = (r.get("existing_tags") or {}).get("genre")
+
+    web_genre = ""
+    web_grounded = False
+    if web_cfg and web_cfg.get("enabled"):
+        artist, title = _record_artist_title(r)
+        key = (artist.lower(), title.lower())
+        wr: dict[str, Any] | None = None
+        if web_cache is not None and key in web_cache:
+            wr = web_cache[key]
+        elif artist and title:
+            from vibechek import genre_web  # noqa: PLC0415
+            wr = genre_web.resolve(
+                artist, title, tag or "", audio_genre or "",
+                backend=web_cfg.get("backend", "ollama"),
+                model=web_cfg.get("model", genre_web.DEFAULT_MODEL),
+            )
+            if web_cache is not None:
+                web_cache[key] = wr
+        if wr:
+            web_genre = wr.get("genre", "") or ""
+            web_grounded = bool(wr.get("source_matched"))
+
     rec = reconcile_genre(
         audio_genre, audio_sub or "",
         ml.get("ml_genre_raw_confidence") or ml.get("ml_genre_confidence") or 0.0,
         tag, policy, override_conf,
+        web_genre=web_genre, web_grounded=web_grounded,
     )
     ml["ml_genre_audio"] = audio_genre
     ml["ml_subgenre_audio"] = audio_sub
+    if web_genre:
+        ml["ml_genre_web"] = web_genre
+        ml["ml_genre_web_grounded"] = web_grounded
     ml["ml_genre"] = rec.genre
     ml["ml_subgenre"] = rec.subgenre
     ml["ml_genre_source"] = rec.source
@@ -2800,14 +2901,23 @@ def _reconcile_record_genre(
 def _build_report(
     results: list[dict[str, Any]], total: int, in_progress: bool,
     genre_policy: tuple[str, float] = ("prefer_tag", 0.90),
+    web_cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Reconcile ML genre against existing tags on the FINAL report only (partial
     # checkpoints stay raw-ML — they're transient). _reconcile_record_genre is
     # idempotent, so the final pass produces the configured result regardless.
     if not in_progress:
         pol, override = genre_policy
+        # Online web-synthesis genre lookup is per-track network+LLM I/O, so only
+        # run it on the final report, cached per artist+title.
+        web_cache: dict[tuple[str, str], dict[str, Any]] | None = (
+            {} if (web_cfg and web_cfg.get("enabled")) else None
+        )
+        if web_cache is not None:
+            _emit_event("stage", name="resolving_genres_online",
+                        message=f"Resolving genres online for {len(results)} tracks...")
         for r in results:
-            _reconcile_record_genre(r, pol, override)
+            _reconcile_record_genre(r, pol, override, web_cfg, web_cache)
 
     genres: dict[str, int] = defaultdict(int)
     energies: dict[int, int] = defaultdict(int)

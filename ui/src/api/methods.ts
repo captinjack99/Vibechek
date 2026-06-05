@@ -83,6 +83,8 @@ export const RPC_METHODS = [
   // models
   "download_models",
   "setup_onnx_engine",
+  "setup_clap_engine",
+  "setup_genre_resolver",
   "verify_models",
   // config
   "get_config",
@@ -214,6 +216,16 @@ export interface AnalyzeDirectoryRequest {
   skip_paths?: string[];
   /** Default true. Set false for one-off CLI runs. */
   auto_save?: boolean;
+  /** Inference engine: "essentia_tf" | "onnx". */
+  inference_engine?: string;
+  /** Existing-tag vs ML genre reconciliation policy. */
+  genre_source_policy?: string;
+  /** Audio genre model: "discogs" | "clap". */
+  genre_classifier?: string;
+  /** Resolve genre online (local LLM reads web results). */
+  genre_web_lookup?: boolean;
+  /** LLM backend for the online genre lookup ("ollama"). */
+  genre_llm_backend?: string;
 }
 
 // --- duplicates ---
@@ -374,6 +386,25 @@ export interface SetupOnnxEngineResult {
   error?: string | null;
   /** True when the setup was cancelled mid-run. */
   cancelled?: boolean;
+}
+
+/** Optional WSL distro override for the opt-in genre engine setups. */
+export interface SetupGenreEngineRequest {
+  distro?: string;
+}
+
+/** Result of a one-click opt-in genre engine setup (CLAP / online resolver). */
+export interface SetupGenreEngineResult {
+  ok: boolean;
+  ready: boolean;
+  /** The real failure reason when a setup step failed, else null. */
+  error?: string | null;
+  /** True when the setup was cancelled mid-run. */
+  cancelled?: boolean;
+  /** The WSL distro the engine was set up in (Windows). */
+  distro?: string;
+  /** Last lines of the install log (for diagnostics). */
+  tail?: string;
 }
 
 // --- config ---
