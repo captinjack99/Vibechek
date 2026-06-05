@@ -23,6 +23,8 @@ routes to the matching managed venv (`venv` vs `venv-onnx`):
 | Method | Param | Notes |
 |---|---|---|
 | `analyze_directory` | `inference_engine` | The actual analyze routing; without it the ONNX toggle is inert and an onnx-only install fails on the wrong venv. |
+| `analyze_directory` | `genre_classifier` | `discogs` (default) or `clap` — which audio model fills `ml_genre` (validated via `rpc._valid_genre_classifier`). |
+| `analyze_directory` | `genre_web_lookup` / `genre_llm_backend` | Toggle + backend for the online web-synthesis genre lookup (`rpc._valid_llm_backend`). |
 | `preflight` | `engine` | Probes the engine's venv for readiness. |
 | `download_models` | `engine` | `onnx` fetches the converted-head bundle; `essentia_tf` the `.pb` set. |
 | `install_vibechek_in_wsl` | `engine` | Picks the stack/venv to install (essentia-tensorflow vs plain essentia + onnxruntime). |

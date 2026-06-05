@@ -2,10 +2,14 @@
 
 **Vibechek** is an open-source, ML-powered DJ library tool. It analyzes audio with
 Essentia ML models and auto-classifies genre/subgenre, BPM, key, energy, mood,
-timeslot, direction, and vocal type; finds true (acoustic) duplicates; organizes
-files into genre/subgenre folders; and backs up / restores every tag — all while
-preserving Rekordbox cue points and beat grids. It runs entirely on your machine:
-no account, no telemetry, no upload. Free forever under **AGPL-3.0**.
+timeslot, direction, and vocal type; finds true (acoustic) duplicates while keeping
+genuine variants (Extended/Radio/Remix, alt formats); organizes files into
+genre/subgenre folders; and backs up / restores every tag — all while preserving
+Rekordbox cue points and beat grids. Genre specifically has three opt-in
+classifiers (Discogs-EffNet, a pure-audio **CLAP** model ~2× more accurate, and a
+fully-local **online LLM lookup**) plus smart existing-tag reconciliation. It runs
+entirely on your machine: no account, no telemetry, no upload. Free forever under
+**AGPL-3.0**.
 
 - **Repo:** https://github.com/papapew/Vibechek
 - **Current version:** `v0.5.0-beta` (public beta)
@@ -34,14 +38,17 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
   Settings — plus a persistent global audio player and a "Recent operations" undo panel.
 - **Rust shell:** spawns the Python sidecar, multiplexes JSON-RPC by id, re-broadcasts
   progress + per-track records as Tauri events, detects sidecar death on EOF.
-- **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 44 JSON-RPC
+- **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 47 JSON-RPC
   methods, threadpool dispatch (8 workers) so fast reads interleave with long ops,
   cooperative cancellation, and all the real work (analyzer, tagger, duplicates,
-  organizer, journal, profiles, config, wsl, resources, …). Two additions from the
-  beta.8 → beta.10 cycle: `cdj_export` (FLAC → AIFF transcode + Rekordbox-XML rewrite
-  for older CDJs, CLI-only) and `onnx_backend` (an opt-in, GPU-accelerated ONNX Runtime
-  inference engine that mirrors `analyzer.load_models`, selected via the
-  `inference_engine` config field).
+  organizer, journal, profiles, config, wsl, resources, …). Notable add-ons:
+  `cdj_export` (FLAC → AIFF transcode + Rekordbox-XML rewrite for older CDJs, CLI-only);
+  `onnx_backend` (an opt-in, GPU-accelerated ONNX Runtime inference engine mirroring
+  `analyzer.load_models`, via the `inference_engine` config field); and two opt-in genre
+  sources — `clap_genre` (a pure-audio CLAP-embedding + kNN classifier over a bundled
+  reference, via `genre_classifier="clap"`) and `genre_web` (a fully-local LLM that reads
+  web results for artist+title, via `genre_web_lookup`) — both layered into the existing
+  tag-vs-ML reconciliation in `genres.py`.
 - **Auto-generated types:** `scripts/generate_ts_types.py` mirrors Python dataclasses
   into `ui/src/types/generated.ts` so the wire stays type-safe.
 

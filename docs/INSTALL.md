@@ -185,6 +185,29 @@ one of two things to read/write audio:
 
 You only need this for `cdj-export`; nothing else in Vibechek depends on it.
 
+## The opt-in genre engines (CLAP audio model / online resolver)
+
+Genre has two optional accuracy upgrades over the bundled Discogs-EffNet head. Both are
+**opt-in** (the default install ships neither) and both have a one-click **Set up …** button
+in **Settings → Analysis** that does everything below for you — only reach for the CLI if
+you're installing into your own environment.
+
+- **CLAP audio classifier** (`genre_classifier = "clap"`) — a pure-audio model, ~2× the
+  Discogs head's accuracy, that also works on untagged tracks. The in-app setup installs
+  `vibechek[clap]` (`laion-clap` + `torch`) into the analysis venv and downloads the
+  ~2.2 GB CLAP checkpoint once (into `~/.vibechek/clap/`). Manual: `pip install
+  "vibechek[clap]"` then click **Set up CLAP genre engine** (or run the analyze with
+  `--genre-classifier clap`). The small kNN reference library is bundled in the app.
+- **Online genre lookup** (`genre_web_lookup`) — a fully-local LLM reads web results for the
+  track's artist + title. The in-app setup installs `vibechek[resolver]` (`ddgs`) plus a
+  no-sudo **Ollama** + a ~4.7 GB model. Fully private — a local model, no API key, no
+  upload. Manual: `pip install "vibechek[resolver]"` then click **Set up online resolver**
+  (or analyze with `--genre-web-lookup`).
+
+Both run inside the same analysis environment as Essentia (WSL on Windows), so one worker
+does BPM/key/mood *and* the new genre source. See the
+[user guide](USER_GUIDE.md#genre-classifier--online-lookup).
+
 ## Installing fpcalc (for `dedupe`'s audio fingerprinting)
 
 `fpcalc` is the [Chromaprint](https://acoustid.org/chromaprint) command-line tool. Vibechek's `dedupe` works without it (MD5-only mode catches exact-byte duplicates), but with `fpcalc` it also catches re-encoded duplicates.
