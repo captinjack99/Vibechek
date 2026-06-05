@@ -1837,6 +1837,174 @@ def upgrade_vibechek_in_wsl(
 
 
 # ---------------------------------------------------------------------------
+# Opt-in genre engines: CLAP audio student + the online web-synthesis resolver
+# ---------------------------------------------------------------------------
+
+# Pinned no-sudo Ollama release (the WSL distro default user has no passwordless
+# sudo, so we install the standalone tarball into ~/ollama). Bump on maintenance.
+_OLLAMA_RELEASE = "v0.30.4"
+_OLLAMA_TARBALL_URL = (
+    f"https://github.com/ollama/ollama/releases/download/{_OLLAMA_RELEASE}/"
+    "ollama-linux-amd64.tar.zst"
+)
+
+
+def _clap_setup_script(venv_subdir: str, ckpt_url: str) -> str:
+    """Install the CLAP deps into the analysis venv + fetch the checkpoint."""
+    return f"""
+set -e
+VENV="$HOME/.vibechek/{venv_subdir}"
+[ -x "$VENV/bin/pip" ] || {{ echo "ERROR: $VENV missing — run the WSL setup first" >&2; exit 2; }}
+echo "[1/3] Installing CLAP deps (torch, torchvision, laion-clap)..."
+"$VENV/bin/pip" install --quiet torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+  || "$VENV/bin/pip" install --quiet torch torchvision
+"$VENV/bin/pip" install --quiet laion-clap soundfile
+echo "[2/3] Downloading CLAP checkpoint (~2.2 GB, one-time)..."
+mkdir -p "$HOME/.vibechek/clap"
+CKPT="$HOME/.vibechek/clap/music_clap.pt"
+if [ ! -s "$CKPT" ]; then
+  curl -fSL "{ckpt_url}" -o "$CKPT.partial"
+  mv "$CKPT.partial" "$CKPT"
+fi
+echo "[3/3] Verifying..."
+"$VENV/bin/python" -c "import laion_clap, soundfile; print('clap import ok')"
+echo "DONE"
+"""
+
+
+def _resolver_setup_script(venv_subdir: str, model: str) -> str:
+    """Install ddgs + a no-sudo Ollama + pull the model + start the server."""
+    return f"""
+set -e
+VENV="$HOME/.vibechek/{venv_subdir}"
+[ -x "$VENV/bin/pip" ] || {{ echo "ERROR: $VENV missing — run the WSL setup first" >&2; exit 2; }}
+echo "[1/4] Installing ddgs + zstandard..."
+"$VENV/bin/pip" install --quiet ddgs zstandard
+echo "[2/4] Installing Ollama (no-sudo)..."
+if [ ! -x "$HOME/ollama/bin/ollama" ]; then
+  curl -fSL "{_OLLAMA_TARBALL_URL}" -o "$HOME/ollama.tar.zst"
+  "$VENV/bin/python" -c "import zstandard,sys; fi=open('$HOME/ollama.tar.zst','rb'); fo=open('$HOME/ollama.tar','wb'); zstandard.ZstdDecompressor().copy_stream(fi,fo)"
+  mkdir -p "$HOME/ollama"; tar -xf "$HOME/ollama.tar" -C "$HOME/ollama"
+  rm -f "$HOME/ollama.tar" "$HOME/ollama.tar.zst"
+fi
+echo "[3/4] Starting Ollama + pulling {model} (~4.7 GB, one-time)..."
+mkdir -p "$HOME/.vibechek"
+if ! curl -s --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+  OLLAMA_HOST=127.0.0.1:11434 nohup "$HOME/ollama/bin/ollama" serve >"$HOME/.vibechek/ollama.log" 2>&1 &
+  for i in $(seq 1 20); do curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
+fi
+OLLAMA_HOST=127.0.0.1:11434 "$HOME/ollama/bin/ollama" pull {model}
+echo "[4/4] Verifying..."
+curl -s --max-time 5 http://127.0.0.1:11434/api/tags | head -c 60
+echo ""
+echo "DONE"
+"""
+
+
+def _run_managed_wsl_script(
+    distro: str,
+    inner_script: str,
+    on_progress: ProgressCallback | None,
+    timeout_s: int,
+    start_msg: str,
+) -> dict:
+    """Run a one-off setup `inner_script` inside `distro` with cancellation +
+    `[N/M] ...` progress parsing. Mirrors `upgrade_vibechek_in_wsl`'s launcher
+    (setsid + token-file so Cancel kills the whole process group). Returns the
+    same dict shape as the install/upgrade helpers."""
+    if not IS_WINDOWS:
+        return {"ok": False, "error": "Not running on Windows"}
+    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    if not wsl:
+        return {"ok": False, "error": "wsl.exe not found"}
+
+    import re as _re  # noqa: PLC0415
+    import tempfile as _tempfile  # noqa: PLC0415
+
+    from vibechek import cancellation  # noqa: PLC0415
+
+    if on_progress:
+        on_progress(0, 100, start_msg)
+    tail_lines: list[str] = []
+    token_file = Path(_tempfile.gettempdir()) / f"vibechek-wsl-setup-pid-{os.getpid()}.txt"
+    wsl_token = win_to_wsl_path(str(token_file))
+    inner_path = _stage_script_for_wsl(inner_script)
+    inner_wsl = win_to_wsl_path(str(inner_path))
+    launcher = (
+        "#!/usr/bin/env bash\nset -e\n"
+        f'echo $$ > {_shell_quote(wsl_token)}\n'
+        'trap "kill -TERM 0 2>/dev/null; exit 130" SIGTERM SIGINT\n'
+        f"exec bash {_shell_quote(inner_wsl)}\n"
+    )
+    launcher_path = _stage_script_for_wsl(launcher)
+    wsl_launcher = win_to_wsl_path(str(launcher_path))
+    try:
+        proc = subprocess.Popen(
+            [wsl, "-d", distro, "--", "setsid", "-w", "bash", wsl_launcher],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+    except OSError as e:
+        return {"ok": False, "error": f"Could not invoke wsl: {e}"}
+    assert proc.stdout
+    cancel_done, cancel_state = _start_cancellation_watchdog(
+        proc, on_cancel=lambda: _kill_wsl_pgid(wsl, distro, token_file),
+    )
+    marker = _re.compile(r"^\[(\d+)/(\d+)\]\s*(.*)")
+    try:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            tail_lines.append(line)
+            m = marker.match(line)
+            if m and on_progress:
+                cur, tot = int(m.group(1)), int(m.group(2))
+                on_progress(int(cur / max(tot, 1) * 95), 100, m.group(3) or line)
+            elif line == "DONE" and on_progress:
+                on_progress(98, 100, "Finalizing…")
+        try:
+            rc = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            proc.kill(); cancel_done.set()
+            return {"ok": False, "error": f"Setup timed out after {timeout_s}s",
+                    "tail": "\n".join(tail_lines[-40:])}
+        cancel_done.set()
+    finally:
+        launcher_path.unlink(missing_ok=True)
+        inner_path.unlink(missing_ok=True)
+        token_file.unlink(missing_ok=True)
+
+    if cancel_state["v"] or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True,
+                "tail": "\n".join(tail_lines[-40:])}
+    if rc != 0:
+        return {"ok": False, "error": f"Setup exited with {rc}",
+                "tail": "\n".join(tail_lines[-40:])}
+    if on_progress:
+        on_progress(100, 100, "Setup complete")
+    return {"ok": True, "distro": distro, "tail": "\n".join(tail_lines[-40:])}
+
+
+def setup_clap_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
+                      engine: str = "essentia_tf") -> dict:
+    """Install the CLAP genre student into the analysis venv inside `distro`."""
+    from vibechek.clap_genre import _CHECKPOINT_URL  # noqa: PLC0415
+    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    return _run_managed_wsl_script(
+        distro, _clap_setup_script(venv_subdir, _CHECKPOINT_URL), on_progress,
+        timeout_s=60 * 30, start_msg=f"Setting up the CLAP genre engine in {distro}…",
+    )
+
+
+def setup_resolver_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
+                          engine: str = "essentia_tf", model: str = "qwen2.5:7b") -> dict:
+    """Install the online genre resolver (ddgs + Ollama + model) inside `distro`."""
+    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    return _run_managed_wsl_script(
+        distro, _resolver_setup_script(venv_subdir, model), on_progress,
+        timeout_s=60 * 30, start_msg=f"Setting up the online genre resolver in {distro}…",
+    )
+
+
+# ---------------------------------------------------------------------------
 # CUDA library installer (optional GPU enablement inside WSL)
 # ---------------------------------------------------------------------------
 

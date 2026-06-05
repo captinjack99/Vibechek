@@ -10,7 +10,29 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **CLAP pure-audio genre classifier** (opt-in, `genre_classifier = "clap"`). A CLAP
+  audio embedding is matched by kNN against a small bundled reference library
+  (`vibechek/clap_assets/genre_reference.npz`, ~2 MB) — roughly **2× the genre
+  accuracy** of the bundled Discogs-EffNet head on pure audio (~28% → ~54%), and
+  unlike a file tag it works on untagged / white-label tracks. BPM/key/mood are
+  unchanged. One-click **Set up CLAP genre engine** (Settings) installs the deps +
+  downloads the ~2.2 GB checkpoint into the analysis venv. Falls back to Discogs if
+  not set up. The kNN + reference loading is pure-numpy (CI-tested); the embedder is
+  a lazy opt-in dependency (`vibechek[clap]`).
+- **Online web-synthesis genre lookup** (opt-in, `genre_web_lookup`). A local LLM
+  reads keyless web-search results for a track's artist+title and synthesizes the
+  musically-specific subgenre, distrusting commercial chart buckets and verifying
+  the result matches the track. Layered into reconciliation as a high-trust source
+  (**tag › grounded web › audio**): a grounded web read overrides only a *stale*
+  specific tag (taxonomy drift) — zero-regression. One-click **Set up online
+  resolver** installs ddgs + a local Ollama (`vibechek[resolver]`). `resolve()`
+  never raises — it degrades to the audio read on any failure.
+- `reconcile_genre` gained a web tier; the genre taxonomy now recognizes modern
+  Beatport subgenres (Tech/Bass/Funky/Future/Afro/Organic House, Melodic House &
+  Techno, Midtempo Bass, Future Rave, …). New CLI flags `--genre-classifier`,
+  `--genre-web-lookup`, `--genre-llm-backend`; new RPCs `setup_clap_engine`,
+  `setup_genre_resolver`.
 
 ---
 

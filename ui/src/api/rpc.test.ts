@@ -60,6 +60,8 @@ const PYTHON_METHODS = [
   "restore_tags_with_remap",
   "download_models",
   "setup_onnx_engine",
+  "setup_clap_engine",
+  "setup_genre_resolver",
   "get_config",
   "save_config",
   "restore_default_config",

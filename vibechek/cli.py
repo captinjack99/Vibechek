@@ -138,14 +138,29 @@ def main() -> None:
               help="Reconcile an existing genre tag with the ML read: prefer_tag "
                    "(trust a specific existing tag, ML fills gaps + can override if "
                    "very confident), prefer_ml, tag_only, or ml_only (pure audio).")
+@click.option("--genre-classifier", type=click.Choice(["discogs", "clap"]),
+              default="discogs", show_default=True,
+              help="Audio genre model: discogs (bundled Discogs-EffNet) or clap "
+                   "(pure-audio CLAP+kNN student, ~2x better; needs CLAP setup).")
+@click.option("--genre-web-lookup/--no-genre-web-lookup", default=False, show_default=True,
+              help="Resolve genre online (local LLM reads web results for "
+                   "artist+title) and layer it into reconciliation. Needs network "
+                   "+ the local LLM.")
+@click.option("--genre-llm-backend", type=click.Choice(["ollama"]),
+              default="ollama", show_default=True,
+              help="LLM backend for --genre-web-lookup (ollama = local/private).")
 def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
             output: Path, models_dir: Path | None, hybrid: bool, engine: str,
-            genre_policy: str) -> None:
+            genre_policy: str, genre_classifier: str, genre_web_lookup: bool,
+            genre_llm_backend: str) -> None:
     """Analyze every audio file under PATH with the ML models."""
     from vibechek.analyzer import analyze_directory
 
     config = AnalysisConfig(workers=workers, use_gpu=gpu, hybrid_cpu_gpu=hybrid,
-                            inference_engine=engine, genre_source_policy=genre_policy)
+                            inference_engine=engine, genre_source_policy=genre_policy,
+                            genre_classifier=genre_classifier,
+                            genre_web_lookup=genre_web_lookup,
+                            genre_llm_backend=genre_llm_backend)
     if models_dir:
         config.models_dir = models_dir
 

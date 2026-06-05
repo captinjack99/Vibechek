@@ -30,6 +30,9 @@ const DEFAULT_CONFIG: VibechekConfig = {
     inference_engine: "essentia_tf",
     genre_source_policy: "prefer_tag",
     genre_ml_override_confidence: 0.9,
+    genre_classifier: "discogs",
+    genre_web_lookup: false,
+    genre_llm_backend: "ollama",
   },
   tagging: {
     genre_confidence_threshold: 0.85,

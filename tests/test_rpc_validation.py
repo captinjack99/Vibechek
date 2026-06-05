@@ -187,6 +187,44 @@ def test_analyze_directory_clamps_negative_workers(monkeypatch) -> None:
     assert captured["limit"] is None  # negative limit → None (no cap)
 
 
+@pytest.mark.parametrize(("value", "expected"), [
+    ("discogs", "discogs"), ("clap", "clap"),
+    ("bogus", "discogs"), (None, "discogs"), (42, "discogs"),
+])
+def test_valid_genre_classifier(value, expected) -> None:
+    assert rpc._valid_genre_classifier(value) == expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("ollama", "ollama"), ("openai", "ollama"), (None, "ollama"),
+])
+def test_valid_llm_backend(value, expected) -> None:
+    assert rpc._valid_llm_backend(value) == expected
+
+
+def test_analyze_directory_threads_genre_options(monkeypatch) -> None:
+    captured = {}
+
+    def fake_analyze(library_path, config=None, **kw):
+        captured["classifier"] = config.genre_classifier
+        captured["web"] = config.genre_web_lookup
+        captured["backend"] = config.genre_llm_backend
+        return {"summary": {}, "tracks": []}
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+    rpc._analyze_directory({
+        "path": "/tmp/x", "auto_save": False,
+        "genre_classifier": "clap",
+        "genre_web_lookup": True,
+        "genre_llm_backend": "ollama",
+    })
+    assert captured == {"classifier": "clap", "web": True, "backend": "ollama"}
+    # a bogus classifier is rejected back to the default
+    rpc._analyze_directory({"path": "/tmp/x", "auto_save": False,
+                            "genre_classifier": "evil"})
+    assert captured["classifier"] == "discogs"
+
+
 # ---------------------------------------------------------------------------
 # _save_config payload-type guard
 # ---------------------------------------------------------------------------

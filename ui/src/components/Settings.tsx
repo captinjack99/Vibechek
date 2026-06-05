@@ -9,7 +9,7 @@ import { AnimatePresence } from "framer-motion";
 
 import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
 import { isCancellation, rpc, sidecarStatus, useSidecarProgress } from "../hooks/useSidecar";
-import { setupOnnxEngine } from "../api/rpc";
+import { setupOnnxEngine, setupClapEngine, setupGenreResolver } from "../api/rpc";
 import {
   listProfiles, loadProfile, doctor as runDoctor, verifyModels,
   upgradeVibechekInWSL,
@@ -21,6 +21,7 @@ import { ConfirmModal } from "./ConfirmModal";
 import { LogsViewer } from "./LogsViewer";
 import { PreflightDialog } from "./PreflightDialog";
 import { OnnxSetupDialog, type OnnxSetupState } from "./OnnxSetupDialog";
+import { GenreSetupDialog, type GenreSetupState } from "./GenreSetupDialog";
 
 // The workers slider used to cap at sysInfo.cpu_count,
 // which silently truncated a user-set value when sysInfo loaded asynchronously
@@ -127,8 +128,12 @@ export function Settings() {
   };
 
   // ---- Diagnostics & maintenance (doctor / verify_models / upgrade WSL) ----
-  const [diagBusy, setDiagBusy] = useState<null | "doctor" | "verify" | "upgrade" | "onnx-setup">(null);
+  const [diagBusy, setDiagBusy] = useState<
+    null | "doctor" | "verify" | "upgrade" | "onnx-setup" | "clap-setup" | "resolver-setup"
+  >(null);
   const [onnxSetup, setOnnxSetup] = useState<OnnxSetupState>(null);
+  const [clapSetup, setClapSetup] = useState<GenreSetupState>(null);
+  const [resolverSetup, setResolverSetup] = useState<GenreSetupState>(null);
 
   const handleCopyDiagnostic = async () => {
     setDiagBusy("doctor");
@@ -260,6 +265,49 @@ export function Settings() {
       await rpc("cancel_operation");
     } catch {
       /* user-cancel — sidecar handles its own logging */
+    }
+  };
+
+  // Opt-in genre engine setups (CLAP audio student / online web resolver). Both
+  // install heavy deps + download a multi-GB model into the analysis venv, with
+  // live progress + cancellation — same shape as the ONNX setup above.
+  const handleSetupGenreEngine = async (
+    kind: "clap" | "resolver",
+    setState: (s: GenreSetupState) => void,
+    call: (p: { distro?: string }) => Promise<{ ok: boolean; error?: string | null }>,
+  ) => {
+    setDiagBusy(kind === "clap" ? "clap-setup" : "resolver-setup");
+    setState({ phase: "running" });
+    begin("install-essentia");
+    try {
+      const distro = preflightResult?.wsl?.usable_distro;
+      const res = await call(distro ? { distro } : {});
+      finish();
+      if (res.ok) {
+        setState({ phase: "done" });
+        refreshPreflight();
+      } else {
+        setState({ phase: "error", error: res.error || "Setup did not complete." });
+      }
+    } catch (e) {
+      fail(e);
+      if (!isCancellation(e)) {
+        setState({ phase: "error", error: e instanceof Error ? e.message : String(e) });
+      } else {
+        setState(null);
+      }
+    } finally {
+      if (isMounted.current) setDiagBusy(null);
+    }
+  };
+  const handleSetupClap = () => handleSetupGenreEngine("clap", setClapSetup, setupClapEngine);
+  const handleSetupResolver = () =>
+    handleSetupGenreEngine("resolver", setResolverSetup, setupGenreResolver);
+  const handleCancelGenreSetup = async () => {
+    try {
+      await rpc("cancel_operation");
+    } catch {
+      /* user-cancel */
     }
   };
 
@@ -671,6 +719,68 @@ export function Settings() {
             existing genre and uses ML only to fill gaps or override when it's very
             confident and disagrees — generic junk tags ("Dance/Pop", "Electronic")
             are ignored in favor of ML. <strong>ML only</strong> is pure audio.
+          </Hint>
+        </Field>
+
+        <Field label="Genre classifier (audio model)">
+          <div className="flex gap-2">
+            {([
+              { id: "discogs", label: "Discogs-EffNet (bundled)" },
+              { id: "clap", label: "CLAP audio (better)" },
+            ] as const).map(({ id, label }) => (
+              <button
+                key={id}
+                onClick={() => updateAnalysis({ genre_classifier: id })}
+                className={`btn ${
+                  cfg.analysis.genre_classifier === id
+                    ? "bg-accent text-white"
+                    : "bg-white/5 text-white/70 hover:bg-white/10"
+                }`}
+              >
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
+          {cfg.analysis.genre_classifier === "clap" && (
+            <button
+              className="btn-primary mt-2"
+              onClick={handleSetupClap}
+              disabled={diagBusy !== null || active !== null}
+            >
+              <Download className="w-4 h-4" />
+              {diagBusy === "clap-setup" ? "Setting up CLAP…" : "Set up CLAP genre engine"}
+            </button>
+          )}
+          <Hint>
+            <strong>CLAP audio</strong> is a pure-audio genre model ~2x as accurate
+            as the bundled Discogs model, and it works even on untagged tracks.
+            One-time setup downloads a ~2.2 GB model; BPM/key/mood are unchanged.
+            Falls back to Discogs if not set up.
+          </Hint>
+        </Field>
+
+        <Field label="Online genre lookup">
+          <Toggle
+            label="Resolve genre online (local LLM + web)"
+            checked={cfg.analysis.genre_web_lookup}
+            onChange={(v) => updateAnalysis({ genre_web_lookup: v })}
+          />
+          {cfg.analysis.genre_web_lookup && (
+            <button
+              className="btn-primary mt-2"
+              onClick={handleSetupResolver}
+              disabled={diagBusy !== null || active !== null}
+            >
+              <Download className="w-4 h-4" />
+              {diagBusy === "resolver-setup" ? "Setting up resolver…" : "Set up online resolver"}
+            </button>
+          )}
+          <Hint>
+            Looks up each track's genre online (a local LLM reads web results for
+            the artist + title), then layers it into reconciliation (tag › web ›
+            audio) — the most accurate option (~60%) on tagged libraries. Needs
+            network + a local LLM (one-time ~4.7 GB setup, fully private). Adds time
+            per track; off by default.
           </Hint>
         </Field>
 
@@ -1116,6 +1226,21 @@ export function Settings() {
         state={onnxSetup}
         onClose={() => setOnnxSetup(null)}
         onCancel={handleCancelOnnxSetup}
+      />
+
+      <GenreSetupDialog
+        state={clapSetup}
+        title="Set up CLAP genre engine"
+        doneMessage="CLAP audio genre engine ready. Re-analyze your library to use it."
+        onClose={() => setClapSetup(null)}
+        onCancel={handleCancelGenreSetup}
+      />
+      <GenreSetupDialog
+        state={resolverSetup}
+        title="Set up online genre resolver"
+        doneMessage="Online genre resolver ready. Re-analyze with online lookup enabled to use it."
+        onClose={() => setResolverSetup(null)}
+        onCancel={handleCancelGenreSetup}
       />
 
       <AnimatePresence>

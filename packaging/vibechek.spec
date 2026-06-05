@@ -76,6 +76,11 @@ datas += collect_data_files("rich")
 # against the spec dir, not the repo root).
 datas += [(os.path.join(_REPO_ROOT, "vibechek", "onnx_assets"), "onnx_assets")]
 
+# Bundle the CLAP genre kNN reference library (~2 MB). clap_genre.
+# bundled_clap_assets_dir() reads it from <_MEIPASS>/clap_assets at runtime. The
+# 2.2 GB CLAP checkpoint is NOT bundled — the in-app CLAP setup downloads it.
+datas += [(os.path.join(_REPO_ROOT, "vibechek", "clap_assets"), "clap_assets")]
+
 a = Analysis(
     ["entrypoint.py"],
     pathex=[],

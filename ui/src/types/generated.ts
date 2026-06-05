@@ -42,6 +42,9 @@ export interface AnalysisConfig {
   inference_engine: string;
   genre_source_policy: string;
   genre_ml_override_confidence: number;
+  genre_classifier: string;
+  genre_web_lookup: boolean;
+  genre_llm_backend: string;
 }
 
 export interface DuplicateConfig {
