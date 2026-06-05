@@ -125,6 +125,15 @@ Two passes run:
 
 (If you don't have `fpcalc` installed, only MD5 runs. The app says so.)
 
+### Variants aren't duplicates
+
+By default Vibechek keeps the versions a DJ actually wants side by side — an **Extended**
+vs **Radio** vs **Remix** edit, or a FLAC *Original Mix* next to an MP3 *Extended* — and
+only flags true duplicates *within* the same version. So a clean "same song, two formats"
+pair collapses, but your alternate edits survive. Tune it in **Settings → Duplicate
+detection**: collapse across versions if you'd rather keep one per song, keep one file per
+format, or adjust the duration tolerance that catches mislabeled lengths.
+
 ### The result
 
 A summary strip up top: total files scanned, duplicate groups found, files that'd be removed, disk space freed.
@@ -314,7 +323,7 @@ cached for 5 minutes. Click **Re-probe** to force a fresh check.
 Click **Advanced settings** to expand:
 
 - **Tagging** — genre confidence threshold (slider); a **"Write these fields" grid** to turn each ML field on/off independently (Genre, Energy, Mood, Vocal, Timeslot, Direction, BPM, Key — BPM & Key default off because Rekordbox is usually better); a **"Vocal detection sensitivity"** dual slider (Instrumental ≤ / Vocal ≥) that re-labels tracks from their stored score without re-analyzing; preserve Rekordbox frames (always on by default — *don't turn this off unless you really know what you're doing*), write subgenre as main genre, backup before write.
-- **Duplicate detection** — toggle MD5 / Chromaprint, similarity threshold, action (report / move / trash).
+- **Duplicate detection** — toggle MD5 / Chromaprint, similarity threshold, action (report / move / trash), and the **variant** controls (keep distinct Extended/Radio/Remix versions, keep one file per format, duration tolerance).
 - **Organization** — use subgenres, min genre size, target root.
 
 At the bottom:
@@ -352,6 +361,29 @@ runtime for the hardware it detects (NVIDIA → CUDA, AMD → ROCm, Apple → Co
 **Settings → System** then shows what the ONNX engine actually sees — its device
 and provider, e.g. *"RTX 4070 · CUDA"*. Switch back any time. Most users can leave
 the default; reach for ONNX if you have a non-NVIDIA GPU or want off TF.
+
+### Genre classifier & online lookup
+
+Genre is the hardest field to get right, so it has its own controls under **Settings →
+Analysis** (BPM/key/mood are unaffected by these):
+
+- **Genre classifier** — **Discogs-EffNet** (default, bundled) or **CLAP audio** (opt-in).
+  CLAP is a modern audio-embedding model that's **~2× more accurate on pure audio** and,
+  unlike a file tag, works on **untagged / white-label** tracks. Select it and click
+  **Set up CLAP genre engine** (a one-time ~2.2 GB download), then re-analyze.
+- **Online genre lookup** (toggle) — a **fully-local LLM** reads web results for each
+  track's artist + title and synthesizes the specific subgenre, distrusting commercial
+  chart buckets ("Dance/Pop") and verifying the match. It's layered in as **your tag ›
+  grounded web › audio** — the most accurate option on tagged libraries, and fully private
+  (a local model, no API key, no upload). Click **Set up online resolver** (a one-time
+  local-LLM install). It adds time per track and is **off by default**.
+- **Genre source** — how an *existing* tag is reconciled with the model read:
+  **Prefer existing tag** (default — trust a specific Beatport-style tag, use the model to
+  fill gaps + override only when very confident, ignore generic junk), **Prefer ML**,
+  **Tag only**, or **ML only** (pure audio).
+
+All of this feeds one reconciliation, so the defaults are unchanged unless you opt in — and
+you can mix them (trust tags, fall back to CLAP, escalate to web only when unsure).
 
 ---
 

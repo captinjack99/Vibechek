@@ -64,9 +64,19 @@ Vibechek uses the [Discogs-EffNet model](https://essentia.upf.edu/models.html), 
 
 You get a tunable confidence threshold per attribute. Tracks below the bar don't get rewritten.
 
-### 🔍 De-duplication that doesn't lie
+### 🎯 Genre, your way — three classifiers + smart tag reconciliation
 
-MD5 catches the same MP3 saved twice. **Chromaprint** catches the same song saved as FLAC *and* MP3 *and* `(Original Mix)` *and* `(Extended Mix)` — by listening to the audio itself. Auto-keeper rules pick the best version by codec → bitrate → file size → newest → shortest path (or whatever order you configure), and you can override any choice before anything moves.
+The Discogs-EffNet head above is the default. But genre is the hardest field to get right, so Vibechek lets you pick how it's decided — and it's smart about libraries that already carry tags:
+
+- **Trust your existing tags (default).** Beatport/curated tags are usually better than any audio guess, so Vibechek *keeps a specific existing genre* and uses the model only to fill gaps — while ignoring generic junk ("Dance/Pop", "Electronic") and letting a confident model read override a tag that's clearly wrong. Fully configurable (`prefer_tag` / `prefer_ml` / `tag_only` / `ml_only`).
+- **CLAP audio classifier (opt-in).** A modern audio-embedding model matched against a curated reference library — **roughly 2× the genre accuracy** of the Discogs head on pure audio, and unlike a tag it works on **untagged / white-label** tracks. One-click *Set up CLAP genre engine* in Settings (a ~2.2 GB model, downloaded once). BPM/key/mood are unchanged.
+- **Online genre lookup (opt-in).** A fully-local LLM reads web results for the track's artist + title and synthesizes the specific subgenre — distrusting commercial chart buckets and verifying the match — then layers it in as **tag › grounded web › audio**. The most accurate option on tagged libraries, fully private (a local model, no API key). One-click *Set up online resolver*.
+
+All three feed the same reconciliation, so the **default behavior is unchanged unless you opt in** — and you can mix them (e.g. trust tags, fall back to the CLAP model, escalate to web only when unsure).
+
+### 🔍 De-duplication that doesn't lie — *and knows a remix isn't a dupe*
+
+MD5 catches the same MP3 saved twice. **Chromaprint** catches the same song saved as FLAC *and* MP3 — by listening to the audio itself. But it's **variant-aware**: by default it *keeps* the versions a DJ actually wants side by side — an **Extended** vs **Radio** vs **Remix** edit, or a FLAC *Original Mix* next to an MP3 *Extended* — and only collapses true duplicates *within* the same version. Every part is configurable (collapse across versions, keep one file per format, duration tolerance for mislabeled lengths). Auto-keeper rules then pick the best file by codec → bitrate → file size → newest → shortest path (or whatever order you set), and you can override any choice before anything moves.
 
 ### 🗂️ One-click organize
 
@@ -174,9 +184,10 @@ Full developer setup + the platform-specific bits: [docs/INSTALL.md](docs/INSTAL
 React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]──► Python sidecar
                                                                           │
                               ┌───────────────────────────────────────────┴───────────┐
-                              │ vibechek package (44 RPC methods)                     │
+                              │ vibechek package (47 RPC methods)                     │
                               │  analyzer · tagger · duplicates · organizer · genres  │
-                              │  journal · profiles · config · cancellation            │
+                              │  clap_genre · genre_web · journal · profiles · config  │
+                              │  cancellation · onnx_backend                           │
                               │  library_state · backup_history · preflight · wsl      │
                               │  resources · logging_setup                             │
                               └───────────────────────────────────────────────────────┘
@@ -209,10 +220,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**777 Python tests** · **45 JSON-RPC methods** · **29 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**833 Python tests** · **47 JSON-RPC methods** · **31 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 38 frontend tests across keeperRules, rpc, LibraryFilters, ConfirmModal, Sidebar, DuplicatesView
+- 62 frontend tests across keeperRules, rpc, LibraryFilters, ConfirmModal, Sidebar, DuplicatesView
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 
@@ -235,7 +246,9 @@ If you're more of an ideas person than a code person — [open an issue](https:/
 ## Acknowledgements
 
 - [Essentia](https://essentia.upf.edu/) — the open ML audio library from UPF Barcelona that powers everything
-- [Discogs-EffNet](https://essentia.upf.edu/models.html) — the genre classification model
+- [Discogs-EffNet](https://essentia.upf.edu/models.html) — the default genre classification model
+- [LAION-CLAP](https://github.com/LAION-AI/CLAP) — the audio-embedding model behind the opt-in CLAP genre classifier
+- [Ollama](https://ollama.com/) — the local LLM runtime behind the opt-in online genre lookup
 - [Chromaprint](https://acoustid.org/chromaprint) — acoustic fingerprinting
 - [Mutagen](https://mutagen.readthedocs.io/) — careful audio tag I/O
 - [Tauri](https://v2.tauri.app/) — the small, fast desktop shell that makes "ship a Rust+React+Python app" reasonable
