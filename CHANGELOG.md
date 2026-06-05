@@ -14,7 +14,7 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 - **CLAP pure-audio genre classifier** (opt-in, `genre_classifier = "clap"`). A CLAP
   audio embedding is matched by kNN against a small bundled reference library
   (`vibechek/clap_assets/genre_reference.npz`, ~2 MB) — roughly **2× the genre
-  accuracy** of the bundled Discogs-EffNet head on pure audio (~28% → ~54%), and
+  accuracy** of the bundled Discogs-EffNet head on pure audio (~28% → ~50%), and
   unlike a file tag it works on untagged / white-label tracks. BPM/key/mood are
   unchanged. One-click **Set up CLAP genre engine** (Settings) installs the deps +
   downloads the ~2.2 GB checkpoint into the analysis venv. Falls back to Discogs if
