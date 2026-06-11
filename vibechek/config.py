@@ -350,6 +350,29 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "falling back to 'essentia_tf'", cls.__name__, coerced,
             )
             continue  # use the dataclass default ("essentia_tf")
+        # The genre enums steer model loading + reconciliation the same way —
+        # a hand-edited value ("CLAP", "ml") would render Settings with neither
+        # option selected and silently run default behavior. Snap back loudly.
+        if key == "genre_classifier" and coerced not in ("discogs", "clap"):
+            log.warning(
+                "Config field %s.genre_classifier has unknown value %r; "
+                "falling back to 'discogs'", cls.__name__, coerced,
+            )
+            continue
+        if key == "genre_source_policy" and coerced not in (
+            "prefer_tag", "prefer_ml", "tag_only", "ml_only",
+        ):
+            log.warning(
+                "Config field %s.genre_source_policy has unknown value %r; "
+                "falling back to 'prefer_tag'", cls.__name__, coerced,
+            )
+            continue
+        if key == "genre_llm_backend" and coerced not in ("ollama",):
+            log.warning(
+                "Config field %s.genre_llm_backend has unknown value %r; "
+                "falling back to 'ollama'", cls.__name__, coerced,
+            )
+            continue
         kwargs[key] = coerced
     return cls(**kwargs)
 

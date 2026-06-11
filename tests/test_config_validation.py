@@ -163,6 +163,29 @@ def test_subset_rejects_out_of_range_id3_encoding(
     assert any("id3_text_encoding" in r.message for r in caplog.records)
 
 
+@pytest.mark.parametrize(("field", "bad", "default"), [
+    ("genre_classifier", "CLAP", "discogs"),
+    ("genre_classifier", "ml", "discogs"),
+    ("genre_source_policy", "ml", "prefer_tag"),
+    ("genre_source_policy", "PREFER_TAG", "prefer_tag"),
+    ("genre_llm_backend", "openai", "ollama"),
+])
+def test_subset_snaps_back_unknown_genre_enums(
+    field: str, bad: str, default: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The genre enums steer model loading + reconciliation; a hand-edited
+    value would render Settings with no option selected and silently run
+    default behavior. Snap back loudly like inference_engine."""
+    from vibechek.config import AnalysisConfig  # noqa: PLC0415
+    caplog.set_level(logging.WARNING, logger="vibechek.config")
+    cfg = _subset(AnalysisConfig, {field: bad})
+    assert getattr(cfg, field) == default
+    assert any(field in r.message for r in caplog.records)
+    # valid values pass through untouched
+    good = _subset(AnalysisConfig, {field: default})
+    assert getattr(good, field) == default
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: corrupted config doesn't crash the loader
 # ---------------------------------------------------------------------------

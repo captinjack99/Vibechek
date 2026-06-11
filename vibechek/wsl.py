@@ -1862,8 +1862,19 @@ echo "[1/3] Installing CLAP deps (torch, torchvision, laion-clap)..."
 echo "[2/3] Downloading CLAP checkpoint (~2.2 GB, one-time)..."
 mkdir -p "$HOME/.vibechek/clap"
 CKPT="$HOME/.vibechek/clap/music_clap.pt"
+# Clean the partial on ANY exit (cancel/SIGTERM included) so a cancelled run
+# doesn't strand 2 GB in the WSL home; on success the mv already happened so
+# the rm is a no-op. --speed-limit turns a stalled TCP connection into a fast
+# failure instead of an indefinite hang (the Python-side timeout only starts
+# counting after stdout EOF).
+trap 'rm -f "$CKPT.partial"' EXIT
 if [ ! -s "$CKPT" ]; then
-  curl -fSL "{ckpt_url}" -o "$CKPT.partial"
+  curl -fSL --speed-limit 1024 --speed-time 60 "{ckpt_url}" -o "$CKPT.partial"
+  SIZE=$(stat -c%s "$CKPT.partial" 2>/dev/null || echo 0)
+  if [ "$SIZE" -lt 1500000000 ]; then
+    echo "ERROR: checkpoint download incomplete ($SIZE bytes)" >&2
+    exit 3
+  fi
   mv "$CKPT.partial" "$CKPT"
 fi
 echo "[3/3] Verifying..."
@@ -1881,8 +1892,9 @@ VENV="$HOME/.vibechek/{venv_subdir}"
 echo "[1/4] Installing ddgs + zstandard..."
 "$VENV/bin/pip" install --quiet ddgs zstandard
 echo "[2/4] Installing Ollama (no-sudo)..."
+trap 'rm -f "$HOME/ollama.tar.zst" "$HOME/ollama.tar"' EXIT
 if [ ! -x "$HOME/ollama/bin/ollama" ]; then
-  curl -fSL "{_OLLAMA_TARBALL_URL}" -o "$HOME/ollama.tar.zst"
+  curl -fSL --speed-limit 1024 --speed-time 60 "{_OLLAMA_TARBALL_URL}" -o "$HOME/ollama.tar.zst"
   "$VENV/bin/python" -c "import zstandard,sys; fi=open('$HOME/ollama.tar.zst','rb'); fo=open('$HOME/ollama.tar','wb'); zstandard.ZstdDecompressor().copy_stream(fi,fo)"
   mkdir -p "$HOME/ollama"; tar -xf "$HOME/ollama.tar" -C "$HOME/ollama"
   rm -f "$HOME/ollama.tar" "$HOME/ollama.tar.zst"
@@ -1963,6 +1975,10 @@ def _run_managed_wsl_script(
         try:
             rc = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            # Kill the WSL-side process GROUP first — proc.kill() only takes
+            # down wsl.exe on the Windows side, orphaning pip/curl/ollama
+            # inside the VM.
+            _kill_wsl_pgid(wsl, distro, token_file)
             proc.kill(); cancel_done.set()
             return {"ok": False, "error": f"Setup timed out after {timeout_s}s",
                     "tail": "\n".join(tail_lines[-40:])}
@@ -1988,9 +2004,12 @@ def setup_clap_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
     """Install the CLAP genre student into the analysis venv inside `distro`."""
     from vibechek.clap_genre import _CHECKPOINT_URL  # noqa: PLC0415
     venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    # 2 h wall clock: these are multi-GB downloads on arbitrary connections.
+    # Real stalls die fast via curl --speed-limit, so the generous ceiling only
+    # bounds genuinely slow-but-progressing links instead of aborting them.
     return _run_managed_wsl_script(
         distro, _clap_setup_script(venv_subdir, _CHECKPOINT_URL), on_progress,
-        timeout_s=60 * 30, start_msg=f"Setting up the CLAP genre engine in {distro}…",
+        timeout_s=60 * 120, start_msg=f"Setting up the CLAP genre engine in {distro}…",
     )
 
 
@@ -2000,7 +2019,7 @@ def setup_resolver_in_wsl(distro: str, on_progress: ProgressCallback | None = No
     venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
     return _run_managed_wsl_script(
         distro, _resolver_setup_script(venv_subdir, model), on_progress,
-        timeout_s=60 * 30, start_msg=f"Setting up the online genre resolver in {distro}…",
+        timeout_s=60 * 120, start_msg=f"Setting up the online genre resolver in {distro}…",
     )
 
 

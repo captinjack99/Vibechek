@@ -149,10 +149,14 @@ def main() -> None:
 @click.option("--genre-llm-backend", type=click.Choice(["ollama"]),
               default="ollama", show_default=True,
               help="LLM backend for --genre-web-lookup (ollama = local/private).")
+@click.option("--genre-override-confidence", type=click.FloatRange(0.0, 1.0),
+              default=0.90, show_default=True,
+              help="With --genre-policy prefer_tag: minimum ML confidence for "
+                   "the model to override a disagreeing specific tag.")
 def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
             output: Path, models_dir: Path | None, hybrid: bool, engine: str,
             genre_policy: str, genre_classifier: str, genre_web_lookup: bool,
-            genre_llm_backend: str) -> None:
+            genre_llm_backend: str, genre_override_confidence: float) -> None:
     """Analyze every audio file under PATH with the ML models."""
     from vibechek.analyzer import analyze_directory
 
@@ -160,7 +164,8 @@ def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
                             inference_engine=engine, genre_source_policy=genre_policy,
                             genre_classifier=genre_classifier,
                             genre_web_lookup=genre_web_lookup,
-                            genre_llm_backend=genre_llm_backend)
+                            genre_llm_backend=genre_llm_backend,
+                            genre_ml_override_confidence=genre_override_confidence)
     if models_dir:
         config.models_dir = models_dir
 

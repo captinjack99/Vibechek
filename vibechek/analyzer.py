@@ -781,6 +781,19 @@ def _do_one_download(
             raise
 
 
+def _per_worker_mb(genre_classifier: str) -> int:
+    """RAM budget per analysis worker, used to cap the worker count.
+
+    The baseline ~800 MB covers the essentia/TF model weights + runtime. The
+    CLAP genre classifier loads a ~2.2 GB fp32 checkpoint + the torch runtime
+    INTO EVERY worker (load_models → _maybe_load_clap), so its per-worker
+    footprint is ~3.5 GB — sizing CLAP runs off the 800 MB assumption put a
+    32 GB box at 15 workers (~50 GB resident) and an OOM-killer storm whose
+    only symptom was the 300 s stall-watchdog error.
+    """
+    return 3500 if genre_classifier == "clap" else 800
+
+
 def _maybe_load_clap(loaded: dict[str, Any], genre_classifier: str, use_gpu: str) -> None:
     """When the CLAP genre classifier is selected, load the encoder + bundled kNN
     reference into the models dict (alongside the essentia/onnx models, so one
@@ -1184,13 +1197,30 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 
             audio_48k = MonoLoader(filename=str(filepath), sampleRate=48000, resampleQuality=4)()
             emb = clap_genre.embed_audio(models["clap_model"], audio_48k)
-            g, conf = clap_genre.knn_predict(emb, models["clap_reference"])
+            # The 48 kHz buffer is the largest of the three decodes (~50% of
+            # peak per-worker RAM on long mixes) and only the 3×20 s segments
+            # inside embed_audio were needed — release it before inference.
+            del audio_48k
+            shares = clap_genre.knn_vote_shares(emb, models["clap_reference"])
+            g = max(shares, key=shares.__getitem__) if shares else ""
             if g and g != "Unknown":
                 parent, sub = split_tag_genre(g)
+                # Confidence semantics must match the Discogs head's scale: the
+                # tagger's genre gate (0.85) and the reconcile override floor
+                # (0.90) were tuned against genres.get_best_genre's FAMILY-SUM
+                # confidence. The kNN's raw top-1 vote share runs far lower
+                # (mass splits across sibling subgenres), so an uncalibrated
+                # share would leave most CLAP reads below the write gate —
+                # defeating its headline use (untagged tracks). Family share =
+                # the summed vote of every neighbour in the winner's family.
+                fam_conf = sum(
+                    s for lab, s in shares.items()
+                    if split_tag_genre(lab)[0] == parent
+                )
                 result.ml_genre = parent
                 result.ml_subgenre = sub
-                result.ml_genre_confidence = round(float(conf), 3)
-                result.ml_genre_raw_confidence = round(float(conf), 3)
+                result.ml_genre_confidence = round(min(fam_conf, 1.0), 3)
+                result.ml_genre_raw_confidence = round(float(shares[g]), 3)
                 clap_done = True
         except Exception as e:  # noqa: BLE001
             log.warning("CLAP genre failed for %s (falling back to Discogs): %s", filepath.name, e)
@@ -2174,14 +2204,15 @@ def analyze_directory(
     try:
         import psutil  # noqa: PLC0415
         total_mb = psutil.virtual_memory().total // (1024 * 1024)
-        # Reserve 2 GB for the host; assume ~800 MB per worker for models + TF.
+        per_worker_mb = _per_worker_mb(config.genre_classifier)
         usable_mb = max(0, total_mb - 2048)
-        memory_cap = max(1, usable_mb // 800)
+        memory_cap = max(1, usable_mb // per_worker_mb)
         if memory_cap < workers:
             log.warning(
                 "Capping workers from %d -> %d based on available RAM "
-                "(%d MB total, ~800 MB per worker)",
-                workers, memory_cap, total_mb,
+                "(%d MB total, ~%d MB per worker%s)",
+                workers, memory_cap, total_mb, per_worker_mb,
+                " — CLAP genre model loads in every worker" if per_worker_mb != 800 else "",
             )
             workers = memory_cap
     except ImportError:
@@ -2536,6 +2567,7 @@ def _analyze_via_native_venv(
         "--genre-policy", config.genre_source_policy,
         "--genre-classifier", config.genre_classifier,
         "--genre-llm-backend", config.genre_llm_backend,
+        "--genre-override-confidence", str(config.genre_ml_override_confidence),
         "--genre-web-lookup" if config.genre_web_lookup else "--no-genre-web-lookup",
     ]
     if workers > 0:
@@ -2643,6 +2675,7 @@ def _analyze_via_wsl(
         "--genre-policy", config.genre_source_policy,
         "--genre-classifier", config.genre_classifier,
         "--genre-llm-backend", config.genre_llm_backend,
+        "--genre-override-confidence", str(config.genre_ml_override_confidence),
         "--genre-web-lookup" if config.genre_web_lookup else "--no-genre-web-lookup",
     ]
     if workers > 0:
@@ -2753,6 +2786,33 @@ def _analyze_via_wsl(
 
     result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir)
 
+    if result.returncode != 0 and any("no such option" in ln.lower() for ln in stderr_tail):
+        # Same-version-but-code-stale WSL install: the version strings MATCH
+        # (we don't bump per commit) but the WSL CLI predates a flag we now
+        # pass unconditionally, so click exits 2 with "No such option". The
+        # version-drift guard above can't see this (it compares versions for
+        # strict inequality) — treat click's rejection itself as the drift
+        # signal: update the WSL package in place once and retry the analyze.
+        from vibechek.wsl import upgrade_vibechek_in_wsl  # noqa: PLC0415
+        log.warning(
+            "WSL vibechek rejected a CLI flag (same-version code drift) — "
+            "auto-updating in place and retrying once",
+        )
+        report_progress(on_progress, 0, 0,
+                        f"Updating the analysis engine in {distro} (one-time)…")
+        up = upgrade_vibechek_in_wsl(
+            distro, on_progress=on_progress, engine=config.inference_engine,
+        )
+        if up.get("cancelled"):
+            raise cancellation.CancelledError("Analysis cancelled by user")
+        if up.get("ok"):
+            stderr_tail.clear()
+            result = run_vibechek_in_wsl(
+                distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir,
+            )
+        # If the upgrade failed we fall through: the generic error below shows
+        # the "No such option" stderr tail, which is an honest description.
+
     if result.returncode != 0:
         stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"
         raise RuntimeError(
@@ -2817,9 +2877,18 @@ def _write_partial(output_path: Path, results: list[dict[str, Any]], total: int,
     # the whole point of writing partials every 50 tracks is crash recovery,
     # which a non-atomic write_text would defeat (a kill during the write
     # leaves a zero-byte/corrupt file).
+    #
+    # Checkpoints ALWAYS write status="in_progress" (the caller's flag is
+    # deliberately ignored): the genuinely-final report — with the user's
+    # configured genre policy + web lookup applied — is written by
+    # analyze_directory right after the loop. Reconciling here with default
+    # args used to stamp "complete" + default-policy genres on disk at the
+    # last checkpoint, which a crash/cancel during the (potentially long)
+    # web-lookup phase would then leave behind as a lying "complete" report.
+    del in_progress
     atomic_write_json(
         Path(output_path),
-        _build_report(results, total, in_progress),
+        _build_report(results, total, in_progress=True),
         indent=2,
     )
 
@@ -2914,9 +2983,33 @@ def _build_report(
             {} if (web_cfg and web_cfg.get("enabled")) else None
         )
         if web_cache is not None:
-            _emit_event("stage", name="resolving_genres_online",
-                        message=f"Resolving genres online for {len(results)} tracks...")
-        for r in results:
+            from vibechek import genre_web  # noqa: PLC0415
+
+            # The local LLM backend dies with the WSL VM (reboot / `wsl
+            # --shutdown`); ensure_backend() restarts the managed Ollama if it
+            # can. When it can't, SKIP the web tier loudly instead of paying a
+            # wasted web search per track only to silently fall back anyway.
+            if not genre_web.ensure_backend(web_cfg.get("backend", "ollama")):
+                log.warning(
+                    "Online genre lookup enabled but the local LLM backend is "
+                    "not reachable — falling back to tags + audio only",
+                )
+                _emit_event(
+                    "stage", name="genre_web_unavailable",
+                    message="Online genre lookup unavailable (local LLM not "
+                            "reachable) — using tags + audio only",
+                )
+                web_cache = None
+                web_cfg = None
+        n = len(results)
+        for i, r in enumerate(results):
+            # In-process cancel point (native/CLI path): the web tier can take
+            # seconds per track, and even the offline reconcile shouldn't pin a
+            # cancelled run.
+            cancellation.check()
+            if web_cache is not None and (i % 5 == 0 or i == n - 1):
+                _emit_event("stage", name="resolving_genres_online",
+                            message=f"Resolving genres online ({i + 1}/{n})…")
             _reconcile_record_genre(r, pol, override, web_cfg, web_cache)
 
     genres: dict[str, int] = defaultdict(int)

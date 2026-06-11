@@ -226,6 +226,8 @@ export interface AnalyzeDirectoryRequest {
   genre_web_lookup?: boolean;
   /** LLM backend for the online genre lookup ("ollama"). */
   genre_llm_backend?: string;
+  /** prefer_tag: min ML confidence to override a disagreeing specific tag. */
+  genre_ml_override_confidence?: number;
 }
 
 // --- duplicates ---
@@ -241,6 +243,12 @@ export interface FindDuplicatesRequest {
   review_folder?: string | null;
   /** Default true. Pass false to skip the per-file mutagen probe. */
   read_metadata?: boolean;
+  /** Keep Extended/Radio/Remix etc. as distinct versions (default true). */
+  keep_distinct_versions?: boolean;
+  /** Keep the best file of EVERY format within a version (default false). */
+  keep_all_formats?: boolean;
+  /** Duration tolerance for the same-version check, 0..1 (default 0.12). */
+  version_duration_tolerance?: number;
 }
 
 export interface HandleDuplicatesRequest {
@@ -388,9 +396,13 @@ export interface SetupOnnxEngineResult {
   cancelled?: boolean;
 }
 
-/** Optional WSL distro override for the opt-in genre engine setups. */
+/** Optional overrides for the opt-in genre engine setups. */
 export interface SetupGenreEngineRequest {
   distro?: string;
+  /** The LIVE engine selection ("essentia_tf" | "onnx") — the setup installs
+   * into this engine's venv. The UI sends it because the saved config can lag
+   * the selector by the autosave debounce. */
+  inference_engine?: string;
 }
 
 /** Result of a one-click opt-in genre engine setup (CLAP / online resolver). */

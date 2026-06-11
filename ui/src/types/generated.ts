@@ -274,6 +274,7 @@ export interface OrganizeStats {
   moved: number;
   errors: string[];
   journal_path: string | null;
+  moved_pairs: string[][];
 }
 
 export interface PlannedMove {

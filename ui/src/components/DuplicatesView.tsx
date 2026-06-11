@@ -116,6 +116,7 @@ export function DuplicatesView() {
         // (only collapse redundant encodings) unless the user turned it off.
         keep_distinct_versions: dupCfg.keep_distinct_versions,
         keep_all_formats: dupCfg.keep_all_formats,
+        version_duration_tolerance: dupCfg.version_duration_tolerance,
       });
       setReport(r);
       finish();

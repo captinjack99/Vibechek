@@ -20,11 +20,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+OLLAMA_TAGS_URL = "http://127.0.0.1:11434/api/tags"
 DEFAULT_MODEL = "qwen2.5:7b"
 
 # Controlled genre vocabulary the LLM must choose from (matches the CLAP
@@ -61,19 +64,80 @@ _SYSTEM = (
 
 
 def _canon(g: str | None) -> str:
-    """Map an LLM/web genre string onto the known taxonomy (best-effort)."""
+    """Map an LLM/web genre string onto the known taxonomy (best-effort).
+
+    Exact (case/separator-insensitive) vocab match first, then the LONGEST
+    vocab entry contained in the answer. Never the reverse containment — that
+    direction mapped generic answers onto the first *specific* subgenre that
+    happened to contain them ("house" → "Tech House", "disco" → "Nu-Disco"),
+    and the wrong subgenre then flowed into reconciliation as the web read.
+    """
     from vibechek.genres import DJ_GENRE_MAP  # noqa: PLC0415
 
     t = (g or "").strip()
     if not t:
         return ""
-    if t in VOCAB:
-        return DJ_GENRE_MAP.get(t, t)
-    low = t.lower()
-    for v in VOCAB:                       # tolerant substring match
-        if v.lower() in low or low in v.lower():
+    norm = re.sub(r"[-_/]+", " ", t.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    for v in VOCAB:
+        if norm == v.lower():
             return DJ_GENRE_MAP.get(v, v)
+    best = ""
+    for v in VOCAB:
+        if v.lower() in norm and len(v) > len(best):
+            best = v
+    if best:
+        return DJ_GENRE_MAP.get(best, best)
     return DJ_GENRE_MAP.get(t, t)
+
+
+def ensure_backend(backend: str = "ollama", timeout: float = 3.0) -> bool:
+    """True when the LLM backend is reachable; best-effort starts the managed
+    local Ollama when it isn't. NEVER raises.
+
+    The resolver setup nohup-starts `ollama serve` exactly once — it dies with
+    the WSL VM (reboot, `wsl --shutdown`), which used to leave the web lookup
+    silently dead: every track still paid a web search, then the LLM call
+    failed and fell back to audio with no signal. Callers should skip the web
+    tier entirely (loudly) when this returns False.
+    """
+    if backend != "ollama":
+        return False
+    import urllib.request  # noqa: PLC0415
+
+    def _up() -> bool:
+        try:
+            with urllib.request.urlopen(OLLAMA_TAGS_URL, timeout=timeout):  # noqa: S310
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    if _up():
+        return True
+    exe = Path.home() / "ollama" / "bin" / "ollama"   # the no-sudo managed install
+    if not exe.is_file():
+        return False
+    try:
+        import os  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+
+        log_path = Path.home() / ".vibechek" / "ollama.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as lf:
+            subprocess.Popen(  # noqa: S603
+                [str(exe), "serve"],
+                env={**os.environ, "OLLAMA_HOST": "127.0.0.1:11434"},
+                stdout=lf, stderr=lf,
+                start_new_session=True,   # detach: survives this process
+            )
+        for _ in range(20):
+            time.sleep(0.5)
+            if _up():
+                log.info("Restarted the managed Ollama server for genre lookup")
+                return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("Could not start the managed Ollama server: %s", e)
+    return False
 
 
 def _ollama_chat(system: str, user: str, model: str, timeout: float = 60.0) -> dict:
@@ -106,13 +170,29 @@ def _llm_chat(system: str, user: str, backend: str, model: str, timeout: float) 
 
 
 def _ddgs_snippets(query: str, n: int = 6) -> str:
-    """Keyless web search → newline-joined 'title: body' snippets (lazy ddgs)."""
+    """Keyless web search → newline-joined 'title: body' snippets (lazy ddgs).
+
+    One retry with a short sleep: sequential per-track queries over a large
+    library WILL hit transient rate limits, and without the retry every track
+    after the first throttle silently degrades to an ungrounded LLM guess.
+    """
     try:
         from ddgs import DDGS  # noqa: PLC0415
     except ImportError:
         from duckduckgo_search import DDGS  # type: ignore  # noqa: PLC0415
-    with DDGS() as d:
-        res = d.text(query, max_results=n)
+    res = None
+    last: Exception | None = None
+    for attempt in range(2):
+        try:
+            with DDGS() as d:
+                res = d.text(query, max_results=n)
+            break
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt == 0:
+                time.sleep(2.0)
+    if res is None:
+        raise last if last else RuntimeError("ddgs returned nothing")
     lines = []
     for r in res:
         t = (r.get("title") or "")[:90]
@@ -174,7 +254,14 @@ def resolve(
     genre = _canon(obj.get("genre"))
     if not genre:
         return {**empty, "used_web": used_web}
-    src = bool(obj.get("source_matched")) and _evidence_supports(genre, str(obj.get("evidence", "")))
+    # Grounding requires ACTUAL web results: with no snippets a model can still
+    # claim source_matched + fabricate plausible "evidence" text, which would
+    # pass the text gate and earn a tag-override authority it never had.
+    src = (
+        used_web
+        and bool(obj.get("source_matched"))
+        and _evidence_supports(genre, str(obj.get("evidence", "")))
+    )
     try:
         conf = float(obj.get("confidence", 0.5) or 0.5)
     except (TypeError, ValueError):
@@ -182,4 +269,4 @@ def resolve(
     return {"genre": genre, "confidence": conf, "source_matched": src, "used_web": used_web}
 
 
-__all__ = ["resolve", "VOCAB", "DEFAULT_MODEL"]
+__all__ = ["resolve", "ensure_backend", "VOCAB", "DEFAULT_MODEL"]

@@ -305,6 +305,7 @@ export function OrganizeView() {
     try {
       const stats = await rpc<{
         planned: number; moved: number; errors: string[]; journal_path: string | null;
+        moved_pairs?: string[][];
         cancelled?: boolean;
       }>(
         "organize",
@@ -325,11 +326,23 @@ export function OrganizeView() {
       // Sync the library store: each successful move means the on-disk path
       // changed. Without this, the next time the user clicks Show in Folder /
       // Play / Re-tag we'd FileNotFoundError against the old path.
-      // We pass the FULL captured plan map; updateTrackPaths is a no-op for
-      // any track that wasn't in the library to begin with.
+      //
+      // CRITICAL: map from the sidecar's ACTUAL moved pairs, never the plan —
+      // (a) a cancelled/partly-failed run moved only a subset (mapping the
+      // whole plan pointed unmoved tracks at phantom destinations), and (b)
+      // the real destination can differ from the planned one (re-uniquified at
+      // execute time to avoid clobbering an existing file). The plan fallback
+      // only covers an older sidecar that doesn't send moved_pairs, and only
+      // for clean, complete runs.
       const pathMap = new Map<string, string>();
-      for (const move of capturedPlan.moves) {
-        pathMap.set(move.source, move.destination);
+      if (stats.moved_pairs) {
+        for (const [src, dst] of stats.moved_pairs) {
+          pathMap.set(src, dst);
+        }
+      } else if (!stats.cancelled && stats.errors.length === 0) {
+        for (const move of capturedPlan.moves) {
+          pathMap.set(move.source, move.destination);
+        }
       }
       updateTrackPaths(pathMap);
 
@@ -862,9 +875,19 @@ function OrganizeResultPanel({
 
   const handleUndo = async () => {
     if (!result.journalPath) return;
+    // Register the revert as the global active op: without begin(), every
+    // other view stayed enabled during the (potentially long) undo and each
+    // click produced a confusing sidecar busy-rejection.
+    if (useOperationStore.getState().active !== null) {
+      notify("Another operation is running — wait for it to finish first.", { kind: "info" });
+      return;
+    }
+    const ops = useOperationStore.getState();
+    ops.begin("revert");
     setUndoing(true);
     try {
       const summary = await revertJournal({ journal_path: result.journalPath });
+      ops.finish();
       setUndone(true);
       const parts = [`Restored ${summary.reverted}`];
       if (summary.skipped) parts.push(`skipped ${summary.skipped}`);
@@ -874,6 +897,7 @@ function OrganizeResultPanel({
         detail: "Re-open or re-scan the library to refresh paths.",
       });
     } catch (e) {
+      useOperationStore.getState().fail(e);
       if (!isCancellation(e)) {
         notify(
           typeof e === "object" && e !== null && "message" in e

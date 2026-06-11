@@ -515,6 +515,7 @@ export function LibraryBrowser() {
         genre_classifier: analysisCfg.genre_classifier,
         genre_web_lookup: analysisCfg.genre_web_lookup,
         genre_llm_backend: analysisCfg.genre_llm_backend,
+        genre_ml_override_confidence: analysisCfg.genre_ml_override_confidence,
         skip_paths: alreadyAnalyzed,
         // Forwarded for forward-compat / debugging; the current sidecar ignores
         // unknown params. The authoritative guard is the frontend run token.

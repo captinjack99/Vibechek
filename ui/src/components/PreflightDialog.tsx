@@ -101,6 +101,15 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     method: string,
     params: object = {},
   ): Promise<T | null> => {
+    // Don't clobber a long op that's already running (a 30-min genre setup,
+    // an analyze): begin() would overwrite the global active/progress state,
+    // the sidecar would busy-reject this call anyway, and the fail() below
+    // would then clear `active` while the REAL op was still running — every
+    // active-gated button in the app would re-enable mid-operation.
+    if (useOperationStore.getState().active !== null) {
+      setActionMessage("Another operation is running — wait for it to finish (or cancel it) first.");
+      return null;
+    }
     setBusyAction(action);
     setActionMessage(null);
     setPostInstallNote(null);
