@@ -36,7 +36,7 @@ def test_onnx_head_bases_default_points_at_release(monkeypatch) -> None:
     bases = az._onnx_head_bases()
     assert len(bases) == 1
     assert bases[0].endswith(az._ONNX_MODELS_RELEASE)
-    assert bases[0].startswith("https://github.com/papapew/Vibechek/releases/download/")
+    assert bases[0].startswith("https://github.com/captinjack99/Vibechek/releases/download/")
 
 
 def test_onnx_head_bases_respects_user_override(monkeypatch) -> None:

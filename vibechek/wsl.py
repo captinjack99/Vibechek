@@ -1510,14 +1510,14 @@ fi
 echo "[4/4] Installing Vibechek + {label} (this is the slow part)..."
 {pip} install --upgrade --quiet pip wheel
 {ml_line}
-{pip} install --upgrade --quiet git+https://github.com/papapew/Vibechek.git
+{pip} install --upgrade --quiet git+https://github.com/captinjack99/Vibechek.git
 # `--upgrade` alone does NOT re-pull a git+ (VCS) install when a version is
 # already present — pip treats the URL requirement as satisfied without cloning
 # to compare. So re-running "Set up WSL" on a drifted install would silently
 # leave the stale package and never clear the analyzer's version-drift guard.
 # Force-reinstall just the vibechek package (its deps were handled above) so a
 # re-run always lands on the current GitHub head. Matches upgrade_vibechek_in_wsl.
-{pip} install --upgrade --force-reinstall --no-deps --quiet git+https://github.com/papapew/Vibechek.git
+{pip} install --upgrade --force-reinstall --no-deps --quiet git+https://github.com/captinjack99/Vibechek.git
 
 {symlink_block}
 echo "DONE"
@@ -1727,7 +1727,7 @@ echo "[1/1] Upgrading vibechek package (essentia + apt unchanged)..."
 # keeps us from touching essentia/numpy/tensorflow, which is the whole point
 # of the fast path.
 "$VENV/bin/pip" install --upgrade --force-reinstall --no-deps --quiet \
-    git+https://github.com/papapew/Vibechek.git
+    git+https://github.com/captinjack99/Vibechek.git
 
 echo "DONE"
 "$VENV/bin/vibechek" --version

@@ -164,7 +164,7 @@ The current `_DEFAULT_MODEL_BASE_URLS` chain is:
 
 ```
 https://essentia.upf.edu/models                                  (upstream, .pb only)
-https://github.com/papapew/Vibechek/releases/download/models-v1  (our mirror)
+https://github.com/captinjack99/Vibechek/releases/download/models-v1  (our mirror)
 ```
 
 After conversion:

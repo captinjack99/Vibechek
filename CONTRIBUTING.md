@@ -9,7 +9,7 @@ Before you start anything large, please open an issue or a draft PR so we can ta
 ## Quick start (developer setup)
 
 ```bash
-git clone https://github.com/papapew/Vibechek.git
+git clone https://github.com/captinjack99/Vibechek.git
 cd Vibechek
 
 # Python core
@@ -144,6 +144,6 @@ The authoritative method list lives in [`vibechek/rpc.py`](vibechek/rpc.py).
 - [docs/PROJECT_SUMMARY.md](docs/PROJECT_SUMMARY.md) — the high-level architecture + feature map.
 - [ui/README.md](ui/README.md) — the desktop UI internals + sidecar protocol.
 
-If you get stuck, open a [Discussion](https://github.com/papapew/Vibechek/discussions) or a draft PR with `WIP:` in the title. We'd rather help early than review a finished thing that took a wrong turn.
+If you get stuck, open a [Discussion](https://github.com/captinjack99/Vibechek/discussions) or a draft PR with `WIP:` in the title. We'd rather help early than review a finished thing that took a wrong turn.
 
 By contributing, you agree your contributions are licensed under AGPL-3.0-or-later (the same license as the rest of the project) and that you have followed the [Code of Conduct](CODE_OF_CONDUCT.md).

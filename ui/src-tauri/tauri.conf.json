@@ -67,7 +67,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/papapew/Vibechek/releases/latest/download/latest.json"
+        "https://github.com/captinjack99/Vibechek/releases/latest/download/latest.json"
       ],
       "pubkey": "PLACEHOLDER_REPLACE_WITH_TAURI_SIGNER_PUBKEY"
     }

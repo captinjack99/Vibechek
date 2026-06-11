@@ -19,7 +19,7 @@ Vibechek looks at your music folder and helps you do four things:
 
 ## First launch
 
-1. Download the installer from [Releases](https://github.com/papapew/Vibechek/releases).
+1. Download the installer from [Releases](https://github.com/captinjack99/Vibechek/releases).
 2. Run it. On Windows the installer offers "Add to PATH" — you can leave it unchecked unless you want to use the CLI.
 3. Launch Vibechek.
 
@@ -479,9 +479,9 @@ The CLI is the same code the GUI uses; anything the GUI can do, the CLI can do.
 
 ## I want to help / report a bug / request a feature
 
-- **Bugs**: [github.com/papapew/Vibechek/issues](https://github.com/papapew/Vibechek/issues). The error toast has a "Report on GitHub" button that pre-fills the issue with your platform + sidecar info.
+- **Bugs**: [github.com/captinjack99/Vibechek/issues](https://github.com/captinjack99/Vibechek/issues). The error toast has a "Report on GitHub" button that pre-fills the issue with your platform + sidecar info.
 - **Features**: same place. Open an issue describing the use case.
 - **Code**: see [CONTRIBUTING](../README.md#contributing) in the main README.
-- **Money**: [GitHub Sponsors](https://github.com/sponsors/papapew) if Vibechek saved you a license fee. Entirely optional — starring the repo helps too.
+- **Money**: [GitHub Sponsors](https://github.com/sponsors/captinjack99) if Vibechek saved you a license fee. Entirely optional — starring the repo helps too.
 
 Thanks for using Vibechek. Hope it saves you a weekend.

@@ -61,11 +61,11 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 #      breaks the install.
 #
 # When publishing a new mirror, upload the .pb + .json files to
-# https://github.com/papapew/Vibechek/releases/download/models-v1/ and bump
+# https://github.com/captinjack99/Vibechek/releases/download/models-v1/ and bump
 # the tag below.
 _DEFAULT_MODEL_BASE_URLS = (
     "https://essentia.upf.edu/models",
-    "https://github.com/papapew/Vibechek/releases/download/models-v1",
+    "https://github.com/captinjack99/Vibechek/releases/download/models-v1",
 )
 _USER_MODEL_BASE_URL = os.environ.get("VIBECHEK_MODELS_URL", "").strip() or None
 MODEL_BASE_URLS: tuple[str, ...] = (
@@ -223,7 +223,7 @@ def _onnx_head_bases() -> list[str]:
     if _USER_MODEL_BASE_URL:
         return [_USER_MODEL_BASE_URL]
     return [
-        f"https://github.com/papapew/Vibechek/releases/download/{_ONNX_MODELS_RELEASE}"
+        f"https://github.com/captinjack99/Vibechek/releases/download/{_ONNX_MODELS_RELEASE}"
     ]
 
 

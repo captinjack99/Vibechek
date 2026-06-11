@@ -143,7 +143,7 @@ vibechek revert <journal>        # undo an organize/dedupe move
 
 ## Install
 
-**End users.** Grab the installer for your OS from the [Releases page](https://github.com/papapew/Vibechek/releases). The first time you click *Analyze*, the in-app setup walks you through everything missing:
+**End users.** Grab the installer for your OS from the [Releases page](https://github.com/captinjack99/Vibechek/releases). The first time you click *Analyze*, the in-app setup walks you through everything missing:
 
 - **Windows** → auto-installs WSL Ubuntu (UAC prompt), Vibechek + Essentia inside it, then optionally CUDA libs for GPU acceleration.
 - **macOS / Linux** → creates a managed venv at `~/.vibechek/venv/` and installs Essentia + Vibechek into it. Doesn't touch your system Python.
@@ -155,7 +155,7 @@ Either way: ~5-10 minutes total, no terminal, no `pip` to remember. Full walkthr
 **Developers** (for contributing or running from source):
 
 ```bash
-git clone https://github.com/papapew/Vibechek.git
+git clone https://github.com/captinjack99/Vibechek.git
 cd Vibechek
 
 # Python core
@@ -239,7 +239,7 @@ The whole point of Vibechek being OSS is that DJs-who-code can shape it. Contrib
 4. If you touched a Python dataclass, regenerate TS: `./.venv/Scripts/python.exe scripts/generate_ts_types.py`.
 5. Open a PR.
 
-If you're more of an ideas person than a code person — [open an issue](https://github.com/papapew/Vibechek/issues). Especially: what's missing from your DJ workflow that no tool currently does?
+If you're more of an ideas person than a code person — [open an issue](https://github.com/captinjack99/Vibechek/issues). Especially: what's missing from your DJ workflow that no tool currently does?
 
 ---
 
@@ -257,4 +257,4 @@ If you're more of an ideas person than a code person — [open an issue](https:/
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE). TL;DR: use it, fork it, modify it — but if you ship a modified version to others (including as a hosted web service), they must get the source too.
 
-If Vibechek saves you the cost of a Mixed In Key license, consider [sponsoring development](https://github.com/sponsors/papapew) or just starring the repo. It actually helps.
+If Vibechek saves you the cost of a Mixed In Key license, consider [sponsoring development](https://github.com/sponsors/captinjack99) or just starring the repo. It actually helps.

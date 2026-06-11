@@ -29,7 +29,7 @@ git push origin v0.5.0-beta
 #    - PUBLISHES a release for the tag with all artifacts attached
 #      (marked "pre-release" for -beta/-rc tags; auto-generated notes)
 #
-# 4. The release appears at https://github.com/papapew/Vibechek/releases.
+# 4. The release appears at https://github.com/captinjack99/Vibechek/releases.
 #    Optionally edit the auto-generated notes. Nothing else to click.
 ```
 
@@ -216,7 +216,7 @@ This prints a **public key** and writes the **private key** to `~/.tauri/vibeche
 
 When `createUpdaterArtifacts: true`, the bundler emits the per-platform updater bundle (`*.nsis.zip` on Windows, `*.app.tar.gz` on macOS, the `*.AppImage` on Linux) **plus a detached `*.sig` signature** for each. The signing is gated exactly like the OS certs: the `Configure code signing (opt-in)` step in `build-tauri` exports `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` to `$GITHUB_ENV` **only when the secret is non-empty**. With no key configured (and `createUpdaterArtifacts: false`), the build still succeeds — unsigned bundles, no `*.sig`, and the `release` job skips writing `latest.json`, so the in-app updater stays inert until you supply the key.
 
-The `release` job collects the `*.sig` files and synthesizes `release/latest.json` (the manifest `plugins.updater.endpoints` points at: `https://github.com/papapew/Vibechek/releases/latest/download/latest.json`), then attaches it alongside the installers. Because the endpoint resolves to `/releases/latest`, only a **published** (non-draft) release is visible to the updater — and the workflow now publishes on tag (`draft: false`), so a tagged release feeds the updater automatically once signing is enabled. (`/releases/latest` resolves to the latest **non-pre-release**, so `-beta`/`-rc` tags won't be served to the updater as "latest" — intended.)
+The `release` job collects the `*.sig` files and synthesizes `release/latest.json` (the manifest `plugins.updater.endpoints` points at: `https://github.com/captinjack99/Vibechek/releases/latest/download/latest.json`), then attaches it alongside the installers. Because the endpoint resolves to `/releases/latest`, only a **published** (non-draft) release is visible to the updater — and the workflow now publishes on tag (`draft: false`), so a tagged release feeds the updater automatically once signing is enabled. (`/releases/latest` resolves to the latest **non-pre-release**, so `-beta`/`-rc` tags won't be served to the updater as "latest" — intended.)
 
 ### Windows / macOS *installer* signing
 

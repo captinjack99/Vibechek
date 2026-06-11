@@ -35,7 +35,7 @@ def test_user_bootstrap_force_reinstalls_vibechek(engine: str) -> None:
     Regression: 'Set up now' left a stale beta.9 in WSL while the drift error
     told the user to do exactly that."""
     script = _user_bootstrap(engine)
-    assert "git+https://github.com/papapew/Vibechek.git" in script
+    assert "git+https://github.com/captinjack99/Vibechek.git" in script
     assert "--force-reinstall" in script, (
         f"{engine} bootstrap must force-reinstall vibechek to fix drift on re-run"
     )

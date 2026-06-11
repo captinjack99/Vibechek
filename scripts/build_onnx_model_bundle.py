@@ -90,13 +90,13 @@ def main() -> int:
     print(f"\nBundle: {out}  ({len(files)} files)\n")
     print(snippet)
     file_list = " ".join(f'"{out}/{name}"' for name in sorted(hashes))
-    print("Publish (run as the repo owner, authenticated as papapew):")
+    print("Publish (run as the repo owner, authenticated as captinjack99):")
     print(f"  gh release create {RELEASE_TAG} {file_list} \\")
     print('    --title "ONNX models v1" \\')
     print('    --notes "Converted Discogs-EffNet classification heads (.onnx + .json) for the '
           'TF-free ONNX inference engine. See docs/ONNX_MIGRATION.md." \\')
-    print("    -R papapew/Vibechek")
-    print(f"\n  # already exists?  gh release upload {RELEASE_TAG} {file_list} -R papapew/Vibechek --clobber")
+    print("    -R captinjack99/Vibechek")
+    print(f"\n  # already exists?  gh release upload {RELEASE_TAG} {file_list} -R captinjack99/Vibechek --clobber")
     return 0
 
 

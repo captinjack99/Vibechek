@@ -17,7 +17,7 @@ import { useNotificationStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
 import { LogsViewer } from "./LogsViewer";
 
-const ISSUES_URL = "https://github.com/papapew/Vibechek/issues/new";
+const ISSUES_URL = "https://github.com/captinjack99/Vibechek/issues/new";
 
 export function ErrorToast() {
   const error = useOperationStore((s) => s.error);

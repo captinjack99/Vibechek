@@ -568,21 +568,21 @@ First public beta. Feature-complete, headed for stable.
 
 ---
 
-[Unreleased]: https://github.com/papapew/Vibechek/compare/v0.5.0-beta...HEAD
-[0.5.0-beta]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.10...v0.5.0-beta
-[0.4.0-beta.10]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.9...v0.4.0-beta.10
-[0.4.0-beta.9]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.8...v0.4.0-beta.9
-[0.4.0-beta.8]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.6...v0.4.0-beta.8
-[0.4.0-beta.6]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.3...v0.4.0-beta.6
-[0.4.0-beta.3]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.11...v0.4.0-beta.3
-[0.3.0-beta.11]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.10...v0.3.0-beta.11
-[0.3.0-beta.10]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.9...v0.3.0-beta.10
-[0.3.0-beta.9]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.8...v0.3.0-beta.9
-[0.3.0-beta.8]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.7...v0.3.0-beta.8
-[0.3.0-beta.7]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.6...v0.3.0-beta.7
-[0.3.0-beta.6]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.5...v0.3.0-beta.6
-[0.3.0-beta.5]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.4...v0.3.0-beta.5
-[0.3.0-beta.4]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.3...v0.3.0-beta.4
-[0.3.0-beta.3]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.2...v0.3.0-beta.3
-[0.3.0-beta.2]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.1...v0.3.0-beta.2
-[0.3.0-beta.1]: https://github.com/papapew/Vibechek/releases/tag/v0.3.0-beta.1
+[Unreleased]: https://github.com/captinjack99/Vibechek/compare/v0.5.0-beta...HEAD
+[0.5.0-beta]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.10...v0.5.0-beta
+[0.4.0-beta.10]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.9...v0.4.0-beta.10
+[0.4.0-beta.9]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.8...v0.4.0-beta.9
+[0.4.0-beta.8]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.6...v0.4.0-beta.8
+[0.4.0-beta.6]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.3...v0.4.0-beta.6
+[0.4.0-beta.3]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.11...v0.4.0-beta.3
+[0.3.0-beta.11]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.10...v0.3.0-beta.11
+[0.3.0-beta.10]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.9...v0.3.0-beta.10
+[0.3.0-beta.9]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.8...v0.3.0-beta.9
+[0.3.0-beta.8]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.7...v0.3.0-beta.8
+[0.3.0-beta.7]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.6...v0.3.0-beta.7
+[0.3.0-beta.6]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.5...v0.3.0-beta.6
+[0.3.0-beta.5]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.4...v0.3.0-beta.5
+[0.3.0-beta.4]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.3...v0.3.0-beta.4
+[0.3.0-beta.3]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.2...v0.3.0-beta.3
+[0.3.0-beta.2]: https://github.com/captinjack99/Vibechek/compare/v0.3.0-beta.1...v0.3.0-beta.2
+[0.3.0-beta.1]: https://github.com/captinjack99/Vibechek/releases/tag/v0.3.0-beta.1

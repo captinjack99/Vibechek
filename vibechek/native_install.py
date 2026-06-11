@@ -350,7 +350,7 @@ def install_essentia_native(
     # ---- Step 4: vibechek itself ----
     if on_progress:
         on_progress(85, 100, "Installing vibechek...")
-    source = vibechek_source or "git+https://github.com/papapew/Vibechek.git"
+    source = vibechek_source or "git+https://github.com/captinjack99/Vibechek.git"
     rc, tail = _run_with_progress(
         [*venv_pip, "install", "--upgrade", source],
         on_progress=lambda line: on_progress and on_progress(90, 100, line[:120]),

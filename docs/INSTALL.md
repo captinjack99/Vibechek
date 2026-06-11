@@ -2,7 +2,7 @@
 
 Two flavors:
 
-- **Desktop app** (recommended for most users) — point-and-click. Handles its own dependencies via the in-app setup dialog. Download the installer for your OS from [Releases](https://github.com/papapew/Vibechek/releases). Windows ships a `.exe` (NSIS) installer, Linux a `.deb`/`.AppImage`, macOS a `.dmg` (Apple Silicon).
+- **Desktop app** (recommended for most users) — point-and-click. Handles its own dependencies via the in-app setup dialog. Download the installer for your OS from [Releases](https://github.com/captinjack99/Vibechek/releases). Windows ships a `.exe` (NSIS) installer, Linux a `.deb`/`.AppImage`, macOS a `.dmg` (Apple Silicon).
 - **CLI** (`vibechek` command) — for scripting, headless use, or running on a server.
 
 > **macOS first launch (beta builds are unsigned).** The `.dmg` isn't notarized yet,
@@ -14,7 +14,7 @@ Two flavors:
 > **In-app updates.** The desktop app can check for, download, and install updates from
 > **Settings → Software updates** once update signing is configured. Beta builds ship
 > unsigned, so the feature is inert on them — grab new betas from the
-> [Releases](https://github.com/papapew/Vibechek/releases) page until signing is enabled
+> [Releases](https://github.com/captinjack99/Vibechek/releases) page until signing is enabled
 > for the stable release.
 
 See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop app.
@@ -30,7 +30,7 @@ See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop 
 
 ### Recommended: pre-built release
 
-1. Go to [Releases](https://github.com/papapew/Vibechek/releases).
+1. Go to [Releases](https://github.com/captinjack99/Vibechek/releases).
 2. Download the archive for your OS.
 3. Extract somewhere stable (e.g. `C:\Program Files\Vibechek\` or `~/.local/bin/vibechek/`).
 4. Add the extracted folder to your `PATH`. The Windows CLI ships as `vibechek-windows-x64.zip` — there's no separate setup program, so add the extracted folder to your user `PATH` by hand (System Properties → Environment Variables). *(The point-and-click desktop app is a separate NSIS `.exe` — see the two flavors above.)*
@@ -39,7 +39,7 @@ See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop 
 ### Alternative: pip install from source
 
 ```bash
-git clone https://github.com/papapew/Vibechek.git
+git clone https://github.com/captinjack99/Vibechek.git
 cd Vibechek
 pip install -e .
 ```

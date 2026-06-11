@@ -466,7 +466,7 @@ jobs:
             vibechek download-models
             ```
 
-            Windows: see [docs/INSTALL.md](https://github.com/papapew/Vibechek/blob/main/docs/INSTALL.md) for the WSL workaround.
+            Windows: see [docs/INSTALL.md](https://github.com/captinjack99/Vibechek/blob/main/docs/INSTALL.md) for the WSL workaround.
 
             ### What's new
             <!-- generate_release_notes fills this in from commits since last tag -->

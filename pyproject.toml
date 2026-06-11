@@ -110,9 +110,9 @@ dev = [
 vibechek = "vibechek.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/papapew/Vibechek"
-Issues = "https://github.com/papapew/Vibechek/issues"
-Documentation = "https://github.com/papapew/Vibechek/tree/main/docs"
+Homepage = "https://github.com/captinjack99/Vibechek"
+Issues = "https://github.com/captinjack99/Vibechek/issues"
+Documentation = "https://github.com/captinjack99/Vibechek/tree/main/docs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vibechek"]

@@ -11,7 +11,7 @@ fully-local **online LLM lookup**) plus smart existing-tag reconciliation. It ru
 entirely on your machine: no account, no telemetry, no upload. Free forever under
 **AGPL-3.0**.
 
-- **Repo:** https://github.com/papapew/Vibechek
+- **Repo:** https://github.com/captinjack99/Vibechek
 - **Current version:** `v0.5.0-beta` (public beta)
 - **Platforms:** Windows, macOS, Linux (desktop app + CLI)
 
