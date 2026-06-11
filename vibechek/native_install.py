@@ -143,13 +143,18 @@ def probe_native_venv(engine: str = "essentia_tf") -> NativeVenvStatus:
             pass
 
     # Disk-only check for essentia (avoids the ~10s TF load that
-    # `import essentia` would trigger).
+    # `import essentia` would trigger). NB: the wildcard segment must be
+    # globbed from the venv ROOT — `Path.glob()` only expands wildcards in
+    # the pattern argument, so the old `(vd/"lib"/"python3.*").glob(
+    # "site-packages")` treated `python3.*` as a literal directory name and
+    # the Unix venv layout never matched: Linux/macOS always reported
+    # "essentia not installed" even right after a successful install.
     site_packages_globs = [
-        vd / "lib" / "python3.*" / "site-packages",
-        vd / "Lib" / "site-packages",  # Windows venv layout
+        "lib/python3.*/site-packages",  # Unix venv layout
+        "Lib/site-packages",  # Windows venv layout
     ]
     for pattern in site_packages_globs:
-        for sp in pattern.parent.glob(pattern.name):
+        for sp in vd.glob(pattern):
             # `essentia-tensorflow` installs both `essentia/` and a dist-info
             for d in sp.glob("essentia*.dist-info"):
                 status.essentia_installed = True

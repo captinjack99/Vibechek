@@ -11,6 +11,13 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 ## [Unreleased]
 
 ### Added
+- **Native smoke workflow** (`native-smoke.yml`, manual + weekly). The unit-test
+  matrix already covers all three OSes, but nothing ever exercised the LIVE
+  sidecar on real Linux/macOS hardware. The new `scripts/rpc_smoke.py` driver
+  spawns the actual `vibechek rpc` entry the desktop shell uses against a
+  base (`pip install -e .`, no dev extras) install — proving the runtime
+  dependency closure — and asserts ping / venv probe / scan / no-engine
+  analyze behavior end-to-end on ubuntu + macos runners.
 - **Operation ids on progress events.** Long-op RPCs accept a client-generated
   `op_id`; the sidecar echoes it (plus the op `kind`) on every `progress` /
   `track_analyzed` notification, and every GUI consumer of the shared progress
@@ -78,6 +85,13 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   unified modal/button skins.
 
 ### Fixed
+- **Linux/macOS always reported "essentia not installed"** for the managed
+  native venv: `probe_native_venv` put the `python3.*` wildcard in the glob's
+  *parent* path, which `Path.glob()` treats as a literal directory name, so
+  the Unix `lib/python3.x/site-packages` layout never matched — the Settings
+  engine row showed the install as missing even immediately after a
+  successful one. Globs now run from the venv root; locked with
+  unix/windows-layout regression tests.
 - A fresh end-to-end audit (19 findings): CLAP-aware worker memory budgeting
   (prevents an OOM storm on 32 GB boxes), cancellable + progress-emitting web
   lookup that probes/restarts the local LLM first, checkpoint files no longer
