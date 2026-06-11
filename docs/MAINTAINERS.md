@@ -103,10 +103,12 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
   - **Dev/CI-on-demand scripts** (none in the wheel or the unit suite):
     `scripts/onnx_parity.py` (the parity gate — proves ONNX matches essentia-TF; needs the
     real models + both runtimes), `scripts/convert_heads_to_onnx.py` (the one-off tf2onnx
-    head conversion), and `scripts/build_onnx_model_bundle.py` (assembles the
-    `models-onnx-v1` release bundle). **The converted head `.onnx` files still need hosting
-    on the model mirror** to flip the default; until then a developer runs the convert
-    script locally.
+    head conversion), and `scripts/build_onnx_model_bundle.py` (historical — assembled the
+    never-needed `models-onnx-v1` bundle). **The hosting gate is GONE:** the converted
+    heads (~5 MB) ship **bundled** in `vibechek/onnx_assets/` (PyInstaller datas + the
+    wheel), and the one-click `setup_onnx_engine` stages them + fetches only the official
+    EffNet backbone from essentia. Flipping the ONNX default now only awaits cross-vendor
+    GPU validation on real AMD/Apple hardware.
 - **Every test must import-cleanly on a `[dev]`-only install.** CI installs *only* the
   `[dev]` extra — no essentia, onnxruntime, or soundfile. A test that imports a heavy dep
   at module top level breaks the *whole* collection (not just that test). Gate heavy deps

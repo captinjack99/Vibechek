@@ -9,10 +9,11 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 (the authoritative method list), and the "Sidecar protocol" section of
 [`ui/README.md`](../ui/README.md).
 
-> **The method surface stays at 44** — no new RPC *methods* through beta.10. FLAC → CDJ
-> export is a CLI-only command (`vibechek cdj-export`). The ONNX inference engine did not
-> add a method either, but it **did add params to existing methods** (the engine selection
-> crosses the wire) — see "Engine-aware params" below.
+> **The method surface is 47.** The one-click engine setups added three methods —
+> `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` (all cancellable,
+> progress-emitting) — while FLAC → CDJ export stayed CLI-only (`vibechek cdj-export`).
+> Engine/genre selection also **added params to existing methods** (they cross the
+> wire) — see "Engine-aware params" below.
 
 ## Engine-aware params (ONNX inference engine)
 

@@ -112,9 +112,10 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 
 ## Project stats
 
-<!-- These mirror the README stats line (auto-updated by scripts/update_readme_stats.py). -->
-- **675 Python tests**, **44 JSON-RPC methods**, **29 Python modules**
-- **38 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+<!-- These mirror the README stats line. NOTE: scripts/update_readme_stats.py
+     only rewrites README.md — refresh this copy by hand when it drifts. -->
+- **861 Python tests**, **47 JSON-RPC methods**, **31 Python modules**
+- **62 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
 - Production-tested against a ~12,000-track personal DJ library
 
 ## Roadmap

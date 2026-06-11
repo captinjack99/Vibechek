@@ -48,7 +48,7 @@ ui/
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │  `vibechek rpc` (Python sidecar)                       │
-│  - 44 RPC methods, threadpool dispatch (8 workers)     │
+│  - 47 RPC methods, threadpool dispatch (8 workers)     │
 │  - Stdout lock keeps concurrent JSON frames atomic     │
 │  - Cooperative cancellation token                      │
 │  - All real work: analyzer, tagger, dedup, organize    │
