@@ -31,8 +31,43 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 - `reconcile_genre` gained a web tier; the genre taxonomy now recognizes modern
   Beatport subgenres (Tech/Bass/Funky/Future/Afro/Organic House, Melodic House &
   Techno, Midtempo Bass, Future Rave, …). New CLI flags `--genre-classifier`,
-  `--genre-web-lookup`, `--genre-llm-backend`; new RPCs `setup_clap_engine`,
-  `setup_genre_resolver`.
+  `--genre-web-lookup`, `--genre-llm-backend`, `--genre-override-confidence`;
+  new RPCs `setup_clap_engine`, `setup_genre_resolver`.
+- **Variant-aware de-duplication.** Acoustic dedupe now keeps the versions a DJ
+  wants side by side — Extended vs Radio vs Remix edits, or a FLAC *Original Mix*
+  next to an MP3 *Extended* — collapsing only true duplicates *within* a version.
+  Configurable: `keep_distinct_versions` (default on), `keep_all_formats`,
+  `version_duration_tolerance`; CLI `--across-versions` / `--keep-all-formats`.
+- **Configurable existing-tag ↔ ML genre reconciliation**
+  (`genre_source_policy`: prefer_tag default / prefer_ml / tag_only / ml_only,
+  with `genre_ml_override_confidence`). Specific curated tags are trusted,
+  generic junk ("Dance/Pop") is ignored, and a confident disagreeing model read
+  can override. The WSL analyzer now **auto-updates in place** on version drift
+  (and on same-version code drift via the "No such option" self-heal) instead of
+  failing or silently degrading.
+
+### Changed
+- **UI elevation across every view (all OSs).** Bundled Inter Variable +
+  JetBrains Mono (identical rendering on Windows/macOS/Linux); dark
+  `color-scheme` so native widgets (select popups, checkboxes, scrollbars) stop
+  rendering light; dark titlebar + no white startup flash; visible keyboard
+  focus rings app-wide; `prefers-reduced-motion` respected; desktop-app
+  text-selection + context-menu behavior; library column headers; keyboard-
+  operable track rows; modal a11y (role/aria-modal/Esc) on every dialog;
+  toasts above modals with pause-on-hover + an amber warning kind; WCAG
+  contrast bumps for informational text; solid-red destructive buttons;
+  unified modal/button skins.
+
+### Fixed
+- A fresh end-to-end audit (19 findings): CLAP-aware worker memory budgeting
+  (prevents an OOM storm on 32 GB boxes), cancellable + progress-emitting web
+  lookup that probes/restarts the local LLM first, checkpoint files no longer
+  claim "complete" mid-run, genre canonicalization no longer invents
+  specificity ("house" → "Tech House"), grounding requires real web results,
+  CLAP confidence calibrated to the tag-gate scale, Psytrance-family mapping,
+  organize path updates now use the sidecar's actual moved pairs (cancelled
+  runs no longer point the library at phantom locations), setup-dialog cancel
+  no longer renders as an error, and more (see commit for the full list).
 
 ---
 
@@ -522,7 +557,13 @@ First public beta. Feature-complete, headed for stable.
 
 ---
 
-[Unreleased]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.11...HEAD
+[Unreleased]: https://github.com/papapew/Vibechek/compare/v0.5.0-beta...HEAD
+[0.5.0-beta]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.10...v0.5.0-beta
+[0.4.0-beta.10]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.9...v0.4.0-beta.10
+[0.4.0-beta.9]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.8...v0.4.0-beta.9
+[0.4.0-beta.8]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.6...v0.4.0-beta.8
+[0.4.0-beta.6]: https://github.com/papapew/Vibechek/compare/v0.4.0-beta.3...v0.4.0-beta.6
+[0.4.0-beta.3]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.11...v0.4.0-beta.3
 [0.3.0-beta.11]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.10...v0.3.0-beta.11
 [0.3.0-beta.10]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.9...v0.3.0-beta.10
 [0.3.0-beta.9]: https://github.com/papapew/Vibechek/compare/v0.3.0-beta.8...v0.3.0-beta.9
