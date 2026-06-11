@@ -28,12 +28,20 @@ export default {
         },
       },
       fontFamily: {
+        // Inter Variable is BUNDLED (main.tsx imports @fontsource-variable/
+        // inter), so body + headings render identically on every OS instead
+        // of the Segoe-UI / SF-Pro / DejaVu lottery. The system stack remains
+        // as fallback for the pre-font-load frame.
         sans: [
-          "ui-sans-serif", "system-ui", "-apple-system", "Segoe UI",
-          "Helvetica Neue", "Arial", "sans-serif",
+          "Inter Variable", "Inter", "ui-sans-serif", "system-ui",
+          "-apple-system", "Segoe UI", "Helvetica Neue", "Arial", "sans-serif",
         ],
-        display: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
-        mono: ["JetBrains Mono", "ui-monospace", "SFMono-Regular", "monospace"],
+        display: [
+          "Inter Variable", "Inter", "ui-sans-serif", "system-ui", "sans-serif",
+        ],
+        // JetBrains Mono is bundled too — consistent metrics for the BPM /
+        // key / size columns across platforms.
+        mono: ["JetBrains Mono", "ui-monospace", "SFMono-Regular", "Consolas", "monospace"],
       },
       animation: {
         "fade-in": "fade-in 0.2s ease-out",

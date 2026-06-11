@@ -109,6 +109,9 @@ export function LogsViewer({ open, onClose }: Props) {
       exit={{ opacity: 0 }}
       className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center px-4"
       onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Logs"
     >
       <motion.div
         initial={{ scale: 0.96, y: 10 }}
@@ -122,7 +125,7 @@ export function LogsViewer({ open, onClose }: Props) {
             <h2 className="font-display font-semibold text-lg">Logs</h2>
             <p className="text-xs text-white/40 font-mono truncate">{logFile}</p>
           </div>
-          <button onClick={onClose} className="text-white/40 hover:text-white -m-1 p-1">
+          <button onClick={onClose} className="text-white/40 hover:text-white -m-1 p-1" aria-label="Close">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -172,7 +175,7 @@ export function LogsViewer({ open, onClose }: Props) {
         {/* Log pane */}
         <div
           ref={paneRef}
-          className="flex-1 overflow-auto px-4 py-3 font-mono text-[11px] leading-relaxed text-white/70 bg-surface-300/40"
+          className="flex-1 overflow-auto px-4 py-3 font-mono text-[11px] leading-relaxed text-white/70 bg-surface-300/40 select-text"
         >
           {filtered.length === 0 ? (
             <div className="text-white/30 text-center py-8">

@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { AnimatePresence } from "framer-motion";
+import { AnimatePresence, MotionConfig } from "framer-motion";
 
 import { Sidebar } from "./components/Sidebar";
 import { LibraryBrowser } from "./components/LibraryBrowser";
@@ -98,12 +98,12 @@ export default function App() {
   // `notify` notification (re-broadcast by the Rust shell as `sidecar:notify`)
   // when it detects a risky install location — without a listener this was the
   // single mechanism warning users about hang-prone paths, and it was silently
-  // dropped. The notification store has no "warning" kind, so map level →
-  // "info" (still distinct from the sticky red operation-error toast).
+  // dropped. Warnings render amber (the store's "warning" kind) instead of
+  // being shoehorned into cheerful cyan "info".
   useSidecarEvent<NotifyPayload>("notify", (payload) => {
     if (!payload?.message) return;
     useNotificationStore.getState().notify(payload.message, {
-      kind: "info",
+      kind: payload.level === "warning" ? "warning" : "info",
       detail: payload.detail,
     });
   });
@@ -117,10 +117,12 @@ export default function App() {
   const seenOnboarding = useConfigStore((s) => s.config.ui.seen_onboarding);
   const showOnboarding = configLoaded && !seenOnboarding;
 
-  // Esc closes overlays / clears selection
+  // Esc clears the track-inspector selection — but NOT while a modal dialog
+  // is open: Esc inside ConfirmModal/etc. should only dismiss the dialog, not
+  // also silently close TrackDetails behind it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && !document.querySelector('[role="dialog"]')) {
         useUIStore.getState().setSelectedTrack(null);
       }
     };
@@ -128,40 +130,57 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Desktop-app feel: suppress the browser context menu ("Reload", "Inspect",
+  // "Back") everywhere except editable fields and explicit opt-ins.
+  useEffect(() => {
+    const onContextMenu = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest("input, textarea, [contenteditable], [data-allow-context]")) return;
+      e.preventDefault();
+    };
+    window.addEventListener("contextmenu", onContextMenu);
+    return () => window.removeEventListener("contextmenu", onContextMenu);
+  }, []);
+
   return (
-    <div className="h-full flex flex-col bg-surface-200">
-      <div className="flex-1 flex min-h-0">
-        <Sidebar />
-        <main className="flex-1 min-w-0 overflow-hidden">
-          {viewMode === "library" && <LibraryBrowser />}
-          {viewMode === "duplicates" && <DuplicatesView />}
-          {viewMode === "organize" && <OrganizeView />}
-          {viewMode === "tags" && <TagsView />}
-          {viewMode === "settings" && <Settings />}
-        </main>
-        {/* TrackDetails is library-tab only (it's the track inspector for the
-            library list). Audio playback no longer lives here — the global
-            <GlobalAudioPlayer/> bar owns it and persists across tabs. */}
-        {viewMode === "library" && <TrackDetails />}
+    // reducedMotion="user": every framer-motion animation respects the OS
+    // prefers-reduced-motion setting (the CSS keyframes are handled by the
+    // media query in globals.css).
+    <MotionConfig reducedMotion="user">
+      <div className="h-full flex flex-col bg-surface-200">
+        <div className="flex-1 flex min-h-0">
+          <Sidebar />
+          <main className="flex-1 min-w-0 overflow-hidden">
+            {viewMode === "library" && <LibraryBrowser />}
+            {viewMode === "duplicates" && <DuplicatesView />}
+            {viewMode === "organize" && <OrganizeView />}
+            {viewMode === "tags" && <TagsView />}
+            {viewMode === "settings" && <Settings />}
+          </main>
+          {/* TrackDetails is library-tab only (it's the track inspector for the
+              library list). Audio playback no longer lives here — the global
+              <GlobalAudioPlayer/> bar owns it and persists across tabs. */}
+          {viewMode === "library" && <TrackDetails />}
+        </div>
+
+        {/* The single global audio player — persists across every tab so
+            playback is always controllable and only one track ever sounds. */}
+        <GlobalAudioPlayer />
+
+        <AnimatePresence>
+          <AnalysisProgress />
+          <ErrorToast />
+        </AnimatePresence>
+        <Toast />
+
+        <AnimatePresence>
+          <OperationsHistory />
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {showOnboarding && <Onboarding />}
+        </AnimatePresence>
       </div>
-
-      {/* The single global audio player — persists across every tab so
-          playback is always controllable and only one track ever sounds. */}
-      <GlobalAudioPlayer />
-
-      <AnimatePresence>
-        <AnalysisProgress />
-        <ErrorToast />
-      </AnimatePresence>
-      <Toast />
-
-      <AnimatePresence>
-        <OperationsHistory />
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {showOnboarding && <Onboarding />}
-      </AnimatePresence>
-    </div>
+    </MotionConfig>
   );
 }

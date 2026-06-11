@@ -1,28 +1,32 @@
 /**
  * Stack of transient notifications at the bottom-right.
  *
- * Each notification auto-dismisses after 4 seconds; the user can also click
- * the X to dismiss early. Reads from `useNotificationStore`. Components push
- * notifications via `useNotificationStore.getState().notify(...)`.
+ * Auto-dismisses (4 s, or 8 s when a detail line needs reading time), pauses
+ * the timer on hover, and caps the visible stack (store-side). Reads from
+ * `useNotificationStore`; components push via
+ * `useNotificationStore.getState().notify(...)`.
  *
  * Different from `ErrorToast`: that one is sticky, top-centred, and styled for
- * failure. This one is small, cheerful, and stacks.
+ * failure. This one is small, cheerful, and stacks. Rendered at z-[70] — ABOVE
+ * modal backdrops (z-[60]) so a toast fired while a dialog is open isn't dimmed
+ * behind it.
  */
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle2, Info, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Info, X } from "lucide-react";
 
 import { useNotificationStore, type Notification } from "../stores";
 
 const AUTO_DISMISS_MS = 4000;
+const AUTO_DISMISS_DETAIL_MS = 8000;
 
 export function Toast() {
   const items = useNotificationStore((s) => s.items);
   const dismiss = useNotificationStore((s) => s.dismiss);
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 items-end pointer-events-none">
+    <div className="fixed bottom-4 right-4 z-[70] flex flex-col gap-2 items-end pointer-events-none">
       <AnimatePresence>
         {items.map((n) => (
           <ToastItem key={n.id} notification={n} onDismiss={() => dismiss(n.id)} />
@@ -32,6 +36,12 @@ export function Toast() {
   );
 }
 
+const KIND_STYLE: Record<Notification["kind"], { icon: typeof Info; accent: string }> = {
+  success: { icon: CheckCircle2, accent: "text-accent-green border-accent-green/30 bg-accent-green/10" },
+  info: { icon: Info, accent: "text-accent-cyan border-accent-cyan/30 bg-accent-cyan/10" },
+  warning: { icon: AlertTriangle, accent: "text-accent-yellow border-accent-yellow/30 bg-accent-yellow/10" },
+};
+
 function ToastItem({
   notification,
   onDismiss,
@@ -39,16 +49,27 @@ function ToastItem({
   notification: Notification;
   onDismiss: () => void;
 }) {
-  useEffect(() => {
-    const t = setTimeout(onDismiss, AUTO_DISMISS_MS);
-    return () => clearTimeout(t);
-  }, [onDismiss]);
+  // Pause-on-hover: reading a multi-line detail used to race a fixed 4 s
+  // timer. Hover clears the timeout; leaving re-arms it in full.
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ttl = notification.detail ? AUTO_DISMISS_DETAIL_MS : AUTO_DISMISS_MS;
 
-  const Icon = notification.kind === "success" ? CheckCircle2 : Info;
-  const accent =
-    notification.kind === "success"
-      ? "text-accent-green border-accent-green/30 bg-accent-green/10"
-      : "text-accent-cyan border-accent-cyan/30 bg-accent-cyan/10";
+  const arm = () => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(onDismiss, ttl);
+  };
+  const pause = () => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+  };
+
+  useEffect(() => {
+    arm();
+    return pause;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const { icon: Icon, accent } = KIND_STYLE[notification.kind] ?? KIND_STYLE.info;
 
   return (
     <motion.div
@@ -59,6 +80,8 @@ function ToastItem({
       className={`pointer-events-auto panel-pad min-w-[280px] max-w-md flex items-start gap-3 shadow-lg ${accent}`}
       role="status"
       aria-live="polite"
+      onMouseEnter={pause}
+      onMouseLeave={arm}
     >
       <Icon className="w-5 h-5 flex-none mt-0.5" />
       <div className="flex-1 min-w-0">

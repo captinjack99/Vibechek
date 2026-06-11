@@ -163,7 +163,7 @@ export function Sidebar() {
       </div>
 
       {/* Footer */}
-      <div className="px-4 py-3 text-[10px] text-white/30">
+      <div className="px-4 py-3 text-[10px] text-white/50">
         AGPL-3.0 • open source
       </div>
     </aside>

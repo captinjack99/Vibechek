@@ -6,16 +6,57 @@
  * Base
  * ------------------------------------------------------------------------- */
 
+:root {
+  /* Theme every NATIVE widget dark (select popups, checkboxes, range inputs,
+   * scrollbars, autofill) on WebView2 + WebKitGTK — without this, <select>
+   * dropdowns opened as white lists with black text inside the dark app. */
+  color-scheme: dark;
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;
   padding: 0;
 }
 
+html, body {
+  /* Stop macOS rubber-band / scroll-chaining bounce on the app shell. */
+  overscroll-behavior: none;
+}
+
 body {
   font-family: theme('fontFamily.sans');
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Desktop-app feel: UI chrome (labels, buttons, badges) isn't selectable —
+   * click-dragging a toolbar no longer paints blue selection like a webpage.
+   * Genuinely copyable content opts back in via `select-text` (inputs,
+   * textareas, code/log/path blocks). */
+  user-select: none;
+}
+
+input, textarea, pre, code, [contenteditable] {
+  user-select: text;
+}
+
+/* Keyboard a11y: a clearly visible focus ring, only for keyboard navigation
+ * (mouse clicks don't flash it). Applies app-wide so even unstyled icon
+ * buttons give keyboard users a position fix — previously the app had ZERO
+ * visible focus treatment on a dark background. */
+:focus-visible {
+  outline: 2px solid theme('colors.accent.DEFAULT' / 70%);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Respect prefers-reduced-motion for the CSS keyframe animations (framer-
+ * motion is handled by <MotionConfig reducedMotion="user"> in App.tsx). */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* Scrollbar — subtle on dark background */
@@ -24,8 +65,19 @@ body {
 ::-webkit-scrollbar-thumb {
   background: rgba(255,255,255,0.08);
   border-radius: 5px;
+  /* Padding trick: keep the thumb off the content edge. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); background-clip: padding-box; }
+/* The corner where H+V scrollbars meet rendered as a white square on
+ * WebView2 when content overflowed both ways (e.g. the log viewer). */
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* <summary> disclosure: Chromium hides the marker under display:flex, but
+ * WebKitGTK (Linux) still painted a stray triangle before our icons. */
+summary { list-style: none; }
+summary::-webkit-details-marker { display: none; }
 
 /* ---------------------------------------------------------------------------
  * Reusable component classes
@@ -42,7 +94,15 @@ body {
 
   .btn {
     @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
-           transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+           transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70
+           focus-visible:ring-offset-2 focus-visible:ring-offset-surface-200;
+  }
+
+  /* Small-button modifier: ~10 call sites faked this with ad-hoc text-xs
+   * paddings, and one referenced .btn-sm before it existed. */
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
   }
 
   .btn-primary {
@@ -53,13 +113,18 @@ body {
     @apply btn text-white/80 hover:text-white hover:bg-white/5;
   }
 
+  /* Solid red: a destructive CTA ("Send to trash") used to render QUIETER
+   * than the purple primary next to it — inverted visual weight for the one
+   * button that deletes things. */
   .btn-danger {
-    @apply btn bg-accent-red/20 text-accent-red hover:bg-accent-red/30;
+    @apply btn bg-accent-red text-white hover:bg-accent-red/90;
   }
 
   .input {
     @apply bg-surface-200 border border-white/10 rounded-lg px-3 py-2 text-sm
-           focus:outline-none focus:border-accent/60 placeholder-white/30;
+           placeholder-white/40
+           focus:outline-none focus:border-accent/60
+           focus-visible:ring-2 focus-visible:ring-accent/40;
   }
 
   .label {
@@ -68,7 +133,8 @@ body {
 
   .track-row {
     @apply flex items-center px-4 py-2 border-b border-white/5
-           hover:bg-white/[0.03] cursor-pointer transition-colors;
+           hover:bg-white/[0.03] cursor-pointer transition-colors
+           focus-visible:outline-none focus-visible:bg-white/[0.06];
   }
 
   .track-row.selected {

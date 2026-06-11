@@ -844,6 +844,8 @@ export function Settings() {
                   void validateModelsDir(p);
                 });
               }}
+              aria-label="Choose models folder"
+              title="Choose models folder"
             >
               <FolderOpen className="w-4 h-4" />
             </button>
@@ -1059,6 +1061,8 @@ export function Settings() {
               <button
                 className="btn-ghost"
                 onClick={() => handlePickDir((p) => updateDuplicates({ review_folder: p }))}
+                aria-label="Choose review folder"
+                title="Choose review folder"
               >
                 <FolderOpen className="w-4 h-4" />
               </button>
@@ -1111,6 +1115,8 @@ export function Settings() {
             <button
               className="btn-ghost"
               onClick={() => handlePickDir((p) => updateOrganization({ target_root: p }))}
+              aria-label="Choose target root folder"
+              title="Choose target root folder"
             >
               <FolderOpen className="w-4 h-4" />
             </button>
@@ -1421,7 +1427,9 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 function Hint({ children }: { children: React.ReactNode }) {
-  return <div className="text-xs text-white/40 mt-1">{children}</div>;
+  // /50 ≈ 5.2:1 on the dark surface (WCAG AA); the old /40 (~3.9:1) failed
+  // for what is genuinely informational text.
+  return <div className="text-xs text-white/50 mt-1">{children}</div>;
 }
 
 /**

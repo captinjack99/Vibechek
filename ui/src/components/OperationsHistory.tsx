@@ -147,6 +147,9 @@ export function OperationsHistory() {
       exit={{ opacity: 0 }}
       className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center px-4"
       onClick={() => setOpen(false)}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Recent operations"
     >
       <motion.div
         initial={{ scale: 0.96, y: 10 }}
@@ -163,7 +166,7 @@ export function OperationsHistory() {
               from your OS recycle bin.
             </p>
           </div>
-          <button onClick={() => setOpen(false)} className="text-white/40 hover:text-white -m-1 p-1">
+          <button onClick={() => setOpen(false)} className="text-white/40 hover:text-white -m-1 p-1" aria-label="Close">
             <X className="w-5 h-5" />
           </button>
         </div>

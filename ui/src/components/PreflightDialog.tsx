@@ -75,6 +75,16 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     }
   }, [logLines]);
 
+  // Esc closes the dialog — but not mid-install (matching the suppressed
+  // backdrop click): keyboard users previously had NO way to dismiss it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busyAction) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busyAction, onClose]);
+
   const handleCancel = async () => {
     try {
       await rpc("cancel_operation");
@@ -233,12 +243,15 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center px-4"
+      className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center px-4"
       // don't let a stray backdrop click dismiss the
       // dialog mid-install. The user would lose the live progress log and
       // the post-install note; the underlying install keeps running but they
       // can't see it. Suppress the click while any step is busy.
       onClick={busyAction ? undefined : onClose}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Setup needed before analyze"
     >
       <motion.div
         initial={{ scale: 0.96, y: 10 }}

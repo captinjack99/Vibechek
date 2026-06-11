@@ -1,5 +1,7 @@
 import { clsx } from "clsx";
 
+import { ENERGY_RAMP } from "../lib/colors";
+
 type BadgeColor = "purple" | "cyan" | "green" | "yellow" | "red" | "neutral";
 
 const COLOR_CLASSES: Record<BadgeColor, string> = {
@@ -33,7 +35,7 @@ export function TagBadge({
 /** Compact 5-step energy bar (level 0-5). */
 export function EnergyBar({ level }: { level: number }) {
   const safe = Math.max(0, Math.min(5, level));
-  const colors = ["#10b981", "#84cc16", "#f59e0b", "#f97316", "#ef4444"];
+  const colors = ENERGY_RAMP;
   return (
     <div className="flex items-center gap-0.5">
       {Array.from({ length: 5 }, (_, i) => {

@@ -508,7 +508,12 @@ export function OrganizeView() {
                 }}
                 onBlur={(e) => validateTarget(e.target.value)}
               />
-              <button className="btn-ghost" onClick={handlePickTargetRoot}>
+              <button
+                className="btn-ghost"
+                onClick={handlePickTargetRoot}
+                aria-label="Choose target root folder"
+                title="Choose target root folder"
+              >
                 <FolderOpen className="w-4 h-4" />
               </button>
             </div>
