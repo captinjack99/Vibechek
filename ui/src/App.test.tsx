@@ -75,9 +75,9 @@ describe("<App /> — sidecar:notify install-path warning", () => {
     const item = useNotificationStore
       .getState()
       .items.find((n) => n.message.includes("Google Drive"))!;
-    // The store has no "warning" kind; a warning maps to "info" (not the sticky
-    // red operation-error toast).
-    expect(item.kind).toBe("info");
+    // A sidecar warning renders as the amber "warning" kind (distinct from
+    // cheerful info AND from the sticky red operation-error toast).
+    expect(item.kind).toBe("warning");
     expect(item.detail).toMatch(/hang on launch/);
   });
 

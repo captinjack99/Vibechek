@@ -1017,6 +1017,18 @@ export function LibraryBrowser() {
         </div>
       )}
 
+      {/* Column header — the badge/size columns were unlabeled, leaving a new
+          user to guess that "8A" is a key and the mono number is megabytes. */}
+      {filtered.length > 0 && (
+        <div className="flex items-center px-4 py-1.5 border-b border-white/10 text-[10px] uppercase tracking-wider text-white/40 select-none">
+          <span className="w-7 mr-2 flex-none" aria-hidden="true" />
+          <span className="flex-1 min-w-0 mr-4">Title / Artist</span>
+          <span className="hidden sm:block mr-4">Genre · BPM · Key</span>
+          <span className="w-20 hidden md:block mr-4">Energy</span>
+          <span className="w-16 text-right">Size</span>
+        </div>
+      )}
+
       {/* Track list */}
       <div className="flex-1 min-h-0">
         <Virtuoso
@@ -1268,9 +1280,19 @@ function TrackRow({ track, selected, checked, onCheck, onClick }: TrackRowProps)
     <div
       onClick={onClick}
       className={cx("track-row", selected && "selected")}
+      // Keyboard operability: the row is the ONLY way to open the track
+      // inspector, and a plain clickable div was unreachable by keyboard.
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
     >
       <button
-        className="text-white/30 hover:text-white p-1 mr-2 flex-none"
+        className="text-white/40 hover:text-white p-1 mr-2 flex-none"
         onClick={(e) => { e.stopPropagation(); onCheck(); }}
         title={checked ? "Deselect" : "Select"}
       >
@@ -1285,7 +1307,7 @@ function TrackRow({ track, selected, checked, onCheck, onClick }: TrackRowProps)
         <div className="text-sm text-white truncate">
           {track.filename_title ?? track.filename}
         </div>
-        <div className="text-xs text-white/40 truncate">
+        <div className="text-xs text-white/50 truncate">
           {track.filename_artist ?? ""}
         </div>
       </div>

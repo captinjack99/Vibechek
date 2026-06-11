@@ -19,6 +19,7 @@ import WaveSurfer from "wavesurfer.js";
 import { Play, Pause, X, AlertCircle, Loader2, Music } from "lucide-react";
 
 import { usePlayerStore } from "../stores";
+import { ACCENT } from "../lib/colors";
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds)) return "--:--";
@@ -70,7 +71,7 @@ export function GlobalAudioPlayer() {
     const ws = WaveSurfer.create({
       container: containerRef.current,
       waveColor: "rgba(255,255,255,0.25)",
-      progressColor: "#a855f7",
+      progressColor: ACCENT,
       cursorColor: "rgba(255,255,255,0.4)",
       barWidth: 2,
       barGap: 1,

@@ -401,10 +401,18 @@ export function TagsView() {
               <div className="text-accent-yellow">This seems stuck.</div>
               <div className="text-xs text-white/60 mt-1">
                 No progress for over a minute. The operation may still be working
-                on a single large file, or it may have hung. Cancel to abort and
-                try again.
+                on a single large file, or it may have hung.
               </div>
             </div>
+            {/* The old copy said "Cancel to abort" without offering a Cancel —
+                embed the affordance instead of pointing at one elsewhere. */}
+            <button
+              className="btn-ghost btn-sm text-accent-yellow flex-none"
+              onClick={() => { void rpc("cancel_operation").catch(() => undefined); }}
+              title="Cancel the stuck operation"
+            >
+              Cancel
+            </button>
           </div>
         )}
 
@@ -635,13 +643,24 @@ function RemapRestoreDialog({
   onBackdropClick: () => void;
 }) {
   const canRun = backupPath.length > 0 && libraryRoot.length > 0 && !busy;
+  // Esc mirrors the backdrop click (the handler upstream suppresses while busy).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onBackdropClick();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onBackdropClick]);
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60"
       onClick={onBackdropClick}
+      role="dialog"
+      aria-modal="true"
+      aria-label="Restore (auto-detect moved files)"
     >
       <div
-        className="bg-surface-200 border border-white/10 rounded-lg shadow-xl w-full max-w-xl mx-4 p-5"
+        className="panel shadow-2xl w-full max-w-xl mx-4 p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between mb-4">
@@ -659,6 +678,7 @@ function RemapRestoreDialog({
             onClick={onClose}
             disabled={busy}
             title="Close"
+            aria-label="Close"
           >
             <X className="w-4 h-4" />
           </button>

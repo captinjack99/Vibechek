@@ -27,7 +27,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Copy, Search, FileAudio, AlertCircle, Folder, Trash2, Star,
-  ChevronUp, ChevronDown, GripVertical, RotateCcw, Wand2,
+  ChevronUp, ChevronDown, RotateCcw, Wand2,
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Virtuoso } from "react-virtuoso";
@@ -637,7 +637,7 @@ function RulesPanel({
       <summary className="px-4 py-3 cursor-pointer flex items-center gap-2 select-none">
         <Wand2 className="w-4 h-4 text-accent" />
         <span className="font-medium text-white">How to pick which copy to keep</span>
-        <span className="text-xs text-white/40 ml-2">drag, toggle, or reorder</span>
+        <span className="text-xs text-white/50 ml-2">toggle or reorder with ▲▼</span>
         <button
           className="ml-auto text-xs text-white/40 hover:text-white"
           onClick={(e) => { e.preventDefault(); reset(); }}
@@ -686,8 +686,9 @@ function RuleRow({
 }) {
   return (
     <div className={`flex items-center gap-3 py-2 ${rule.enabled ? "" : "opacity-40"}`}>
-      <GripVertical className="w-4 h-4 text-white/20" />
-      <div className="w-6 text-center text-xs font-mono text-white/40">
+      {/* Position number only — the grip icon implied drag-reordering, which
+          doesn't exist (the ▲▼ buttons are the reorder affordance). */}
+      <div className="w-6 text-center text-xs font-mono text-white/50">
         {position}
       </div>
       <label className="flex items-center gap-2 cursor-pointer flex-1">

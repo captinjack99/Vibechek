@@ -1,9 +1,10 @@
 /**
- * Notification store — transient, auto-dismissing success/info toasts.
+ * Notification store — transient, auto-dismissing success/info/warning toasts.
  *
  * Different from useOperationStore.error (which is sticky, scary, and
  * reserved for operation failures). Notifications are the "done" pat on
- * the back.
+ * the back — and "warning" carries non-fatal caution (e.g. the sidecar's
+ * risky-install-path notice) without dressing it as cheerful info.
  *
  * Split out of stores/index.ts. Re-exported from `../stores` for
  * backwards compatibility.
@@ -11,7 +12,7 @@
 
 import { create } from "zustand";
 
-export type NotificationKind = "success" | "info";
+export type NotificationKind = "success" | "info" | "warning";
 
 export interface Notification {
   id: number;
@@ -29,6 +30,10 @@ interface NotificationState {
 
 let nextNotificationId = 1;
 
+/** Cap the visible stack — a rapid burst of ops used to pile toasts without
+ * bound; the oldest drop off first. */
+const MAX_STACK = 5;
+
 export const useNotificationStore = create<NotificationState>((set) => ({
   items: [],
   notify: (message, opts) => {
@@ -39,7 +44,7 @@ export const useNotificationStore = create<NotificationState>((set) => ({
       message,
       detail: opts?.detail,
     };
-    set((s) => ({ items: [...s.items, item] }));
+    set((s) => ({ items: [...s.items, item].slice(-MAX_STACK) }));
   },
   dismiss: (id) =>
     set((s) => ({ items: s.items.filter((n) => n.id !== id) })),

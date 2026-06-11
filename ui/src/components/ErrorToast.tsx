@@ -92,7 +92,8 @@ export function ErrorToast() {
       initial={{ opacity: 0, y: -20 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -20 }}
-      className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-2xl w-full px-4"
+      className="fixed top-4 left-1/2 -translate-x-1/2 z-[70] max-w-2xl w-full px-4"
+      role="alert"
     >
       <div className="panel-pad bg-accent-red/10 border-accent-red/40 flex items-start gap-3 shadow-lg">
         <AlertCircle className="w-5 h-5 text-accent-red flex-none mt-0.5" />
@@ -148,6 +149,7 @@ export function ErrorToast() {
           onClick={clearError}
           className="text-white/40 hover:text-white p-1 -m-1 flex-none"
           title="Dismiss"
+          aria-label="Dismiss error"
         >
           <X className="w-4 h-4" />
         </button>

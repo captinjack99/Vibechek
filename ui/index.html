@@ -3,7 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
     <title>Vibechek</title>
+    <!-- Paint dark IMMEDIATELY: without this the webview flashes white until
+         the CSS bundle loads (very visible at startup on Windows). -->
+    <style>html { background: #11111b; }</style>
   </head>
   <body class="bg-surface-200 text-white">
     <div id="root"></div>

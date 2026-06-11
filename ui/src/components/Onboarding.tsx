@@ -78,8 +78,9 @@ export function Onboarding() {
             Vibechek never touches your files until you confirm.
           </p>
           <p className="text-sm text-white/60 leading-relaxed">
-            Tags backup is one click in the Tags tab. Built-in undo isn&apos;t here yet —
-            back up tags before any operation that writes.
+            Tags backup is one click in the Tags tab, and organize / dedupe moves
+            have one-click Undo under <strong>Recent operations</strong> in the
+            sidebar. Back up tags before any operation that writes them.
           </p>
         </div>
       ),

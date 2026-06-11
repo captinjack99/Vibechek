@@ -6,8 +6,11 @@
  * while emitting `progress` notifications. This modal shows a live bar + the
  * current step message so the user knows the app is working, not hung, and a
  * clear success / error state at the end.
+ *
+ * A11y: role="dialog" + aria-modal; Esc closes the settled (done/error)
+ * states; progress resets when a new run starts.
  */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2, CheckCircle2, AlertCircle, X, Cpu, StopCircle } from "lucide-react";
 
 import { useSidecarProgress } from "../hooks/useSidecar";
@@ -40,12 +43,37 @@ export function OnnxSetupDialog({
     }
   });
 
+  // Reset stale progress when a new run starts (the component stays mounted
+  // with state=null between runs).
+  const prevPhase = useRef<string | null>(null);
+  useEffect(() => {
+    if (state?.phase === "running" && prevPhase.current !== "running") {
+      setProgress({ current: 0, total: 4, message: "Starting…" });
+    }
+    prevPhase.current = state?.phase ?? null;
+  }, [state]);
+
+  // Esc closes the settled states.
+  useEffect(() => {
+    if (!state || state.phase === "running") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [state, onClose]);
+
   if (!state) return null;
   const pct = progress.total > 0 ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : 0;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="w-[480px] max-w-full rounded-xl border border-white/10 bg-surface-100 p-5 shadow-2xl">
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Set up ONNX engine"
+    >
+      <div className="panel w-[480px] max-w-full p-5 shadow-2xl">
         <div className="mb-4 flex items-center justify-between">
           <h3 className="flex items-center gap-2 text-sm font-semibold text-white">
             <Cpu className="h-4 w-4 text-accent" /> Set up ONNX engine
@@ -66,7 +94,7 @@ export function OnnxSetupDialog({
             <div className="h-2 overflow-hidden rounded-full bg-white/10">
               <div className="h-full rounded-full bg-accent transition-all duration-300" style={{ width: `${pct}%` }} />
             </div>
-            <p className="text-[11px] leading-snug text-white/40">
+            <p className="text-[11px] leading-snug text-white/50">
               Step {Math.min(progress.current, progress.total)} of {progress.total}. The first run installs the
               engine and fetches the EffNet backbone, so it can take a few minutes — the app isn't hung. You can
               keep using other tabs.
@@ -74,7 +102,7 @@ export function OnnxSetupDialog({
             {onCancel && (
               <button
                 onClick={onCancel}
-                className="flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-2 text-sm font-medium text-white hover:bg-white/20"
+                className="btn-ghost bg-white/10 hover:bg-white/20"
                 title="Stop the ONNX engine setup"
               >
                 <StopCircle className="h-4 w-4" />
@@ -86,14 +114,14 @@ export function OnnxSetupDialog({
 
         {state.phase === "done" && (
           <div className="space-y-3">
-            <div className="flex items-center gap-2 text-sm font-medium text-green-400">
+            <div className="flex items-center gap-2 text-sm font-medium text-accent-green">
               <CheckCircle2 className="h-5 w-5" /> ONNX engine ready
             </div>
             <p className="text-xs leading-snug text-white/60">
               {state.staged} model files staged. Switch the inference engine to ONNX (if you haven't) and
               re-analyze your library to use it.
             </p>
-            <button onClick={onClose} className="w-full rounded-lg bg-accent px-3 py-2 text-sm font-medium text-white hover:bg-accent/90">
+            <button onClick={onClose} className="btn-primary w-full justify-center">
               Done
             </button>
           </div>
@@ -104,10 +132,10 @@ export function OnnxSetupDialog({
             <div className="flex items-center gap-2 text-sm font-medium text-accent-red">
               <AlertCircle className="h-5 w-5" /> Setup didn't finish
             </div>
-            <p className="max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-snug text-white/60">
+            <p className="max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-snug text-white/60 select-text">
               {state.error}
             </p>
-            <button onClick={onClose} className="w-full rounded-lg bg-white/10 px-3 py-2 text-sm font-medium text-white hover:bg-white/20">
+            <button onClick={onClose} className="btn-ghost w-full justify-center bg-white/10 hover:bg-white/20">
               Close
             </button>
           </div>
