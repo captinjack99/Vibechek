@@ -68,6 +68,14 @@ class OrganizeStats:
     # Path to the undo journal written for this run (None if nothing moved or
     # the journal couldn't be opened). The GUI uses it to offer "Undo".
     journal_path: str | None = None
+    # (source, ACTUAL destination) for every COMPLETED move. The GUI must
+    # update its in-memory track paths from THIS list, never from the plan:
+    # the real destination can differ from the planned one (re-uniquified at
+    # execute time to avoid clobbering), and on a cancelled or partly-failed
+    # run only a subset of the plan moved — mapping the whole plan rewrote
+    # store paths to files that never moved (phantom locations that then break
+    # preview / re-tag / dedupe until a re-scan).
+    moved_pairs: list[tuple[str, str]] = field(default_factory=list)
 
 
 # Substrings (case-insensitive) that almost always mean the chosen target is
@@ -368,6 +376,7 @@ def organize_from_analysis(
                 # Record AFTER the move succeeds, BEFORE the next iteration.
                 jrnl.record_move(move.source, dest)
                 stats.moved += 1
+                stats.moved_pairs.append((str(move.source), str(dest)))
             except OSError as e:
                 stats.errors.append(f"{move.source.name}: {e}")
     except cancellation.CancelledError as exc:

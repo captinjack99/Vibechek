@@ -345,6 +345,12 @@ def _analyze_directory(params: dict) -> dict:
         genre_classifier=_valid_genre_classifier(params.get("genre_classifier")),
         genre_web_lookup=bool(params.get("genre_web_lookup", False)),
         genre_llm_backend=_valid_llm_backend(params.get("genre_llm_backend")),
+        # The ML-override floor for prefer_tag reconciliation. Previously this
+        # documented config field never reached analyze (no param, no flag) —
+        # the hard-coded dataclass default always won.
+        genre_ml_override_confidence=_clamp01(
+            params.get("genre_ml_override_confidence", 0.90), 0.90,
+        ),
     )
     if "models_dir" in params and params["models_dir"]:
         config.models_dir = Path(params["models_dir"])
@@ -559,6 +565,12 @@ def _find_duplicates(params: dict) -> dict:
         # versions, collapse to the single best encoding within a version.
         keep_distinct_versions=bool(params.get("keep_distinct_versions", True)),
         keep_all_formats=bool(params.get("keep_all_formats", False)),
+        # Duration tolerance for the "same version?" check (mislabeled-length
+        # split). Clamped: 0 would split every variant pair, >1 would merge a
+        # radio edit into an extended mix.
+        version_duration_tolerance=_clamp01(
+            params.get("version_duration_tolerance", 0.12), 0.12,
+        ),
     )
     # Default True for safety — the GUI's auto-keeper rules need bitrate/duration.
     # The GUI can pass read_metadata=false for MD5-only dedup with default rules,
@@ -997,11 +1009,19 @@ def _setup_onnx_engine(params: dict) -> dict:
 
 
 def _active_engine(params: dict) -> str:
-    """The inference engine whose venv the opt-in genre setup should target."""
+    """The inference engine whose venv the opt-in genre setup should target.
+
+    An explicit request param wins: the UI sends its LIVE selection, which can
+    lead the saved config by the 500 ms autosave debounce (and `VibechekConfig.
+    load()` never raises, so a config-based fallback-on-exception was dead
+    code that silently ignored the param)."""
+    explicit = params.get("inference_engine")
+    if explicit in ("essentia_tf", "onnx"):
+        return explicit
     try:
         return _valid_engine(VibechekConfig.load().analysis.inference_engine)
     except Exception:  # noqa: BLE001
-        return _valid_engine(params.get("inference_engine"))
+        return "essentia_tf"
 
 
 def _setup_genre_engine(params: dict, *, kind: str) -> dict:

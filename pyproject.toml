@@ -85,10 +85,13 @@ clap = [
     "torchvision>=0.15",
     "soundfile>=0.12",
 ]
-# Online web-synthesis genre resolver (opt-in). ddgs is the only pip dep; the
-# local LLM (Ollama) is installed by the in-app resolver setup.
+# Online web-synthesis genre resolver (opt-in). ddgs is the runtime dep; the
+# local LLM (Ollama) is installed by the in-app resolver setup, which also
+# needs zstandard (to unpack the Ollama release tarball) — declared here so the
+# manual install path matches the one-click setup exactly.
 resolver = [
     "ddgs>=6.0",
+    "zstandard>=0.22",
 ]
 # Dev / tests
 dev = [

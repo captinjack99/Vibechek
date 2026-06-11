@@ -95,29 +95,28 @@ def load_reference(assets_dir: Path | None = None) -> ClapReference:
     return ClapReference(emb=emb, labels=labels, meta=meta)
 
 
-def knn_predict(
+def knn_vote_shares(
     query_emb: Any, ref: ClapReference, k: int = _DEFAULT_K,
-) -> tuple[str, float]:
-    """Cosine kNN, distance-weighted vote → (genre, confidence). Pure numpy.
+) -> dict[str, float]:
+    """Normalized, distance-weighted vote share per label among the top-k
+    cosine neighbours (pure numpy). Empty dict on a degenerate query/reference.
 
-    `query_emb` is a (dim,) vector (need not be normalized). Confidence is the
-    winning label's share of the weighted vote (0..1).
+    Distance weighting = 1 / cosine-distance (sklearn's weights="distance"):
+    it sharply favours the closest neighbours and is worth ~+15 pts exact over
+    flat/cosine weighting on the genre corpus — a near-duplicate at cosine 0.97
+    should dominate a loose 0.5 neighbour.
     """
     import numpy as np  # noqa: PLC0415
 
     q = np.asarray(query_emb, dtype=np.float32).ravel()
     nq = np.linalg.norm(q)
     if nq == 0 or ref.emb.shape[0] == 0:
-        return "Unknown", 0.0
+        return {}
     q = q / nq
     sims = ref.emb @ q                      # cosine (ref is normalized)
     k = int(min(max(1, k), sims.shape[0]))
     top = np.argpartition(-sims, k - 1)[:k]
     top = top[np.argsort(-sims[top])]
-    # Distance-weighted vote: weight = 1 / cosine-distance. This sharply favours
-    # the closest neighbours (equivalent to sklearn's weights="distance") and is
-    # worth ~+15 pts exact over flat/cosine weighting on the genre corpus — a
-    # near-duplicate at cosine 0.97 should dominate a loose 0.5 neighbour.
     votes: dict[str, float] = {}
     total = 0.0
     for idx in top:
@@ -126,9 +125,24 @@ def knn_predict(
         votes[lab] = votes.get(lab, 0.0) + w
         total += w
     if total <= 0:
-        return str(ref.labels[top[0]]), 0.0
-    winner = max(votes, key=votes.__getitem__)
-    return winner, round(votes[winner] / total, 3)
+        return {}
+    return {lab: w / total for lab, w in votes.items()}
+
+
+def knn_predict(
+    query_emb: Any, ref: ClapReference, k: int = _DEFAULT_K,
+) -> tuple[str, float]:
+    """Cosine kNN, distance-weighted vote → (genre, confidence). Pure numpy.
+
+    `query_emb` is a (dim,) vector (need not be normalized). Confidence is the
+    winning label's share of the weighted vote (0..1); use `knn_vote_shares`
+    when you need the full distribution (e.g. family-sum confidence).
+    """
+    shares = knn_vote_shares(query_emb, ref, k)
+    if not shares:
+        return "Unknown", 0.0
+    winner = max(shares, key=shares.__getitem__)
+    return winner, round(shares[winner], 3)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +161,16 @@ def clap_checkpoint_path() -> Path:
 
 
 def load_clap_model(checkpoint: Path | None = None, use_gpu: str = "auto") -> Any:
-    """Load the CLAP model (LAZY laion_clap + torch). Opt-in heavy dependency."""
+    """Load the CLAP model (LAZY laion_clap + torch). Opt-in heavy dependency.
+
+    Pinned to CPU regardless of `use_gpu` (param kept for a future opt-in):
+    CLAP_Module otherwise self-selects CUDA when torch sees a GPU, and a
+    ~2 GB fp32 model landing on the card OUTSIDE the analyzer's VRAM worker
+    budget (sized for the EffNet engine only) OOMs consumer GPUs in hybrid
+    mode. Embedding 3×20 s segments on CPU costs a few seconds per track —
+    small next to the rest of the analysis.
+    """
+    del use_gpu
     ckpt = Path(checkpoint) if checkpoint else clap_checkpoint_path()
     if not ckpt.is_file():
         raise RuntimeError(
@@ -160,7 +183,7 @@ def load_clap_model(checkpoint: Path | None = None, use_gpu: str = "auto") -> An
             "CLAP genre classifier needs laion-clap + torch. Install with: "
             "pip install 'vibechek[clap]' (or use the in-app CLAP setup)."
         ) from e
-    model = laion_clap.CLAP_Module(enable_fusion=False, amodel=_AMODEL)
+    model = laion_clap.CLAP_Module(enable_fusion=False, amodel=_AMODEL, device="cpu")
     model.load_ckpt(str(ckpt))
     return model
 
@@ -204,6 +227,7 @@ __all__ = [
     "bundled_clap_assets_dir",
     "load_reference",
     "knn_predict",
+    "knn_vote_shares",
     "clap_checkpoint_path",
     "load_clap_model",
     "embed_audio",

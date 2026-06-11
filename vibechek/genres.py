@@ -109,6 +109,18 @@ DJ_GENRE_MAP: dict[str, str] = {
     "K-pop": "K-Pop", "J-pop": "J-Pop",
 }
 
+# Canonical display names must inherit their hierarchy parent too: DJ_GENRE_MAP
+# renames e.g. "Psy-Trance" → "Psytrance", but SUBGENRE_TO_PARENT was keyed on
+# the raw hierarchy names only — so split_tag_genre("Psytrance") lost its Trance
+# parent, and a same-family web/tag pair ("Psytrance" vs "Trance") counted as a
+# family CONFLICT, enabling a wrongful grounded-web override of a correct tag.
+for _parent, _subs in GENRE_HIERARCHY.items():
+    for _sub in _subs:
+        _canon_name = DJ_GENRE_MAP.get(_sub, _sub)
+        if _canon_name not in SUBGENRE_TO_PARENT:
+            SUBGENRE_TO_PARENT[_canon_name] = _parent
+del _parent, _subs, _canon_name
+
 # Discogs parent categories that map to DJ-friendly genre buckets when subgenre
 # information is too generic to use as the main genre.
 _PARENT_CATEGORY_OVERRIDES = {

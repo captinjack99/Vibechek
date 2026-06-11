@@ -209,6 +209,7 @@ def test_analyze_directory_threads_genre_options(monkeypatch) -> None:
         captured["classifier"] = config.genre_classifier
         captured["web"] = config.genre_web_lookup
         captured["backend"] = config.genre_llm_backend
+        captured["override"] = config.genre_ml_override_confidence
         return {"summary": {}, "tracks": []}
 
     monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
@@ -217,12 +218,48 @@ def test_analyze_directory_threads_genre_options(monkeypatch) -> None:
         "genre_classifier": "clap",
         "genre_web_lookup": True,
         "genre_llm_backend": "ollama",
+        "genre_ml_override_confidence": 0.75,
     })
-    assert captured == {"classifier": "clap", "web": True, "backend": "ollama"}
-    # a bogus classifier is rejected back to the default
+    assert captured == {"classifier": "clap", "web": True, "backend": "ollama",
+                        "override": 0.75}
+    # a bogus classifier is rejected back to the default; a numeric override
+    # confidence outside [0,1] CLAMPS (7 -> 1.0, consistent with the other
+    # threshold params), and non-numeric garbage falls back to 0.90
     rpc._analyze_directory({"path": "/tmp/x", "auto_save": False,
-                            "genre_classifier": "evil"})
+                            "genre_classifier": "evil",
+                            "genre_ml_override_confidence": 7})
     assert captured["classifier"] == "discogs"
+    assert captured["override"] == 1.0
+    rpc._analyze_directory({"path": "/tmp/x", "auto_save": False,
+                            "genre_ml_override_confidence": "junk"})
+    assert captured["override"] == 0.90
+
+
+def test_find_duplicates_threads_version_tolerance(monkeypatch) -> None:
+    captured = {}
+
+    def fake_find(path, config, on_progress=None, read_metadata=True,
+                  similarity_threshold=0.95):
+        captured["tol"] = config.version_duration_tolerance
+        return type("R", (), {"to_dict": lambda self: {}})()
+
+    monkeypatch.setattr("vibechek.duplicates.find_duplicates", fake_find)
+    rpc._find_duplicates({"path": "/tmp/x", "version_duration_tolerance": 0.25})
+    assert captured["tol"] == 0.25
+    rpc._find_duplicates({"path": "/tmp/x"})           # default
+    assert captured["tol"] == 0.12
+    rpc._find_duplicates({"path": "/tmp/x", "version_duration_tolerance": "junk"})
+    assert captured["tol"] == 0.12                     # garbage snaps back
+
+
+def test_active_engine_honors_request_param() -> None:
+    """The UI sends its LIVE engine selection — it must beat the saved config
+    (which can lag by the autosave debounce)."""
+    assert rpc._active_engine({"inference_engine": "onnx"}) == "onnx"
+    assert rpc._active_engine({"inference_engine": "essentia_tf"}) == "essentia_tf"
+    # invalid/absent falls back to the saved config (a valid engine either way)
+    assert rpc._active_engine({"inference_engine": "evil"}) in ("essentia_tf", "onnx")
+    assert rpc._active_engine({}) in ("essentia_tf", "onnx")
 
 
 # ---------------------------------------------------------------------------
