@@ -423,3 +423,72 @@ def test_classify_vocal_thresholds_are_configurable() -> None:
     # A caller can override the cutoffs (e.g. a stricter or looser profile).
     assert analyzer._classify_vocal(0.65, instrumental_max=0.5) == "Light Vocal"
     assert analyzer._classify_vocal(0.65, instrumental_max=0.5, full_min=0.6) == "Vocal"
+
+
+# --- _vote_key: 3-segment majority vote (parallel-key confusion suppressor) ---
+
+
+class _SeqKey:
+    """Fake KeyExtractor returning queued (key, scale) reads in call order and
+    recording the sample-length of each chunk it was handed."""
+
+    def __init__(self, reads: list[tuple[str, str]]) -> None:
+        self._reads = list(reads)
+        self.call_lengths: list[int] = []
+
+    def __call__(self, audio):  # noqa: ANN001
+        self.call_lengths.append(len(audio))
+        key, scale = self._reads.pop(0)
+        return (key, scale, 0.9)
+
+
+def test_vote_key_majority_overrides_a_flipped_segment() -> None:
+    """The real win: two segments hear D major, one flips to the parallel D
+    minor → the major reading wins (it would have lost on a single full read)."""
+    np = pytest.importorskip("numpy")
+    audio = np.zeros(3 * analyzer._MIN_KEY_SEGMENT_SAMPLES, dtype=np.float32)
+    ke = _SeqKey([("D", "major"), ("D", "major"), ("D", "minor")])
+    assert analyzer._vote_key(ke, audio) == "10B"  # D major
+    assert len(ke.call_lengths) == 3  # segmented, never read the whole track
+
+
+def test_vote_key_tie_resolves_to_first_segment() -> None:
+    """All three segments disagree → deterministic fall-back to segment 0."""
+    np = pytest.importorskip("numpy")
+    audio = np.zeros(3 * analyzer._MIN_KEY_SEGMENT_SAMPLES, dtype=np.float32)
+    ke = _SeqKey([("A", "minor"), ("C", "major"), ("E", "minor")])
+    assert analyzer._vote_key(ke, audio) == "8A"  # A minor, the first read
+
+
+def test_vote_key_short_audio_falls_back_to_one_full_read() -> None:
+    """Below KEY_VOTE_SEGMENTS × 1 s there isn't enough audio to segment, so a
+    single full-track read is used instead of voting."""
+    np = pytest.importorskip("numpy")
+    audio = np.zeros(analyzer._MIN_KEY_SEGMENT_SAMPLES, dtype=np.float32)  # 1 s
+    ke = _SeqKey([("F", "minor")])
+    assert analyzer._vote_key(ke, audio) == "4A"  # F minor
+    assert ke.call_lengths == [analyzer._MIN_KEY_SEGMENT_SAMPLES]  # one full read
+
+
+def test_vote_key_one_bad_segment_does_not_sink_the_vote() -> None:
+    np = pytest.importorskip("numpy")
+    audio = np.zeros(3 * analyzer._MIN_KEY_SEGMENT_SAMPLES, dtype=np.float32)
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __call__(self, _audio):  # noqa: ANN001
+            self.n += 1
+            if self.n == 2:
+                raise RuntimeError("essentia hiccup on segment 2")
+            return ("G", "major", 0.9)
+
+    assert analyzer._vote_key(_Flaky(), audio) == "9B"  # G major from 2 good reads
+
+
+def test_vote_key_unparseable_reads_return_none() -> None:
+    np = pytest.importorskip("numpy")
+    audio = np.zeros(3 * analyzer._MIN_KEY_SEGMENT_SAMPLES, dtype=np.float32)
+    ke = _SeqKey([("?", "?"), ("?", "?"), ("?", "?")])
+    assert analyzer._vote_key(ke, audio) is None

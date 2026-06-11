@@ -20,7 +20,7 @@ import multiprocessing
 import os
 import re
 import urllib.request
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from multiprocessing import cpu_count
@@ -122,13 +122,28 @@ MODELS: dict[str, tuple[str, str, str]] = {
 # (named) class. Determined by Essentia model documentation.
 _MOOD_INDEX = {"aggressive": 0, "happy": 0, "relaxed": 1, "sad": 1}
 
-# Essentia KeyExtractor pitch profile. The default profile is general-purpose
-# and lands around KeyFinder tier (~77%) on EDM. Essentia ships an EDM-tuned
-# profile ("edma", from Faraldo et al., "Key Estimation in EDM", ISMIR 2016)
-# that materially improves accuracy on the electronic-music-heavy libraries
-# Vibechek targets — the single highest-ROI accuracy change in the audit.
-# Exposed as a module constant so it can be tuned without touching call sites.
-KEY_PROFILE = "edma"
+# Essentia KeyExtractor pitch profile. A shoot-out of every Essentia profile on
+# the 72-track gold corpus (internal/bughunt/profile_shootout.py) ranked Shaath's
+# profile highest for our electronic-music libraries — ahead of the EDM-tuned
+# "edma" it replaced (66.7% vs 65.3% exact-Camelot single-read; the gap widens
+# once segment-voting is layered on, see KEY_VOTE_SEGMENTS). Exposed as a module
+# constant so it can be tuned without touching call sites.
+KEY_PROFILE = "shaath"
+
+# Key detection majority-votes across this many equal track segments rather than
+# reading the whole file once. A single full-track read shows a systematic
+# confusion on this corpus: major tracks get reported as their PARALLEL MINOR
+# (same tonic, wrong mode — D major → D minor), 14:1 in that direction. Voting
+# over thirds dilutes it (segments where the tonality is unambiguous outvote the
+# ones that flip), halving those errors. Measured on the gold corpus this lifts
+# exact-Camelot 65% → 71% and harmonically-mixable (exact+relative+adjacent)
+# 69% → 78%, at ~no added cost — three third-length reads process the same total
+# samples as one full read. Voting with the full read as an anchor was tested and
+# was WORSE (the biased full read dominates the tally), so segments vote alone.
+KEY_VOTE_SEGMENTS = 3
+# A segment shorter than this (1 s at 44.1 kHz) is too brief for a stable read;
+# tracks too short to yield KEY_VOTE_SEGMENTS such segments fall back to one read.
+_MIN_KEY_SEGMENT_SAMPLES = 44100
 
 
 # Content-hash pinning for downloaded model files. A compromised or
@@ -1152,6 +1167,34 @@ def _pick_timeslot(
     return slot
 
 
+def _vote_key(key_extractor: Callable[[Any], Any], audio: Any) -> str | None:
+    """Majority-vote the musical key across equal segments of ``audio``.
+
+    ``key_extractor`` is a constructed Essentia ``KeyExtractor`` (or any callable
+    returning ``(key, scale, strength)``). Splitting the track into
+    ``KEY_VOTE_SEGMENTS`` parts and voting suppresses the single-read parallel-key
+    (major↔minor) confusion documented at KEY_VOTE_SEGMENTS. Ties resolve to the
+    earliest segment (``Counter.most_common`` keeps insertion order). Returns a
+    Camelot string, or None when no read succeeds / parses.
+    """
+    reads: list[tuple[str, str]] = []
+    n = len(audio)
+    if n >= KEY_VOTE_SEGMENTS * _MIN_KEY_SEGMENT_SAMPLES:
+        for i in range(KEY_VOTE_SEGMENTS):
+            segment = audio[i * n // KEY_VOTE_SEGMENTS:(i + 1) * n // KEY_VOTE_SEGMENTS]
+            try:
+                key, scale, _strength = key_extractor(segment)
+            except Exception:  # noqa: BLE001 — one bad segment must not sink the vote
+                continue
+            reads.append((key, scale))
+    if not reads:
+        # Too short to segment, or every segment read failed: one full read.
+        key, scale, _strength = key_extractor(audio)
+        reads.append((key, scale))
+    winner = Counter(reads).most_common(1)[0][0]
+    return key_to_camelot(f"{winner[0]} {winner[1]}")
+
+
 def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
     """Run the full Essentia analysis on a single track."""
     try:
@@ -1246,8 +1289,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 
     # ---------- Key ----------
     try:
-        key, scale, _strength = KeyExtractor(profileType=KEY_PROFILE)(audio_44k)
-        result.ml_key = key_to_camelot(f"{key} {scale}")
+        result.ml_key = _vote_key(KeyExtractor(profileType=KEY_PROFILE), audio_44k)
     except Exception as e:  # noqa: BLE001
         log.debug("Key detection failed for %s: %s", filepath.name, e)
 

@@ -47,6 +47,17 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   failing or silently degrading.
 
 ### Changed
+- **Key detection is materially more accurate.** Switched the Essentia key
+  profile from `edma` to Shaath's (a gold-corpus shoot-out of every profile
+  ranked it highest for electronic music) and replaced the single full-track
+  read with a **3-segment majority vote**. A full-track read systematically
+  reported major tracks as their *parallel minor* (right tonic, wrong mode);
+  voting across thirds dilutes that confusion. Measured on the 72-track gold
+  corpus: **exact-Camelot 65% → 71%**, harmonically-mixable (exact + relative +
+  adjacent) **69% → 78%**, at no meaningful extra cost. (The long-standing "~28%"
+  figure was a *measurement* bug — the internal scorer string-compared keys
+  without normalizing non-Camelot ground truth like "Ab Major" to "4B"; the real
+  single-read number was always ~65%.)
 - **UI elevation across every view (all OSs).** Bundled Inter Variable +
   JetBrains Mono (identical rendering on Windows/macOS/Linux); dark
   `color-scheme` so native widgets (select popups, checkboxes, scrollbars) stop
