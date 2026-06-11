@@ -11,6 +11,13 @@ Protocol (one JSON object per line):
     Error:         {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"..."}}
     Notification:  {"jsonrpc":"2.0","method":"progress","params":{"current":50,"total":100,"message":"..."}}
 
+Long-op requests MAY carry a client-generated `op_id` string in params. It is
+stripped before the handler runs and echoed back — together with the op's
+`kind` — on every `progress` / `track_analyzed` notification emitted while the
+op runs, so the GUI can attribute events on the shared notification stream to
+the exact operation instance that produced them. Both fields are omitted when
+unknown (CLI / legacy clients), which consumers must treat as "match anything".
+
 stdout is reserved for protocol traffic only. All logging goes to stderr.
 """
 
@@ -204,11 +211,13 @@ def _emit_progress(current: int, total: int, message: str = "") -> None:
             return  # rate-limited
         _LAST_PROGRESS_TIME = now
 
-    _write_message({
-        "jsonrpc": "2.0",
-        "method": "progress",
-        "params": {"current": current, "total": total, "message": message},
-    })
+    params: dict[str, Any] = {"current": current, "total": total, "message": message}
+    kind, op_id = cancellation.current_op()
+    if kind is not None:
+        params["kind"] = kind
+    if op_id is not None:
+        params["op_id"] = op_id
+    _write_message({"jsonrpc": "2.0", "method": "progress", "params": params})
 
 
 def _emit_track_analyzed(record: dict, current: int, total: int) -> None:
@@ -223,11 +232,13 @@ def _emit_track_analyzed(record: dict, current: int, total: int) -> None:
     is a unique record we'd lose to a "drop one per N" throttle. Progress
     bars stay throttled via _emit_progress; this channel is purely additive.
     """
-    _write_message({
-        "jsonrpc": "2.0",
-        "method": "track_analyzed",
-        "params": {"current": current, "total": total, "track": record},
-    })
+    params: dict[str, Any] = {"current": current, "total": total, "track": record}
+    kind, op_id = cancellation.current_op()
+    if kind is not None:
+        params["kind"] = kind
+    if op_id is not None:
+        params["op_id"] = op_id
+    _write_message({"jsonrpc": "2.0", "method": "track_analyzed", "params": params})
 
 
 def _ok(req_id: Any, result: Any) -> None:
@@ -1616,6 +1627,22 @@ def _dispatch(request: dict[str, Any]) -> None:
             _err(req_id, INVALID_PARAMS, "'params' must be an object")
         return
 
+    # Protocol-level correlation id (optional). The GUI stamps long-op requests
+    # with a client-generated `op_id`; every progress / track_analyzed
+    # notification emitted while that op runs echoes it back (_emit_progress),
+    # so each dialog can filter the shared event stream down to ITS op instead
+    # of leaning on the single-long-op invariant alone. Popped for EVERY method
+    # so handlers never see a protocol-level key; recorded only for cancellable
+    # ops — short ops interleave on the thread pool and must not claim the
+    # process-wide singleton.
+    op_id = params.pop("op_id", None)
+    if op_id is not None and not isinstance(op_id, str):
+        op_id = str(op_id)  # forgiving — a buggy client shouldn't kill its op
+    if op_id:
+        op_id = op_id[:128]  # defensive cap: it rides on every progress frame
+    else:
+        op_id = None
+
     kind = _CANCELLABLE_METHODS.get(method)
     if kind is not None:
         # The cancellation module is a process-wide singleton (one flag, one
@@ -1637,7 +1664,7 @@ def _dispatch(request: dict[str, Any]) -> None:
                         data={"busy": True, "running": existing},
                     )
                 return
-            cancellation.begin(kind)
+            cancellation.begin(kind, op_id)
             # Fresh op → fresh throttle clock, so its first progress tick isn't
             # suppressed by the previous op's last-emit timestamp.
             _reset_progress_throttle()

@@ -48,13 +48,21 @@ older UIs that omit the param keep working.
 Request:       {"jsonrpc":"2.0","id":1,"method":"dedupe","params":{"path":"..."}}
 Response:      {"jsonrpc":"2.0","id":1,"result":{...}}
 Error:         {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"..."}}
-Notification:  {"jsonrpc":"2.0","method":"progress","params":{"current":50,"total":100,"message":"..."}}
+Notification:  {"jsonrpc":"2.0","method":"progress","params":{"current":50,"total":100,"message":"...","kind":"analyze","op_id":"<uuid>"}}
 ```
 
 - **stdout is protocol-only.** All logging goes to stderr. A stray `print()` in a handler
   corrupts the stream — use the logger.
 - Long ops emit `progress` notifications (throttled ~20/sec) and, for analyze, per-track
   `track_analyzed` notifications. The Rust shell re-broadcasts both as Tauri events.
+- **Operation ids.** A long-op request MAY carry a client-generated `op_id` string in
+  params. The dispatcher strips it before the handler runs (handlers never see it) and
+  echoes it — together with the op's `kind` — on every `progress` / `track_analyzed`
+  notification emitted while that op runs. Both fields are omitted when unknown (CLI,
+  legacy clients); consumers must treat absence as "match anything". The GUI generates
+  one per `useOperationStore.begin()` and drops events on a positive mismatch
+  (`progressMatches` in `ui/src/stores/operation.ts`), so the dialogs sharing the one
+  event stream can't render a straggler from a cancelled/previous op.
 
 ## The five steps
 

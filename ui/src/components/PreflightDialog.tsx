@@ -27,6 +27,7 @@ import {
 
 import { isCancellation, rpc, useSidecarProgress } from "../hooks/useSidecar";
 import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
+import { progressMatches } from "../stores/operation";
 import type { InstallResult, PreflightResult, WSLStatus } from "../types";
 
 interface Props {
@@ -58,10 +59,15 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   // Live log lines accumulated from sidecar:progress while a step is running.
   const [logLines, setLogLines] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
+  // Correlation id of the step currently driven by THIS dialog — progress
+  // events stamped with a different op's id are stragglers and stay out of
+  // the live log.
+  const opIdRef = useRef<string | null>(null);
 
   // Subscribe to progress notifications; only collect while a step is busy
   useSidecarProgress((evt) => {
     if (!busyAction) return;
+    if (!progressMatches(evt, opIdRef.current)) return;
     setLogLines((prev) => {
       const next = [...prev, evt.message || `${evt.current}/${evt.total}`];
       return next.length > 200 ? next.slice(-200) : next;
@@ -124,9 +130,10 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     setActionMessage(null);
     setPostInstallNote(null);
     setLogLines([]);
-    begin("download-models"); // generic "busy" indicator
+    const opId = begin("download-models"); // generic "busy" indicator
+    opIdRef.current = opId;
     try {
-      const result = await rpc<T>(method, params);
+      const result = await rpc<T>(method, { ...params, op_id: opId });
       if (!result.ok) {
         // previously called `finish()` even when the
         // op reported failure, which left the global op state inconsistent.
@@ -226,9 +233,10 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
 
   const handleDownloadModels = async () => {
     setBusyAction("models");
-    begin("download-models");
+    const opId = begin("download-models");
+    opIdRef.current = opId;
     try {
-      await rpc("download_models", { models_dir: preflight.models.models_dir, engine });
+      await rpc("download_models", { models_dir: preflight.models.models_dir, engine, op_id: opId });
       finish();
       await reCheck();
     } catch (e) {

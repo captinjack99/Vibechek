@@ -101,10 +101,11 @@ export function DuplicatesView() {
     // fast double-click can bypass it. The ref is set before any await.
     if (scanningRef.current) return;
     scanningRef.current = true;
-    begin("dedupe");
+    const opId = begin("dedupe");
     try {
       const r = await rpc<DuplicateReport>("find_duplicates", {
         path: scanPath,
+        op_id: opId,
         use_md5: dupCfg.use_md5,
         use_chromaprint: dupCfg.use_chromaprint,
         // The backend reads this as `threshold` (rpc._find_duplicates). Without
@@ -178,11 +179,11 @@ export function DuplicatesView() {
     const { action, filtered, reviewFolder } = pendingResolve;
     setPendingResolve(null);
 
-    begin("dedupe");
+    const opId = begin("dedupe");
     try {
       const summary = await rpc<Record<string, number> & { journal_path?: string | null }>(
         "handle_duplicates",
-        { report: filtered, action, review_folder: reviewFolder },
+        { report: filtered, action, review_folder: reviewFolder, op_id: opId },
       );
       finish();
       const word = action === "trash" ? "Trashed" : "Moved";

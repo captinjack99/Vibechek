@@ -18,6 +18,7 @@ import {
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import { useLibraryStore, useNotificationStore, useOperationStore } from "../stores";
+import { progressMatches } from "../stores/operation";
 import { rpc, useSidecarProgress } from "../hooks/useSidecar";
 import { ConfirmModal } from "./ConfirmModal";
 import type { AnalysisReport, BackupHistory, BackupRecord } from "../types";
@@ -132,9 +133,10 @@ export function TagsView() {
 
   // Re-arm the stall timer every time a progress event arrives during a
   // backup/restore op. (`useSidecarProgress` fires regardless of which view
-  // is active — we just ignore it when we're not in a backup-class op.)
-  useSidecarProgress((_e) => {
-    if (active === "backup") {
+  // is active — we ignore it when we're not in a backup-class op, and drop
+  // stragglers stamped with a different op's id so they can't mask a stall.)
+  useSidecarProgress((e) => {
+    if (active === "backup" && progressMatches(e, useOperationStore.getState().opId)) {
       armStallTimer();
     }
   });
@@ -181,12 +183,12 @@ export function TagsView() {
     });
     if (typeof outFile !== "string") return;
 
-    begin("backup");
+    const opId = begin("backup");
     armStallTimer();
     try {
       const stats = await rpc<{ total: number; backed_up: number; errors: string[] }>(
         "backup_tags",
-        { path: pathToBackup, output_path: outFile },
+        { path: pathToBackup, output_path: outFile, op_id: opId },
       );
       finish();
       setLastBackup({ file: outFile, count: stats.backed_up });
@@ -276,11 +278,11 @@ export function TagsView() {
     // currently-open library when unknown.
     const record = history.find((r) => r.backup_path === restoreCandidate);
     const restoredFor = record?.library_path ?? null;
-    begin("backup"); // (operation kind: restore is a backup-class op)
+    const opId = begin("backup"); // (operation kind: restore is a backup-class op)
     try {
       const stats = await rpc<{
         total: number; restored: number; skipped_missing: number; errors: string[];
-      }>("restore_tags", { backup_path: restoreCandidate });
+      }>("restore_tags", { backup_path: restoreCandidate, op_id: opId });
       finish();
       const detailLines: string[] = [];
       if (stats.skipped_missing > 0) {
@@ -342,11 +344,12 @@ export function TagsView() {
     }
     setRemapValidationError(null);
 
-    begin("backup");
+    const opId = begin("backup");
     try {
       const stats = await rpc<RemapRestoreStats>("restore_tags_with_remap", {
         backup_path: remapBackupPath,
         library_root: remapLibraryRoot,
+        op_id: opId,
       });
       finish();
       setRemapResult(stats);

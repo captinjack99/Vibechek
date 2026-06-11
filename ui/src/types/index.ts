@@ -107,6 +107,13 @@ export interface ProgressEvent {
   current: number;
   total: number;
   message: string;
+  /** Operation kind stamped by the sidecar while a cancellable op runs
+   *  (e.g. "analyze", "install-essentia"). Absent on legacy frames. */
+  kind?: string;
+  /** Client-generated correlation id echoed back by the sidecar — the value
+   *  returned by useOperationStore.begin() and passed to the api wrapper.
+   *  Absent when the op wasn't started with one (CLI, legacy sidecar). */
+  op_id?: string;
 }
 
 export interface ReadyEvent {

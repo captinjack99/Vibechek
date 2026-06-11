@@ -16,6 +16,7 @@ import { OperationsHistory } from "./components/OperationsHistory";
 import { GlobalAudioPlayer } from "./components/GlobalAudioPlayer";
 
 import { useUIStore, useOperationStore, useConfigStore, useLibraryStore, useNotificationStore } from "./stores";
+import { progressMatches } from "./stores/operation";
 import { useSidecarProgress, useSidecarEvent } from "./hooks/useSidecar";
 import { useConfigPersistence } from "./hooks/useConfigPersistence";
 import type { TrackAnalysis } from "./types";
@@ -56,9 +57,17 @@ export default function App() {
   const setProgress = useOperationStore((s) => s.setProgress);
   const mergeAnalyzedTrack = useLibraryStore((s) => s.mergeAnalyzedTrack);
 
-  // Pipe every sidecar progress notification into the operation store. Any
-  // component can read it; the progress overlay does so.
-  useSidecarProgress((evt) => setProgress(evt));
+  // Pipe sidecar progress notifications into the operation store. Any
+  // component can read it; the progress overlay does so. An event stamped
+  // with an op_id that isn't the active op's is dropped — it's a straggler
+  // from a cancelled/finished op still queued in the sidecar thread pool +
+  // Tauri event channel. Unstamped events (legacy sidecar, ops started
+  // without an id) pass through. State is read fresh per event (not via the
+  // subscription closure) so the first frames of an op that land before the
+  // post-begin() re-render still see the new opId.
+  useSidecarProgress((evt) => {
+    if (progressMatches(evt, useOperationStore.getState().opId)) setProgress(evt);
+  });
 
   // Live-merge per-track results as the sidecar streams them during analyze.
   // The user sees tracks appear in the library table in real-time instead of

@@ -72,7 +72,7 @@ export function useApplyTags(): UseApplyTagsReturn {
         return null;
       }
 
-      begin("tag");
+      const opId = begin("tag");
       try {
         // Trim the per-track payload down to just what the RPC needs:
         // `path` (used as the file identifier) and `ml_analysis` (the
@@ -85,6 +85,7 @@ export function useApplyTags(): UseApplyTagsReturn {
         }));
 
         const stats = await rpc<RpcStats>("apply_ml_tags", {
+          op_id: opId,
           analysis: { tracks: slim },
           confidence: taggingCfg.genre_confidence_threshold,
           parent_genre_confidence_threshold: taggingCfg.parent_genre_confidence_threshold,

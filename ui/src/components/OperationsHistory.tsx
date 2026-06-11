@@ -108,9 +108,9 @@ export function OperationsHistory() {
     setRevertingPath(j.path);
     // Register with the operation store so the global progress overlay shows
     // the revert AND the server-side long-op lock is mirrored client-side.
-    begin("revert");
+    const opId = begin("revert");
     try {
-      const summary = await revertJournal({ journal_path: j.path });
+      const summary = await revertJournal({ journal_path: j.path }, opId);
       finish();
       const parts = [`Restored ${summary.reverted}`];
       if (summary.skipped) parts.push(`skipped ${summary.skipped}`);

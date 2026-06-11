@@ -23,23 +23,33 @@ class CancelledError(RuntimeError):
 
 _flag = threading.Event()
 _current_kind: str | None = None
+_current_op_id: str | None = None
 _lock = threading.Lock()
 
 
-def begin(kind: str) -> None:
-    """Start a new cancellable operation. Clears any prior cancel state."""
-    global _current_kind
+def begin(kind: str, op_id: str | None = None) -> None:
+    """Start a new cancellable operation. Clears any prior cancel state.
+
+    `op_id` is an optional client-generated correlation id (the GUI sends one
+    per long-op request). It is echoed onto every progress / track_analyzed
+    notification emitted while this op runs (see rpc._emit_progress) so the
+    frontend can attribute events on the shared stream to the exact operation
+    instance that produced them — not just to "whatever is running".
+    """
+    global _current_kind, _current_op_id
     with _lock:
         _flag.clear()
         _current_kind = kind
+        _current_op_id = op_id
 
 
 def end() -> None:
     """Mark the current operation as finished. Clears the cancel flag."""
-    global _current_kind
+    global _current_kind, _current_op_id
     with _lock:
         _flag.clear()
         _current_kind = None
+        _current_op_id = None
 
 
 def cancel() -> str | None:
@@ -60,6 +70,12 @@ def current_kind() -> str | None:
         return _current_kind
 
 
+def current_op() -> tuple[str | None, str | None]:
+    """Atomic snapshot of (kind, op_id) — (None, None) when no op is running."""
+    with _lock:
+        return _current_kind, _current_op_id
+
+
 def check() -> None:
     """Raise CancelledError if a cancel has been requested."""
     if _flag.is_set():
@@ -73,5 +89,6 @@ __all__ = [
     "cancel",
     "is_cancelled",
     "current_kind",
+    "current_op",
     "check",
 ]

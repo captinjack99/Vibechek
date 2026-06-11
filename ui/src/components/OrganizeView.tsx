@@ -288,9 +288,9 @@ export function OrganizeView() {
         return;
       }
       backupPath = out;
-      begin("backup");
+      const backupOpId = begin("backup");
       try {
-        await rpc("backup_tags", { path: plan.base_dir, output_path: out });
+        await rpc("backup_tags", { path: plan.base_dir, output_path: out, op_id: backupOpId });
         finish();
       } catch (e) {
         fail(e);
@@ -301,7 +301,7 @@ export function OrganizeView() {
     // Capture the planned destinations before we mutate `plan`
     const capturedPlan = plan;
 
-    begin("organize");
+    const opId = begin("organize");
     try {
       const stats = await rpc<{
         planned: number; moved: number; errors: string[]; journal_path: string | null;
@@ -309,7 +309,7 @@ export function OrganizeView() {
         cancelled?: boolean;
       }>(
         "organize",
-        { ...buildParams(), dry_run: false },
+        { ...buildParams(), dry_run: false, op_id: opId },
       );
       finish();
 
@@ -888,10 +888,10 @@ function OrganizeResultPanel({
       return;
     }
     const ops = useOperationStore.getState();
-    ops.begin("revert");
+    const opId = ops.begin("revert");
     setUndoing(true);
     try {
-      const summary = await revertJournal({ journal_path: result.journalPath });
+      const summary = await revertJournal({ journal_path: result.journalPath }, opId);
       ops.finish();
       setUndone(true);
       const parts = [`Restored ${summary.reverted}`];

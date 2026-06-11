@@ -55,6 +55,17 @@ def test_check_does_not_raise_when_not_cancelled() -> None:
     cancellation.check()
 
 
+def test_current_op_tracks_kind_and_op_id() -> None:
+    assert cancellation.current_op() == (None, None)
+    cancellation.begin("analyze", "op-1")
+    assert cancellation.current_op() == ("analyze", "op-1")
+    cancellation.end()
+    assert cancellation.current_op() == (None, None)
+    # op_id defaults to None — the CLI / legacy clients never send one.
+    cancellation.begin("dedupe")
+    assert cancellation.current_op() == ("dedupe", None)
+
+
 def test_end_clears_flag_and_kind() -> None:
     cancellation.begin("analyze")
     cancellation.cancel()

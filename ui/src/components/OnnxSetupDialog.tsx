@@ -14,6 +14,7 @@ import { useEffect, useRef, useState } from "react";
 import { Loader2, CheckCircle2, AlertCircle, X, Cpu, StopCircle } from "lucide-react";
 
 import { useSidecarProgress } from "../hooks/useSidecar";
+import { progressMatches } from "../stores/operation";
 
 export type OnnxSetupState =
   | { phase: "running" }
@@ -25,6 +26,7 @@ export function OnnxSetupDialog({
   state,
   onClose,
   onCancel,
+  opId,
 }: {
   state: OnnxSetupState;
   onClose: () => void;
@@ -32,13 +34,17 @@ export function OnnxSetupDialog({
   // (it calls cancellation.check() during the network fetch/install), so a
   // user on a slow/flaky mirror isn't trapped behind a non-dismissable modal.
   onCancel?: () => void;
+  /** Correlation id of the in-flight setup RPC — progress events stamped
+   *  with a different op's id are ignored (stragglers from a previous op). */
+  opId?: string | null;
 }) {
   const [progress, setProgress] = useState({ current: 0, total: 4, message: "Starting…" });
 
-  // While the setup is running, the only in-flight op is setup_onnx_engine, so
-  // its progress notifications are the ones we render.
+  // While the setup runs, render the progress notifications stamped with OUR
+  // op id (or legacy unstamped frames) — not stragglers from a previous op
+  // still queued in the event channel.
   useSidecarProgress((e) => {
-    if (state?.phase === "running") {
+    if (state?.phase === "running" && progressMatches(e, opId)) {
       setProgress({ current: e.current, total: e.total || 4, message: e.message || "Working…" });
     }
   });

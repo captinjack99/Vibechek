@@ -11,6 +11,14 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 ## [Unreleased]
 
 ### Added
+- **Operation ids on progress events.** Long-op RPCs accept a client-generated
+  `op_id`; the sidecar echoes it (plus the op `kind`) on every `progress` /
+  `track_analyzed` notification, and every GUI consumer of the shared progress
+  stream (global overlay, ONNX/genre setup dialogs, preflight live log, CUDA
+  install banner, backup stall timer) now ignores events stamped with a
+  different op's id — stragglers from a cancelled or just-finished operation
+  can no longer repaint another dialog's progress. Unstamped events keep the
+  old behavior, so the CLI and older sidecars are unaffected.
 - **CLAP pure-audio genre classifier** (opt-in, `genre_classifier = "clap"`). A CLAP
   audio embedding is matched by kNN against a small bundled reference library
   (`vibechek/clap_assets/genre_reference.npz`, ~2 MB) — roughly **2× the genre

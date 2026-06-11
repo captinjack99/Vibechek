@@ -470,9 +470,9 @@ export function LibraryBrowser() {
   const runFastScan = async () => {
     if (!libraryPath) return;
     const myGen = ++analyzeGen.current;
-    begin("analyze");
+    const opId = begin("analyze");
     try {
-      const report = await rpc<AnalysisReport>("scan_only", { path: libraryPath });
+      const report = await rpc<AnalysisReport>("scan_only", { path: libraryPath, op_id: opId });
       // If a later analyze/scan started after this one (e.g. user clicked
       // Re-analyze while scan_only was still in flight), drop our result —
       // committing it would clobber the newer pass.
@@ -499,10 +499,13 @@ export function LibraryBrowser() {
     // run so a cancelled/replaced analyze's queued events stop merging (see
     // the listener in App.tsx). Cleared in `finally` once this run settles.
     const runId = beginAnalyzeRun(libraryPath);
-    begin("analyze");
+    const opId = begin("analyze");
     try {
       const report = await rpc<AnalysisReport>("analyze_directory", {
         path: libraryPath,
+        // Correlation id — echoed on this op's progress events so consumers
+        // can drop stragglers from cancelled/replaced ops (see App.tsx).
+        op_id: opId,
         workers: analysisCfg.workers,
         use_gpu: analysisCfg.use_gpu,
         hybrid_cpu_gpu: analysisCfg.hybrid_cpu_gpu,

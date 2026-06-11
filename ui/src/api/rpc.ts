@@ -104,6 +104,20 @@ import type {
   WSLStatusRequest,
 } from "./methods";
 
+/**
+ * Spread a client-generated correlation id into a long-op param object.
+ *
+ * The sidecar strips `op_id` before the handler runs and echoes it (plus the
+ * op's kind) on every progress notification the op emits, so the GUI can
+ * attribute events on the shared `sidecar:progress` stream to the exact op
+ * instance — see `useOperationStore.begin()` / `progressMatches()` in
+ * stores/operation.ts. Cancellable wrappers below take the id as an optional
+ * trailing arg; omitting it keeps the legacy unstamped behavior.
+ */
+function withOpId<T extends object>(params: T, opId?: string): object {
+  return opId ? { ...params, op_id: opId } : params;
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
@@ -162,15 +176,17 @@ export function nativeVenvStatus(): Promise<NativeVenvStatus> {
 /** Install WSL + a distro via elevated PowerShell (triggers UAC). Cancellable. */
 export function installWSL(
   params: InstallWSLRequest = {},
+  opId?: string,
 ): Promise<InstallResultPayload> {
-  return rpc<InstallResultPayload>("install_wsl", params);
+  return rpc<InstallResultPayload>("install_wsl", withOpId(params, opId));
 }
 
 /** Install vibechek + essentia-tensorflow + chromaprint inside a WSL distro. Cancellable. */
 export function installVibechekInWSL(
   params: InstallVibechekInWSLRequest,
+  opId?: string,
 ): Promise<InstallResultPayload> {
-  return rpc<InstallResultPayload>("install_vibechek_in_wsl", params);
+  return rpc<InstallResultPayload>("install_vibechek_in_wsl", withOpId(params, opId));
 }
 
 /**
@@ -180,20 +196,22 @@ export function installVibechekInWSL(
  */
 export function upgradeVibechekInWSL(
   params: UpgradeVibechekInWSLRequest,
+  opId?: string,
 ): Promise<InstallResultPayload> {
-  return rpc<InstallResultPayload>("upgrade_vibechek_in_wsl", params);
+  return rpc<InstallResultPayload>("upgrade_vibechek_in_wsl", withOpId(params, opId));
 }
 
 /** Install the CUDA runtime libs essentia's bundled TF needs. Cancellable. */
 export function installCudaLibsInWSL(
   params: InstallCudaLibsInWSLRequest,
+  opId?: string,
 ): Promise<InstallResultPayload> {
-  return rpc<InstallResultPayload>("install_cuda_libs_in_wsl", params);
+  return rpc<InstallResultPayload>("install_cuda_libs_in_wsl", withOpId(params, opId));
 }
 
 /** Install essentia + vibechek into the managed native venv (Linux/macOS). Cancellable. */
-export function installEssentiaNative(): Promise<InstallResultPayload> {
-  return rpc<InstallResultPayload>("install_essentia_native");
+export function installEssentiaNative(opId?: string): Promise<InstallResultPayload> {
+  return rpc<InstallResultPayload>("install_essentia_native", withOpId({}, opId));
 }
 
 /** One-shot diagnostic repair of a broken venv shim left by older installers. */
@@ -218,8 +236,11 @@ export function scanDirectory(
  * Cheap library load — filename-parsed hints + existing tags, no ML.
  * Cancellable. Returns the same AnalysisReport shape as `analyze_directory`.
  */
-export function scanOnly(params: ScanOnlyRequest): Promise<AnalysisReport> {
-  return rpc<AnalysisReport>("scan_only", params);
+export function scanOnly(
+  params: ScanOnlyRequest,
+  opId?: string,
+): Promise<AnalysisReport> {
+  return rpc<AnalysisReport>("scan_only", withOpId(params, opId));
 }
 
 /**
@@ -228,8 +249,9 @@ export function scanOnly(params: ScanOnlyRequest): Promise<AnalysisReport> {
  */
 export function analyzeDirectory(
   params: AnalyzeDirectoryRequest,
+  opId?: string,
 ): Promise<AnalysisReport> {
-  return rpc<AnalysisReport>("analyze_directory", params);
+  return rpc<AnalysisReport>("analyze_directory", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------
@@ -242,8 +264,9 @@ export function analyzeDirectory(
  */
 export function findDuplicates(
   params: FindDuplicatesRequest,
+  opId?: string,
 ): Promise<DuplicateReport> {
-  return rpc<DuplicateReport>("find_duplicates", params);
+  return rpc<DuplicateReport>("find_duplicates", withOpId(params, opId));
 }
 
 /**
@@ -252,8 +275,9 @@ export function findDuplicates(
  */
 export function handleDuplicates(
   params: HandleDuplicatesRequest,
+  opId?: string,
 ): Promise<Record<string, number>> {
-  return rpc<Record<string, number>>("handle_duplicates", params);
+  return rpc<Record<string, number>>("handle_duplicates", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------
@@ -268,8 +292,11 @@ export function planOrganization(
 }
 
 /** Execute the moves for an organize plan. Cancellable. */
-export function organize(params: OrganizeRequest): Promise<OrganizeStats> {
-  return rpc<OrganizeStats>("organize", params);
+export function organize(
+  params: OrganizeRequest,
+  opId?: string,
+): Promise<OrganizeStats> {
+  return rpc<OrganizeStats>("organize", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------
@@ -279,22 +306,25 @@ export function organize(params: OrganizeRequest): Promise<OrganizeStats> {
 /** Apply ML-derived tags to the on-disk files. Cancellable. */
 export function applyMlTags(
   params: ApplyMlTagsRequest,
+  opId?: string,
 ): Promise<TagApplyStats> {
-  return rpc<TagApplyStats>("apply_ml_tags", params);
+  return rpc<TagApplyStats>("apply_ml_tags", withOpId(params, opId));
 }
 
 /** Snapshot all on-disk tags under `path` into a JSON backup file. Cancellable. */
 export function backupTags(
   params: BackupTagsRequest,
+  opId?: string,
 ): Promise<TagBackupStats> {
-  return rpc<TagBackupStats>("backup_tags", params);
+  return rpc<TagBackupStats>("backup_tags", withOpId(params, opId));
 }
 
 /** Replay a tag backup verbatim. Cancellable. */
 export function restoreTags(
   params: RestoreTagsRequest,
+  opId?: string,
 ): Promise<TagRestoreStats> {
-  return rpc<TagRestoreStats>("restore_tags", params);
+  return rpc<TagRestoreStats>("restore_tags", withOpId(params, opId));
 }
 
 /**
@@ -303,8 +333,9 @@ export function restoreTags(
  */
 export function restoreTagsWithRemap(
   params: RestoreTagsWithRemapRequest,
+  opId?: string,
 ): Promise<TagRemapRestoreStats> {
-  return rpc<TagRemapRestoreStats>("restore_tags_with_remap", params);
+  return rpc<TagRemapRestoreStats>("restore_tags_with_remap", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------
@@ -314,8 +345,9 @@ export function restoreTagsWithRemap(
 /** Download the essentia model weights (~200 MB). Cancellable. */
 export function downloadModels(
   params: DownloadModelsRequest = {},
+  opId?: string,
 ): Promise<DownloadModelsResult> {
-  return rpc<DownloadModelsResult>("download_models", params);
+  return rpc<DownloadModelsResult>("download_models", withOpId(params, opId));
 }
 
 /** SHA256-verify every downloaded model against the pinned table. */
@@ -331,8 +363,9 @@ export function verifyModels(): Promise<VerifyModelsResult> {
  */
 export function setupOnnxEngine(
   params: SetupOnnxEngineRequest = {},
+  opId?: string,
 ): Promise<SetupOnnxEngineResult> {
-  return rpc<SetupOnnxEngineResult>("setup_onnx_engine", params);
+  return rpc<SetupOnnxEngineResult>("setup_onnx_engine", withOpId(params, opId));
 }
 
 /**
@@ -342,8 +375,9 @@ export function setupOnnxEngine(
  */
 export function setupClapEngine(
   params: SetupGenreEngineRequest = {},
+  opId?: string,
 ): Promise<SetupGenreEngineResult> {
-  return rpc<SetupGenreEngineResult>("setup_clap_engine", params);
+  return rpc<SetupGenreEngineResult>("setup_clap_engine", withOpId(params, opId));
 }
 
 /**
@@ -352,8 +386,9 @@ export function setupClapEngine(
  */
 export function setupGenreResolver(
   params: SetupGenreEngineRequest = {},
+  opId?: string,
 ): Promise<SetupGenreEngineResult> {
-  return rpc<SetupGenreEngineResult>("setup_genre_resolver", params);
+  return rpc<SetupGenreEngineResult>("setup_genre_resolver", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------
@@ -483,8 +518,9 @@ export function listJournals(
 /** Reverse the moves recorded in a journal. Cancellable. */
 export function revertJournal(
   params: RevertJournalRequest,
+  opId?: string,
 ): Promise<RevertJournalResult> {
-  return rpc<RevertJournalResult>("revert_journal", params);
+  return rpc<RevertJournalResult>("revert_journal", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------

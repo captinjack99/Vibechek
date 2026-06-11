@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from "react";
 import { Loader2, CheckCircle2, AlertCircle, X, Cpu, StopCircle } from "lucide-react";
 
 import { useSidecarProgress } from "../hooks/useSidecar";
+import { progressMatches } from "../stores/operation";
 
 export type GenreSetupState =
   | { phase: "running" }
@@ -28,17 +29,21 @@ export function GenreSetupDialog({
   doneMessage,
   onClose,
   onCancel,
+  opId,
 }: {
   state: GenreSetupState;
   title: string;
   doneMessage: string;
   onClose: () => void;
   onCancel?: () => void;
+  /** Correlation id of the in-flight setup RPC — progress events stamped
+   *  with a different op's id are ignored (stragglers from a previous op). */
+  opId?: string | null;
 }) {
   const [progress, setProgress] = useState({ pct: 0, message: "Starting…" });
 
   useSidecarProgress((e) => {
-    if (state?.phase === "running") {
+    if (state?.phase === "running" && progressMatches(e, opId)) {
       const pct = e.total > 0 ? Math.min(100, Math.round((e.current / e.total) * 100)) : 0;
       setProgress({ pct, message: e.message || "Working…" });
     }

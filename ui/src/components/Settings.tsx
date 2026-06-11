@@ -8,6 +8,7 @@ import {
 import { AnimatePresence } from "framer-motion";
 
 import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
+import { newOpId, progressMatches } from "../stores/operation";
 import { isCancellation, rpc, sidecarStatus, useSidecarProgress } from "../hooks/useSidecar";
 import { setupOnnxEngine, setupClapEngine, setupGenreResolver } from "../api/rpc";
 import {
@@ -200,9 +201,9 @@ export function Settings() {
       return;
     }
     setDiagBusy("upgrade");
-    begin("install-essentia");
+    const opId = begin("install-essentia");
     try {
-      const res = await upgradeVibechekInWSL({ distro });
+      const res = await upgradeVibechekInWSL({ distro }, opId);
       finish();
       if (res.ok) {
         notify("WSL Vibechek updated", {
@@ -220,6 +221,12 @@ export function Settings() {
     }
   };
 
+  // Correlation id of the in-flight engine setup (ONNX / CLAP / resolver) —
+  // passed to the corresponding dialog so it renders only ITS op's progress
+  // events. One ref is enough: the sidecar serializes long ops, so at most one
+  // of the three setup dialogs is in the running phase at a time.
+  const engineSetupOpIdRef = useRef<string | null>(null);
+
   // Provision the TF-free ONNX engine: a separate managed venv (~/.vibechek/
   // venv-onnx) with plain essentia + onnxruntime. essentia and essentia-
   // tensorflow can't share a venv, so the ONNX engine gets its own. Idempotent
@@ -230,11 +237,12 @@ export function Settings() {
     // clean stale files, and verify. It auto-detects WSL vs native + the distro,
     // so there's no fast-click race to guard. The dialog shows live progress.
     setDiagBusy("onnx-setup");
+    const opId = begin("install-essentia");
+    engineSetupOpIdRef.current = opId;
     setOnnxSetup({ phase: "running" });
-    begin("install-essentia");
     try {
       const distro = preflightResult?.wsl?.usable_distro;
-      const res = await setupOnnxEngine(distro ? { distro } : {});
+      const res = await setupOnnxEngine(distro ? { distro } : {}, opId);
       finish();
       if (res.cancelled) {
         // Cancel during the install step RESOLVES with cancelled=true (the
@@ -285,18 +293,19 @@ export function Settings() {
   const handleSetupGenreEngine = async (
     kind: "clap" | "resolver",
     setState: (s: GenreSetupState) => void,
-    call: (p: { distro?: string; inference_engine?: string }) =>
+    call: (p: { distro?: string; inference_engine?: string }, opId?: string) =>
       Promise<{ ok: boolean; error?: string | null; cancelled?: boolean }>,
   ) => {
     setDiagBusy(kind === "clap" ? "clap-setup" : "resolver-setup");
+    const opId = begin("install-essentia");
+    engineSetupOpIdRef.current = opId;
     setState({ phase: "running" });
-    begin("install-essentia");
     try {
       const distro = preflightResult?.wsl?.usable_distro;
       // Send the LIVE engine selection: the setup targets this engine's venv,
       // and the saved config can lag the selector by the autosave debounce.
       const engine = useConfigStore.getState().config.analysis.inference_engine;
-      const res = await call({ ...(distro ? { distro } : {}), inference_engine: engine });
+      const res = await call({ ...(distro ? { distro } : {}), inference_engine: engine }, opId);
       finish();
       if (res.cancelled) {
         // A user-initiated Cancel resolves (not rejects) with cancelled=true —
@@ -484,12 +493,13 @@ export function Settings() {
   }, [cfg.analysis.inference_engine]);
 
   const handleDownloadModels = async () => {
-    begin("download-models");
+    const opId = begin("download-models");
     try {
       // read the latest models_dir from the store
       // via cfgRef so we don't ship a stale value from the original render.
       await rpc("download_models", {
         models_dir: cfgRef.current.analysis.models_dir || undefined,
+        op_id: opId,
       });
       finish();
       refreshPreflight();
@@ -1274,6 +1284,7 @@ export function Settings() {
         state={onnxSetup}
         onClose={() => setOnnxSetup(null)}
         onCancel={handleCancelOnnxSetup}
+        opId={engineSetupOpIdRef.current}
       />
 
       <GenreSetupDialog
@@ -1282,6 +1293,7 @@ export function Settings() {
         doneMessage="CLAP audio genre engine ready. Re-analyze your library to use it."
         onClose={() => setClapSetup(null)}
         onCancel={handleCancelGenreSetup}
+        opId={engineSetupOpIdRef.current}
       />
       <GenreSetupDialog
         state={resolverSetup}
@@ -1289,6 +1301,7 @@ export function Settings() {
         doneMessage="Online genre resolver ready. Re-analyze with online lookup enabled to use it."
         onClose={() => setResolverSetup(null)}
         onCancel={handleCancelGenreSetup}
+        opId={engineSetupOpIdRef.current}
       />
 
       <AnimatePresence>
@@ -1782,6 +1795,9 @@ function EngineGpuFixableBlock({
   const [installResult, setInstallResult] = useState<string | null>(null);
   const [latestProgress, setLatestProgress] = useState<string>("");
   const mountedRef = useRef(true);
+  // Correlation id of OUR install op — events stamped with another op's id
+  // (stragglers from a previous/parallel op) must not repaint this banner.
+  const opIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1792,6 +1808,7 @@ function EngineGpuFixableBlock({
 
   useSidecarProgress((evt) => {
     if (!installing) return;
+    if (!progressMatches(evt, opIdRef.current)) return;
     setLatestProgress(evt.message || `${evt.current}/${evt.total}`);
   });
 
@@ -1819,6 +1836,7 @@ function EngineGpuFixableBlock({
     setInstallError(null);
     setInstallResult(null);
     setLatestProgress("");
+    opIdRef.current = newOpId();
     try {
       const result = await rpc<{
         ok: boolean;
@@ -1827,6 +1845,7 @@ function EngineGpuFixableBlock({
       }>("install_cuda_libs_in_wsl", {
         distro,
         missing_libs: engineGpu.missing_cuda_libs,
+        op_id: opIdRef.current,
       });
       if (!mountedRef.current) return;
       if (result.ok) {
