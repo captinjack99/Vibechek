@@ -466,6 +466,27 @@ def _valid_engine(value: Any, default: str = "essentia_tf") -> str:
     return value if value in ("essentia_tf", "onnx") else default
 
 
+def _valid_vibechek_source(params: dict) -> str | None:
+    """Optional local-directory override for the managed venv's vibechek install.
+
+    CI/dev plumbing: the native-smoke workflow passes the checked-out repo so
+    the venv gets the commit under test instead of GitHub main (the hard-coded
+    default in `native_install`). Restricted to an existing local directory so
+    the RPC can't be steered into installing from an arbitrary URL. Raises
+    ValueError (→ INVALID_PARAMS at the dispatch seam) on anything else.
+    Linux/macOS only — the WSL install path doesn't honor it.
+    """
+    src = params.get("vibechek_source")
+    if src is None or src == "":
+        return None
+    p = Path(str(src))
+    if not p.is_dir():
+        raise ValueError(
+            f"vibechek_source must be an existing local directory, got {str(src)!r}"
+        )
+    return str(p)
+
+
 def _valid_genre_policy(value: Any, default: str = "prefer_tag") -> str:
     """Whitelist the existing-tag-vs-ML genre reconciliation policy."""
     return value if value in ("prefer_tag", "prefer_ml", "tag_only", "ml_only") else default
@@ -514,10 +535,15 @@ def _install_essentia_native(params: dict) -> dict:
     The Linux/macOS counterpart to install_vibechek_in_wsl. `engine` picks the
     stack/venv ("essentia_tf" default, or "onnx" → plain essentia + onnxruntime
     in venv-onnx). On Windows this short-circuits — Windows uses the WSL path.
+    Optional `vibechek_source` (existing local directory only) overrides where
+    pip installs vibechek from — CI/dev use; see _valid_vibechek_source.
     """
     from vibechek.native_install import install_essentia_native
     engine = _valid_engine(params.get("engine"))
-    return install_essentia_native(on_progress=_emit_progress, engine=engine)
+    source = _valid_vibechek_source(params)
+    return install_essentia_native(
+        on_progress=_emit_progress, engine=engine, vibechek_source=source,
+    )
 
 
 def _native_venv_status(params: dict) -> dict:
@@ -907,12 +933,19 @@ def _setup_onnx_engine(params: dict) -> dict:
       4. Verify readiness via the ONNX preflight.
 
     Cancellable. Returns {ok, ready, staged, bundle_source, reasons_not_ready}.
+    Optional `vibechek_source` (existing local directory only) overrides where
+    the native venv install gets vibechek from — CI/dev use; WSL ignores it.
     """
     from vibechek import onnx_backend  # noqa: PLC0415
     from vibechek.analyzer import download_models  # noqa: PLC0415
     from vibechek.config import MODELS_DIR  # noqa: PLC0415
     from vibechek.platform import IS_WINDOWS  # noqa: PLC0415
     from vibechek.preflight import preflight  # noqa: PLC0415
+
+    # Validate the optional CI/dev source override BEFORE staging starts so a
+    # bad param fails fast as INVALID_PARAMS (native install branch only — the
+    # WSL branch always installs from GitHub).
+    source_override = _valid_vibechek_source(params)
 
     total = 4
 
@@ -977,6 +1010,7 @@ def _setup_onnx_engine(params: dict) -> dict:
             res = install_essentia_native(
                 engine="onnx",
                 on_progress=lambda d, t, m: _emit_progress(2, total, m),
+                vibechek_source=source_override,
             )
             # install_essentia_native also RETURNS {ok: False, error: ...} on
             # failure rather than raising — same short-circuit as the WSL branch.

@@ -18,6 +18,27 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   base (`pip install -e .`, no dev extras) install — proving the runtime
   dependency closure — and asserts ping / venv probe / scan / no-engine
   analyze behavior end-to-end on ubuntu + macos runners.
+- **Native smoke FULL tier** (second `native-smoke.yml` job, ubuntu/macos ×
+  essentia_tf/onnx). Past the no-engine error path, the smoke now drives the
+  REAL one-click engine setup through the live sidecar — managed-venv pip
+  install, model download/staging, then a real ML analyze of synthetic
+  fixtures with strict assertions (2/2 track records, `ml_bpm`/`ml_key`/
+  `ml_energy` populated, zero errors) plus the post-install venv probe (the
+  invariant the unix site-packages glob bug had silently broken). Install
+  RPCs (`install_essentia_native`, `setup_onnx_engine`) accept an optional
+  `vibechek_source` local-directory override so CI installs the commit under
+  test instead of GitHub main; everything runs sandboxed under a throwaway
+  HOME.
+
+### Fixed
+- **The native (Linux/macOS) GPU engine install no longer dies at 15 minutes.**
+  `install_essentia_native` auto-selects `onnxruntime-gpu` + the CUDA 12 wheel
+  set on NVIDIA machines — a multi-GB download that the ML-stack step's hard
+  15-minute ceiling killed mid-fetch on ordinary connections (live-reproduced:
+  cudnn alone is 721 MB). The ceiling is now branch-aware: 2 h for the GPU
+  stacks (matching the WSL genre setups' multi-GB precedent), 30 min for the
+  CPU sets (matching the WSL essentia install). The step was already
+  cancellable + progress-streaming either way.
 - **Operation ids on progress events.** Long-op RPCs accept a client-generated
   `op_id`; the sidecar echoes it (plus the op `kind`) on every `progress` /
   `track_analyzed` notification, and every GUI consumer of the shared progress

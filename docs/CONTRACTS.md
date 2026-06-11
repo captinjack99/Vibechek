@@ -30,6 +30,7 @@ routes to the matching managed venv (`venv` vs `venv-onnx`):
 | `download_models` | `engine` | `onnx` fetches the converted-head bundle; `essentia_tf` the `.pb` set. |
 | `install_vibechek_in_wsl` | `engine` | Picks the stack/venv to install (essentia-tensorflow vs plain essentia + onnxruntime). |
 | `install_essentia_native` | `engine` | Native (Linux/macOS) counterpart. |
+| `install_essentia_native`, `setup_onnx_engine` | `vibechek_source` | Optional, CI/dev only: an **existing local directory** that pip installs vibechek from, instead of the hard-coded GitHub default (`rpc._valid_vibechek_source`; anything else → `INVALID_PARAMS`). Honored by the native (Linux/macOS) install only — the WSL branch ignores it. The native-smoke full tier passes the checkout so CI tests the commit under test. The GUI never sends it. |
 | `engine_gpu_status` | `engine` | The ONNX path probes onnxruntime's live ExecutionProviders in `venv-onnx`; the TF path probes TensorFlow. |
 | `native_venv_status` | `engine` | Reports what's installed in the engine's managed venv. |
 | `wsl_status` | `engine` | Selects which venv subdir (`venv` / `venv-onnx`) the per-distro probe inspects. |

@@ -1087,7 +1087,7 @@ def test_setup_onnx_engine_forwards_install_failure_reason(monkeypatch: pytest.M
     monkeypatch.setattr(native_mod, "probe_native_venv", lambda engine: _Probe())
     monkeypatch.setattr(
         native_mod, "install_essentia_native",
-        lambda engine=None, on_progress=None: {
+        lambda engine=None, on_progress=None, vibechek_source=None: {
             "ok": False, "error": "No space left on device", "cancelled": False,
         },
     )
@@ -1110,6 +1110,129 @@ def test_setup_onnx_engine_forwards_install_failure_reason(monkeypatch: pytest.M
     # specific reason survives rather than being replaced by preflight's generic
     # string only.
     assert "No space left on device" in str(out["error"])
+
+
+# ---------------------------------------------------------------------------
+# vibechek_source: the CI/dev install-source override on the install RPCs
+# ---------------------------------------------------------------------------
+
+
+def test_install_essentia_native_forwards_vibechek_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """A valid local-directory `vibechek_source` reaches the installer — the
+    native-smoke workflow relies on this to install the commit under test
+    instead of GitHub main."""
+    import vibechek.native_install as native_mod
+
+    seen: dict = {}
+
+    def _fake_install(on_progress=None, engine="essentia_tf", vibechek_source=None):
+        seen["engine"] = engine
+        seen["vibechek_source"] = vibechek_source
+        return {"ok": True}
+
+    monkeypatch.setattr(native_mod, "install_essentia_native", _fake_install)
+
+    out = rpc._install_essentia_native(
+        {"engine": "onnx", "vibechek_source": str(tmp_path)}
+    )
+    assert out == {"ok": True}
+    assert seen == {"engine": "onnx", "vibechek_source": str(tmp_path)}
+
+
+def test_install_essentia_native_defaults_source_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No param (the GUI path) → vibechek_source=None → the installer's
+    hard-coded GitHub default applies."""
+    import vibechek.native_install as native_mod
+
+    seen: dict = {}
+
+    def _fake_install(on_progress=None, engine="essentia_tf", vibechek_source="UNSET"):
+        seen["vibechek_source"] = vibechek_source
+        return {"ok": True}
+
+    monkeypatch.setattr(native_mod, "install_essentia_native", _fake_install)
+
+    rpc._install_essentia_native({})
+    assert seen["vibechek_source"] is None
+
+
+def test_install_essentia_native_rejects_nonexistent_source(tmp_path) -> None:
+    """A vibechek_source that isn't an existing local directory must be
+    rejected at the param seam (ValueError → INVALID_PARAMS) — the RPC must
+    not become an arbitrary pip-source installer."""
+    with pytest.raises(ValueError, match="existing local directory"):
+        rpc._install_essentia_native({"vibechek_source": str(tmp_path / "nope")})
+
+
+def test_install_essentia_native_rejects_url_source() -> None:
+    """URLs are not local directories — explicitly rejected."""
+    with pytest.raises(ValueError, match="existing local directory"):
+        rpc._install_essentia_native(
+            {"vibechek_source": "git+https://github.com/evil/package.git"}
+        )
+
+
+def test_setup_onnx_engine_forwards_vibechek_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """The source override flows through setup_onnx_engine's native install
+    branch (and a bad value fails fast, before staging)."""
+    import vibechek.onnx_backend as onnx_mod
+
+    monkeypatch.setattr(
+        onnx_mod, "stage_bundled_onnx_heads",
+        lambda models_dir, on_progress=None: {"staged": [], "source": "bundled"},
+    )
+
+    import vibechek.platform as platform_mod
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", False, raising=False)
+
+    import vibechek.native_install as native_mod
+
+    class _Probe:
+        essentia_installed = False
+        vibechek_installed = False
+
+    seen: dict = {}
+
+    def _fake_install(engine=None, on_progress=None, vibechek_source=None):
+        seen["vibechek_source"] = vibechek_source
+        return {"ok": False, "error": "stub stops here", "cancelled": False}
+
+    monkeypatch.setattr(native_mod, "probe_native_venv", lambda engine: _Probe())
+    monkeypatch.setattr(native_mod, "install_essentia_native", _fake_install)
+
+    import vibechek.preflight as pf_mod
+
+    class _PF:
+        ready = False
+        reasons_not_ready = ["stub"]
+        analyze_via = "native"
+
+    monkeypatch.setattr(pf_mod, "preflight", lambda *a, **k: _PF())
+
+    out = rpc._setup_onnx_engine({"vibechek_source": str(tmp_path)})
+    assert seen["vibechek_source"] == str(tmp_path)
+    assert out["error"] == "stub stops here"
+
+
+def test_setup_onnx_engine_rejects_bad_source_before_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """Validation happens BEFORE the staging step touches the models dir."""
+    import vibechek.onnx_backend as onnx_mod
+
+    def _must_not_run(*a, **k):  # pragma: no cover - the assertion IS the test
+        raise AssertionError("staging ran before param validation")
+
+    monkeypatch.setattr(onnx_mod, "stage_bundled_onnx_heads", _must_not_run)
+
+    with pytest.raises(ValueError, match="existing local directory"):
+        rpc._setup_onnx_engine({"vibechek_source": str(tmp_path / "missing")})
 
 
 # ---------------------------------------------------------------------------

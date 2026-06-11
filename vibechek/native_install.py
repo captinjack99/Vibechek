@@ -338,14 +338,24 @@ def install_essentia_native(
         if any(p.startswith("onnxruntime-") for p in ml_packages)
         else " + ".join(ml_packages)
     )
+    # The GPU stacks are multi-GB (the CUDA 12 wheel set alone is ~2 GB) — on an
+    # ordinary home connection that blows any quarter-hour ceiling (live-verified:
+    # cudnn alone took 10+ min at ~1.2 MB/s), so align with the 2 h wall-clock the
+    # WSL genre setups use for arbitrary-connection downloads. The CPU sets are
+    # ≤ ~0.5 GB → the WSL essentia install's 30 min precedent. Either way the
+    # step streams progress and stays cancellable; the ceiling only catches a
+    # true hang.
+    gpu_stack = any(p.startswith(("onnxruntime-", "nvidia-")) for p in ml_packages)
+    ml_timeout = 60 * 120 if gpu_stack else 60 * 30
     if on_progress:
-        on_progress(25, 100, f"Installing {ml_label} (this is the slow step, ~3-5 min)...")
+        eta = "multi-GB GPU stack — can take tens of minutes" if gpu_stack else "~3-5 min"
+        on_progress(25, 100, f"Installing {ml_label} (this is the slow step, {eta})...")
     rc, tail = _run_with_progress(
         [*venv_pip, "install", *ml_packages],
         on_progress=lambda line: on_progress and on_progress(
             _parse_pip_pct(line, base=25, span=55), 100, line[:120],
         ),
-        timeout=60 * 15,  # 15 min ceiling — usually ~3-5 min on a decent connection
+        timeout=ml_timeout,
     )
     if cancellation.is_cancelled():
         return {"ok": False, "error": "Cancelled by user", "cancelled": True}
