@@ -112,6 +112,14 @@ def _run_install_capturing_ml_step(
     (onnx_vd / "bin").mkdir(parents=True)
     (onnx_vd / "bin" / "python3").write_text("#!/bin/sh\n")
     monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
+    # Pin the platform to Linux so the package-selection branch under test is
+    # reachable regardless of the CI host OS. The ONNX branch checks `if IS_MAC`
+    # FIRST and forces CPU `onnxruntime` on macOS — so without this the
+    # nvidia-smi GPU path is unreachable on a macOS runner and the GPU-stack
+    # ceiling assertion fails there (the GPU wheel set only exists on Linux+NVIDIA
+    # anyway). Was a real macOS-only CI red.
+    monkeypatch.setattr(native_install, "IS_MAC", False)
+    monkeypatch.setattr(native_install, "IS_LINUX", True)
     monkeypatch.setattr(native_install, "VENV_DIR", vd)
     monkeypatch.setattr(native_install, "_find_host_python", lambda: "/usr/bin/python3")
     monkeypatch.setattr(
