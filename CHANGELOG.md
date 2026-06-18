@@ -11,6 +11,18 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 ## [Unreleased]
 
 ### Changed
+- **Vocal detection: a feat-credit prior fixes vocal tracks misread as
+  Instrumental.** The voice/instrumental model means its per-frame voice
+  probability over the whole track, so a vocal track with long instrumental
+  intros/breaks (the norm in dance music) reads as a low mean and was labelled
+  "Instrumental" — measured on the gold corpus, 4 of 5 feat-credited tracks
+  (which definitely have vocals) fell below the cutoff. A "feat."/"ft." title
+  credit is a near-certain vocal signal with no false-positives on
+  instrumentals, so reconciliation now upgrades **only** the Instrumental→vocal
+  case on feat-credited tracks. Zero regression by construction: it never
+  touches non-feat tracks, so the deliberately-tuned 0.72 cutoff (which keeps
+  melodic-but-instrumental dance tracks like "Children"/"Pjanoo" out of Vocal)
+  is preserved. Mirrors the prefer_tag philosophy; sets `ml_vocal_source`.
 - **CLAP genre classifier is more accurate (~50% → ~54% exact / 59% → 69%
   family on the gold corpus).** The bundled kNN reference was built with a
   filter that excluded "House" — the single largest genre class (407 of ~2500

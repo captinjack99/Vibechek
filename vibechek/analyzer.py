@@ -2407,6 +2407,45 @@ def _reconcile_record_genre(
         ml["ml_genre_confidence"] = round(rec.confidence, 3)
 
 
+# A featured-artist credit in the title/artist means the track HAS vocals — a
+# high-precision metadata signal (you don't credit a featured vocalist on an
+# instrumental). Word-bounded so we don't match "soft"/"drift"/"feature". We
+# deliberately do NOT match "with" — too loose ("Dancing With Myself").
+_FEAT_CREDIT_RE = re.compile(r"\b(?:feat\.?|ft\.?|featuring)\b", re.IGNORECASE)
+
+
+def _reconcile_record_vocal(r: dict[str, Any]) -> None:
+    """Apply a feat-credit metadata prior to the vocal label, in place.
+
+    The voice/instrumental model means its per-frame voice probability over the
+    WHOLE track, so a vocal track with long instrumental intros/breaks (the norm
+    in dance music) reads as a low mean and gets mislabelled "Instrumental".
+    Measured on the gold corpus, 4 of 5 feat-credited tracks (which definitely
+    have vocals) fell below the Instrumental cutoff. A "feat."/"ft." credit is a
+    near-certain vocal signal with no false-positives on instrumentals (they're
+    not credited), so we upgrade ONLY the Instrumental→vocal case — mirroring the
+    prefer_tag philosophy and never overriding a confident audio vocal read.
+
+    Idempotent: re-derives the audio label from the stored ml_vocal_score, stashes
+    it in `ml_vocal_audio`, and records `ml_vocal_source` ("audio"|"feat_credit").
+    """
+    ml = r.get("ml_analysis")
+    if not ml:
+        return
+    score = ml.get("ml_vocal_score")
+    if score is None:
+        return  # model didn't run (ml_vocal stays "Unknown")
+    audio_label = _classify_vocal(float(score))
+    ml["ml_vocal_audio"] = audio_label
+    _artist, title = _record_artist_title(r)
+    if audio_label == "Instrumental" and _FEAT_CREDIT_RE.search(f"{_artist} {title}"):
+        ml["ml_vocal"] = "Vocal"
+        ml["ml_vocal_source"] = "feat_credit"
+    else:
+        ml["ml_vocal"] = audio_label
+        ml["ml_vocal_source"] = "audio"
+
+
 def _build_report(
     results: list[dict[str, Any]], total: int, in_progress: bool,
     genre_policy: tuple[str, float] = ("prefer_tag", 0.90),
@@ -2451,6 +2490,7 @@ def _build_report(
                 _emit_event("stage", name="resolving_genres_online",
                             message=f"Resolving genres online ({i + 1}/{n})…")
             _reconcile_record_genre(r, pol, override, web_cfg, web_cache)
+            _reconcile_record_vocal(r)
 
     genres: dict[str, int] = defaultdict(int)
     energies: dict[int, int] = defaultdict(int)

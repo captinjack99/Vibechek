@@ -425,6 +425,73 @@ def test_classify_vocal_thresholds_are_configurable() -> None:
     assert analyzer._classify_vocal(0.65, instrumental_max=0.5, full_min=0.6) == "Vocal"
 
 
+# --- _reconcile_record_vocal: feat-credit metadata prior ---
+# The voice model means its per-frame score over the whole track, so a vocal
+# track with long instrumental intros/breaks reads low and mislabels as
+# Instrumental. A "feat." credit is a near-certain vocal signal with no false
+# positives on instrumentals, so we upgrade ONLY the Instrumental case.
+
+
+def _rec(score, title="", artist=""):
+    return {"ml_analysis": {"ml_vocal_score": score}, "filename_title": title,
+            "filename_artist": artist, "existing_tags": {}}
+
+
+def test_vocal_feat_credit_upgrades_diluted_instrumental() -> None:
+    # 0.43 = ODESZA feat. Zyra "It's Only" (measured) — diluted mean, real vocals.
+    r = _rec(0.43, "It's Only (feat. Zyra)")
+    analyzer._reconcile_record_vocal(r)
+    assert r["ml_analysis"]["ml_vocal"] == "Vocal"
+    assert r["ml_analysis"]["ml_vocal_source"] == "feat_credit"
+    assert r["ml_analysis"]["ml_vocal_audio"] == "Instrumental"  # the un-upgraded read
+
+
+def test_vocal_feat_credit_matches_ft_and_artist_field() -> None:
+    r = _rec(0.3, "Chemicals (Feat. Nat Slater)")
+    analyzer._reconcile_record_vocal(r)
+    assert r["ml_analysis"]["ml_vocal"] == "Vocal"
+    r2 = _rec(0.3, "Some Title", artist="Artist ft. Vocalist")
+    analyzer._reconcile_record_vocal(r2)
+    assert r2["ml_analysis"]["ml_vocal"] == "Vocal"
+
+
+def test_vocal_no_feat_instrumental_stays_instrumental() -> None:
+    # Robert Miles "Children" (0.703) — instrumental, no feat credit. The
+    # deliberately-tuned 0.72 cutoff must hold; the prior must NOT touch it.
+    r = _rec(0.703, "Children")
+    analyzer._reconcile_record_vocal(r)
+    assert r["ml_analysis"]["ml_vocal"] == "Instrumental"
+    assert r["ml_analysis"]["ml_vocal_source"] == "audio"
+
+
+def test_vocal_feat_does_not_match_substrings() -> None:
+    # "soft"/"feature"/"drift"/"with" must not trigger the feat prior.
+    for title in ("Soft Touch", "Feature Presentation", "Drifting", "Dancing With Myself"):
+        r = _rec(0.2, title)
+        analyzer._reconcile_record_vocal(r)
+        assert r["ml_analysis"]["ml_vocal"] == "Instrumental", title
+
+
+def test_vocal_feat_credit_does_not_change_confident_vocal() -> None:
+    # A confident audio vocal read on a feat track stays Vocal via the audio path.
+    r = _rec(0.95, "Track (feat. Singer)")
+    analyzer._reconcile_record_vocal(r)
+    assert r["ml_analysis"]["ml_vocal"] == "Vocal"
+    assert r["ml_analysis"]["ml_vocal_source"] == "audio"  # audio already said Vocal
+
+
+def test_vocal_reconcile_idempotent_and_skips_missing_score() -> None:
+    r = _rec(0.43, "It's Only (feat. Zyra)")
+    analyzer._reconcile_record_vocal(r)
+    analyzer._reconcile_record_vocal(r)  # second pass
+    assert r["ml_analysis"]["ml_vocal"] == "Vocal"
+    assert r["ml_analysis"]["ml_vocal_source"] == "feat_credit"
+    # No score → untouched (model didn't run).
+    r2 = {"ml_analysis": {"ml_vocal": "Unknown"}, "filename_title": "X (feat. Y)"}
+    analyzer._reconcile_record_vocal(r2)
+    assert r2["ml_analysis"]["ml_vocal"] == "Unknown"
+
+
 # --- _vote_key: 3-segment majority vote (parallel-key confusion suppressor) ---
 
 
