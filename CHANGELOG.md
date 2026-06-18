@@ -10,6 +10,23 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 ## [Unreleased]
 
+### Changed
+- **CLAP genre classifier is more accurate (~50% → ~54% exact / 59% → 69%
+  family on the gold corpus).** The bundled kNN reference was built with a
+  filter that excluded "House" — the single largest genre class (407 of ~2500
+  reference tracks) — plus "Electro", because the build reused the prefer_tag
+  *tag-distrust* generic-set (where a bare "House" file tag is rightly
+  untrusted). For a kNN *reference*, though, House/Electro are real, useful
+  classes (and gold truth labels) — excluding them meant a House track could
+  never be predicted House. The reference is now rebuilt keeping those classes,
+  dropping only truly content-free labels and clearly non-DJ genres
+  (Pop/Hip Hop/…), and without the per-class cap (distance-weighted kNN already
+  favours the nearest neighbours, so capping only discarded useful ones).
+  Measured through the production `clap_genre.knn_predict` on the essentia
+  decode path. Default genre source is unchanged (prefer_tag); this lifts the
+  opt-in CLAP audio path, which now matches the metadata default while working
+  on untagged tracks.
+
 ### Internal
 - **Split the model catalog + downloader out of `analyzer.py`** into a new
   `vibechek/model_download.py` (the god file dropped ~650 lines to ~2.5k). The
@@ -77,7 +94,7 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 - **CLAP pure-audio genre classifier** (opt-in, `genre_classifier = "clap"`). A CLAP
   audio embedding is matched by kNN against a small bundled reference library
   (`vibechek/clap_assets/genre_reference.npz`, ~2 MB) — roughly **2× the genre
-  accuracy** of the bundled Discogs-EffNet head on pure audio (~28% → ~50%), and
+  accuracy** of the bundled Discogs-EffNet head on pure audio (~28% → ~54%), and
   unlike a file tag it works on untagged / white-label tracks. BPM/key/mood are
   unchanged. One-click **Set up CLAP genre engine** (Settings) installs the deps +
   downloads the ~2.2 GB checkpoint into the analysis venv. Falls back to Discogs if

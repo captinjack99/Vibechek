@@ -2,7 +2,7 @@
   "model": "HTSAT-base",
   "checkpoint": "music_audioset_epoch_15_esc_90.14.pt",
   "dim": 512,
-  "n": 2035,
+  "n": 2313,
   "knn_k": 15,
   "metric": "cosine",
   "segments": {
