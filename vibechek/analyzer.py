@@ -1029,6 +1029,16 @@ def _classify_mood(brightness: float) -> str:
 
 # Minimum start→end delta in the per-frame aggressive (energy proxy) score
 # before we call a track "Up"/"Down" rather than "Steady".
+#
+# Empirically validated against 40 real DJ tracks (internal/bughunt/
+# direction_timeslot_probe.py, 2026-06-17): the signed first-third→last-third
+# delta has mean +0.027 / std 0.096 / |Δ| median 0.06, and ±0.08 yields a
+# 70/25/5 Steady/Up/Down split — non-degenerate (the pre-fix column bug was
+# 100% Steady) and intentionally PRECISION-LEANING (it sits just above the |Δ|
+# median, so only a clear trend earns a direction; a wrong Up/Down on a
+# secondary field is worse than a conservative Steady). Lowering to 0.06 would
+# flag ~50% of tracks directional — over-eager on marginal ±0.05-0.08 wobble,
+# with no ground truth to justify it. Don't retune without re-running the probe.
 DIRECTION_DELTA = 0.08
 
 

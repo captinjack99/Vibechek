@@ -83,6 +83,39 @@ def test_direction_never_raises_on_garbage() -> None:
     assert analyzer._classify_direction("not an array") == "Steady"
 
 
+def _stepped_aggressive(first: float, last: float, frames: int = 30):
+    """An (frames, 2) array whose aggressive column is exactly `first` over the
+    first third and `last` over the last third, so the helper's measured delta
+    is precisely `last - first` (independent of ramp geometry)."""
+    np = pytest.importorskip("numpy")
+    third = frames // 3
+    mid = frames - 2 * third
+    agg = np.concatenate([
+        np.full(third, first),
+        np.full(mid, (first + last) / 2),
+        np.full(third, last),
+    ])
+    return np.stack([agg, 1.0 - agg], axis=1)
+
+
+def test_direction_calibration_marginal_trend_stays_steady() -> None:
+    """Locks the empirically-validated ±0.08 calibration (the probe on 40 real
+    tracks): a sub-threshold delta (~0.05 — a marginal wind-up/down) must read
+    "Steady". DIRECTION_DELTA is intentionally precision-leaning; a careless
+    lowering that flips this is the regression this guards. See the constant's
+    comment + internal/bughunt/direction_timeslot_probe.py."""
+    assert analyzer.DIRECTION_DELTA == 0.08
+    assert analyzer._classify_direction(_stepped_aggressive(0.50, 0.55)) == "Steady"
+    assert analyzer._classify_direction(_stepped_aggressive(0.55, 0.50)) == "Steady"
+
+
+def test_direction_calibration_clear_trend_is_directional() -> None:
+    """The flip side: a delta at the probe's ~p75 magnitude (|Δ|≈0.12) is a real
+    build/breakdown and must be labeled — the gate flags clear trends, not none."""
+    assert analyzer._classify_direction(_stepped_aggressive(0.40, 0.52)) == "Up"
+    assert analyzer._classify_direction(_stepped_aggressive(0.52, 0.40)) == "Down"
+
+
 # ---------------------------------------------------------------------------
 # BPM octave-error guard (SOTA)
 # ---------------------------------------------------------------------------
