@@ -121,12 +121,16 @@ def test_download_models_default_engine_does_not_fetch_onnx(monkeypatch, tmp_pat
     def _fake_needs(path, url, expected=None):  # noqa: ANN001
         return False  # everything already present → no network
 
-    monkeypatch.setattr(az, "_needs_download", _fake_needs)
+    # Patch at model_download (the downloader's real home) — download_models
+    # calls its OWN module globals, so patching the analyzer re-export is inert
+    # and the test would hit the real network (it did: a Windows runner with no
+    # route to essentia.upf.edu failed here while networked runners "passed").
+    monkeypatch.setattr(md, "_needs_download", _fake_needs)
     monkeypatch.setattr(
-        az, "_download_from_mirrors",
+        md, "_download_from_mirrors",
         lambda urls, dest, **kw: fetched.append(str(dest)),  # noqa: ARG005
     )
     # Pretend the .pb/.json already exist so the loop records descriptors only.
-    descriptors = az.download_models(tmp_path, engine="essentia_tf")
+    descriptors = md.download_models(tmp_path, engine="essentia_tf")
     assert "effnet_onnx" not in descriptors
     assert not any(f.endswith(".onnx") for f in fetched)
