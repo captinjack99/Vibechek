@@ -10,7 +10,7 @@ hosted yet so it 404s):
      re-download DELETED the good model. With the unhosted ONNX mirror, every
      analyze wiped the staged heads.
 
-These tests are pure-stdlib + analyzer import (CI-clean — no essentia / onnx /
+These tests are pure-stdlib + model_download import (CI-clean — no essentia / onnx /
 network).
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from vibechek import analyzer
+from vibechek import model_download
 
 
 def _sha(p: Path) -> str:
@@ -41,7 +41,7 @@ def test_needs_download_keeps_valid_pinned_file_when_mirror_unreachable(tmp_path
     pin = _sha(f)
     monkeypatch.setattr(urllib.request, "urlopen", _boom_head)
     # HEAD fails but the cached file matches its pin -> keep it, do NOT refetch.
-    assert analyzer._needs_download(f, "http://nope.invalid/danceability.onnx", pin) is False
+    assert model_download._needs_download(f, "http://nope.invalid/danceability.onnx", pin) is False
 
 
 def test_needs_download_refetches_when_cached_fails_pin(tmp_path, monkeypatch) -> None:
@@ -49,7 +49,7 @@ def test_needs_download_refetches_when_cached_fails_pin(tmp_path, monkeypatch) -
     f.write_bytes(b"x" * 200_000)
     monkeypatch.setattr(urllib.request, "urlopen", _boom_head)
     # HEAD fails AND the cached file's hash != pin -> a genuine refetch.
-    assert analyzer._needs_download(f, "http://nope.invalid/danceability.onnx", "ab" * 32) is True
+    assert model_download._needs_download(f, "http://nope.invalid/danceability.onnx", "ab" * 32) is True
 
 
 def test_failed_download_does_not_delete_existing_models(tmp_path, monkeypatch) -> None:
@@ -60,29 +60,29 @@ def test_failed_download_does_not_delete_existing_models(tmp_path, monkeypatch) 
 
     md = tmp_path
     # The ONNX engine keeps its files in the dedicated <models>/onnx/ subdir
-    # (analyzer._ONNX_SUBDIR), so seed the fixture THERE — seeding the parent
+    # (model_download._ONNX_SUBDIR), so seed the fixture THERE — seeding the parent
     # root would let the assertion pass trivially without exercising the path
     # download_models actually writes to.
-    onnx_dir = md / analyzer._ONNX_SUBDIR
+    onnx_dir = md / model_download._ONNX_SUBDIR
     onnx_dir.mkdir()
     (onnx_dir / BACKBONE_ONNX_FILENAME).write_bytes(b"b" * 200_000)
-    for stem in analyzer._ONNX_HEAD_STEMS:
+    for stem in model_download._ONNX_HEAD_STEMS:
         (onnx_dir / f"{stem}.onnx").write_bytes(b"h" * 200_000)
         (onnx_dir / f"{stem}.json").write_text('{"classes": ["a", "b"]}', encoding="utf-8")
     before = sorted(p.name for p in onnx_dir.glob("*.onnx"))
     assert before, "fixture should have created .onnx files"
 
     # Force the download path for every file and make every download fail.
-    monkeypatch.setattr(analyzer, "_needs_download", lambda *a, **k: True)
+    monkeypatch.setattr(model_download, "_needs_download", lambda *a, **k: True)
 
     def boom_dl(*_a, **_k):
         raise RuntimeError("All 1 mirror(s) failed (HTTP 404 — not hosted)")
 
-    monkeypatch.setattr(analyzer, "_download_from_mirrors", boom_dl)
-    monkeypatch.setattr(analyzer, "verify_model_sha256", lambda *a, **k: None)
+    monkeypatch.setattr(model_download, "_download_from_mirrors", boom_dl)
+    monkeypatch.setattr(model_download, "verify_model_sha256", lambda *a, **k: None)
 
     with pytest.raises(RuntimeError):  # it still reports the failures at the end
-        analyzer.download_models(md, engine="onnx")
+        model_download.download_models(md, engine="onnx")
 
     after = sorted(p.name for p in onnx_dir.glob("*.onnx"))
     assert after == before, (
@@ -129,7 +129,7 @@ def test_do_one_download_aborts_mid_stream_on_cancel(tmp_path, monkeypatch) -> N
     cancellation.begin("clap-setup")
     try:
         with pytest.raises(cancellation.CancelledError):
-            analyzer._do_one_download(
+            model_download._do_one_download(
                 "http://example.invalid/ckpt", dest, on_progress=None, chunk_size=100,
             )
     finally:
@@ -153,10 +153,10 @@ def test_download_from_mirrors_does_not_fail_over_on_cancel(monkeypatch, tmp_pat
         attempts.append(url)
         raise cancellation.CancelledError("cancelled by user")
 
-    monkeypatch.setattr(analyzer, "_download_with_progress", _cancelled_download)
+    monkeypatch.setattr(model_download, "_download_with_progress", _cancelled_download)
 
     with pytest.raises(cancellation.CancelledError):
-        analyzer._download_from_mirrors(
+        model_download._download_from_mirrors(
             ["http://mirror-one.invalid/f", "http://mirror-two.invalid/f"],
             tmp_path / "f.bin", label="f",
         )

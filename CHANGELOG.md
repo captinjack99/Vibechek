@@ -10,6 +10,16 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 ## [Unreleased]
 
+### Internal
+- **Split the model catalog + downloader out of `analyzer.py`** into a new
+  `vibechek/model_download.py` (the god file dropped ~650 lines to ~2.5k). The
+  module owns `MODELS`, the SHA256 pins, the mirror base URLs, the ONNX head
+  layout, and the streaming/mirror-failover/hash-verified/cancellable
+  downloader; it's deliberately import-light (essentia/numpy-free) so the CLI,
+  doctor, and preflight keep importing the catalog cheaply. `analyzer.py`
+  re-exports every moved name, so no call site changed — purely internal, no
+  behavior change. PyInstaller picks it up via `collect_submodules`.
+
 ### Added
 - **Native smoke workflow** (`native-smoke.yml`, manual + weekly). The unit-test
   matrix already covers all three OSes, but nothing ever exercised the LIVE

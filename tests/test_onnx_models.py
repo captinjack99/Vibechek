@@ -7,6 +7,7 @@ constants stay consistent with the converted bundle + the onnx_backend loader.
 from __future__ import annotations
 
 import vibechek.analyzer as az
+import vibechek.model_download as md
 from vibechek.onnx_backend import _HEAD_SPECS
 
 
@@ -32,16 +33,19 @@ def test_head_stems_match_onnx_backend_loader() -> None:
 
 
 def test_onnx_head_bases_default_points_at_release(monkeypatch) -> None:
-    monkeypatch.setattr(az, "_USER_MODEL_BASE_URL", None)
-    bases = az._onnx_head_bases()
+    # _onnx_head_bases + its mirror constants live in vibechek.model_download now
+    # (analyzer re-exports the public names, but this reads the module global the
+    # function actually closes over, so patch it at its real home).
+    monkeypatch.setattr(md, "_USER_MODEL_BASE_URL", None)
+    bases = md._onnx_head_bases()
     assert len(bases) == 1
-    assert bases[0].endswith(az._ONNX_MODELS_RELEASE)
+    assert bases[0].endswith(md._ONNX_MODELS_RELEASE)
     assert bases[0].startswith("https://github.com/captinjack99/Vibechek/releases/download/")
 
 
 def test_onnx_head_bases_respects_user_override(monkeypatch) -> None:
-    monkeypatch.setattr(az, "_USER_MODEL_BASE_URL", "https://mirror.example/models")
-    assert az._onnx_head_bases() == ["https://mirror.example/models"]
+    monkeypatch.setattr(md, "_USER_MODEL_BASE_URL", "https://mirror.example/models")
+    assert md._onnx_head_bases() == ["https://mirror.example/models"]
 
 
 def test_analyze_directory_rpc_threads_inference_engine(monkeypatch) -> None:

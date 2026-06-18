@@ -14,7 +14,7 @@ import pytest
 
 
 def test_download_from_mirrors_uses_first_url_when_it_works(tmp_path: Path) -> None:
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     dest = tmp_path / "model.pb"
     calls: list[str] = []
@@ -35,7 +35,7 @@ def test_download_from_mirrors_uses_first_url_when_it_works(tmp_path: Path) -> N
 
 def test_download_from_mirrors_falls_through_on_first_failure(tmp_path: Path) -> None:
     """The whole point: when primary is down, fall to mirror."""
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     dest = tmp_path / "model.pb"
     calls: list[str] = []
@@ -57,7 +57,7 @@ def test_download_from_mirrors_falls_through_on_first_failure(tmp_path: Path) ->
 
 
 def test_download_from_mirrors_raises_when_all_mirrors_fail(tmp_path: Path) -> None:
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     dest = tmp_path / "model.pb"
 
@@ -73,7 +73,7 @@ def test_download_from_mirrors_raises_when_all_mirrors_fail(tmp_path: Path) -> N
 
 
 def test_download_from_mirrors_rejects_empty_url_list(tmp_path: Path) -> None:
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     with pytest.raises(ValueError, match="No mirror URLs"):
         analyzer._download_from_mirrors([], tmp_path / "x.pb", "x.pb")
@@ -82,24 +82,25 @@ def test_download_from_mirrors_rejects_empty_url_list(tmp_path: Path) -> None:
 def test_env_var_override_replaces_default_mirrors(monkeypatch: pytest.MonkeyPatch) -> None:
     """VIBECHEK_MODELS_URL replaces the entire default tuple (no mixing)."""
     monkeypatch.setenv("VIBECHEK_MODELS_URL", "https://my-mirror.example/models")
-    # Re-import to pick up the env var
+    # Re-import to pick up the env var. The mirror tuple is computed at import
+    # in vibechek.model_download now (analyzer re-exports it), so reload THAT.
     import importlib
 
-    import vibechek.analyzer
-    importlib.reload(vibechek.analyzer)
+    import vibechek.model_download
+    importlib.reload(vibechek.model_download)
 
     try:
-        assert vibechek.analyzer.MODEL_BASE_URLS == ("https://my-mirror.example/models",)
-        assert vibechek.analyzer.MODEL_BASE_URL == "https://my-mirror.example/models"
+        assert vibechek.model_download.MODEL_BASE_URLS == ("https://my-mirror.example/models",)
+        assert vibechek.model_download.MODEL_BASE_URL == "https://my-mirror.example/models"
     finally:
         # Restore module state for other tests — re-reload without the env var
         monkeypatch.delenv("VIBECHEK_MODELS_URL", raising=False)
-        importlib.reload(vibechek.analyzer)
+        importlib.reload(vibechek.model_download)
 
 
 def test_no_env_var_uses_default_mirror_tuple() -> None:
     """Default config trusts UPF first, then the GitHub Release mirror."""
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     assert "essentia.upf.edu" in analyzer.MODEL_BASE_URLS[0]
     assert len(analyzer.MODEL_BASE_URLS) >= 2, \
@@ -114,7 +115,7 @@ def test_no_env_var_uses_default_mirror_tuple() -> None:
 def test_verify_model_sha256_noop_when_expected_none(tmp_path: Path) -> None:
     """Empty MODEL_SHA256 table is the documented default; verify must
     return cleanly so callers can wire it in unconditionally."""
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     bogus = tmp_path / "anything.pb"
     bogus.write_bytes(b"contents")
@@ -126,7 +127,7 @@ def test_verify_model_sha256_noop_when_expected_none(tmp_path: Path) -> None:
 def test_verify_model_sha256_accepts_correct_hash(tmp_path: Path) -> None:
     import hashlib
 
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     target = tmp_path / "model.pb"
     body = b"fake model weights payload"
@@ -137,7 +138,7 @@ def test_verify_model_sha256_accepts_correct_hash(tmp_path: Path) -> None:
 
 
 def test_verify_model_sha256_rejects_mismatch(tmp_path: Path) -> None:
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     target = tmp_path / "model.pb"
     target.write_bytes(b"these bytes do not match the expected hash")
@@ -147,7 +148,7 @@ def test_verify_model_sha256_rejects_mismatch(tmp_path: Path) -> None:
 
 def test_verify_model_sha256_error_mentions_remediation(tmp_path: Path) -> None:
     """The error message should tell the user how to recover."""
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     target = tmp_path / "model.pb"
     target.write_bytes(b"bad")
@@ -160,7 +161,7 @@ def test_model_sha256_table_is_dict_of_dicts() -> None:
     default until the release-build pass populates it; this test just
     locks the shape so a future PR can't accidentally change it to a flat
     dict."""
-    from vibechek import analyzer
+    from vibechek import model_download as analyzer
 
     assert isinstance(analyzer.MODEL_SHA256, dict)
     for name, suffixes in analyzer.MODEL_SHA256.items():
