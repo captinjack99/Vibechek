@@ -86,12 +86,6 @@ export function Settings() {
   const [sidecarBinary, setSidecarBinary] = useState<string | null>(null);
   const [sysInfo, setSysInfo] = useState<SystemResources | null>(null);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
-  // The one-click genre engine setups (CLAP / online resolver) are wired for
-  // Windows/WSL only — hide the buttons elsewhere so a Linux/macOS user isn't
-  // offered a flow that immediately errors. Defaults to true while the
-  // preflight probe is still in flight (Windows users shouldn't see it pop in).
-  const genreSetupSupported =
-    !preflightResult || preflightResult.platform.toLowerCase().includes("win");
   // models_dir is a free-text input. Validate on blur
   // (cheap `scan_directory` quick call) so an obvious typo or stale path
   // surfaces before the user kicks off a download or analyze.
@@ -779,7 +773,7 @@ export function Settings() {
               </button>
             ))}
           </div>
-          {cfg.analysis.genre_classifier === "clap" && genreSetupSupported && (
+          {cfg.analysis.genre_classifier === "clap" && (
             <button
               className="btn-primary mt-2"
               onClick={handleSetupClap}
@@ -788,13 +782,6 @@ export function Settings() {
               <Download className="w-4 h-4" />
               {diagBusy === "clap-setup" ? "Setting up CLAP…" : "Set up CLAP genre engine"}
             </button>
-          )}
-          {cfg.analysis.genre_classifier === "clap" && !genreSetupSupported && (
-            <div className="text-xs text-accent-yellow/90 mt-1">
-              One-click CLAP setup is Windows-only for now. On Linux/macOS install
-              manually: <code>pip install "vibechek[clap]"</code> into the managed
-              venv, then re-analyze.
-            </div>
           )}
           <Hint>
             <strong>CLAP audio</strong> is a pure-audio genre model ~2x as accurate
@@ -810,7 +797,7 @@ export function Settings() {
             checked={cfg.analysis.genre_web_lookup}
             onChange={(v) => updateAnalysis({ genre_web_lookup: v })}
           />
-          {cfg.analysis.genre_web_lookup && genreSetupSupported && (
+          {cfg.analysis.genre_web_lookup && (
             <button
               className="btn-primary mt-2"
               onClick={handleSetupResolver}
@@ -819,13 +806,6 @@ export function Settings() {
               <Download className="w-4 h-4" />
               {diagBusy === "resolver-setup" ? "Setting up resolver…" : "Set up online resolver"}
             </button>
-          )}
-          {cfg.analysis.genre_web_lookup && !genreSetupSupported && (
-            <div className="text-xs text-accent-yellow/90 mt-1">
-              One-click resolver setup is Windows-only for now. On Linux/macOS
-              install <code>pip install "vibechek[resolver]"</code> + Ollama
-              manually, then re-analyze.
-            </div>
           )}
           <Hint>
             Looks up each track's genre online (a local LLM reads web results for

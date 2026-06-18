@@ -1075,16 +1075,27 @@ def _setup_genre_engine(params: dict, *, kind: str) -> dict:
     `kind` is "clap" (pure-audio CLAP+kNN student: torch+laion-clap + 2.2 GB
     checkpoint) or "resolver" (online web-synthesis: ddgs + Ollama + 4.7 GB
     model). Both install into the ACTIVE analysis venv so one worker can run them
-    alongside essentia/onnx. Cancellable; emits `progress`. Windows → WSL; native
-    Linux/macOS is not yet wired for these heavy opt-in engines.
+    alongside essentia/onnx. Cancellable; emits `progress`. Windows → WSL;
+    Linux/macOS → the native managed venv (same paths, no WSL).
     """
     from vibechek.platform import IS_WINDOWS  # noqa: PLC0415
 
     engine = _active_engine(params)
-    label = "CLAP genre engine" if kind == "clap" else "online genre resolver"
     if not IS_WINDOWS:
-        return {"ok": False, "ready": False,
-                "error": f"{label} setup is currently available on Windows/WSL only."}
+        from vibechek.native_install import (  # noqa: PLC0415
+            setup_clap_native,
+            setup_resolver_native,
+        )
+
+        native_fn = setup_clap_native if kind == "clap" else setup_resolver_native
+        res = native_fn(on_progress=_emit_progress, engine=engine)
+        ok = bool(res.get("ok"))
+        return {
+            "ok": ok, "ready": ok,
+            "error": res.get("error"),
+            "cancelled": bool(res.get("cancelled")),
+            "tail": res.get("tail"),
+        }
 
     from vibechek.wsl import (  # noqa: PLC0415
         detect_wsl,

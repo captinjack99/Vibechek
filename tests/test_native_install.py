@@ -170,3 +170,224 @@ def test_ml_install_essentia_tf_keeps_thirty_min_ceiling(
     )
     assert "essentia-tensorflow" in packages
     assert timeout == 60 * 30
+
+
+# ---------------------------------------------------------------------------
+# Native genre-engine setups (CLAP / resolver) — the Linux/macOS analogs of the
+# WSL scripts. All subprocess/download seams mocked; platform-independent.
+# ---------------------------------------------------------------------------
+
+
+def _genre_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, venv_exists: bool = True
+) -> Path:
+    """Point IS_SUPPORTED/VENV_DIR/Path.home at a tmp skeleton."""
+    monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
+    vd = tmp_path / "venv"
+    if venv_exists:
+        (vd / "bin").mkdir(parents=True)
+        (vd / "bin" / "python3").write_text("#!/bin/sh\n")
+    monkeypatch.setattr(native_install, "VENV_DIR", vd)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    return vd
+
+
+def test_setup_clap_native_requires_engine_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _genre_env(tmp_path, monkeypatch, venv_exists=False)
+    out = native_install.setup_clap_native()
+    assert out["ok"] is False
+    assert "engine setup" in out["error"]
+
+
+def test_setup_clap_native_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CPU torch index first, laion-clap installed, checkpoint downloaded to
+    ~/.vibechek/clap/, import-verify run — ok:True."""
+    _genre_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(native_install, "_CLAP_MIN_CKPT_BYTES", 10)
+
+    pip_calls: list[list[str]] = []
+
+    def _fake_run_with_progress(args, on_progress, timeout, env=None):
+        pip_calls.append(list(args))
+        return 0, []
+
+    monkeypatch.setattr(native_install, "_run_with_progress", _fake_run_with_progress)
+    monkeypatch.setattr(
+        native_install, "_run_subprocess_cancellable",
+        lambda args, timeout: (0, "clap import ok", "", False),
+    )
+
+    downloaded: dict = {}
+
+    def _fake_download(urls, dest, label, on_progress=None):
+        downloaded["url"] = urls[0]
+        Path(dest).write_bytes(b"x" * 64)
+
+    import vibechek.analyzer as analyzer_mod
+    monkeypatch.setattr(analyzer_mod, "_download_from_mirrors", _fake_download)
+
+    out = native_install.setup_clap_native()
+
+    assert out["ok"] is True, out
+    # First pip call tries the CPU wheel index (CLAP is pinned to CPU).
+    assert "--index-url" in pip_calls[0]
+    assert "torch" in pip_calls[0]
+    assert any("laion-clap" in c for c in pip_calls[1])
+    assert "huggingface.co" in downloaded["url"]
+    assert (tmp_path / ".vibechek" / "clap" / "music_clap.pt").is_file()
+
+
+def test_setup_clap_native_reuses_existing_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _genre_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(native_install, "_CLAP_MIN_CKPT_BYTES", 10)
+    ckpt = tmp_path / ".vibechek" / "clap" / "music_clap.pt"
+    ckpt.parent.mkdir(parents=True)
+    ckpt.write_bytes(b"y" * 64)
+
+    monkeypatch.setattr(
+        native_install, "_run_with_progress", lambda *a, **k: (0, []),
+    )
+    monkeypatch.setattr(
+        native_install, "_run_subprocess_cancellable",
+        lambda args, timeout: (0, "clap import ok", "", False),
+    )
+
+    def _must_not_download(*a, **k):  # pragma: no cover - the assertion IS the test
+        raise AssertionError("checkpoint re-downloaded despite a valid cached file")
+
+    import vibechek.analyzer as analyzer_mod
+    monkeypatch.setattr(analyzer_mod, "_download_from_mirrors", _must_not_download)
+
+    out = native_install.setup_clap_native()
+    assert out["ok"] is True, out
+
+
+def test_setup_clap_native_falls_back_to_default_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Some platforms lack cpu-index wheels — the plain-index retry must run."""
+    _genre_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(native_install, "_CLAP_MIN_CKPT_BYTES", 10)
+
+    pip_calls: list[list[str]] = []
+
+    def _fake_run_with_progress(args, on_progress, timeout, env=None):
+        pip_calls.append(list(args))
+        # Fail ONLY the cpu-index torch attempt.
+        return (1, ["no matching distribution"]) if "--index-url" in args else (0, [])
+
+    monkeypatch.setattr(native_install, "_run_with_progress", _fake_run_with_progress)
+    monkeypatch.setattr(
+        native_install, "_run_subprocess_cancellable",
+        lambda args, timeout: (0, "clap import ok", "", False),
+    )
+
+    import vibechek.analyzer as analyzer_mod
+    monkeypatch.setattr(
+        analyzer_mod, "_download_from_mirrors",
+        lambda urls, dest, label, on_progress=None: Path(dest).write_bytes(b"x" * 64),
+    )
+
+    out = native_install.setup_clap_native()
+    assert out["ok"] is True, out
+    torch_calls = [c for c in pip_calls if "torch" in c]
+    assert len(torch_calls) == 2  # cpu-index attempt + plain-index fallback
+    assert "--index-url" in torch_calls[0]
+    assert "--index-url" not in torch_calls[1]
+
+
+def test_setup_resolver_native_requires_engine_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _genre_env(tmp_path, monkeypatch, venv_exists=False)
+    out = native_install.setup_resolver_native()
+    assert out["ok"] is False
+    assert "engine setup" in out["error"]
+
+
+def test_setup_resolver_native_reuses_installed_ollama_and_pulls_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ~/ollama/bin/ollama already present: no download, server ensured,
+    `ollama pull <model>` run with OLLAMA_HOST pinned."""
+    _genre_env(tmp_path, monkeypatch)
+    ollama_bin = tmp_path / "ollama" / "bin" / "ollama"
+    ollama_bin.parent.mkdir(parents=True)
+    ollama_bin.write_text("#!/bin/sh\n")
+
+    pulls: list[tuple[list[str], dict | None]] = []
+
+    def _fake_run_with_progress(args, on_progress, timeout, env=None):
+        pulls.append((list(args), env))
+        return 0, ["success"]
+
+    monkeypatch.setattr(native_install, "_run_with_progress", _fake_run_with_progress)
+
+    import vibechek.genre_web as genre_web_mod
+    monkeypatch.setattr(genre_web_mod, "ensure_backend", lambda *a, **k: True)
+
+    def _must_not_download(*a, **k):  # pragma: no cover
+        raise AssertionError("ollama re-downloaded despite an existing install")
+
+    import vibechek.analyzer as analyzer_mod
+    monkeypatch.setattr(analyzer_mod, "_download_from_mirrors", _must_not_download)
+
+    out = native_install.setup_resolver_native(model="qwen2.5:0.5b")
+    assert out["ok"] is True, out
+    pull_call = next(c for c, _env in pulls if "pull" in c)
+    assert "qwen2.5:0.5b" in pull_call
+    pull_env = next(env for c, env in pulls if "pull" in c)
+    assert pull_env is not None and pull_env.get("OLLAMA_HOST") == "127.0.0.1:11434"
+
+
+def test_setup_resolver_native_fails_when_server_never_comes_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _genre_env(tmp_path, monkeypatch)
+    ollama_bin = tmp_path / "ollama" / "bin" / "ollama"
+    ollama_bin.parent.mkdir(parents=True)
+    ollama_bin.write_text("#!/bin/sh\n")
+
+    monkeypatch.setattr(native_install, "_run_with_progress", lambda *a, **k: (0, []))
+
+    import vibechek.genre_web as genre_web_mod
+    monkeypatch.setattr(genre_web_mod, "ensure_backend", lambda *a, **k: False)
+
+    out = native_install.setup_resolver_native()
+    assert out["ok"] is False
+    assert "server" in out["error"].lower()
+
+
+@pytest.mark.parametrize(
+    ("is_mac", "machine", "expected_fragment", "expected_kind"),
+    [
+        (True, "arm64", "ollama-darwin.tgz", "tgz"),
+        (False, "x86_64", "ollama-linux-amd64.tar.zst", "tar.zst"),
+        (False, "aarch64", "ollama-linux-arm64.tar.zst", "tar.zst"),
+    ],
+)
+def test_ollama_tarball_picks_platform_asset(
+    monkeypatch: pytest.MonkeyPatch,
+    is_mac: bool,
+    machine: str,
+    expected_fragment: str,
+    expected_kind: str,
+) -> None:
+    import platform as platform_stdlib
+
+    monkeypatch.setattr(native_install, "IS_MAC", is_mac)
+    monkeypatch.setattr(platform_stdlib, "machine", lambda: machine)
+
+    url, kind = native_install._ollama_tarball()
+    assert expected_fragment in url
+    assert kind == expected_kind
+    # The pin must match the WSL setup's release so both paths install the
+    # same build.
+    from vibechek.wsl import _OLLAMA_RELEASE
+    assert _OLLAMA_RELEASE in url

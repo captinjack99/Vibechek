@@ -1236,6 +1236,65 @@ def test_setup_onnx_engine_rejects_bad_source_before_staging(
 
 
 # ---------------------------------------------------------------------------
+# _setup_genre_engine: the non-Windows branch dispatches to the NATIVE setups
+# (Linux/macOS used to get a flat "Windows-only" error).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "native_attr"),
+    [("clap", "setup_clap_native"), ("resolver", "setup_resolver_native")],
+)
+def test_setup_genre_engine_dispatches_native_on_non_windows(
+    monkeypatch: pytest.MonkeyPatch, kind: str, native_attr: str,
+) -> None:
+    import vibechek.native_install as native_mod
+    import vibechek.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", False, raising=False)
+
+    seen: dict = {}
+
+    def _fake_setup(on_progress=None, engine="essentia_tf"):
+        seen["engine"] = engine
+        return {"ok": True, "tail": "done"}
+
+    # Neutralize the OTHER kind so a dispatch bug fails loudly.
+    def _wrong_kind(on_progress=None, engine="essentia_tf"):  # pragma: no cover
+        raise AssertionError(f"dispatched to the wrong native setup for kind={kind!r}")
+
+    monkeypatch.setattr(native_mod, native_attr, _fake_setup)
+    other = "setup_resolver_native" if native_attr == "setup_clap_native" else "setup_clap_native"
+    monkeypatch.setattr(native_mod, other, _wrong_kind)
+
+    out = rpc._setup_genre_engine({"inference_engine": "onnx"}, kind=kind)
+    assert out == {"ok": True, "ready": True, "error": None,
+                   "cancelled": False, "tail": "done"}
+    # The ACTIVE engine must reach the native setup (it picks venv vs venv-onnx).
+    assert seen["engine"] == "onnx"
+
+
+def test_setup_genre_engine_native_failure_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibechek.native_install as native_mod
+    import vibechek.platform as platform_mod
+
+    monkeypatch.setattr(platform_mod, "IS_WINDOWS", False, raising=False)
+    monkeypatch.setattr(
+        native_mod, "setup_clap_native",
+        lambda on_progress=None, engine="essentia_tf": {
+            "ok": False, "error": "disk full", "cancelled": False, "tail": "x",
+        },
+    )
+
+    out = rpc._setup_genre_engine({}, kind="clap")
+    assert out["ok"] is False
+    assert out["ready"] is False
+    assert out["error"] == "disk full"
+
+
+# ---------------------------------------------------------------------------
 # backup_before_write: the apply RPC must actually snapshot the apply set first.
 # ---------------------------------------------------------------------------
 

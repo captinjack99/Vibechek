@@ -12,6 +12,9 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 > **The method surface is 47.** The one-click engine setups added three methods —
 > `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` (all cancellable,
 > progress-emitting) — while FLAC → CDJ export stayed CLI-only (`vibechek cdj-export`).
+> The genre setups route per platform behind the same wire shape: Windows → the WSL
+> scripts, Linux/macOS → `native_install.setup_clap_native`/`setup_resolver_native`
+> (same venv + artifact paths, so analyze-time consumers don't care which ran).
 > Engine/genre selection also **added params to existing methods** (they cross the
 > wire) — see "Engine-aware params" below.
 

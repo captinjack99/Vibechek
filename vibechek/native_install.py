@@ -456,11 +456,13 @@ def _run_with_progress(
     args: list[str],
     on_progress: Callable[[str], None],
     timeout: int,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, list[str]]:
     """Run `args`, stream stdout (+stderr merged) to `on_progress` line-by-line.
 
     Returns (returncode, last-N-lines). On timeout, kills the process and
-    returns -1 plus whatever we collected.
+    returns -1 plus whatever we collected. `env` overrides the child
+    environment (None = inherit).
 
     Cooperatively cancellable: a watchdog thread polls
     `vibechek.cancellation.is_cancelled()` every 500ms and terminates the
@@ -484,6 +486,7 @@ def _run_with_progress(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
     except OSError as e:
         return -1, [f"Could not invoke: {e}"]
@@ -718,6 +721,293 @@ def run_vibechek_in_native_venv(
 
 
 
+# ---------------------------------------------------------------------------
+# Opt-in genre engines (CLAP student / online resolver) — native analogs of
+# wsl.setup_clap_in_wsl / setup_resolver_in_wsl. Same venv layout, same
+# artifact paths (~/.vibechek/clap/music_clap.pt, ~/ollama/bin/ollama), so the
+# analyze-time consumers (analyzer._maybe_load_clap, genre_web.ensure_backend)
+# work unchanged on native Linux/macOS.
+# ---------------------------------------------------------------------------
+
+# The 2.2 GB CLAP checkpoint; anything below this is a truncated/error download
+# (mirrors the WSL script's `stat -c%s` floor).
+_CLAP_MIN_CKPT_BYTES = 1_500_000_000
+
+
+def _ollama_tarball() -> tuple[str, str]:
+    """(url, kind) of the pinned no-sudo Ollama tarball for this OS/arch.
+
+    Single-sources the release pin from `vibechek.wsl` (the WSL setup installs
+    the same build). Linux ships `.tar.zst` (CUDA/ROCm libs bundled; extracts
+    `bin/ollama` + `lib/` into ~/ollama); macOS ships a plain `.tgz` holding
+    the bare universal `ollama` binary at the tar root (verified against the
+    v0.30.4 asset), which we land at ~/ollama/bin/ollama ourselves.
+    """
+    import platform as _platform  # noqa: PLC0415
+
+    from vibechek.wsl import _OLLAMA_RELEASE  # noqa: PLC0415
+
+    base = f"https://github.com/ollama/ollama/releases/download/{_OLLAMA_RELEASE}"
+    if IS_MAC:
+        return f"{base}/ollama-darwin.tgz", "tgz"
+    machine = _platform.machine().lower()
+    arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
+    return f"{base}/ollama-linux-{arch}.tar.zst", "tar.zst"
+
+
+def _genre_venv_python(engine: str) -> tuple[Path | None, str | None]:
+    """The analysis venv's python for `engine`, or (None, error) if absent.
+
+    The genre extras install INTO the engine's venv (one worker runs them
+    alongside essentia/onnx), so the engine setup must have run first — same
+    precondition as the WSL scripts' `[ -x $VENV/bin/pip ]` guard.
+    """
+    vd = _venv_dir(engine)
+    py = next((p for p in (vd / "bin" / "python3", vd / "bin" / "python") if p.exists()), None)
+    if py is None:
+        return None, (
+            f"The analysis venv at {vd} is missing — run the engine setup "
+            "(Install analysis engine / Set up ONNX engine) first."
+        )
+    return py, None
+
+
+def setup_clap_native(
+    on_progress: ProgressCallback | None = None,
+    engine: str = "essentia_tf",
+) -> dict:
+    """Install the CLAP genre student into the native managed venv (Linux/macOS).
+
+    Mirror of `wsl.setup_clap_in_wsl`, in Python instead of a WSL bash script:
+      1. torch + torchvision (CPU wheel index first — CLAP is pinned to CPU by
+         design; plain-index fallback) + laion-clap + soundfile into the
+         engine's venv;
+      2. the ~2.2 GB checkpoint → ~/.vibechek/clap/music_clap.pt (idempotent,
+         .partial-staged, size-validated, cancellable mid-stream);
+      3. import-verify inside the venv.
+    Cancellable; streams progress. Returns the WSL helpers' dict shape.
+    """
+    if not IS_SUPPORTED:
+        return {"ok": False, "error": f"Native genre-engine setup not supported on {sys.platform}"}
+
+    from vibechek import cancellation  # noqa: PLC0415
+    from vibechek.clap_genre import _CHECKPOINT_NAME, _CHECKPOINT_URL  # noqa: PLC0415
+
+    venv_python, err = _genre_venv_python(engine)
+    if venv_python is None:
+        return {"ok": False, "error": err}
+    venv_pip = [str(venv_python), "-m", "pip"]
+
+    def _step(pct: int, msg: str) -> None:
+        if on_progress:
+            on_progress(pct, 100, msg)
+
+    # ---- 1. deps. The CPU torch index keeps it ~200 MB; the plain-index
+    # fallback (some platforms lack cpu-index wheels) can pull the multi-GB
+    # CUDA build, so the step gets the GPU-stack 2 h ceiling.
+    _step(2, "[1/3] Installing CLAP deps (torch, torchvision, laion-clap)...")
+    rc, tail = _run_with_progress(
+        [*venv_pip, "install", "--quiet", "torch", "torchvision",
+         "--index-url", "https://download.pytorch.org/whl/cpu"],
+        on_progress=lambda line: _step(10, line[:120]),
+        timeout=60 * 120,
+    )
+    if cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+    if rc != 0:
+        _step(10, "CPU wheel index failed — retrying from the default index...")
+        rc, tail = _run_with_progress(
+            [*venv_pip, "install", "--quiet", "torch", "torchvision"],
+            on_progress=lambda line: _step(15, line[:120]),
+            timeout=60 * 120,
+        )
+        if cancellation.is_cancelled():
+            return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+        if rc != 0:
+            return _fail("torch install", rc, tail)
+    rc, tail = _run_with_progress(
+        [*venv_pip, "install", "--quiet", "laion-clap", "soundfile"],
+        on_progress=lambda line: _step(35, line[:120]),
+        timeout=60 * 30,
+    )
+    if cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+    if rc != 0:
+        return _fail("laion-clap install", rc, tail)
+
+    # ---- 2. checkpoint (idempotent; the downloader stages to .partial,
+    # validates Content-Length, and aborts mid-stream on cancel).
+    ckpt = Path.home() / ".vibechek" / "clap" / _CHECKPOINT_NAME
+    if ckpt.exists() and ckpt.stat().st_size >= _CLAP_MIN_CKPT_BYTES:
+        _step(90, "CLAP checkpoint already present, reusing")
+    else:
+        _step(50, "[2/3] Downloading CLAP checkpoint (~2.2 GB, one-time)...")
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        from vibechek.analyzer import _download_from_mirrors  # noqa: PLC0415
+
+        def _dl_progress(done: int, total: int) -> None:
+            pct = 50 + int(40 * done / total) if total > 0 else 60
+            _step(pct, f"CLAP checkpoint ({done // 2**20} MB/{total // 2**20} MB)")
+
+        try:
+            _download_from_mirrors(
+                [_CHECKPOINT_URL], ckpt, label=_CHECKPOINT_NAME, on_progress=_dl_progress,
+            )
+        except cancellation.CancelledError:
+            return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+        except RuntimeError as e:
+            return {"ok": False, "error": f"CLAP checkpoint download failed: {e}"}
+        if ckpt.stat().st_size < _CLAP_MIN_CKPT_BYTES:
+            size = ckpt.stat().st_size
+            ckpt.unlink(missing_ok=True)
+            return {"ok": False,
+                    "error": f"CLAP checkpoint download incomplete ({size} bytes)"}
+
+    # ---- 3. verify
+    _step(95, "[3/3] Verifying...")
+    rc, out, errout, cancelled = _run_subprocess_cancellable(
+        [str(venv_python), "-c", "import laion_clap, soundfile; print('clap import ok')"],
+        timeout=180,
+    )
+    if cancelled or cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+    if rc != 0:
+        return {"ok": False,
+                "error": f"CLAP deps installed but import-verify failed:\n{errout[-800:]}"}
+    _step(100, "CLAP genre engine ready")
+    return {"ok": True, "tail": out.strip()}
+
+
+def setup_resolver_native(
+    on_progress: ProgressCallback | None = None,
+    engine: str = "essentia_tf",
+    model: str = "qwen2.5:7b",
+) -> dict:
+    """Install the online genre resolver natively (Linux/macOS).
+
+    Mirror of `wsl.setup_resolver_in_wsl`: ddgs + zstandard into the engine's
+    venv, a no-sudo Ollama under ~/ollama (platform tarball via
+    `_ollama_tarball`), start the server (reuses `genre_web.ensure_backend` —
+    the same code that self-heals it at analyze time), pull `model`, verify.
+    Cancellable; streams progress. Returns the WSL helpers' dict shape.
+    """
+    if not IS_SUPPORTED:
+        return {"ok": False, "error": f"Native genre-engine setup not supported on {sys.platform}"}
+
+    import tempfile  # noqa: PLC0415
+
+    from vibechek import cancellation  # noqa: PLC0415
+
+    venv_python, err = _genre_venv_python(engine)
+    if venv_python is None:
+        return {"ok": False, "error": err}
+    venv_pip = [str(venv_python), "-m", "pip"]
+
+    def _step(pct: int, msg: str) -> None:
+        if on_progress:
+            on_progress(pct, 100, msg)
+
+    # ---- 1. python deps (zstandard also decompresses the linux tarball below)
+    _step(2, "[1/4] Installing ddgs + zstandard...")
+    rc, tail = _run_with_progress(
+        [*venv_pip, "install", "--quiet", "ddgs", "zstandard"],
+        on_progress=lambda line: _step(8, line[:120]),
+        timeout=60 * 10,
+    )
+    if cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+    if rc != 0:
+        return _fail("ddgs install", rc, tail)
+
+    # ---- 2. the no-sudo Ollama under ~/ollama (idempotent)
+    ollama_bin = Path.home() / "ollama" / "bin" / "ollama"
+    if not ollama_bin.is_file():
+        url, kind = _ollama_tarball()
+        _step(15, f"[2/4] Installing Ollama (no-sudo, {kind})...")
+        from vibechek.analyzer import _download_from_mirrors  # noqa: PLC0415
+
+        with tempfile.TemporaryDirectory(prefix="vibechek-ollama-") as td:
+            archive = Path(td) / f"ollama.{kind}"
+
+            def _dl_progress(done: int, total: int) -> None:
+                pct = 15 + int(25 * done / total) if total > 0 else 25
+                _step(pct, f"Ollama download ({done // 2**20} MB/{total // 2**20} MB)")
+
+            try:
+                _download_from_mirrors([url], archive, label="ollama", on_progress=_dl_progress)
+            except cancellation.CancelledError:
+                return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+            except RuntimeError as e:
+                return {"ok": False, "error": f"Ollama download failed: {e}"}
+
+            _step(42, "Unpacking Ollama...")
+            target = Path.home() / "ollama"
+            if kind == "tar.zst":
+                # Decompress with the venv's zstandard (installed in step 1) —
+                # no system zstd dependency; then plain tar (linux layout has
+                # bin/ + lib/ at the archive root).
+                tar_path = Path(td) / "ollama.tar"
+                rc, out, errout, cancelled = _run_subprocess_cancellable(
+                    [str(venv_python), "-c",
+                     "import zstandard,sys;"
+                     "fi=open(sys.argv[1],'rb');fo=open(sys.argv[2],'wb');"
+                     "zstandard.ZstdDecompressor().copy_stream(fi,fo)",
+                     str(archive), str(tar_path)],
+                    timeout=60 * 10,
+                )
+                if cancelled or cancellation.is_cancelled():
+                    return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+                if rc != 0:
+                    return {"ok": False, "error": f"Ollama unpack (zstd) failed:\n{errout[-500:]}"}
+                target.mkdir(parents=True, exist_ok=True)
+                rc, out, errout, cancelled = _run_subprocess_cancellable(
+                    ["tar", "-xf", str(tar_path), "-C", str(target)], timeout=60 * 10,
+                )
+            else:
+                # darwin .tgz: the bare `ollama` binary at the tar root → land
+                # it in bin/ ourselves so ensure_backend's path works.
+                (target / "bin").mkdir(parents=True, exist_ok=True)
+                rc, out, errout, cancelled = _run_subprocess_cancellable(
+                    ["tar", "-xzf", str(archive), "-C", str(target / "bin")], timeout=60 * 10,
+                )
+            if cancelled or cancellation.is_cancelled():
+                return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+            if rc != 0:
+                return {"ok": False, "error": f"Ollama unpack (tar) failed:\n{errout[-500:]}"}
+        if not ollama_bin.is_file():
+            return {"ok": False,
+                    "error": f"Ollama unpacked but {ollama_bin} is missing (layout change?)"}
+        ollama_bin.chmod(0o755)
+    else:
+        _step(40, "Ollama already installed, reusing")
+
+    # ---- 3. server + model pull
+    _step(50, f"[3/4] Starting Ollama + pulling {model} (one-time)...")
+    from vibechek.genre_web import ensure_backend  # noqa: PLC0415
+
+    if not ensure_backend():
+        return {"ok": False,
+                "error": "Ollama installed but the server did not come up "
+                         "(see ~/.vibechek/ollama.log)"}
+    rc, tail = _run_with_progress(
+        [str(ollama_bin), "pull", model],
+        on_progress=lambda line: _step(70, line[:120]),
+        timeout=60 * 120,  # multi-GB model on arbitrary connections
+        env={**os.environ, "OLLAMA_HOST": "127.0.0.1:11434"},
+    )
+    if cancellation.is_cancelled():
+        return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+    if rc != 0:
+        return _fail(f"ollama pull {model}", rc, tail)
+
+    # ---- 4. verify
+    _step(95, "[4/4] Verifying...")
+    if not ensure_backend():
+        return {"ok": False, "error": "Ollama server unreachable after setup"}
+    _step(100, "Online genre resolver ready")
+    return {"ok": True, "tail": "\n".join(tail[-10:])}
+
+
 __all__ = [
     "IS_SUPPORTED",
     "VENV_DIR",
@@ -726,4 +1016,6 @@ __all__ = [
     "probe_native_venv",
     "install_essentia_native",
     "run_vibechek_in_native_venv",
+    "setup_clap_native",
+    "setup_resolver_native",
 ]

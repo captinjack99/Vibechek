@@ -668,6 +668,8 @@ def _download_from_mirrors(
     if not urls:
         raise ValueError("No mirror URLs provided")
 
+    from vibechek import cancellation  # noqa: PLC0415
+
     mirror_errors: list[str] = []
     for url in urls:
         try:
@@ -677,6 +679,11 @@ def _download_from_mirrors(
                 max_attempts=max_attempts_per_mirror,
             )
             return  # success
+        except cancellation.CancelledError:
+            # A user cancel is not a mirror failure — do NOT fail over to the
+            # next mirror (CancelledError subclasses RuntimeError, so without
+            # this it would re-download from mirror 2 after a cancel).
+            raise
         except RuntimeError as e:
             log.warning("Mirror %s failed for %s: %s", url, dest.name, e)
             mirror_errors.append(f"{url}: {e}")
@@ -746,6 +753,8 @@ def _do_one_download(
     """One attempt at downloading `url` to `dest`. Raises on failure."""
     import time as _time
 
+    from vibechek import cancellation  # noqa: PLC0415
+
     with urllib.request.urlopen(url, timeout=30) as resp:
         total = int(resp.headers.get("Content-Length") or 0)
         bytes_done = 0
@@ -757,6 +766,12 @@ def _do_one_download(
         try:
             with open(tmp_dest, "wb") as f:
                 while True:
+                    # A flag read per 64 KB chunk — effectively free, and it
+                    # makes Cancel actually stop a multi-GB fetch (the CLAP
+                    # checkpoint is 2.2 GB) instead of letting it run to
+                    # completion behind a "cancelling…" dialog. The partial is
+                    # unlinked by the except-cleanup below.
+                    cancellation.check()
                     chunk = resp.read(chunk_size)
                     if not chunk:
                         break

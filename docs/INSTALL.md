@@ -204,9 +204,9 @@ you're installing into your own environment.
   upload. Manual: `pip install "vibechek[resolver]"` then click **Set up online resolver**
   (or analyze with `--genre-web-lookup`).
 
-Both run inside the same analysis environment as Essentia (WSL on Windows), so one worker
-does BPM/key/mood *and* the new genre source. See the
-[user guide](USER_GUIDE.md#genre-classifier--online-lookup).
+Both run inside the same analysis environment as Essentia (WSL on Windows, the managed
+`~/.vibechek` venv on Linux/macOS), so one worker does BPM/key/mood *and* the new genre
+source. See the [user guide](USER_GUIDE.md#genre-classifier--online-lookup).
 
 ## Installing fpcalc (for `dedupe`'s audio fingerprinting)
 

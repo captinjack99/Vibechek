@@ -30,6 +30,23 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   test instead of GitHub main; everything runs sandboxed under a throwaway
   HOME.
 
+- **Native (Linux/macOS) one-click setups for the opt-in genre engines.** The
+  CLAP audio classifier and the online genre resolver previously had one-click
+  setup on Windows/WSL only — Linux/macOS users got a "Windows-only" notice
+  and a manual pip recipe. `setup_clap_engine` / `setup_genre_resolver` now
+  route to native installers (`native_install.setup_clap_native` /
+  `setup_resolver_native`) that mirror the WSL scripts against the same
+  managed-venv and artifact paths (`~/.vibechek/venv[-onnx]`,
+  `~/.vibechek/clap/music_clap.pt`, `~/ollama/bin/ollama`) — torch-CPU +
+  laion-clap + the checkpoint for CLAP; ddgs + a no-sudo platform-matched
+  Ollama tarball (linux amd64/arm64 `.tar.zst`, darwin `.tgz`) + the model
+  pull for the resolver. The Settings buttons now show on every platform.
+- **Model/checkpoint downloads cancel mid-stream.** The shared download path
+  (`.pb` models, ONNX backbone, and now the 2.2 GB CLAP checkpoint) polls
+  cancellation per chunk — Cancel used to let a multi-GB fetch run to
+  completion behind the dialog — and a cancel no longer fails over to the
+  next mirror to start the same download again.
+
 ### Fixed
 - **The native (Linux/macOS) GPU engine install no longer dies at 15 minutes.**
   `install_essentia_native` auto-selects `onnxruntime-gpu` + the CUDA 12 wheel

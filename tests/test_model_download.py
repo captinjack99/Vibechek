@@ -91,6 +91,80 @@ def test_failed_download_does_not_delete_existing_models(tmp_path, monkeypatch) 
     )
 
 
+# --- Cancellation: a multi-GB download must stop mid-stream on cancel. ---
+
+
+def test_do_one_download_aborts_mid_stream_on_cancel(tmp_path, monkeypatch) -> None:
+    """Cancel during the byte loop raises CancelledError and removes the
+    .partial (regression for the CLAP 2.2 GB checkpoint: before this, Cancel
+    let the whole download run to completion behind the dialog)."""
+    from vibechek import cancellation
+
+    class _FakeResp:
+        headers = {"Content-Length": "1000"}
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read(self, _n: int) -> bytes:
+            self.reads += 1
+            if self.reads == 2:
+                cancellation.cancel()  # flag flips AFTER the first chunk landed
+            if self.reads >= 5:
+                # Safety valve: if the cancellation check regresses, end the
+                # stream so the test FAILS (truncated-size RuntimeError !=
+                # CancelledError) instead of hanging the suite forever.
+                return b""
+            return b"x" * 100
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _FakeResp())
+    dest = tmp_path / "music_clap.pt"
+
+    cancellation.begin("clap-setup")
+    try:
+        with pytest.raises(cancellation.CancelledError):
+            analyzer._do_one_download(
+                "http://example.invalid/ckpt", dest, on_progress=None, chunk_size=100,
+            )
+    finally:
+        cancellation.end()
+
+    assert not dest.exists()
+    assert not dest.with_suffix(dest.suffix + ".partial").exists(), (
+        "a cancelled download stranded its .partial"
+    )
+
+
+def test_download_from_mirrors_does_not_fail_over_on_cancel(monkeypatch, tmp_path) -> None:
+    """CancelledError subclasses RuntimeError — without the explicit re-raise,
+    the mirror loop would treat a user cancel as a mirror failure and start the
+    SAME multi-GB download again from mirror 2."""
+    from vibechek import cancellation
+
+    attempts: list[str] = []
+
+    def _cancelled_download(url, dest, label, on_progress=None, chunk_size=0, max_attempts=0):
+        attempts.append(url)
+        raise cancellation.CancelledError("cancelled by user")
+
+    monkeypatch.setattr(analyzer, "_download_with_progress", _cancelled_download)
+
+    with pytest.raises(cancellation.CancelledError):
+        analyzer._download_from_mirrors(
+            ["http://mirror-one.invalid/f", "http://mirror-two.invalid/f"],
+            tmp_path / "f.bin", label="f",
+        )
+    assert attempts == ["http://mirror-one.invalid/f"], (
+        f"cancel failed over to the next mirror: {attempts}"
+    )
+
+
 # --- One-click setup: bundled ONNX heads ship in the repo + stage cleanly. ---
 
 
