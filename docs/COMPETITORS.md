@@ -107,6 +107,48 @@ updated to match reality:
   auto-detection, timeslot tagging, local-first + open-source + $0, and GPU acceleration** —
   none of the five offers ML genre auto-detection or is open source.
 
+## Analysis accuracy & methodology vs the field (researched 2026-06-18)
+
+This matrix is about *capabilities*. On *accuracy*, the honest finding is that **no competitor publishes
+gold-corpus accuracy numbers**, so cross-tool comparison rests on academic proxies + reputation, not
+measurement. Deep-research synthesis (cited, adversarially verified):
+
+- **Key — Vibechek's ~71% exact-Camelot is AT the state of the art for electronic music, not behind it.**
+  The best published systems on GiantSteps (604 Beatport EDM excerpts, the directly comparable benchmark)
+  cluster in the high-60s–mid-70s exact-correct band: supervised CNN (Korzeniowski-Widmer, 67.9% exact),
+  genre-agnostic AllConv (67.9%), self-supervised S-KEY 2025 (~72% MIREX). A third-party reimplementation
+  even put **Mixed In Key 8.3 at ~69% exact — beaten by a CNN in some runs, beating it in others.** Caveat:
+  academic figures are MIREX-weighted/-correct, not Camelot-exact, so this is same-ballpark, not point-for-point.
+  Sources: arxiv 1706.02921, 1808.05340, 2501.12907.
+- **The major→parallel-minor flip is INHERENT to single-key detection, not a Vibechek bug.** It persists even
+  in CNNs under train/test tonality shift, and MIREX scores it as the *worst* near-miss (0.2 credit, vs 0.5 for a
+  fifth, 0.3 for relative). Confirms the standing "don't blind-correct the flip" rule. Source: MIREX 2025 Audio
+  Key Detection wiki + arxiv 1706.02921.
+- **Swapping essentia's pitch-class template for a CNN key model is the only credible per-track key lever — but
+  the realistic gain over 71% is low single digits** (CNN beat the best EDM template by only ~4 pts; Vibechek's
+  71% already exceeds it), gated by deployment cost (madmom is non-viable on the py3.13 toolchain), and a generic
+  non-EDM-trained CNN *collapses* on electronic material. Not worth it without a production-path A/B on our own
+  gold corpus first.
+- **BPM — Vibechek's ~97% is NOT comparable to the ~74% audio-only literature figures.** Our 97% reflects
+  filename reconciliation + octave-folding on an easy electronic-only corpus; pure-audio cross-genre *exact*
+  tempo (Acc1) plateaus ~74% because **octave (half/double-time) errors are the dominant, persistent failure
+  mode** — which our octave-folding already targets. Single-value BPM has little headroom. Sources: TISMIR
+  10.5334/tismir.43, arxiv 2401.00209.
+- **The one structural gap is VARIABLE beatgrids** (local tempo / drift), which Rekordbox's "dynamic" analysis
+  provides and Vibechek's single static BPM lacks. A capability gap, not an accuracy gap (see ROADMAP "Variable /
+  dynamic beatgrid"). NB the research could NOT directly source how Rekordbox/Serato/Traktor implement variable
+  beatgrids, and confirmed **Mixed In Key does NOT do variable beatgrids** (fixed 0/30/70% chunks + ±3 BPM
+  consensus → one static BPM — same class as Vibechek). Source: mixidaw.com/BPM.
+- **Mixed In Key's 1-10 Energy: nothing to copy.** Its patented algorithm's technical basis is undocumented and
+  community-disputed (volume-bias, narrow 5-8 effective range); it's a set-building UX feature, not a published
+  method. The only realistic target is matching the UX (a monotonic, set-orderable scale) — consistent with
+  Vibechek's own finding that energy/mood has no measurable accuracy lever. Source: mixedinkey.com energy guide.
+
+**Bottom line for README/launch claims:** do NOT claim "more accurate than $TOOL" — we can't measure them, and on
+the comparable academic proxy our key is at parity with the SOTA, not ahead. The honest, defensible framing stays
+*capability* coverage + local-first + open-source + $0 (the existing matrix above), plus "key/BPM accuracy on par
+with the best published methods for electronic music."
+
 ## Tone guidance
 
 Be fair, not dismissive. Mixed In Key is genuinely great at key detection — it's *narrow*,
