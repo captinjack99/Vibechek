@@ -94,16 +94,14 @@ class PreflightResult:
             )
         if self.models.missing:
             out.append(f"{len(self.models.missing)} ML model file(s) missing")
-        # Version drift on the WSL path: essentia is present but the WSL vibechek
-        # is older than this app, which the analyzer refuses to run.
-        if have_engine and self.analyze_via == "wsl":
-            from vibechek import __version__ as _sidecar_version  # noqa: PLC0415
-            outdated, wv = _wsl_version_drift(self.wsl, _sidecar_version)
-            if outdated:
-                out.append(
-                    f"WSL analyzer is out of date ({wv} < {_sidecar_version}) — "
-                    f'run Settings → "Update WSL install"'
-                )
+        # NOTE: WSL version drift is deliberately NOT a "not ready" reason. The
+        # analyzer auto-updates an outdated WSL vibechek in place on the next
+        # analyze (engine-aware, one-time, with a progress step) instead of
+        # rejecting it — so a present-but-stale install IS usable and must not
+        # dead-end here. (This used to append an "out of date — Update WSL
+        # install" reason back when the analyzer *refused* drift; that premise
+        # ended when the auto-update shipped, leaving this a silent trap that
+        # fired on every app upgrade / reinstall.)
         return out
 
 
@@ -184,28 +182,6 @@ def check_models(models_dir: Path | None = None, engine: str = "essentia_tf") ->
     return result
 
 
-def _wsl_version_drift(wsl_status, sidecar_version: str) -> tuple[bool, str | None]:
-    """Is the usable WSL distro's vibechek strictly older than the sidecar?
-
-    Returns (is_outdated, wsl_version). A missing version (quick probe / no
-    dist-info) is a degraded probe, NOT a definite drift -> (False, None), so we
-    never block on incomplete data. Mirrors the analyzer's analyze-time guard so
-    preflight can't report "ready" for a stale WSL install that the guard will
-    then reject. Drift only ever applies to the WSL analyze path.
-    """
-    if not wsl_status or not getattr(wsl_status, "usable_distro", None):
-        return (False, None)
-    distro = next(
-        (d for d in getattr(wsl_status, "distros", []) if d.name == wsl_status.usable_distro),
-        None,
-    )
-    wv = getattr(distro, "vibechek_version", None) if distro else None
-    if not wv:
-        return (False, None)
-    from vibechek.analyzer import _wsl_install_is_outdated  # noqa: PLC0415
-    return (_wsl_install_is_outdated(wv, sidecar_version), wv)
-
-
 def preflight(
     models_dir: Path | None = None,
     *,
@@ -245,17 +221,14 @@ def preflight(
     have_native_venv = native_venv.essentia_installed and native_venv.vibechek_installed
     have_engine = have_native or have_wsl or have_native_venv
 
-    # A WSL install that's strictly older than this sidecar will be rejected by
-    # the analyzer's drift guard at analyze time — so don't advertise "ready"
-    # for it here (that mismatch is exactly what made "set up → Ready → analyze
-    # fails with 'out of date'" so confusing). Only meaningful on a full probe
-    # (quick mode has no version); a degraded probe never blocks.
-    from vibechek import __version__ as _sidecar_version  # noqa: PLC0415
-    wsl_outdated = False
-    if have_wsl and not have_native and not have_native_venv:
-        wsl_outdated, _ = _wsl_version_drift(wsl_status, _sidecar_version)
-
-    ready = have_engine and not models.missing and not wsl_outdated
+    # WSL version drift does NOT block readiness: the analyzer auto-updates an
+    # outdated WSL vibechek in place on the next analyze (engine-aware, one-time,
+    # with a progress step) rather than rejecting it. Blocking here turned every
+    # app upgrade / reinstall into a dead-end "out of date" dialog AND shadowed
+    # that self-heal so it never ran (analyze_directory re-checks preflight and
+    # raised before reaching the auto-update). A genuinely-missing engine still
+    # blocks via have_engine; a stale-but-present one heals on first analyze.
+    ready = have_engine and not models.missing
     if have_native:
         analyze_via = "native"
     elif have_wsl:

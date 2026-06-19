@@ -526,7 +526,12 @@ def _upgrade_vibechek_in_wsl(params: dict) -> dict:
     """
     from vibechek.wsl import upgrade_vibechek_in_wsl
     distro = str(params["distro"])
-    return upgrade_vibechek_in_wsl(distro, on_progress=_emit_progress)
+    # Engine-aware: a manual "Update WSL install" must repair the venv for the
+    # CURRENTLY SELECTED engine ("venv" for essentia_tf, "venv-onnx" for onnx).
+    # Without this it always updated the default essentia_tf venv, so an
+    # out-of-date ONNX install could never be fixed from the button.
+    engine = _valid_engine(params.get("engine") or params.get("inference_engine"))
+    return upgrade_vibechek_in_wsl(distro, on_progress=_emit_progress, engine=engine)
 
 
 def _install_essentia_native(params: dict) -> dict:

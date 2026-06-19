@@ -123,13 +123,15 @@ def test_reasons_not_ready_empty_when_all_good() -> None:
     assert r.reasons_not_ready == []
 
 
-def test_reasons_not_ready_flags_wsl_version_drift() -> None:
-    """WSL has the engine but an OLD vibechek -> the analyzer's drift guard will
-    reject it, so preflight must NOT call it ready; it surfaces an actionable
-    'Update WSL install' reason. Regression: preflight reported 'Ready to
-    analyze' while a real analyze failed with 'out of date'."""
+def test_wsl_version_drift_is_not_a_not_ready_reason() -> None:
+    """An OLD WSL vibechek must NOT be surfaced as a 'not ready' reason: the
+    analyzer auto-updates it in place on the next analyze (engine-aware,
+    one-time). Regression: preflight used to flag 'out of date — Update WSL
+    install' and block, which dead-ended every app upgrade / reinstall at a
+    dialog AND shadowed the self-heal so it never ran (analyze_directory
+    re-checks preflight and raised before reaching the auto-update guard)."""
     r = PreflightResult(
-        ready=False,
+        ready=True,
         essentia=EssentiaCheck(installed=False, error="ImportError (host)"),
         models=ModelsCheck(models_dir="/x", found=["effnet"]),  # models present
         platform="Windows-10",
@@ -137,8 +139,8 @@ def test_reasons_not_ready_flags_wsl_version_drift() -> None:
         analyze_via="wsl",
     )
     reasons = r.reasons_not_ready
-    assert any("out of date" in x.lower() for x in reasons), reasons
-    assert any("update wsl install" in x.lower() for x in reasons), reasons
+    assert not any("out of date" in x.lower() for x in reasons), reasons
+    assert not any("update wsl install" in x.lower() for x in reasons), reasons
 
 
 def test_reasons_not_ready_no_drift_when_wsl_matches_sidecar() -> None:
@@ -357,6 +359,31 @@ def test_preflight_via_wsl_when_only_wsl_has_engine(monkeypatch: pytest.MonkeyPa
     r = preflight()
     assert r.ready is True
     assert r.analyze_via == "wsl"
+
+
+def test_preflight_ready_when_wsl_engine_present_but_outdated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OUTDATED WSL vibechek must still be 'ready' — the analyzer auto-updates
+    it in place on first analyze. Regression for the silent upgrade trap: drift
+    used to make preflight not-ready, so the GUI dead-ended at a dialog and the
+    auto-update never got a chance to run."""
+    monkeypatch.setattr(
+        preflight_mod, "check_essentia",
+        lambda: EssentiaCheck(installed=False, error="ImportError"),
+    )
+    monkeypatch.setattr(
+        preflight_mod, "check_models",
+        lambda _d=None, engine="essentia_tf": ModelsCheck(models_dir="/x", found=["effnet"]),
+    )
+    monkeypatch.setattr(
+        preflight_mod, "detect_wsl",
+        lambda quick=True, venv_subdir="venv": _wsl_drifted("0.1.0"),
+    )
+    r = preflight()
+    assert r.ready is True
+    assert r.analyze_via == "wsl"
+    assert not any("out of date" in x.lower() for x in r.reasons_not_ready)
 
 
 def test_preflight_native_preferred_over_wsl(monkeypatch: pytest.MonkeyPatch) -> None:

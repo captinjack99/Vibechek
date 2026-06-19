@@ -160,6 +160,10 @@ export interface InstallVibechekInWSLRequest {
 
 export interface UpgradeVibechekInWSLRequest {
   distro: string;
+  /** Which engine's venv to repair ("essentia_tf" | "onnx"). Defaults to
+   *  essentia_tf server-side; the GUI passes the selected engine so an
+   *  out-of-date ONNX install can be fixed from the button too. */
+  inference_engine?: string;
 }
 
 export interface InstallCudaLibsInWSLRequest {

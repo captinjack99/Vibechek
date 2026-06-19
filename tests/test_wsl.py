@@ -43,6 +43,39 @@ def test_user_bootstrap_force_reinstalls_vibechek(engine: str) -> None:
     # so a re-run doesn't drag essentia-tensorflow down again.
     assert "--no-deps" in script
 
+
+def test_upgrade_rpc_forwards_selected_engine() -> None:
+    """'Update WSL install' must repair the venv for the SELECTED engine.
+    Regression: the RPC dropped the engine, so it always updated the default
+    essentia_tf venv — an out-of-date ONNX install (venv-onnx) could never be
+    fixed from the button, leaving the user stuck on a drift error."""
+    from vibechek import rpc
+    seen: dict = {}
+
+    def fake_upgrade(distro, on_progress=None, engine="essentia_tf"):
+        seen["distro"] = distro
+        seen["engine"] = engine
+        return {"ok": True}
+
+    with patch("vibechek.wsl.upgrade_vibechek_in_wsl", fake_upgrade):
+        out = rpc._upgrade_vibechek_in_wsl({"distro": "Ubuntu", "inference_engine": "onnx"})
+    assert out == {"ok": True}
+    assert seen == {"distro": "Ubuntu", "engine": "onnx"}
+
+
+def test_upgrade_rpc_defaults_engine_when_omitted() -> None:
+    """No engine param -> essentia_tf default (back-compat with older GUIs)."""
+    from vibechek import rpc
+    seen: dict = {}
+
+    def fake_upgrade(distro, on_progress=None, engine="essentia_tf"):
+        seen["engine"] = engine
+        return {"ok": True}
+
+    with patch("vibechek.wsl.upgrade_vibechek_in_wsl", fake_upgrade):
+        rpc._upgrade_vibechek_in_wsl({"distro": "Ubuntu"})
+    assert seen["engine"] == "essentia_tf"
+
 # ---------------------------------------------------------------------------
 # Path translation
 # ---------------------------------------------------------------------------

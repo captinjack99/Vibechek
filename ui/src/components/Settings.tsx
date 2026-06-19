@@ -197,7 +197,8 @@ export function Settings() {
     setDiagBusy("upgrade");
     const opId = begin("install-essentia");
     try {
-      const res = await upgradeVibechekInWSL({ distro }, opId);
+      const engine = useConfigStore.getState().config.analysis.inference_engine;
+      const res = await upgradeVibechekInWSL({ distro, inference_engine: engine }, opId);
       finish();
       if (res.ok) {
         notify("WSL Vibechek updated", {
