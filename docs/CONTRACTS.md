@@ -68,6 +68,25 @@ Notification:  {"jsonrpc":"2.0","method":"progress","params":{"current":50,"tota
   (`progressMatches` in `ui/src/stores/operation.ts`), so the dialogs sharing the one
   event stream can't render a straggler from a cancelled/previous op.
 
+## Optional fields on the wire (`None` is dropped)
+
+Result dataclasses are serialized with `None` values **omitted**, not emitted as
+`null` — `analyze_track` builds each record as `{k: v for k, v in asdict(ml).items()
+if v is not None}`. So a field typed `X | null` in `generated.ts` may be **absent**
+(`undefined`) on the wire, not `null`. **TS consumers must use truthy / `?.` checks,
+never `=== null`.**
+
+This is how new optional fields stay backwards-safe: declaring them on the dataclass
+with a `None` default makes the generator emit them (type-safe for the UI) while keeping
+them off the wire until something sets them — the raw record shape is unchanged.
+
+Concretely, the genre/vocal **reconciliation-provenance** fields on `MLResult`
+(`ml_genre_source`, `ml_genre_conflict`, `ml_genre_audio`, `ml_subgenre_audio`,
+`ml_genre_web`, `ml_genre_web_grounded`, `ml_vocal_audio`, `ml_vocal_source`) are
+stamped only on the **final** report (in `_reconcile_record_genre` / `_reconcile_record_vocal`),
+so they're absent on the raw per-track `track_analyzed` notifications that stream during
+analyze. The library UI's conflict surfacing keys off them with truthy checks accordingly.
+
 ## The five steps
 
 ### 1. Implement the handler

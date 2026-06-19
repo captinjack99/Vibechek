@@ -71,8 +71,9 @@ The Discogs-EffNet head above is the default. But genre is the hardest field to 
 - **Trust your existing tags (default).** Beatport/curated tags are usually better than any audio guess, so Vibechek *keeps a specific existing genre* and uses the model only to fill gaps — while ignoring generic junk ("Dance/Pop", "Electronic") and letting a confident model read override a tag that's clearly wrong. Fully configurable (`prefer_tag` / `prefer_ml` / `tag_only` / `ml_only`).
 - **CLAP audio classifier (opt-in).** A modern audio-embedding model matched against a curated reference library — **roughly 2× the genre accuracy** of the Discogs head on pure audio, and unlike a tag it works on **untagged / white-label** tracks. One-click *Set up CLAP genre engine* in Settings (a ~2.2 GB model, downloaded once). BPM/key/mood are unchanged.
 - **Online genre lookup (opt-in).** A fully-local LLM reads web results for the track's artist + title and synthesizes the specific subgenre — distrusting commercial chart buckets and verifying the match — then layers it in as **tag › grounded web › audio**. The most accurate option on tagged libraries, fully private (a local model, no API key). One-click *Set up online resolver*.
+- **Conflicts surfaced, never silently resolved.** When your tag, the audio model, and the web lookup disagree, Vibechek flags the track for **one-click review** instead of quietly picking a winner — an "N to review" toolbar filter and a per-row marker, plus a **Genre sources** panel in Track Details showing all three reads, which one won, and why ("Changed your tag *Tech House* → *Trance* — the audio model disagreed"). It augments your curation; it never overwrites it behind your back.
 
-All three feed the same reconciliation, so the **default behavior is unchanged unless you opt in** — and you can mix them (e.g. trust tags, fall back to the CLAP model, escalate to web only when unsure).
+All four feed the same reconciliation, so the **default behavior is unchanged unless you opt in** — and you can mix them (e.g. trust tags, fall back to the CLAP model, escalate to web only when unsure).
 
 ### 🔍 De-duplication that doesn't lie — *and knows a remix isn't a dupe*
 
@@ -220,10 +221,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**913 Python tests** · **47 JSON-RPC methods** · **32 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**914 Python tests** · **47 JSON-RPC methods** · **32 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 62 frontend tests across keeperRules, rpc, LibraryFilters, ConfirmModal, Sidebar, DuplicatesView
+- 93 frontend tests across 14 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 

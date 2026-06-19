@@ -296,4 +296,97 @@ describe("<LibraryBrowser /> — review (genre conflict) filter", () => {
       expect(screen.getByText("1 / 2")).toBeInTheDocument();
     });
   });
+
+  it("Review and Errors filters are mutually exclusive", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockResolvedValue({ recent: [], active: null });
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [
+        track("D:/LibraryA/bad.mp3", { error: "decode failed", ml_analysis: null }),
+        track("D:/LibraryA/conflict.mp3", {
+          existing_tags: { genre: "Tech House" },
+          ml_analysis: ml({
+            ml_genre_source: "ml_override",
+            ml_genre_conflict: true,
+            ml_genre: "Trance",
+            ml_subgenre: "Trance",
+            ml_genre_audio: "Trance",
+          }),
+        }),
+      ],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+
+    // Engage Review.
+    await user.click(await screen.findByRole("button", { name: /1 to review/i }));
+    expect(
+      await screen.findByRole("button", { name: /to review.*showing/i }),
+    ).toBeInTheDocument();
+
+    // Engaging Errors must turn Review off (they're different views).
+    await user.click(screen.getByRole("button", { name: /1 error/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /error.*showing/i })).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole("button", { name: /to review.*showing/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("resets the Review filter on a library switch", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [recordB], active: null };
+          case "load_recent_analysis":
+            return {
+              loaded: true,
+              report: { tracks: [track("D:/LibraryB/c1.mp3"), track("D:/LibraryB/c2.mp3")] },
+            };
+          case "count_new_tracks":
+            return { new_count: 0, total_count: 2 };
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [
+        track("D:/LibraryA/clean.mp3"),
+        track("D:/LibraryA/conflict.mp3", {
+          existing_tags: { genre: "Tech House" },
+          ml_analysis: ml({
+            ml_genre_source: "ml_override",
+            ml_genre_conflict: true,
+            ml_genre: "Trance",
+            ml_subgenre: "Trance",
+            ml_genre_audio: "Trance",
+          }),
+        }),
+      ],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+
+    await user.click(await screen.findByRole("button", { name: /1 to review/i }));
+    await waitFor(() => expect(screen.getByText("1 / 2")).toBeInTheDocument());
+
+    // Switch to the clean LibraryB — the review filter must NOT carry over and
+    // strand the new (conflict-free) library behind a "0 / 2" view.
+    await user.click(await screen.findByRole("button", { name: /^Library/i }));
+    await user.click(await screen.findByRole("option", { name: /LibraryB/ }));
+
+    await waitFor(() => expect(screen.getByText("2 / 2")).toBeInTheDocument());
+  });
 });

@@ -1056,8 +1056,8 @@ export function LibraryBrowser() {
                   className={cx(
                     "flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition-colors",
                     showErrorsOnly
-                      ? "bg-accent-yellow/20 text-accent-yellow border-accent-yellow/40"
-                      : "bg-accent-yellow/10 text-accent-yellow border-accent-yellow/30 hover:bg-accent-yellow/20",
+                      ? "bg-accent-red/20 text-accent-red border-accent-red/40"
+                      : "bg-accent-red/10 text-accent-red border-accent-red/30 hover:bg-accent-red/20",
                   )}
                   title={
                     showErrorsOnly

@@ -78,8 +78,9 @@ Right-side panel slides in:
 - **File metadata** — path, size, filename-derived hints
 - **Tag diff** — current tags vs ML results, with an arrow on anything that'd change
 - **Confidence indicator** — green check if above threshold, yellow warning if below
+- **Genre sources** — when your existing tag, the audio model, and the (optional) web lookup disagree on the genre, this panel shows all three reads, which one won, and a plain-English reason. So when Vibechek changes a tag you can see *why* — and decide whether to trust it.
 
-You can hit **Apply ML tags to this file** to commit just this one. More commonly, you'll do bulk tagging next.
+A track whose genre sources disagree also gets a small ⚠ marker in the list and is counted by the **"N to review"** filter in the toolbar (see Workflow 2). Nothing is written to your files from the detail panel unless you click **Apply ML tags to this file**; more commonly, you'll do bulk tagging next.
 
 ---
 
@@ -109,8 +110,15 @@ Use the **filter chips** in the toolbar to narrow down which tracks you're targe
 - **Energy** dropdown → energy levels 0-5
 - **Mood** → Dark / Neutral / Bright
 - **Vocal** → Instrumental / Light Vocal / Vocal
+- **Direction** → Up / Steady / Down
+- **Key** → the Camelot wheel, with compatible keys highlighted
 
 Then select all visible tracks (header checkbox) and apply.
+
+There are also two review toggles on the right of the chip bar:
+
+- **"N to review"** — narrows to tracks whose genre sources disagree (your tag vs the audio model vs the web lookup). A fast way to audit just the model's uncertain calls — and the tags Vibechek would *change* — before a bulk write. It composes with the chip filters, so you can ask "show me the *House* tracks I should double-check".
+- **"N errors"** — narrows to tracks that failed to scan or analyze.
 
 ---
 
@@ -384,6 +392,11 @@ Analysis** (BPM/key/mood are unaffected by these):
 
 All of this feeds one reconciliation, so the defaults are unchanged unless you opt in — and
 you can mix them (trust tags, fall back to CLAP, escalate to web only when unsure).
+
+Whichever policy you pick, when the sources disagree the track is flagged for **review** on
+the Library tab (the "N to review" filter + a per-row ⚠ marker), and Track Details shows
+which source won and why. So a policy like **Prefer ML** that lets the model overrule a tag
+never does it silently — you can see, and reverse, every change. (See Workflow 2.)
 
 ---
 

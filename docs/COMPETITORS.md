@@ -13,6 +13,7 @@ corrected and the change is noted under "Corrections applied" at the bottom.
 | Capability | Vibechek | Mixed In Key | Lexicon | Rekordbox | beaTunes | Tunebat |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | ML genre + subgenre auto-detection | ✅ | — | — | — | — | — |
+| Surfaces tag ↔ detection genre conflicts for review (augment, not overwrite) | ✅ | — | — | — | — | — |
 | Timeslot tag (Opener/Warm-Up/Peak/Afterhours) | ✅ | — | — | — | — | — |
 | Energy rating | ✅ (0-5) | ✅ (1-10) | ✅ | — | ~ (loudness) | ✅ (0-100, Pro) |
 | Mood labels | ✅ | — | ~ (Spotify) | ~ (HIGH/MID/LOW)¹ | ~ (inferred) | ~ ("Happiness") |
@@ -155,3 +156,10 @@ Be fair, not dismissive. Mixed In Key is genuinely great at key detection — it
 not bad. Lexicon is a strong, deep library manager. The honest framing is "Vibechek covers
 the parts those tools don't (and is free + open source)," not "those tools are bad." If a
 claim can't be re-verified against a primary source, soften or drop it.
+
+A distinctive, honest angle to lead with: Vibechek **augments** a DJ's existing tags and
+**surfaces conflicts for one-click review instead of silently overwriting** hand-curation —
+where the other tools either don't touch genre or just impose their own values. Lead with
+*trust* + capability coverage + local-first/OSS/$0, not accuracy bragging: Vibechek's
+analysis numbers are **at parity with the field, not ahead** (see "Analysis accuracy &
+methodology" above — key ≈71% is SOTA-tier for electronic, not a record).

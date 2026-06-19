@@ -43,9 +43,9 @@ Security fixes are backported to the latest minor release line only. Everything 
 
 | Version          | Status                | Notes |
 |------------------|-----------------------|-------|
-| `0.4.x`          | Supported (current)   | Active development line. |
-| `0.3.x`          | Supported for 90 days | Critical-severity fixes only. |
-| `0.2.x` or older | Not supported         | Please upgrade. |
+| `0.5.x`          | Supported (current)   | Active development line. |
+| `0.4.x`          | Supported for 90 days | Critical-severity fixes only. |
+| `0.3.x` or older | Not supported         | Please upgrade. |
 
 "Supported" means we will ship a tagged release with the fix on the supported branch. Unsupported versions may still receive a fix on `main`, but we make no commitments.
 

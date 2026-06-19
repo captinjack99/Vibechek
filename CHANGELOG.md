@@ -50,6 +50,22 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   behavior change. PyInstaller picks it up via `collect_submodules`.
 
 ### Added
+- **Trust UX: genre source conflicts are surfaced for one-click review.** The
+  analyzer already reconciles up to three genre signals — your in-file tag, the
+  pure-audio model, and the optional online lookup — into one effective value and
+  records the provenance (`ml_genre_source`, `ml_genre_conflict`, plus the
+  pre-reconcile audio/web reads). Those fields are now carried to the UI: the
+  library shows a per-row **review marker** on tracks where the sources disagree
+  and an **"N to review"** toolbar filter (composes with the chip filters;
+  mutually exclusive with "errors only"), and the Track Details panel gains a
+  **"Genre sources"** breakdown — your tag vs audio vs web, which one won, and a
+  plain-English reason (e.g. "Changed your tag 'Tech House' → 'Trance' — the audio
+  model disagreed"). Read-only: it flags disagreements for a look, it never
+  silently overwrites a hand-curated tag. The vocal diff also notes when a label
+  came from a "feat." credit rather than the audio model. (The eight provenance
+  fields now live on the `MLResult` dataclass so the generated TS types carry
+  them; they default `None`, so the raw per-track wire record is byte-unchanged
+  until reconciliation.)
 - **Native smoke workflow** (`native-smoke.yml`, manual + weekly). The unit-test
   matrix already covers all three OSes, but nothing ever exercised the LIVE
   sidecar on real Linux/macOS hardware. The new `scripts/rpc_smoke.py` driver

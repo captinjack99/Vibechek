@@ -147,6 +147,28 @@ describe("reviewReason", () => {
   it("returns null when there's nothing to review", () => {
     expect(reviewReason(ml({ ml_genre_source: "tag", ml_genre_conflict: false }), tags("House"))).toBeNull();
   });
+
+  it("handles an override with no prior tag (defensive)", () => {
+    const m = ml({
+      ml_genre_source: "ml_override",
+      ml_genre_conflict: true,
+      ml_genre: "Techno",
+      ml_subgenre: "Techno",
+    });
+    expect(reviewReason(m, tags(null))).toBe("Set to “Techno” by the audio model.");
+  });
+
+  it("falls back to a generic message when a conflict has no comparand (defensive)", () => {
+    // source=tag + conflict but neither web nor audio populated — unreachable via
+    // the real pipeline, but the pure helper must not produce a broken sentence.
+    const m = ml({
+      ml_genre_source: "tag",
+      ml_genre_conflict: true,
+      ml_genre: "House",
+      ml_subgenre: "Tech House",
+    });
+    expect(reviewReason(m, tags("Tech House"))).toBe("Sources disagree on the genre.");
+  });
 });
 
 describe("genreProvenance / hasInterestingProvenance", () => {
@@ -206,5 +228,20 @@ describe("genreProvenance / hasInterestingProvenance", () => {
       tags("Tech House"),
     );
     expect(hasInterestingProvenance(p)).toBe(true);
+  });
+
+  it("treats a case-only difference between audio and effective as NOT interesting", () => {
+    const p = genreProvenance(
+      ml({
+        ml_genre_source: "tag",
+        ml_genre_conflict: false,
+        ml_genre: "House",
+        ml_subgenre: "Tech House",
+        ml_genre_audio: "house",
+        ml_subgenre_audio: "tech house",
+      }),
+      tags("Tech House"),
+    );
+    expect(hasInterestingProvenance(p)).toBe(false);
   });
 });

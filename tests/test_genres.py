@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from vibechek.genres import (
     GENRE_HIERARCHY,
     SUBGENRE_TO_PARENT,
@@ -187,6 +189,34 @@ def test_build_report_prefer_ml_records_discarded_tag_conflict() -> None:
     assert ml["ml_genre_conflict"] is True     # ...but the tag was discarded
     assert ml["ml_genre"] == "Trance"          # ML won
     assert ml["ml_genre_audio"] == "Trance"
+
+
+def test_build_report_stamps_web_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the online resolver runs, its read + grounding flag land on the
+    record so the UI's 'Genre sources' panel can show the web row honestly."""
+    from vibechek import analyzer, genre_web
+    monkeypatch.setattr(genre_web, "ensure_backend", lambda *a, **k: True)
+    monkeypatch.setattr(
+        genre_web, "resolve",
+        lambda *a, **k: {"genre": "Trance", "confidence": 0.9,
+                         "source_matched": True, "used_web": True},
+    )
+    results = [{
+        "path": "/m/x.flac", "filename": "x.flac",
+        "existing_tags": {"genre": "Tech House", "artist": "A", "title": "T"},
+        "ml_analysis": {"ml_genre": "House", "ml_subgenre": "Deep House",
+                        "ml_genre_raw_confidence": 0.4},
+    }]
+    rep = analyzer._build_report(
+        results, 1, in_progress=False,
+        web_cfg={"enabled": True, "backend": "ollama"},
+    )
+    ml = rep["tracks"][0]["ml_analysis"]
+    assert ml["ml_genre_web"] == "Trance"
+    assert ml["ml_genre_web_grounded"] is True
+    # A grounded web read that disagrees with the specific tag's family overrides it.
+    assert ml["ml_genre_source"] == "web_override"
+    assert ml["ml_genre_conflict"] is True
 
 
 def test_mlresult_declares_provenance_fields() -> None:

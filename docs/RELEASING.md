@@ -70,12 +70,12 @@ Two **lockfiles** also embed the version and must be regenerated/bumped in the s
 | `ui/src-tauri/Cargo.lock` | the `vibechek-desktop` package's `version` entry |
 | `ui/package-lock.json` | the root `version` and the self-referencing `packages."".version` |
 
-The git tag itself is `v0.3.0-beta.1`. Keep these in sync — `vibechek --version` reads `__init__.py`, the desktop installer name reads `tauri.conf.json`, and pip install reads `pyproject.toml`. Drift causes "the about page says v0.3.0 but the installer says v0.2.9"-class bugs.
+The git tag itself is `v0.5.0-beta`. Keep these in sync — `vibechek --version` reads `__init__.py`, the desktop installer name reads `tauri.conf.json`, and pip install reads `pyproject.toml`. Drift causes "the about page says v0.5.0 but the installer says v0.4.0"-class bugs.
 
 ### Pre-release suffix conventions
 
 - Alpha (early, broken expected): `0.3.0-alpha.1` / pyproject `0.3.0a1`
-- Beta (feature-complete, bug hunt): `0.3.0-beta.1` / pyproject `0.3.0b1`
+- Beta (feature-complete, bug hunt): `0.3.0-beta` / pyproject `0.3.0b0` (the `0.x` line signals beta; the `-beta.N` counter was dropped — see the box above)
 - Release candidate: `0.3.0-rc.1` / pyproject `0.3.0rc1`
 - Stable: `0.3.0` / pyproject `0.3.0`
 
@@ -98,9 +98,9 @@ Runs PyInstaller via the per-OS scripts in `packaging/`. Produces:
 
 Downloads the sidecar binary from job 1, stages it at `ui/src-tauri/binaries/`, then builds the desktop installers via `tauri-action`:
 
-- Windows: `Vibechek_0.3.0-beta.1_x64-setup.exe` + `.msi`
-- macOS: `Vibechek_0.3.0-beta.1_aarch64.dmg`
-- Linux: `Vibechek_0.3.0-beta.1_amd64.AppImage` + `.deb`
+- Windows: `Vibechek_0.5.0-beta_x64-setup.exe` (NSIS)
+- macOS: `Vibechek_0.5.0-beta_aarch64.dmg`
+- Linux: `Vibechek_0.5.0-beta_amd64.AppImage` + `.deb`
 
 ### 3. `release` (ubuntu, runs after both)
 
@@ -172,15 +172,15 @@ If you tagged but realized you needed a fix before publishing:
 ```bash
 # Don't delete a published release. For a draft, delete the draft from
 # the GitHub UI, then:
-git tag -d v0.3.0-beta.1            # local delete
-git push origin :refs/tags/v0.3.0-beta.1  # remote delete
+git tag -d v0.5.0-beta            # local delete
+git push origin :refs/tags/v0.5.0-beta  # remote delete
 
 # Make the fix, commit, then re-tag:
-git tag v0.3.0-beta.1
-git push origin v0.3.0-beta.1
+git tag v0.5.0-beta
+git push origin v0.5.0-beta
 ```
 
-If a release is already **published**, do not delete — issue a `v0.3.0-beta.2` instead. Re-using a published version number breaks anyone who's already downloaded it.
+If a release is already **published**, do not delete — issue the next version instead (e.g. `v0.5.1-beta`). Re-using a published version number breaks anyone who's already downloaded it.
 
 ---
 

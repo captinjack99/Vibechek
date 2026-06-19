@@ -27,7 +27,7 @@ package entry) and `ui/package-lock.json` (root + self-reference). See
 ## Release flow (short version)
 
 1. Bump the five manifests, update `CHANGELOG.md`, run `python scripts/update_readme_stats.py`.
-2. Commit, then `git tag vX.Y.Z-beta.N`, then `git push origin main && git push origin <tag>`.
+2. Commit, then `git tag vX.Y.Z-beta`, then `git push origin main && git push origin <tag>`.
 3. The tag push triggers [`.github/workflows/release.yml`](../.github/workflows/release.yml):
    builds the PyInstaller CLI + the Tauri installers per OS, then **publishes** a GitHub
    Release for the tag (`draft: false`, pre-release for `-beta`/`-rc`). No manual click.

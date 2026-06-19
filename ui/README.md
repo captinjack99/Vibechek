@@ -8,7 +8,7 @@ ui/
 │   ├── components/       UI components (Sidebar, LibraryBrowser, TagsView, Settings, …)
 │   ├── stores/           Zustand global state (library, operation, UI, config, notification)
 │   ├── hooks/            useSidecar, useApplyTags, useConfigPersistence, useUpdater
-│   ├── lib/              keeperRules — auto-pick logic for duplicate keepers
+│   ├── lib/              keeperRules (duplicate-keeper logic), review (genre conflict surfacing), colors
 │   ├── types/            generated.ts (auto-mirrored from Python) + index.ts (view-only types)
 │   └── test/             vitest setup with Tauri mocks
 ├── src-tauri/            Rust shell
@@ -32,7 +32,7 @@ ui/
 ┌────────────────────────────────────────────────────────┐
 │  React frontend (Vite)                                 │
 │  - Zustand stores, virtualized track list, settings UI │
-│  - 38 vitest tests (Tauri APIs mocked in setup)        │
+│  - 93 vitest tests (Tauri APIs mocked in setup)        │
 └──────────────────────────┬─────────────────────────────┘
                            │ Tauri invoke("rpc_call", method, params)
                            ▼
@@ -66,9 +66,9 @@ never freezes waiting for a 2-hour analyze.
 |---|---|
 | `App.tsx` | Shell + view router + global mounts (ErrorToast, Toast, AnalysisProgress, TrackDetails, Onboarding) |
 | `Sidebar.tsx` | Library / Duplicates / Organize / Tags / Settings nav with consistent badges |
-| `LibraryBrowser.tsx` | Virtualized track list, search filter, bulk select, "Apply ML tags to N", error badge, recent-libraries empty state |
-| `LibraryFilters.tsx` | Genre / energy / mood / vocal chip filters with controlled popovers (proper outside-click handling) |
-| `TrackDetails.tsx` | Side panel — file metadata, before/after tag diff; triggers the global player |
+| `LibraryBrowser.tsx` | Virtualized track list, search filter, bulk select, "Apply ML tags to N", error badge, **genre-conflict review filter + per-row marker**, recent-libraries empty state |
+| `LibraryFilters.tsx` | Genre / energy / mood / vocal / direction / Camelot-key chip filters with controlled popovers (proper outside-click handling) |
+| `TrackDetails.tsx` | Side panel — file metadata, before/after tag diff, a **"Genre sources" panel** (your tag vs audio vs web + which won + why), compatible-key suggestions; triggers the global player |
 | `GlobalAudioPlayer.tsx` | Single persistent WaveSurfer.js player bar at the app root (via Tauri asset protocol). Survives navigation; only one preview ever plays; every track starts at 0:00 |
 | `DuplicatesView.tsx` | Per-group rules editor, auto-keeper picks, manual override, action bar |
 | `OrganizeView.tsx` | Source picker, rules, plan preview, polished confirm, post-op result panel with folder breakdown + inline Undo |
@@ -141,15 +141,17 @@ First Tauri compile is 10-15 minutes (downloads + builds ~400 MB of crates). Sub
 
 ```bash
 cd ui
-npm test           # vitest run — 38 tests
+npm test           # vitest run — 93 tests
 npm run test:watch # watch mode
 npm run test:ui    # web UI for tests
 ```
 
-Tests cover:
+Tests cover (representative — 14 test files in total):
 - `lib/keeperRules.test.ts` — pure auto-picker logic
+- `lib/review.test.ts` — genre-conflict severity / reason / provenance helpers
 - `api/rpc.test.ts` — JSON-RPC client wrappers + error mapping
 - `components/LibraryFilters.test.tsx` — filter rendering + applyFilters
+- `components/LibraryBrowser.test.tsx` — library-switch resets, select-all, review filter
 - `components/ConfirmModal.test.tsx` — modal behavior
 - `components/DuplicatesView.test.tsx` — dedupe group rules + keeper override
 - `components/Sidebar.test.tsx` — nav + viewMode
@@ -196,7 +198,7 @@ beta builds ship without them (the updater is inert until a key is enrolled). Se
 
 ## Sidecar protocol
 
-JSON-RPC 2.0, one message per line on stdin/stdout. 44 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
+JSON-RPC 2.0, one message per line on stdin/stdout. 47 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
 
 | Method | What |
 |---|---|
@@ -204,6 +206,7 @@ JSON-RPC 2.0, one message per line on stdin/stdout. 44 methods. See [`vibechek/r
 | `system_info`, `engine_gpu_status` | CPU/RAM/GPU (host) + actual-engine GPU probe |
 | `preflight`, `wsl_status`, `doctor`, `verify_models`, `native_venv_status` | Readiness checks + diagnostics |
 | `install_wsl`, `install_vibechek_in_wsl`, `install_cuda_libs_in_wsl`, `install_essentia_native`, `upgrade_vibechek_in_wsl`, `repair_wsl_shim` | Auto-setup / GPU / version-drift repair |
+| `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` | One-click provisioning of the opt-in ONNX / CLAP-audio / online-resolver engines (cancellable, progress-emitting) |
 | `scan_directory`, `scan_only`, `count_new_tracks` | List files / shallow track records (no ML) |
 | `analyze_directory` | Full ML pass (CPU/GPU/hybrid; supports `skip_paths` for incremental) |
 | `find_duplicates`, `handle_duplicates` | Dedup scan + execute |

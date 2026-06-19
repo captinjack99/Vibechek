@@ -436,6 +436,11 @@ function GenreSourcesSection({
           value={p.web}
           won={winnerIsWeb}
           hint={p.webGrounded ? "cited a source" : "unverified"}
+          hintTitle={
+            p.webGrounded
+              ? "The online lookup cited an explicit source (e.g. a Beatport/Discogs page) naming this genre."
+              : "The model's best guess — no explicit source was cited, so weight it accordingly."
+          }
         />
       )}
     </Section>
@@ -447,11 +452,13 @@ function SourceRow({
   value,
   won,
   hint,
+  hintTitle,
 }: {
   label: string;
   value: string | null;
   won: boolean;
   hint?: string;
+  hintTitle?: string;
 }) {
   return (
     <div className="flex items-center gap-2 py-1">
@@ -462,7 +469,11 @@ function SourceRow({
         ) : (
           <span className="text-xs text-white/30 italic">—</span>
         )}
-        {hint && <span className="text-[10px] text-white/40">{hint}</span>}
+        {hint && (
+          <span className="text-[10px] text-white/40" title={hintTitle}>
+            {hint}
+          </span>
+        )}
         {won && (
           <span title="Used as the genre" className="flex-none ml-auto">
             <CheckCircle2 className="w-3.5 h-3.5 text-accent-green" />

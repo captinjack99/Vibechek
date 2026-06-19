@@ -7,9 +7,10 @@ genuine variants (Extended/Radio/Remix, alt formats); organizes files into
 genre/subgenre folders; and backs up / restores every tag — all while preserving
 Rekordbox cue points and beat grids. Genre specifically has three opt-in
 classifiers (Discogs-EffNet, a pure-audio **CLAP** model ~2× more accurate, and a
-fully-local **online LLM lookup**) plus smart existing-tag reconciliation. It runs
-entirely on your machine: no account, no telemetry, no upload. Free forever under
-**AGPL-3.0**.
+fully-local **online LLM lookup**) plus smart existing-tag reconciliation; when
+those sources disagree it flags the track for one-click **review** instead of
+silently overwriting a hand-curated tag. It runs entirely on your machine: no
+account, no telemetry, no upload. Free forever under **AGPL-3.0**.
 
 - **Repo:** https://github.com/captinjack99/Vibechek
 - **Current version:** `v0.5.0-beta` (public beta)
@@ -57,6 +58,7 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 | Area | Summary |
 |---|---|
 | **ML analysis** | Essentia + Discogs-EffNet: genre/subgenre (~400 classes), BPM, key (Camelot), energy 0-5, mood (Dark/Neutral/Bright), timeslot (Opener/Warm-Up/Peak/Afterhours), direction (Up/Steady/Down), vocal (Instrumental/Light Vocal/Vocal), danceability. Per-field confidence + a two-stage genre fallback (write the parent genre when the subgenre is unsure). |
+| **Trust UX — conflict surfacing** | Genre reconciliation records where the effective value came from (your tag / audio model / web lookup) and whether the sources disagreed. When they do, the track is flagged for one-click **review** — a toolbar filter + a per-row marker — and the Track Details panel shows all three reads, which one won, and a plain-English reason. Augments, never silently overwrites, hand-curated tags. |
 | **Hybrid CPU+GPU** | Analysis runs CPU-only, GPU-only, or **hybrid** — GPU workers and CPU workers share one work-stealing queue, so a VRAM-limited GPU no longer caps throughput while cores idle. Per-device throughput is measured + reported. |
 | **De-duplication** | MD5 (byte-identical) + Chromaprint (acoustic — catches re-encodes/remixes). Rules-based keeper picker (codec → bitrate → size → newest → shortest path), manual override, move-to-review or trash. |
 | **Organize** | Plan + execute a `Genre/Subgenre/` tree; small genres bucket into `Other/`; dry-run preview; overwrite-safe moves. |
@@ -103,7 +105,14 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 5. **GEOB/PRIV preservation** on every tag write — guarded by a regression test.
 6. **JSON config** (not TOML): native null type, graceful load, drops unknown keys so
    adding fields is backwards-safe.
-7. **Opt-in heavy deps stay out of the core install.** The ONNX engine is config-gated
+7. **Surface provenance, don't overwrite silently.** Genre reconciliation stamps each
+   record with its source (`ml_genre_source`) + a conflict flag (`ml_genre_conflict`)
+   and keeps the pre-reconcile audio/web reads. The library UI flags conflicts for
+   review instead of presenting a black-box answer — the augment-not-overwrite stance
+   a skeptical pro needs. (These fields live on the `MLResult` dataclass so the
+   generated TS types carry them; defaulting `None` keeps them off the wire until
+   reconciliation, so the raw record shape is unchanged.)
+8. **Opt-in heavy deps stay out of the core install.** The ONNX engine is config-gated
    (`inference_engine`, default `essentia_tf`) and imports `onnxruntime`/`essentia` lazily;
    CDJ export's `soundfile` lives in the optional `[cdj]` extra (ffmpeg fallback otherwise).
    `numpy` is declared in the `[dev]` extra (not core) because the analysis code imports it
@@ -114,8 +123,8 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 
 <!-- These mirror the README stats line. NOTE: scripts/update_readme_stats.py
      only rewrites README.md — refresh this copy by hand when it drifts. -->
-- **904 Python tests**, **47 JSON-RPC methods**, **32 Python modules**
-- **69 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+- **914 Python tests**, **47 JSON-RPC methods**, **32 Python modules**
+- **93 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
 - Production-tested against a ~12,000-track personal DJ library
 
 ## Roadmap
