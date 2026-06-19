@@ -205,14 +205,35 @@ class TrackAnalysis:
 def _per_worker_mb(genre_classifier: str) -> int:
     """RAM budget per analysis worker, used to cap the worker count.
 
-    The baseline ~800 MB covers the essentia/TF model weights + runtime. The
+    The baseline 800 MB covers the essentia/TF path (measured ~340 MB resident
+    after load; 800 leaves headroom for per-track buffers + TF inference). The
     CLAP genre classifier loads a ~2.2 GB fp32 checkpoint + the torch runtime
-    INTO EVERY worker (load_models → _maybe_load_clap), so its per-worker
-    footprint is ~3.5 GB — sizing CLAP runs off the 800 MB assumption put a
-    32 GB box at 15 workers (~50 GB resident) and an OOM-killer storm whose
-    only symptom was the 300 s stall-watchdog error.
+    INTO EVERY worker (load_models → _maybe_load_clap) — MEASURED at ~3.8 GB
+    resident and peaking higher during inference — so it budgets 4.5 GB. The old
+    3.5 GB estimate still let three 3.8 GB workers OOM a 16 GB machine (silent
+    exit 1, the worker killed before it could print); sizing CLAP off the 800 MB
+    baseline was even worse (a 32 GB box at 15 workers ≈ 50 GB resident).
     """
-    return 3500 if genre_classifier == "clap" else 800
+    return 4500 if genre_classifier == "clap" else 800
+
+
+def _running_under_wsl() -> bool:
+    """True when this process runs inside WSL (every Windows analyze routes here).
+
+    On WSL the Linux VM SHARES one pool of physical RAM with the Windows host,
+    the Tauri GUI, and the user's browser — so the worker-cap must hold back more
+    than the 2 GB that suffices on a dedicated Linux box, or the run OOM-thrashes
+    the whole machine (a worker is silently killed → analyze exits 1/15 with an
+    empty stdout, or the 300 s stall-watchdog fires while everything swaps).
+    """
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(
+            encoding="utf-8", errors="ignore"
+        ).lower()
+    except OSError:
+        return False
 
 
 def _maybe_load_clap(loaded: dict[str, Any], genre_classifier: str, use_gpu: str) -> None:
@@ -1647,10 +1668,13 @@ def analyze_directory(
 
     # Resolve worker count with TWO real-world constraints baked in:
     #
-    #   1. *Memory*: each worker holds ~500 MB of model weights. We use
-    #      psutil to find total RAM, reserve 2 GB for the OS / GUI / other
-    #      apps, and cap workers at floor(available / 800 MB) (the 800 MB
-    #      buffer covers TF runtime overhead beyond just the weights).
+    #   1. *Memory*: each worker loads the models into its own process. We use
+    #      psutil for total RAM, reserve some for the OS (and, under WSL, for the
+    #      Windows host + GUI + browser that share the SAME physical RAM), then
+    #      cap workers at floor(usable / per-worker budget). The budget is
+    #      engine-aware (CLAP loads a 2.2 GB checkpoint per worker — see
+    #      _per_worker_mb); the WSL reserve is what stops three CLAP workers from
+    #      OOM-killing a 16 GB machine while Windows is also using RAM.
     #
     #   2. *GPU contention*: even with TF_FORCE_GPU_ALLOW_GROWTH=true,
     #      N workers each carving up one GPU is fragile. We cap at 4 in GPU
@@ -1663,7 +1687,11 @@ def analyze_directory(
         import psutil  # noqa: PLC0415
         total_mb = psutil.virtual_memory().total // (1024 * 1024)
         per_worker_mb = _per_worker_mb(config.genre_classifier)
-        usable_mb = max(0, total_mb - 2048)
+        # Hold back more under WSL: its RAM is shared with the Windows host +
+        # GUI + browser, so a 2 GB Linux-only reserve starves Windows and the
+        # whole machine thrashes/OOMs (a worker dies silently → exit 1/15).
+        reserve_mb = 4096 if _running_under_wsl() else 2048
+        usable_mb = max(0, total_mb - reserve_mb)
         memory_cap = max(1, usable_mb // per_worker_mb)
         if memory_cap < workers:
             log.warning(
