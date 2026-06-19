@@ -26,6 +26,12 @@ import {
   useLibraryFiltersStore,
   type CamelotMode,
 } from "./LibraryFilters";
+import {
+  genreProvenance,
+  hasInterestingProvenance,
+  reviewReason,
+  type GenreProvenance,
+} from "../lib/review";
 
 export function TrackDetails() {
   const selectedPath = useUIStore((s) => s.selectedTrackPath);
@@ -147,6 +153,7 @@ function DetailContent({
         {ml ? (
           <>
             <DiffSection existing={ext} ml={ml} confidenceThreshold={taggingCfg.genre_confidence_threshold} />
+            <GenreSourcesSection existing={ext} ml={ml} />
             <CompatibleKeysSection mlKey={ml.ml_key} />
           </>
         ) : (
@@ -258,6 +265,8 @@ interface DiffRowData {
   next: string | number | null | undefined;
   badgeColor?: "purple" | "cyan" | "green" | "yellow" | "red" | "neutral";
   renderNext?: (v: string | number) => React.ReactNode;
+  /** Faint provenance hint shown after the value (e.g. how it was derived). */
+  note?: string;
 }
 
 function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
@@ -289,7 +298,14 @@ function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
     { label: "Mood", existing: existing.mood, next: ml.ml_mood, badgeColor: "purple" },
     { label: "Timeslot", existing: existing.timeslot, next: ml.ml_timeslot },
     { label: "Direction", existing: existing.direction, next: ml.ml_direction },
-    { label: "Vocal", existing: existing.vocal, next: ml.ml_vocal },
+    {
+      label: "Vocal",
+      existing: existing.vocal,
+      next: ml.ml_vocal,
+      // Augment-not-overwrite signal: a "feat."/"ft." credit upgraded an
+      // instrumental-sounding read to Vocal. Surface WHY so it's not a black box.
+      note: ml.ml_vocal_source === "feat_credit" ? "from “feat.” credit" : undefined,
+    },
   ];
   return rows.filter((r) => r.existing != null || r.next != null);
 }
@@ -321,6 +337,9 @@ function DiffRow({ row }: { row: DiffRowData }) {
               <TagBadge color={changed || newOnly ? row.badgeColor ?? "neutral" : "neutral"}>
                 {String(row.next)}
               </TagBadge>
+            )}
+            {row.note && (
+              <span className="text-[10px] text-white/40 italic">{row.note}</span>
             )}
           </>
         )}
@@ -369,6 +388,88 @@ function CompatibleKeysSection({ mlKey }: { mlKey: string | null | undefined }) 
         ))}
       </div>
     </Section>
+  );
+}
+
+/**
+ * Genre provenance — the trust-UX payoff. Shows the (up to) three signals the
+ * analyzer reconciled (your tag, the audio model, an online source) side by
+ * side, marks which one won, and explains in plain English when they disagreed.
+ * Hidden for the boring case where everything agreed (the diff row already says
+ * it) — see `hasInterestingProvenance`.
+ */
+function GenreSourcesSection({
+  existing,
+  ml,
+}: {
+  existing: ExistingTags;
+  ml: MLResult;
+}) {
+  const prov = genreProvenance(ml, existing);
+  if (!hasInterestingProvenance(prov)) return null;
+  const p = prov as GenreProvenance;
+  const reason = reviewReason(ml, existing);
+
+  const winnerIsTag = p.source === "tag";
+  const winnerIsAudio = p.source === "ml" || p.source === "ml_override";
+  const winnerIsWeb = p.source === "web" || p.source === "web_override";
+
+  return (
+    <Section title="Genre sources" subtitle={p.conflict ? "they disagree" : "for reference"}>
+      {reason && (
+        <div
+          className={`mb-2 flex gap-2 text-xs rounded-md px-2 py-1.5 ${
+            p.severity === "override"
+              ? "bg-accent-yellow/10 text-accent-yellow"
+              : "bg-white/5 text-white/70"
+          }`}
+        >
+          <AlertTriangle className="w-3.5 h-3.5 flex-none mt-0.5" />
+          <div>{reason}</div>
+        </div>
+      )}
+      <SourceRow label="Your tag" value={p.tag} won={winnerIsTag} />
+      <SourceRow label="Audio model" value={p.audio} won={winnerIsAudio} />
+      {p.web && (
+        <SourceRow
+          label="Online"
+          value={p.web}
+          won={winnerIsWeb}
+          hint={p.webGrounded ? "cited a source" : "unverified"}
+        />
+      )}
+    </Section>
+  );
+}
+
+function SourceRow({
+  label,
+  value,
+  won,
+  hint,
+}: {
+  label: string;
+  value: string | null;
+  won: boolean;
+  hint?: string;
+}) {
+  return (
+    <div className="flex items-center gap-2 py-1">
+      <div className="w-20 text-xs text-white/50 flex-none">{label}</div>
+      <div className="flex-1 min-w-0 flex items-center gap-2">
+        {value ? (
+          <TagBadge color={won ? "purple" : "neutral"}>{value}</TagBadge>
+        ) : (
+          <span className="text-xs text-white/30 italic">—</span>
+        )}
+        {hint && <span className="text-[10px] text-white/40">{hint}</span>}
+        {won && (
+          <span title="Used as the genre" className="flex-none ml-auto">
+            <CheckCircle2 className="w-3.5 h-3.5 text-accent-green" />
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

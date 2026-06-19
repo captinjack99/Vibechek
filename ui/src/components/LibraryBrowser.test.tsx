@@ -40,6 +40,14 @@ function ml(overrides: Partial<MLResult> = {}): MLResult {
     ml_danceability: 0.8,
     ml_mood_scores: null,
     ml_error: null,
+    ml_genre_audio: null,
+    ml_subgenre_audio: null,
+    ml_genre_web: null,
+    ml_genre_web_grounded: null,
+    ml_genre_source: null,
+    ml_genre_conflict: null,
+    ml_vocal_audio: null,
+    ml_vocal_source: null,
     ...overrides,
   };
 }
@@ -243,6 +251,49 @@ describe("<LibraryBrowser /> — select-all checkbox", () => {
 
     await waitFor(() => {
       expect(useLibraryStore.getState().selectedIds.size).toBe(3);
+    });
+  });
+});
+
+describe("<LibraryBrowser /> — review (genre conflict) filter", () => {
+  beforeEach(() => {
+    useLibraryFiltersStore.getState().clearFilters();
+  });
+
+  it("counts conflicting tracks and narrows to them when toggled", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockResolvedValue({ recent: [], active: null });
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [
+        track("D:/LibraryA/clean.mp3"), // tag == audio, no conflict
+        track("D:/LibraryA/conflict.mp3", {
+          existing_tags: { genre: "Tech House" },
+          ml_analysis: ml({
+            ml_genre_source: "ml_override",
+            ml_genre_conflict: true,
+            ml_genre: "Trance",
+            ml_subgenre: "Trance",
+            ml_genre_audio: "Trance",
+          }),
+        }),
+      ],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+
+    // The review pill reports exactly the one conflicting track; both tracks
+    // are still in scope until the filter is engaged.
+    const reviewChip = await screen.findByRole("button", { name: /1 to review/i });
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
+
+    // Engaging it narrows the list to just the conflicting track.
+    await user.click(reviewChip);
+    await waitFor(() => {
+      expect(screen.getByText("1 / 2")).toBeInTheDocument();
     });
   });
 });

@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Virtuoso } from "react-virtuoso";
 import { AnimatePresence } from "framer-motion";
 import {
-  FolderOpen, Sparkles, Search, Music, AlertCircle, CheckSquare, Square, Tag,
-  Eye, RefreshCw, Clock, Loader2, X, ChevronDown, Compass, Pencil,
+  FolderOpen, Sparkles, Search, Music, AlertCircle, AlertTriangle, CheckSquare,
+  Square, Tag, Eye, RefreshCw, Clock, Loader2, X, ChevronDown, Compass, Pencil,
 } from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -24,6 +24,7 @@ import { TagBadge, EnergyBar } from "./TagBadges";
 import { PreflightDialog } from "./PreflightDialog";
 import { ConfirmModal } from "./ConfirmModal";
 import { FilterChips, applyFilters, emptyFilters, useLibraryFiltersStore } from "./LibraryFilters";
+import { needsReview, reviewReason } from "../lib/review";
 
 /** Compact number formatter — "12k" instead of "12,466". */
 const compactFmt = new Intl.NumberFormat(undefined, {
@@ -125,6 +126,10 @@ export function LibraryBrowser() {
   const filters = useLibraryFiltersStore((s) => s.filters);
   const setFilters = useLibraryFiltersStore((s) => s.setFilters);
   const [showErrorsOnly, setShowErrorsOnly] = useState(false);
+  // Trust-UX: narrow to tracks whose genre sources disagree (tag ≠ audio ≠ web),
+  // so a skeptical pro can review exactly the calls Vibechek wasn't sure about.
+  // Composes with the chip filters (unlike errors-only, which replaces them).
+  const [showReviewOnly, setShowReviewOnly] = useState(false);
   const [recentLibraries, setRecentLibraries] = useState<LibraryRecord[]>([]);
   // Tracks whether `handleAnalyze`'s slow preflight probe is in flight. The
   // probe can take 5-10s and used to block silently; we surface a spinner
@@ -207,6 +212,7 @@ export function LibraryBrowser() {
       // new library has errors of its own).
       setSearchFilter("");
       setShowErrorsOnly(false);
+      setShowReviewOnly(false);
       setTracks(tracks);
       setNewTracksCount(null);
       setBannerDismissed(false);
@@ -341,6 +347,12 @@ export function LibraryBrowser() {
     [tracks],
   );
 
+  // Tracks whose genre sources disagree (tag ≠ audio ≠ web) — the review queue.
+  const reviewCount = useMemo(
+    () => tracks.filter((t) => needsReview(t.ml_analysis)).length,
+    [tracks],
+  );
+
   // The currently-selected track (right-rail TrackDetails). We surface a
   // "Find compatible" affordance in the filter bar when it has enough ML
   // signal to seed a useful filter set (at minimum: BPM + energy).
@@ -409,9 +421,16 @@ export function LibraryBrowser() {
   }, [selectedTrack, setFilters, notify]);
 
   const filtered = useMemo(() => {
-    let result = showErrorsOnly
-      ? tracks.filter((t) => t.error || t.ml_analysis?.ml_error)
-      : applyFilters(tracks, filters);
+    // Errors-only is an exclusive view (replaces the chip filters — you're
+    // triaging failures, not browsing). Review-only composes WITH the chips so
+    // you can ask "show me the House tracks whose genre I should double-check".
+    let result;
+    if (showErrorsOnly) {
+      result = tracks.filter((t) => t.error || t.ml_analysis?.ml_error);
+    } else {
+      result = applyFilters(tracks, filters);
+      if (showReviewOnly) result = result.filter((t) => needsReview(t.ml_analysis));
+    }
     if (searchFilter) {
       const q = searchFilter.toLowerCase();
       result = result.filter((t) =>
@@ -423,7 +442,7 @@ export function LibraryBrowser() {
       );
     }
     return result;
-  }, [tracks, searchFilter, filters, showErrorsOnly]);
+  }, [tracks, searchFilter, filters, showErrorsOnly, showReviewOnly]);
 
   // "All selected" for the master checkbox must reflect what the user actually
   // SEES (the filtered set), not raw `selectedIds.size === filtered.length`.
@@ -454,6 +473,7 @@ export function LibraryBrowser() {
     // live outside the filters store (see handleOpenRecent for the rationale).
     setSearchFilter("");
     setShowErrorsOnly(false);
+    setShowReviewOnly(false);
     setTracks([]);
     begin("analyze");
     try {
@@ -975,7 +995,8 @@ export function LibraryBrowser() {
       {/* Filter chips (only render when there are analyzed tracks to filter).
           Also render when the errors-only toggle is active so the "clear"
           affordance is never lost even if errorCount is 0 for the current set. */}
-      {(analyzedCount > 0 || errorCount > 0 || showErrorsOnly) && (
+      {(analyzedCount > 0 || errorCount > 0 || showErrorsOnly ||
+        reviewCount > 0 || showReviewOnly) && (
         <div className="px-4 py-2 border-b border-white/5 flex items-center gap-3 flex-wrap">
           {analyzedCount > 0 && !showErrorsOnly && (
             <FilterChips tracks={tracks} filters={filters} setFilters={setFilters} />
@@ -997,25 +1018,59 @@ export function LibraryBrowser() {
               Find compatible
             </button>
           )}
-          {(errorCount > 0 || showErrorsOnly) && (
-            <button
-              onClick={() => setShowErrorsOnly((v) => !v)}
-              className={cx(
-                "ml-auto flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition-colors",
-                showErrorsOnly
-                  ? "bg-accent-yellow/20 text-accent-yellow border-accent-yellow/40"
-                  : "bg-accent-yellow/10 text-accent-yellow border-accent-yellow/30 hover:bg-accent-yellow/20",
+          {(reviewCount > 0 || showReviewOnly || errorCount > 0 || showErrorsOnly) && (
+            <div className="ml-auto flex items-center gap-2">
+              {/* "Review" — narrows to tracks whose genre sources disagree
+                  (tag ≠ audio ≠ web). The one-click triage queue for a pro who
+                  won't trust a black box but will skim the calls we were unsure
+                  about. Mutually exclusive with errors-only (different views). */}
+              {(reviewCount > 0 || showReviewOnly) && (
+                <button
+                  onClick={() => {
+                    setShowReviewOnly((v) => !v);
+                    setShowErrorsOnly(false);
+                  }}
+                  className={cx(
+                    "flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition-colors",
+                    showReviewOnly
+                      ? "bg-accent-yellow/20 text-accent-yellow border-accent-yellow/40"
+                      : "bg-accent-yellow/10 text-accent-yellow border-accent-yellow/30 hover:bg-accent-yellow/20",
+                  )}
+                  title={
+                    showReviewOnly
+                      ? "Showing only tracks whose genre sources disagree — click to clear"
+                      : "Show only tracks to review — where the tag, audio, and web genre disagree"
+                  }
+                >
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  {reviewCount} to review
+                  {showReviewOnly && <span className="text-accent-yellow/70">· showing</span>}
+                </button>
               )}
-              title={
-                showErrorsOnly
-                  ? "Showing only tracks with errors — click to clear"
-                  : "Show only tracks with errors"
-              }
-            >
-              <AlertCircle className="w-3.5 h-3.5" />
-              {errorCount} error{errorCount === 1 ? "" : "s"}
-              {showErrorsOnly && <span className="text-accent-yellow/70">· showing</span>}
-            </button>
+              {(errorCount > 0 || showErrorsOnly) && (
+                <button
+                  onClick={() => {
+                    setShowErrorsOnly((v) => !v);
+                    setShowReviewOnly(false);
+                  }}
+                  className={cx(
+                    "flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition-colors",
+                    showErrorsOnly
+                      ? "bg-accent-yellow/20 text-accent-yellow border-accent-yellow/40"
+                      : "bg-accent-yellow/10 text-accent-yellow border-accent-yellow/30 hover:bg-accent-yellow/20",
+                  )}
+                  title={
+                    showErrorsOnly
+                      ? "Showing only tracks with errors — click to clear"
+                      : "Show only tracks with errors"
+                  }
+                >
+                  <AlertCircle className="w-3.5 h-3.5" />
+                  {errorCount} error{errorCount === 1 ? "" : "s"}
+                  {showErrorsOnly && <span className="text-accent-yellow/70">· showing</span>}
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -1279,6 +1334,8 @@ interface TrackRowProps {
 
 function TrackRow({ track, selected, checked, onCheck, onClick }: TrackRowProps) {
   const ml = track.ml_analysis;
+  const review = needsReview(ml);
+  const reviewTip = review ? reviewReason(ml, track.existing_tags) : null;
   return (
     <div
       onClick={onClick}
@@ -1307,8 +1364,19 @@ function TrackRow({ track, selected, checked, onCheck, onClick }: TrackRowProps)
       </button>
 
       <div className="flex-1 min-w-0 mr-4">
-        <div className="text-sm text-white truncate">
-          {track.filename_title ?? track.filename}
+        <div className="flex items-center gap-1.5">
+          {review && (
+            <span
+              className="flex-none"
+              title={reviewTip ?? "Genre sources disagree — open to review"}
+              aria-label="Needs review"
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-accent-yellow" />
+            </span>
+          )}
+          <span className="text-sm text-white truncate min-w-0">
+            {track.filename_title ?? track.filename}
+          </span>
         </div>
         <div className="text-xs text-white/50 truncate">
           {track.filename_artist ?? ""}

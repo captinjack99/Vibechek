@@ -151,6 +151,24 @@ class MLResult:
     ml_mood_scores: dict[str, float] | None = None
     ml_error: str | None = None
 
+    # --- Reconciliation provenance (trust-UX) ----------------------------
+    # These are NOT produced by the audio model — they're stamped onto the
+    # record dict by `_reconcile_record_genre`/`_reconcile_record_vocal` on the
+    # FINAL report, recording where the effective value came from and whether
+    # the sources disagreed. Declared here (default None) so they're the single
+    # source of truth for the generated TS types; the wire dict drops None
+    # values (see the asdict comprehension in analyze_track), so raw/in-progress
+    # records stay free of them exactly as before. The UI reads these to flag
+    # tracks for one-click review (tag ≠ audio ≠ web).
+    ml_genre_audio: str | None = None      # pure-audio genre, pre-reconcile
+    ml_subgenre_audio: str | None = None   # pure-audio subgenre, pre-reconcile
+    ml_genre_web: str | None = None        # online web-synthesis genre, if run
+    ml_genre_web_grounded: bool | None = None  # web cited an explicit source
+    ml_genre_source: str | None = None     # tag|ml|ml_override|web|web_override
+    ml_genre_conflict: bool | None = None  # tag and audio/web disagreed on family
+    ml_vocal_audio: str | None = None      # pure-audio vocal label, pre-reconcile
+    ml_vocal_source: str | None = None     # audio|feat_credit
+
 
 @dataclass
 class TrackAnalysis:

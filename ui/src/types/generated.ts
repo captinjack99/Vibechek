@@ -207,6 +207,14 @@ export interface MLResult {
   ml_danceability: number | null;
   ml_mood_scores: Record<string, number> | null;
   ml_error: string | null;
+  ml_genre_audio: string | null;
+  ml_subgenre_audio: string | null;
+  ml_genre_web: string | null;
+  ml_genre_web_grounded: boolean | null;
+  ml_genre_source: string | null;
+  ml_genre_conflict: boolean | null;
+  ml_vocal_audio: string | null;
+  ml_vocal_source: string | null;
 }
 
 export interface TrackAnalysis {

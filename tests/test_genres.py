@@ -144,3 +144,61 @@ def test_build_report_applies_reconciliation() -> None:
                                  "ml_genre_raw_confidence": 0.3}}]
     rep2 = _build_report(results2, 1, in_progress=True)
     assert "ml_genre_source" not in rep2["tracks"][0]["ml_analysis"]
+
+
+def test_build_report_surfaces_override_conflict_for_review() -> None:
+    """The final report must carry the provenance the library UI flags for
+    review: a confident, disagreeing ML read overrides the tag, sets
+    conflict=True, and preserves the pure-audio read so the panel can show
+    'kept/changed your tag → X'."""
+    from vibechek.analyzer import _build_report
+    results = [{
+        "path": "/m/x.flac", "filename": "x.flac",
+        "existing_tags": {"genre": "Tech House"},
+        "ml_analysis": {"ml_genre": "Trance", "ml_subgenre": "Trance",
+                        "ml_genre_raw_confidence": 0.95, "ml_genre_confidence": 0.95},
+    }]
+    rep = _build_report(results, 1, in_progress=False,
+                        genre_policy=("prefer_tag", 0.90))
+    ml = rep["tracks"][0]["ml_analysis"]
+    assert ml["ml_genre_source"] == "ml_override"
+    assert ml["ml_genre_conflict"] is True
+    assert ml["ml_genre_audio"] == "Trance"   # pre-reconcile read preserved
+    assert ml["ml_genre"] == "Trance"          # the override won
+
+
+def test_build_report_prefer_ml_records_discarded_tag_conflict() -> None:
+    """Under prefer_ml a confident audio read WINS over a specific tag: the
+    source is plain 'ml' (NOT 'ml_override') yet conflict is True and the tag was
+    discarded. The library UI keys 'your tag was changed' off source != 'tag'
+    (not the _override suffix) — this locks the backend contract that makes that
+    framing correct, the exact gap an adversarial review caught."""
+    from vibechek.analyzer import _build_report
+    results = [{
+        "path": "/m/x.flac", "filename": "x.flac",
+        "existing_tags": {"genre": "Tech House"},
+        "ml_analysis": {"ml_genre": "Trance", "ml_subgenre": "Trance",
+                        "ml_genre_raw_confidence": 0.7},
+    }]
+    rep = _build_report(results, 1, in_progress=False,
+                        genre_policy=("prefer_ml", 0.90))
+    ml = rep["tracks"][0]["ml_analysis"]
+    assert ml["ml_genre_source"] == "ml"      # plain ml — NO _override suffix
+    assert ml["ml_genre_conflict"] is True     # ...but the tag was discarded
+    assert ml["ml_genre"] == "Trance"          # ML won
+    assert ml["ml_genre_audio"] == "Trance"
+
+
+def test_mlresult_declares_provenance_fields() -> None:
+    """The provenance fields the library UI reads must live ON the MLResult
+    dataclass (so scripts/generate_ts_types.py emits them into the TS bindings)
+    and default to None (so the wire dict — asdict() dropping None values —
+    stays free of them until reconciliation stamps them on the final report)."""
+    from vibechek.analyzer import MLResult
+    m = MLResult()
+    for fname in (
+        "ml_genre_audio", "ml_subgenre_audio", "ml_genre_web",
+        "ml_genre_web_grounded", "ml_genre_source", "ml_genre_conflict",
+        "ml_vocal_audio", "ml_vocal_source",
+    ):
+        assert getattr(m, fname) is None
