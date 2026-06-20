@@ -279,14 +279,22 @@ def load_models(
     TF's device enumeration. (For the onnx engine, GPU selection happens via the
     ONNX Runtime execution-provider chain instead.)
     """
-    if engine == "onnx":
-        # Ensure the backbone .onnx is present (heads come from the conversion
-        # script), then hand off entirely to the ONNX backend.
+    if engine in ("onnx", "native"):
+        # Both engines run inference on ONNX Runtime. "native" is the WSL-free
+        # Windows path: it FORCES the pure-NumPy mel frontend (the DSP-only
+        # native essentia wheel ships no TensorflowInputMusiCNN) and runs
+        # in-process through that wheel for decode/BPM/key — preflight routes it
+        # analyze_via="native" whenever essentia imports in the sidecar's Python.
+        # Same ONNX model set as "onnx", so the download is identical.
         download_models(model_dir, engine="onnx")
         from vibechek.onnx_backend import load_onnx_models  # noqa: PLC0415
 
         # ONNX files live in the dedicated subdir (download_models put them there).
-        loaded = load_onnx_models(model_dir / _ONNX_SUBDIR, use_gpu=use_gpu)
+        loaded = load_onnx_models(
+            model_dir / _ONNX_SUBDIR,
+            use_gpu=use_gpu,
+            numpy_frontend=True if engine == "native" else None,
+        )
         _maybe_load_clap(loaded, genre_classifier, use_gpu)
         return loaded
 

@@ -67,7 +67,11 @@ class AnalysisConfig:
     # (vibechek/onnx_backend.py): cross-vendor GPU + no end-of-life TF runtime,
     # validated to parity in docs/ONNX_MIGRATION.md. essentia is still used for
     # the DSP (decode, melspec, BPM, key) under either engine.
-    inference_engine: str = "essentia_tf"  # "essentia_tf" | "onnx"
+    # "native" is the WSL-free Windows path: ONNX inference + the pure-NumPy mel
+    # frontend + a DSP-only native essentia wheel (decode/BPM/key) run IN-PROCESS
+    # (preflight routes analyze_via="native" when essentia imports locally). On
+    # Linux/macOS essentia already ships wheels, so the onnx engine is native there.
+    inference_engine: str = "essentia_tf"  # "essentia_tf" | "onnx" | "native"
 
     # ----- Existing-tag vs ML reconciliation (genre/BPM/key) ----------------
     # Many libraries already carry curated genre tags (e.g. Beatport downloads)
@@ -344,7 +348,7 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
         # inference_engine steers every `if engine == "onnx"` branch; a typo or
         # wrong-case value ("ONNX", "tf") would silently run the essentia_tf
         # path. Snap anything unrecognized back to the default (fail-soft, loud).
-        if key == "inference_engine" and coerced not in ("essentia_tf", "onnx"):
+        if key == "inference_engine" and coerced not in ("essentia_tf", "onnx", "native"):
             log.warning(
                 "Config field %s.inference_engine has unknown value %r; "
                 "falling back to 'essentia_tf'", cls.__name__, coerced,

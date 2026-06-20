@@ -85,7 +85,9 @@ class PreflightResult:
         )
         if not have_engine:
             pkg = (
-                "the ONNX engine (plain essentia + onnxruntime)"
+                "the native engine (in-process essentia wheel + onnxruntime)"
+                if self.engine == "native"
+                else "the ONNX engine (plain essentia + onnxruntime)"
                 if self.engine == "onnx"
                 else "essentia-tensorflow"
             )
@@ -128,9 +130,11 @@ def _model_files_for_engine(
     genre head is OPTIONAL (the backbone emits genre directly), so a missing one
     doesn't block readiness — matching onnx_backend's loader.
     """
-    if engine == "onnx":
+    if engine in ("onnx", "native"):
         # ONNX models live in their own subdir (see analyzer._ONNX_SUBDIR) so
         # they never collide with the essentia `.pb` set in the parent dir.
+        # "native" uses the same ONNX model set (it just runs the DSP in-process
+        # via a native essentia wheel + the NumPy mel frontend).
         onnx_target = target / _ONNX_SUBDIR
         items: list[tuple[str, Path, Path | None, bool]] = [
             ("effnet (onnx backbone)", onnx_target / BACKBONE_ONNX_FILENAME, None, True),
@@ -210,7 +214,7 @@ def preflight(
     should pass `quick_wsl=False` so they don't false-fail when WSL has
     essentia but quick mode couldn't see it.
     """
-    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    venv_subdir = "venv-onnx" if engine in ("onnx", "native") else "venv"
     essentia = check_essentia()
     models = check_models(models_dir, engine=engine)
     wsl_status = detect_wsl(quick=quick_wsl, venv_subdir=venv_subdir)

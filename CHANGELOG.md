@@ -54,6 +54,22 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   on untagged tracks.
 
 ### Internal
+- **`inference_engine="native"` — a WSL-free Windows analyze path (backend wired,
+  end-to-end validated).** Selecting it runs ONNX inference + the pure-NumPy mel
+  frontend + a DSP-only **native essentia wheel** (decode/BPM/key) **in-process**:
+  preflight already routes `analyze_via="native"` whenever essentia imports in the
+  sidecar's Python, so analysis skips WSL entirely. `load_models("native")` forces
+  the NumPy frontend (the DSP-only wheel ships no `TensorflowInputMusiCNN`) and
+  uses the same ONNX model set as `onnx`. A DSP-only essentia wheel was built on
+  Windows from the wo80 CMake fork (MSVC/VS2022) and packaged self-contained with
+  delvewheel; validated in a fresh wheel-only venv (`import essentia` + DSP run
+  with no DLL path) and end-to-end: a real `analyze` of Darude FLACs ran fully
+  native (preflight `analyze_via=native`, no WSL, no TensorFlow) producing
+  genre/BPM/key/energy/vocal, with the wheel's `RhythmExtractor2013`/`KeyExtractor`
+  matching WSL-essentia ground truth (**KEY 12/12, BPM 11/12 exact**). Config
+  accepts `"native"`; default stays `essentia_tf`. Not yet exposed in Settings or
+  bundled in the installer (the wheel must ship + be rebuilt per target CPython) —
+  those + the gold-corpus gate are the remaining steps to flip the default.
 - **Groundwork for a native-Windows (WSL-free) analyze path — opt-in, default
   unchanged.** Windows routes ML analysis through WSL only because essentia has
   no Windows wheel; the ONNX engine already moved every neural forward pass to
