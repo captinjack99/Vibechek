@@ -99,6 +99,7 @@ export const RPC_METHODS = [
   "library_state",
   "forget_library",
   "load_recent_analysis",
+  "resolve_genre_conflicts",
   "rename_library",
   "tag_library",
   "count_new_tracks",
@@ -170,6 +171,13 @@ export interface InstallCudaLibsInWSLRequest {
   distro: string;
   /** Subset of `engine_gpu_status().missing_cuda_libs` to install. */
   missing_libs?: string[];
+}
+
+/** Approve (accept the reconciled genre) or revert (back to the file tag) a set
+ *  of reviewed genre conflicts; clears `ml_genre_conflict` and persists. */
+export interface ResolveGenreConflictsRequest {
+  library_path: string;
+  items: { path: string; action: "approve" | "revert" }[];
 }
 
 export interface RepairWSLShimRequest {

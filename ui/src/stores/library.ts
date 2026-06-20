@@ -69,6 +69,14 @@ interface LibraryState {
    */
   mergeAnalyzedTrack: (record: TrackAnalysis) => void;
   /**
+   * Merge many analyzed-track records at once (by path), in a single state
+   * update. Used by batch mutations — e.g. resolving a queue of reviewed genre
+   * conflicts — where calling `mergeAnalyzedTrack` per record would fire N
+   * separate setStates (and N re-renders). Records whose path isn't present are
+   * appended; selectedIds is untouched. A no-op for an empty list.
+   */
+  mergeAnalyzedTracks: (records: TrackAnalysis[]) => void;
+  /**
    * Rewrite track paths in-place after a filesystem move (e.g. organize).
    * Each entry of `pathMap` maps an old source path to its new destination.
    * Tracks not in the map are left untouched. Also rewrites the matching
@@ -132,6 +140,20 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     }
     const next = tracks.slice();
     next[idx] = record;
+    set({ tracks: next });
+  },
+
+  mergeAnalyzedTracks: (records) => {
+    if (records.length === 0) return;
+    // Build a path→record overlay once, then a single pass over the existing
+    // list. Existing entries are replaced in place (preserving order); any
+    // record with a path not already present is appended. One setState total.
+    const overlay = new Map(records.map((r) => [r.path, r]));
+    const next = get().tracks.map((t) => overlay.get(t.path) ?? t);
+    const known = new Set(next.map((t) => t.path));
+    for (const r of records) {
+      if (!known.has(r.path)) next.push(r);
+    }
     set({ tracks: next });
   },
 

@@ -338,6 +338,81 @@ describe("<LibraryBrowser /> — review (genre conflict) filter", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("batch-approves selected conflicts and drains the review queue", async () => {
+    const conflict = track("D:/LibraryA/conflict.mp3", {
+      existing_tags: { genre: "Tech House" },
+      ml_analysis: ml({
+        ml_genre_source: "ml_override",
+        ml_genre_conflict: true,
+        ml_genre: "Trance",
+        ml_subgenre: "Trance",
+        ml_genre_audio: "Trance",
+      }),
+    });
+    // What the sidecar returns post-approve: same track, conflict cleared.
+    const resolved = track("D:/LibraryA/conflict.mp3", {
+      existing_tags: { genre: "Tech House" },
+      ml_analysis: ml({
+        ml_genre_source: "approved",
+        ml_genre_conflict: false,
+        ml_genre: "Trance",
+        ml_subgenre: "Trance",
+        ml_genre_audio: "Trance",
+      }),
+    });
+
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string; params?: unknown }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "resolve_genre_conflicts":
+            return { ok: true, updated: 1, tracks: [resolved] };
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/clean.mp3"), conflict],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+
+    // Engage review, then select the (only) visible flagged row.
+    await user.click(await screen.findByRole("button", { name: /1 to review/i }));
+    await user.click(await screen.findByRole("button", { name: /select all/i }));
+
+    // The review-mode toolbar surfaces Approve/Revert (not Apply ML tags).
+    const approve = await screen.findByRole("button", { name: /approve 1/i });
+    expect(screen.queryByRole("button", { name: /apply ml tags/i })).not.toBeInTheDocument();
+    await user.click(approve);
+
+    // The RPC was called with the flagged path + approve action.
+    await waitFor(() => {
+      const call = (invoke as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c) => (c[1] as { method: string }).method === "resolve_genre_conflicts",
+      );
+      expect(call).toBeTruthy();
+      const params = (call![1] as { params: { items: { path: string; action: string }[] } }).params;
+      expect(params.items).toEqual([{ path: "D:/LibraryA/conflict.mp3", action: "approve" }]);
+    });
+
+    // The merged record cleared its conflict, draining the queue → "All caught up".
+    await waitFor(() => {
+      const merged = useLibraryStore
+        .getState()
+        .tracks.find((t) => t.path === "D:/LibraryA/conflict.mp3");
+      expect(merged?.ml_analysis?.ml_genre_conflict).toBe(false);
+    });
+    expect(await screen.findByText(/all caught up/i)).toBeInTheDocument();
+  });
+
   it("resets the Review filter on a library switch", async () => {
     (invoke as ReturnType<typeof vi.fn>).mockImplementation(
       async (_cmd: string, args: { method: string }) => {

@@ -1465,6 +1465,62 @@ def _load_recent_analysis(params: dict) -> dict:
     return {"loaded": True, "report": report}
 
 
+def _resolve_genre_conflicts(params: dict) -> dict:
+    """Resolve genre-source conflicts the user has reviewed, persisting the
+    decision to the saved analysis so it survives a reload.
+
+    params: {"library_path": str, "items": [{"path": str, "action": "approve"|"revert"}]}
+      - "approve": accept the reconciled genre as final (mark source "approved").
+      - "revert":  put the genre back to the file's existing tag.
+    Either way `ml_genre_conflict` is cleared, so the track leaves the review
+    queue. This NEVER writes file tags — it only resolves the in-library review
+    state; the existing apply_ml_tags flow (backup-first) writes to disk.
+
+    Returns {"ok", "updated": int, "tracks": [updated TrackAnalysis...]} so the
+    GUI can sync the exact persisted records.
+    """
+    from vibechek import library_state  # noqa: PLC0415
+    from vibechek.genres import split_tag_genre  # noqa: PLC0415
+
+    library_path = str(params.get("library_path") or "")
+    actions: dict[str, str] = {}
+    for it in params.get("items") or []:
+        if isinstance(it, dict) and it.get("path"):
+            actions[str(it["path"])] = "revert" if it.get("action") == "revert" else "approve"
+    if not library_path or not actions:
+        return {"ok": False, "reason": "missing library_path or items", "updated": 0, "tracks": []}
+
+    state = library_state.load_state()
+    record = next((r for r in state.recent if r.path == library_path), None)
+    if not record:
+        return {"ok": False, "reason": "library not in recents", "updated": 0, "tracks": []}
+    report = library_state.load_analysis(record)
+    if not report:
+        return {"ok": False, "reason": "no saved analysis for library", "updated": 0, "tracks": []}
+
+    updated: list[dict] = []
+    for t in report.get("tracks") or []:
+        if t.get("path") not in actions:
+            continue
+        ml = t.get("ml_analysis")
+        if not ml:
+            continue
+        if actions[t["path"]] == "revert":
+            tag = ((t.get("existing_tags") or {}).get("genre") or "").strip()
+            if tag:
+                parent, sub = split_tag_genre(tag)
+                ml["ml_genre"], ml["ml_subgenre"] = parent, sub
+                ml["ml_genre_source"] = "tag"
+        else:
+            ml["ml_genre_source"] = "approved"
+        ml["ml_genre_conflict"] = False
+        updated.append(t)
+
+    if updated:
+        library_state.save_analysis(record, report)
+    return {"ok": True, "updated": len(updated), "tracks": updated}
+
+
 # ---------------------------------------------------------------------------
 # Undo journals (organize / dedupe-move / dedupe-trash)
 # ---------------------------------------------------------------------------
@@ -1587,6 +1643,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "library_state": _library_state,
     "forget_library": _forget_library,
     "load_recent_analysis": _load_recent_analysis,
+    "resolve_genre_conflicts": _resolve_genre_conflicts,
     "rename_library": _rename_library,
     "tag_library": _tag_library,
     "count_new_tracks": _count_new_tracks,

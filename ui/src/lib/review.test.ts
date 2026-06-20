@@ -244,4 +244,25 @@ describe("genreProvenance / hasInterestingProvenance", () => {
     );
     expect(hasInterestingProvenance(p)).toBe(false);
   });
+
+  it("keeps a user-approved track interesting even though its conflict cleared", () => {
+    // After resolve_genre_conflicts("approve"): source='approved', conflict=false.
+    // severity is null, audio matches effective (no other signal) — but we still
+    // want to show the breakdown + the "you approved this" confirmation.
+    const p = genreProvenance(
+      ml({
+        ml_genre_source: "approved",
+        ml_genre_conflict: false,
+        ml_genre: "Techno",
+        ml_subgenre: "Techno",
+        ml_genre_audio: "Techno",
+        ml_subgenre_audio: "Techno",
+      }),
+      tags("Tech House"),
+    );
+    expect(p!.source).toBe("approved");
+    expect(reviewSeverity(ml({ ml_genre_source: "approved", ml_genre_conflict: false }))).toBeNull();
+    expect(needsReview(ml({ ml_genre_source: "approved", ml_genre_conflict: false }))).toBe(false);
+    expect(hasInterestingProvenance(p)).toBe(true);
+  });
 });

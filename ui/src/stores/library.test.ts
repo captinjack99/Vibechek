@@ -65,3 +65,48 @@ describe("useLibraryStore.updateTrackPaths — player path migration", () => {
     expect(usePlayerStore.getState().path).toBeNull();
   });
 });
+
+describe("useLibraryStore.mergeAnalyzedTracks — batch merge", () => {
+  beforeEach(() => {
+    useLibraryStore.setState({
+      libraryPath: "D:/Music",
+      tracks: [track("D:/Music/a.mp3"), track("D:/Music/b.mp3"), track("D:/Music/c.mp3")],
+      selectedIds: new Set(["D:/Music/a.mp3"]),
+      searchFilter: "",
+    });
+  });
+
+  it("replaces matching records in place, preserving order", () => {
+    const updatedA = { ...track("D:/Music/a.mp3"), filename_title: "A!" } as TrackAnalysis;
+    const updatedC = { ...track("D:/Music/c.mp3"), filename_title: "C!" } as TrackAnalysis;
+
+    useLibraryStore.getState().mergeAnalyzedTracks([updatedA, updatedC]);
+
+    const { tracks } = useLibraryStore.getState();
+    expect(tracks.map((t) => t.path)).toEqual([
+      "D:/Music/a.mp3",
+      "D:/Music/b.mp3",
+      "D:/Music/c.mp3",
+    ]);
+    expect((tracks[0] as TrackAnalysis & { filename_title?: string }).filename_title).toBe("A!");
+    expect((tracks[2] as TrackAnalysis & { filename_title?: string }).filename_title).toBe("C!");
+    // Untouched record stays as-is.
+    expect((tracks[1] as TrackAnalysis & { filename_title?: string }).filename_title).toBeUndefined();
+  });
+
+  it("appends records whose path isn't already present", () => {
+    const novel = track("D:/Music/d.mp3");
+    useLibraryStore.getState().mergeAnalyzedTracks([novel]);
+    const { tracks } = useLibraryStore.getState();
+    expect(tracks.map((t) => t.path)).toContain("D:/Music/d.mp3");
+    expect(tracks).toHaveLength(4);
+  });
+
+  it("leaves the selection untouched and is a no-op for an empty list", () => {
+    const before = useLibraryStore.getState().tracks;
+    useLibraryStore.getState().mergeAnalyzedTracks([]);
+    const after = useLibraryStore.getState();
+    expect(after.tracks).toBe(before); // identical reference — no state write
+    expect([...after.selectedIds]).toEqual(["D:/Music/a.mp3"]);
+  });
+});

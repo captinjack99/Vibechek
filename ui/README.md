@@ -32,7 +32,7 @@ ui/
 ┌────────────────────────────────────────────────────────┐
 │  React frontend (Vite)                                 │
 │  - Zustand stores, virtualized track list, settings UI │
-│  - 93 vitest tests (Tauri APIs mocked in setup)        │
+│  - 98 vitest tests (Tauri APIs mocked in setup)        │
 └──────────────────────────┬─────────────────────────────┘
                            │ Tauri invoke("rpc_call", method, params)
                            ▼
@@ -48,7 +48,7 @@ ui/
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │  `vibechek rpc` (Python sidecar)                       │
-│  - 47 RPC methods, threadpool dispatch (8 workers)     │
+│  - 48 RPC methods, threadpool dispatch (8 workers)     │
 │  - Stdout lock keeps concurrent JSON frames atomic     │
 │  - Cooperative cancellation token                      │
 │  - All real work: analyzer, tagger, dedup, organize    │
@@ -141,7 +141,7 @@ First Tauri compile is 10-15 minutes (downloads + builds ~400 MB of crates). Sub
 
 ```bash
 cd ui
-npm test           # vitest run — 93 tests
+npm test           # vitest run — 98 tests
 npm run test:watch # watch mode
 npm run test:ui    # web UI for tests
 ```
@@ -198,7 +198,7 @@ beta builds ship without them (the updater is inert until a key is enrolled). Se
 
 ## Sidecar protocol
 
-JSON-RPC 2.0, one message per line on stdin/stdout. 47 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
+JSON-RPC 2.0, one message per line on stdin/stdout. 48 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
 
 | Method | What |
 |---|---|

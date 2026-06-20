@@ -274,6 +274,17 @@ def load_analysis(record: LibraryRecord) -> dict[str, Any] | None:
         return None
 
 
+def save_analysis(record: LibraryRecord, report: dict[str, Any]) -> None:
+    """Re-persist an already-recorded analysis in place (atomically).
+
+    For mutations of an existing analysis — e.g. the user approving/reverting
+    genre conflicts from the review queue — that must survive a reload. Unlike
+    record_analysis it does NOT touch the recents index (no count/last-analyzed
+    changes); it only rewrites the analysis JSON the load path reads back.
+    """
+    atomic_write_json(Path(record.analysis_path), report, indent=2, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -316,6 +327,7 @@ __all__ = [
     "record_analysis",
     "forget",
     "load_analysis",
+    "save_analysis",
     "rename_library",
     "tag_library",
 ]

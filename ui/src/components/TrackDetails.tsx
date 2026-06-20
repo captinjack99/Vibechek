@@ -410,12 +410,29 @@ function GenreSourcesSection({
   const p = prov as GenreProvenance;
   const reason = reviewReason(ml, existing);
 
-  const winnerIsTag = p.source === "tag";
-  const winnerIsAudio = p.source === "ml" || p.source === "ml_override";
-  const winnerIsWeb = p.source === "web" || p.source === "web_override";
+  // After the user approves a reviewed conflict the source is "approved" with
+  // no single winning signal — highlight whichever row matches the value they
+  // vouched for so the green check still points somewhere meaningful.
+  const userApproved = p.source === "approved";
+  const isEffective = (v: string | null) =>
+    !!v && !!p.effective && v.toLowerCase() === p.effective.toLowerCase();
+  const winnerIsTag = p.source === "tag" || (userApproved && isEffective(p.tag));
+  const winnerIsAudio =
+    p.source === "ml" || p.source === "ml_override" || (userApproved && isEffective(p.audio));
+  const winnerIsWeb =
+    p.source === "web" || p.source === "web_override" || (userApproved && isEffective(p.web));
 
   return (
-    <Section title="Genre sources" subtitle={p.conflict ? "they disagree" : "for reference"}>
+    <Section
+      title="Genre sources"
+      subtitle={userApproved ? "you approved this" : p.conflict ? "they disagree" : "for reference"}
+    >
+      {userApproved && (
+        <div className="mb-2 flex gap-2 text-xs rounded-md px-2 py-1.5 bg-accent-green/10 text-accent-green">
+          <CheckCircle2 className="w-3.5 h-3.5 flex-none mt-0.5" />
+          <div>You approved “{p.effective}” — cleared from review.</div>
+        </div>
+      )}
       {reason && (
         <div
           className={`mb-2 flex gap-2 text-xs rounded-md px-2 py-1.5 ${

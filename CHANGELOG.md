@@ -10,6 +10,20 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 ## [Unreleased]
 
+### Added
+- **Review queue: approve or revert genre conflicts in one click.** The conflict
+  surfacing that shipped earlier flagged tracks where the file tag, audio model,
+  and online lookup disagreed — now you can act on the whole queue. In the
+  **N to review** filter, select tracks (or select-all) and **Approve** to
+  accept Vibechek's reconciled genre, or **Revert to tag** to keep the genre
+  already in the file. Either clears the conflict (the track drops out of the
+  queue, and the queue shows an "all caught up" state once drained) and the
+  decision is persisted to the saved analysis so it survives a reload — an
+  approved track records `ml_genre_source="approved"`, so a reopened track shows
+  "you approved this" rather than a stale conflict warning. This **never writes
+  file tags**: the existing **Apply ML tags** flow (backup-first) is still the
+  only thing that touches disk. New `resolve_genre_conflicts` RPC (48 total).
+
 ### Changed
 - **Vocal detection: a feat-credit prior fixes vocal tracks misread as
   Instrumental.** The voice/instrumental model means its per-frame voice

@@ -4,6 +4,7 @@ import { AnimatePresence } from "framer-motion";
 import {
   FolderOpen, Sparkles, Search, Music, AlertCircle, AlertTriangle, CheckSquare,
   Square, Tag, Eye, RefreshCw, Clock, Loader2, X, ChevronDown, Compass, Pencil,
+  Check, Undo2,
 } from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -82,6 +83,7 @@ export function LibraryBrowser() {
   const libraryPath = useLibraryStore((s) => s.libraryPath);
   const setLibraryPath = useLibraryStore((s) => s.setLibraryPath);
   const setTracks = useLibraryStore((s) => s.setTracks);
+  const mergeAnalyzedTracks = useLibraryStore((s) => s.mergeAnalyzedTracks);
   const searchFilter = useLibraryStore((s) => s.searchFilter);
   const setSearchFilter = useLibraryStore((s) => s.setSearchFilter);
   const selectedIds = useLibraryStore((s) => s.selectedIds);
@@ -130,6 +132,9 @@ export function LibraryBrowser() {
   // so a skeptical pro can review exactly the calls Vibechek wasn't sure about.
   // Composes with the chip filters (unlike errors-only, which replaces them).
   const [showReviewOnly, setShowReviewOnly] = useState(false);
+  // True while a resolve_genre_conflicts RPC is in flight, so the Approve/Revert
+  // buttons disable and can't double-fire on a slow disk write.
+  const [resolving, setResolving] = useState(false);
   const [recentLibraries, setRecentLibraries] = useState<LibraryRecord[]>([]);
   // Tracks whether `handleAnalyze`'s slow preflight probe is in flight. The
   // probe can take 5-10s and used to block silently; we surface a spinner
@@ -351,6 +356,14 @@ export function LibraryBrowser() {
   const reviewCount = useMemo(
     () => tracks.filter((t) => needsReview(t.ml_analysis)).length,
     [tracks],
+  );
+
+  // How many of the currently-selected tracks actually need review — the count
+  // the Approve/Revert actions will change. (A selection can include tracks
+  // that aren't conflicted; the resolve RPC only touches the flagged ones.)
+  const selectedReviewCount = useMemo(
+    () => tracks.filter((t) => selectedIds.has(t.path) && needsReview(t.ml_analysis)).length,
+    [tracks, selectedIds],
   );
 
   // The currently-selected track (right-rail TrackDetails). We surface a
@@ -609,6 +622,65 @@ export function LibraryBrowser() {
       detail,
       kind: numErrors > 0 ? "info" : "success",
     });
+  };
+
+  // Trust-UX #2: resolve the reviewed genre conflicts in the current selection.
+  // "approve" accepts Vibechek's reconciled genre as final; "revert" puts the
+  // genre back to the file's existing tag. Either way the conflict flag clears,
+  // so the track drops out of the review queue. This NEVER writes file tags —
+  // it persists the decision to the saved analysis (survives reload); the
+  // separate "Apply ML tags" flow is what writes to disk.
+  const runResolveConflicts = async (action: "approve" | "revert") => {
+    if (!libraryPath || resolving) return;
+    // Only the flagged tracks in the selection — the sidecar skips the rest, but
+    // filtering here keeps the count + toast honest.
+    const targets = tracks.filter(
+      (t) => selectedIds.has(t.path) && needsReview(t.ml_analysis),
+    );
+    if (targets.length === 0) {
+      notify("Nothing to resolve in the selection", {
+        detail: "Select one or more flagged (to-review) tracks first.",
+        kind: "info",
+      });
+      return;
+    }
+    setResolving(true);
+    try {
+      const result = await rpc<{
+        ok: boolean;
+        updated: number;
+        reason?: string;
+        tracks: TrackAnalysis[];
+      }>("resolve_genre_conflicts", {
+        library_path: libraryPath,
+        items: targets.map((t) => ({ path: t.path, action })),
+      });
+      if (!result.ok) {
+        fail(result.reason ?? "Could not resolve the selected conflicts");
+        return;
+      }
+      // Merge the authoritative persisted records back (one state update). Their
+      // cleared conflict flag drops them from the review filter automatically.
+      mergeAnalyzedTracks(result.tracks);
+      clearSelection();
+      const n = result.updated;
+      notify(
+        action === "approve"
+          ? `Approved ${n} genre${n === 1 ? "" : "s"} — kept Vibechek's call`
+          : `Reverted ${n} genre${n === 1 ? "" : "s"} to the file tag`,
+        {
+          kind: "success",
+          detail:
+            action === "approve"
+              ? "Cleared from review. Nothing written to your files — use Apply ML tags for that."
+              : "The existing tag is kept as the genre and cleared from review.",
+        },
+      );
+    } catch (e) {
+      fail(e);
+    } finally {
+      setResolving(false);
+    }
   };
 
   // Gate analyze behind preflight. The previous version did a quick=true
@@ -927,24 +999,59 @@ export function LibraryBrowser() {
         </div>
 
         {selectedIds.size > 0 ? (
-          <>
-            <button
-              className="btn-primary"
-              onClick={() =>
-                setConfirmBulkTag({
-                  scope: "selected",
-                  targets: tracks.filter((t) => selectedIds.has(t.path)),
-                })
-              }
-              disabled={active !== null}
-            >
-              <Tag className="w-4 h-4" />
-              Apply ML tags to {selectedIds.size}
-            </button>
-            <button className="btn-ghost" onClick={() => clearSelection()}>
-              Clear
-            </button>
-          </>
+          showReviewOnly ? (
+            // Review queue actions. "Approve" accepts Vibechek's reconciled
+            // genre; "Revert" puts it back to the file tag. Both clear the
+            // conflict (track leaves the queue) and persist to the saved
+            // analysis — neither writes file tags. Counts reflect the flagged
+            // tracks in the selection (selectedReviewCount), not raw selection.
+            <>
+              <button
+                className="btn-primary"
+                onClick={() => runResolveConflicts("approve")}
+                disabled={active !== null || resolving || selectedReviewCount === 0}
+                title="Accept Vibechek's genre for the selected flagged tracks and clear them from review (doesn't write file tags)"
+              >
+                {resolving ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Check className="w-4 h-4" />
+                )}
+                Approve {selectedReviewCount}
+              </button>
+              <button
+                className="btn-ghost"
+                onClick={() => runResolveConflicts("revert")}
+                disabled={active !== null || resolving || selectedReviewCount === 0}
+                title="Keep the genre already in the file's tag for the selected tracks and clear them from review"
+              >
+                <Undo2 className="w-4 h-4" />
+                Revert to tag
+              </button>
+              <button className="btn-ghost" onClick={() => clearSelection()}>
+                Clear
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                className="btn-primary"
+                onClick={() =>
+                  setConfirmBulkTag({
+                    scope: "selected",
+                    targets: tracks.filter((t) => selectedIds.has(t.path)),
+                  })
+                }
+                disabled={active !== null}
+              >
+                <Tag className="w-4 h-4" />
+                Apply ML tags to {selectedIds.size}
+              </button>
+              <button className="btn-ghost" onClick={() => clearSelection()}>
+                Clear
+              </button>
+            </>
+          )
         ) : (
           <>
             {analyzedCount > 0 && (
@@ -1089,19 +1196,41 @@ export function LibraryBrowser() {
 
       {/* Track list */}
       <div className="flex-1 min-h-0">
-        <Virtuoso
-          data={filtered}
-          itemContent={(_, track) => (
-            <TrackRow
-              key={track.path}
-              track={track}
-              checked={selectedIds.has(track.path)}
-              onCheck={() => toggleSelect(track.path)}
-              selected={track.path === selectedTrackPath}
-              onClick={() => setSelectedTrack(track.path)}
-            />
-          )}
-        />
+        {showReviewOnly && filtered.length === 0 ? (
+          // Review queue drained — every flagged conflict has been approved or
+          // reverted. Give the user a clear "you're done" instead of a blank
+          // virtualized list, with a one-click way back to the full library.
+          <div className="h-full flex items-center justify-center px-8">
+            <div className="text-center max-w-sm">
+              <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-accent-green/10 flex items-center justify-center">
+                <Check className="w-6 h-6 text-accent-green" />
+              </div>
+              <h3 className="text-base font-display font-semibold mb-1">
+                All caught up
+              </h3>
+              <p className="text-sm text-white/50 mb-4">
+                No genre conflicts left to review in this library.
+              </p>
+              <button className="btn-ghost" onClick={() => setShowReviewOnly(false)}>
+                Back to full library
+              </button>
+            </div>
+          </div>
+        ) : (
+          <Virtuoso
+            data={filtered}
+            itemContent={(_, track) => (
+              <TrackRow
+                key={track.path}
+                track={track}
+                checked={selectedIds.has(track.path)}
+                onCheck={() => toggleSelect(track.path)}
+                selected={track.path === selectedTrackPath}
+                onClick={() => setSelectedTrack(track.path)}
+              />
+            )}
+          />
+        )}
       </div>
 
       <ConfirmModal

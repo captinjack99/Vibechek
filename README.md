@@ -185,7 +185,7 @@ Full developer setup + the platform-specific bits: [docs/INSTALL.md](docs/INSTAL
 React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]──► Python sidecar
                                                                           │
                               ┌───────────────────────────────────────────┴───────────┐
-                              │ vibechek package (47 RPC methods)                     │
+                              │ vibechek package (48 RPC methods)                     │
                               │  analyzer · tagger · duplicates · organizer · genres  │
                               │  clap_genre · genre_web · journal · profiles · config  │
                               │  cancellation · onnx_backend                           │
@@ -221,10 +221,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**918 Python tests** · **47 JSON-RPC methods** · **32 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**929 Python tests** · **48 JSON-RPC methods** · **32 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 93 frontend tests across 14 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
+- 98 frontend tests across 14 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 

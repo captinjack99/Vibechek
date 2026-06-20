@@ -15,7 +15,16 @@
 
 import type { ExistingTags, MLResult } from "../types";
 
-export type GenreSource = "tag" | "ml" | "ml_override" | "web" | "web_override";
+export type GenreSource =
+  | "tag"
+  | "ml"
+  | "ml_override"
+  | "web"
+  | "web_override"
+  // The user reviewed a conflict and vouched for the reconciled value. Set by
+  // the resolve_genre_conflicts RPC on "approve"; clears the conflict flag so
+  // the track leaves the review queue, but records that a human signed off.
+  | "approved";
 
 /**
  * Severity of a track's genre provenance:
@@ -151,6 +160,9 @@ export function genreProvenance(
 export function hasInterestingProvenance(p: GenreProvenance | null): boolean {
   if (!p) return false;
   if (p.severity !== null) return true;
+  // A user-approved track has no live conflict (severity null) but we still want
+  // to show the breakdown + the "you approved this" confirmation.
+  if (p.source === "approved") return true;
   if (p.web) return true;
   return !!p.audio && !!p.effective && p.audio.toLowerCase() !== p.effective.toLowerCase();
 }

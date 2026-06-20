@@ -39,7 +39,7 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
   Settings — plus a persistent global audio player and a "Recent operations" undo panel.
 - **Rust shell:** spawns the Python sidecar, multiplexes JSON-RPC by id, re-broadcasts
   progress + per-track records as Tauri events, detects sidecar death on EOF.
-- **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 47 JSON-RPC
+- **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 48 JSON-RPC
   methods, threadpool dispatch (8 workers) so fast reads interleave with long ops,
   cooperative cancellation, and all the real work (analyzer, tagger, duplicates,
   organizer, journal, profiles, config, wsl, resources, …). Notable add-ons:
@@ -123,8 +123,8 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 
 <!-- These mirror the README stats line. NOTE: scripts/update_readme_stats.py
      only rewrites README.md — refresh this copy by hand when it drifts. -->
-- **914 Python tests**, **47 JSON-RPC methods**, **32 Python modules**
-- **93 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+- **929 Python tests**, **48 JSON-RPC methods**, **32 Python modules**
+- **98 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
 - Production-tested against a ~12,000-track personal DJ library
 
 ## Roadmap

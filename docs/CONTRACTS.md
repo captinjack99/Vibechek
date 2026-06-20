@@ -9,9 +9,11 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 (the authoritative method list), and the "Sidecar protocol" section of
 [`ui/README.md`](../ui/README.md).
 
-> **The method surface is 47.** The one-click engine setups added three methods —
+> **The method surface is 48.** The one-click engine setups added three methods —
 > `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` (all cancellable,
 > progress-emitting) — while FLAC → CDJ export stayed CLI-only (`vibechek cdj-export`).
+> The trust-UX review queue added `resolve_genre_conflicts` (batch approve/revert of
+> reviewed genre conflicts; persists to the saved analysis, never writes file tags).
 > The genre setups route per platform behind the same wire shape: Windows → the WSL
 > scripts, Linux/macOS → `native_install.setup_clap_native`/`setup_resolver_native`
 > (same venv + artifact paths, so analyze-time consumers don't care which ran).

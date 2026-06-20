@@ -58,6 +58,7 @@ import type {
   LibraryState,
   LoadRecentAnalysisRequest,
   LoadRecentAnalysisResult,
+  ResolveGenreConflictsRequest,
   RenameLibraryRequest,
   TagLibraryRequest,
   LibraryMutationResult,
@@ -219,6 +220,15 @@ export function repairWSLShim(
   params: RepairWSLShimRequest,
 ): Promise<InstallResultPayload> {
   return rpc<InstallResultPayload>("repair_wsl_shim", params);
+}
+
+/** Resolve reviewed genre conflicts: "approve" accepts the reconciled genre,
+ *  "revert" puts it back to the file tag. Clears the conflict flag and persists
+ *  to the saved analysis. Returns the updated track records to sync the store. */
+export function resolveGenreConflicts(
+  params: ResolveGenreConflictsRequest,
+): Promise<{ ok: boolean; updated: number; tracks: AnalysisReport["tracks"] }> {
+  return rpc("resolve_genre_conflicts", params);
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +604,7 @@ const api = {
   libraryState,
   forgetLibrary,
   loadRecentAnalysis,
+  resolveGenreConflicts,
   renameLibrary,
   tagLibrary,
   countNewTracks,
