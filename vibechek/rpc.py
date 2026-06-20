@@ -463,7 +463,7 @@ def _install_wsl(params: dict) -> dict:
 
 def _valid_engine(value: Any, default: str = "essentia_tf") -> str:
     """Whitelist the inference-engine name before it steers install/venv logic."""
-    return value if value in ("essentia_tf", "onnx") else default
+    return value if value in ("essentia_tf", "onnx", "native") else default
 
 
 def _valid_vibechek_source(params: dict) -> str | None:

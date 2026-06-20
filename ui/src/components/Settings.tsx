@@ -685,6 +685,7 @@ export function Settings() {
             {([
               { id: "essentia_tf", label: "Essentia · TensorFlow" },
               { id: "onnx", label: "ONNX Runtime" },
+              { id: "native", label: "Native · no WSL" },
             ] as const).map(({ id, label }) => (
               <button
                 key={id}
@@ -719,6 +720,18 @@ export function Settings() {
               <Download className="w-4 h-4" />
               {diagBusy === "onnx-setup" ? "Setting up ONNX engine…" : "Set up ONNX engine"}
             </button>
+          )}
+          {cfg.analysis.inference_engine === "native" && (
+            <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
+              <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+              <span>
+                Experimental (Windows). Runs the whole ML pipeline <strong>in-process
+                — no WSL</strong> (ONNX inference + a NumPy mel frontend + a native
+                Essentia build for decode/BPM/key). Requires the native engine bundled
+                with the app; if analyze reports it's not ready, this build doesn't ship
+                it yet — use Essentia · TensorFlow or ONNX in the meantime.
+              </span>
+            </div>
           )}
           <Hint>
             <strong>Essentia · TensorFlow</strong> is the default (NVIDIA-only

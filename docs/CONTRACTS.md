@@ -22,9 +22,12 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 
 ## Engine-aware params (ONNX inference engine)
 
-Selecting the inference engine (`essentia_tf` default, or `onnx`) is plumbed through
-existing methods as a param — the Python side validates it via `rpc._valid_engine` and
-routes to the matching managed venv (`venv` vs `venv-onnx`):
+Selecting the inference engine (`essentia_tf` default, `onnx`, or `native` — the
+experimental WSL-free Windows path: ONNX inference + a NumPy mel frontend + an
+in-process native essentia wheel for decode/BPM/key) is plumbed through existing
+methods as a param — the Python side validates it via `rpc._valid_engine` and
+routes to the matching managed venv (`venv` vs `venv-onnx`) or, for `native`,
+runs in-process when essentia imports locally:
 
 | Method | Param | Notes |
 |---|---|---|

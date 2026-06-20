@@ -10,6 +10,8 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
 
 ## [Unreleased]
 
+## [0.6.0-beta] — 2026-06-20
+
 ### Added
 - **Review queue: approve or revert genre conflicts in one click.** The conflict
   surfacing that shipped earlier flagged tracks where the file tag, audio model,

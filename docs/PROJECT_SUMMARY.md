@@ -13,7 +13,7 @@ silently overwriting a hand-curated tag. It runs entirely on your machine: no
 account, no telemetry, no upload. Free forever under **AGPL-3.0**.
 
 - **Repo:** https://github.com/captinjack99/Vibechek
-- **Current version:** `v0.5.0-beta` (public beta)
+- **Current version:** `v0.6.0-beta` (public beta)
 - **Platforms:** Windows, macOS, Linux (desktop app + CLI)
 
 > This is the living project summary. For release history see [CHANGELOG.md](../CHANGELOG.md).
@@ -112,8 +112,11 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
    a skeptical pro needs. (These fields live on the `MLResult` dataclass so the
    generated TS types carry them; defaulting `None` keeps them off the wire until
    reconciliation, so the raw record shape is unchanged.)
-8. **Opt-in heavy deps stay out of the core install.** The ONNX engine is config-gated
-   (`inference_engine`, default `essentia_tf`) and imports `onnxruntime`/`essentia` lazily;
+8. **Opt-in heavy deps stay out of the core install.** The inference engine is config-gated
+   (`inference_engine`: `essentia_tf` default | `onnx` | `native`) and imports
+   `onnxruntime`/`essentia` lazily. `native` (experimental) is the WSL-free Windows path —
+   ONNX inference + a pure-NumPy mel frontend + an in-process native essentia wheel for
+   decode/BPM/key (built via `scripts/build_native_essentia_wheel.ps1`); default unchanged.
    CDJ export's `soundfile` lives in the optional `[cdj]` extra (ffmpeg fallback otherwise).
    `numpy` is declared in the `[dev]` extra (not core) because the analysis code imports it
    lazily while the pure-logic tests import it directly — so a clean `[dev]` install can run
