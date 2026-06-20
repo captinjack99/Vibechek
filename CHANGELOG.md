@@ -54,6 +54,29 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   on untagged tracks.
 
 ### Internal
+- **Groundwork for a native-Windows (WSL-free) analyze path — opt-in, default
+  unchanged.** Windows routes ML analysis through WSL only because essentia has
+  no Windows wheel; the ONNX engine already moved every neural forward pass to
+  ONNX Runtime (Windows wheels exist), leaving four pure-DSP jobs still on
+  essentia: decode, the MusiCNN mel-frontend, BPM, and key. Two of those now
+  have validated native replacements:
+  - `vibechek/numpy_frontend.py` — a pure-NumPy reimplementation of essentia's
+    `TensorflowInputMusiCNN` log-mel (Slaney mel, unit-triangle-area filterbank,
+    `log10(1+10000·x)`). Validated against essentia on 5 real tracks through the
+    production `discogs-effnet-bsdynamic-1.onnx` backbone: per-frame log-mel
+    **L1 = 0.0000**, embedding **cosine = 1.00000**, **genre top-1 5/5** — a
+    bit-close reproduction, not an approximation. Wired into the ONNX backbone
+    behind a flag (`load_onnx_models(numpy_frontend=…)` / `VIBECHEK_NUMPY_FRONTEND`),
+    OFF by default until the full gold-corpus parity gate runs.
+  - `vibechek/native_decode.py` — soundfile (libsndfile) + soxr decode with an
+    ffmpeg fallback (new `[native]` extra). On a 25-track sample, soundfile
+    decoded **24/25** natively; the one damaged MP3 falls back to ffmpeg,
+    restoring essentia/MonoLoader's full codec coverage with no WSL.
+  - Validated end-to-end (soundfile+soxr decode → NumPy mel → ONNX backbone) at
+    embedding cosine ≥0.998 + genre top-1 match vs the essentia path. New
+    `scripts/native_frontend_parity.py` harness + a CI parity test against a
+    committed essentia-mel fixture. Decode/BPM/key still run on essentia (the
+    default path is byte-unchanged); BPM/key remain the last DSP on essentia.
 - **Split the model catalog + downloader out of `analyzer.py`** into a new
   `vibechek/model_download.py` (the god file dropped ~650 lines to ~2.5k). The
   module owns `MODELS`, the SHA256 pins, the mirror base URLs, the ONNX head

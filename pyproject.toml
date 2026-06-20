@@ -93,6 +93,16 @@ resolver = [
     "ddgs>=6.0",
     "zstandard>=0.22",
 ]
+# Native (essentia-free / WSL-free) decode for the Windows analyze path. soundfile
+# (libsndfile, native win_amd64 wheel) decodes WAV/FLAC/OGG/MP3; soxr does the
+# band-limited resampling. Pairs with [onnx] (NumPy mel frontend + ONNX backbone)
+# to run the genre/mood/vocal pipeline with zero essentia; an optional system
+# ffmpeg is the fallback for codecs/files libsndfile can't open. Default analyze
+# path is unchanged until the full gold-corpus parity gate is run.
+native = [
+    "soundfile>=0.12",
+    "soxr>=0.3",
+]
 # Dev / tests
 dev = [
     "pytest>=8.0",
@@ -104,6 +114,10 @@ dev = [
     # direction/BPM, etc.) need it directly. Declared here so CI's `[dev]`-only
     # install can run those tests instead of erroring at collection.
     "numpy>=1.24",
+    # The native-decode + numpy-frontend tests need these at CI time (the native
+    # path's runtime deps). Small pure/native wheels — safe in the dev install.
+    "soundfile>=0.12",
+    "soxr>=0.3",
 ]
 
 [project.scripts]

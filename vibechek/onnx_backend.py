@@ -253,25 +253,42 @@ class _OnnxEffnet:
     (un-pooled) embedding matrix and the analyzer means over axis 0 downstream.
 
     Pipeline (the validated recipe):
-        audio --essentia MusiCNN melspec--> [N, 96]
-              --window hop 64--------------> [k, 128, 96]
-              --backbone ONNX--------------> outputs[1] = [k, 1280]
+        audio --MusiCNN melspec (essentia OR numpy)--> [N, 96]
+              --window hop 64-----------------------> [k, 128, 96]
+              --backbone ONNX-----------------------> outputs[1] = [k, 1280]
+
+    The mel-spectrogram is produced by essentia's `TensorflowInputMusiCNN` by
+    default, OR by the pure-NumPy `vibechek.numpy_frontend` when `numpy_frontend`
+    is set — the latter is the last step to a fully essentia-free (WSL-free)
+    native-Windows analyze path. The NumPy frontend is a bit-close reproduction
+    (validated: embedding cosine 1.00000, genre top-1 5/5 vs essentia); see
+    `numpy_frontend` and `scripts/native_frontend_parity.py`. Default stays
+    essentia until the full gold-corpus parity gate is run.
 
     The 400-class genre activations (`outputs[0]`) are cached per call into
     `self.last_genre_activations` so the genre head can reuse them instead of
     re-running the backbone — see `_OnnxBackboneGenre`.
     """
 
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: Any, numpy_frontend: bool = False) -> None:
         self._sess = session
         self._input_name = session.get_inputs()[0].name
+        self._numpy_frontend = numpy_frontend
         # Per-call cache so the "genre" callable can pull the backbone's own
         # 400-class output for the SAME audio without a second forward pass.
         self.last_genre_activations: np.ndarray | None = None
 
     def _melspec(self, audio: np.ndarray) -> np.ndarray:
-        import essentia.standard as es  # noqa: PLC0415
         import numpy as np  # noqa: PLC0415
+
+        if self._numpy_frontend:
+            # Pure-NumPy path — no essentia. This is what removes the last
+            # essentia dependency from the ONNX inference pipeline on Windows.
+            from vibechek.numpy_frontend import musicnn_mel  # noqa: PLC0415
+
+            return musicnn_mel(audio)
+
+        import essentia.standard as es  # noqa: PLC0415
 
         musicnn = es.TensorflowInputMusiCNN()
         frames = es.FrameGenerator(
@@ -367,7 +384,9 @@ def _read_classes(metadata_path: Path) -> list[str]:
         return []
 
 
-def load_onnx_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
+def load_onnx_models(
+    model_dir: Path, use_gpu: str = "auto", numpy_frontend: bool | None = None
+) -> dict[str, Any]:
     """Load the ONNX-backed model set, mirroring `analyzer.load_models`'s dict.
 
     Returns callables with IDENTICAL signatures to the essentia path so the
@@ -419,8 +438,22 @@ def load_onnx_models(model_dir: Path, use_gpu: str = "auto") -> dict[str, Any]:
     log.info("ONNX backbone EPs (in order): %s", providers)
     backbone_sess = ort.InferenceSession(str(backbone_path), providers=providers or None)
 
+    # Pure-NumPy mel frontend (essentia-free). Explicit arg wins; otherwise the
+    # VIBECHEK_NUMPY_FRONTEND env var opts in. Default OFF — essentia's
+    # TensorflowInputMusiCNN stays the frontend until the full gold-corpus parity
+    # gate is run; this flag exists so the validated native path can be exercised
+    # (and promoted to an AnalysisConfig field) without yet flipping the default.
+    if numpy_frontend is None:
+        import os  # noqa: PLC0415
+
+        numpy_frontend = os.environ.get("VIBECHEK_NUMPY_FRONTEND", "").strip().lower() not in (
+            "", "0", "false", "no", "off",
+        )
+    if numpy_frontend:
+        log.info("ONNX backbone using the pure-NumPy mel frontend (essentia-free)")
+
     loaded: dict[str, Any] = {}
-    effnet = _OnnxEffnet(backbone_sess)
+    effnet = _OnnxEffnet(backbone_sess, numpy_frontend=numpy_frontend)
     loaded["effnet"] = effnet
 
     # Heads. genre_discogs400 is loaded as an OPTIONAL fallback head; the
