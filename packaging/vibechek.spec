@@ -120,15 +120,30 @@ if sys.platform == "win32":
         # expects inside the onefile temp root:
         #   <_MEIPASS>/essentia/_essentia*.pyd   and   <_MEIPASS>/essentia.libs/*.dll
         _ed, _eb, _eh = collect_all("essentia")  # pure-Python tree + metadata
+        # collect_all can sweep the compiled `_essentia*.pyd` into datas on some
+        # PyInstaller versions; we add it to `binaries` explicitly below. A
+        # duplicate data-vs-binary entry at the same dest either errors at build
+        # time or stages the .pyd as inert data the loader won't dependency-
+        # resolve — so drop any .pyd from the collected datas and let the
+        # explicit binary win.
+        _ed = [(_s, _dst) for (_s, _dst) in _ed if not str(_s).lower().endswith(".pyd")]
         datas += _ed
         hiddenimports += _eh
         _ess_pkg = _Path(_ess.__file__).parent
         for _pyd in _ess_pkg.glob("_essentia*.pyd"):
             binaries.append((str(_pyd), "essentia"))
         _ess_libs = _ess_pkg.parent / "essentia.libs"
+        _ndll = 0
         if _ess_libs.is_dir():
             for _dll in _ess_libs.glob("*.dll"):
                 binaries.append((str(_dll), "essentia.libs"))
+                _ndll += 1
+        # Surface the bundle shape in the build log so a future wheel-recipe
+        # change that drops the .pyd or the sibling DLL dir is auditable (and
+        # so `selftest-native` failures can be cross-checked against it).
+        print(f"[vibechek.spec] native bundle: "
+              f"pyd={sum(1 for _src, _dst in binaries if _dst == 'essentia')} "
+              f"essentia.libs/*.dll={_ndll}")
 
         hiddenimports += [
             "essentia", "essentia.standard", "essentia._essentia",

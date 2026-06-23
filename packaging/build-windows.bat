@@ -24,7 +24,9 @@ call .venv\Scripts\activate.bat || exit /b 1
 
 echo Installing build deps...
 python -m pip install --upgrade pip wheel || exit /b 1
-python -m pip install -e . pyinstaller || exit /b 1
+REM Pin the PyInstaller major so collect_all()/onefile staging behaviour in
+REM vibechek.spec stays reproducible across runs (6.x supports Python 3.12).
+python -m pip install -e . "pyinstaller>=6,<7" || exit /b 1
 
 REM --- Best-effort: bundle the native (WSL-free) engine when its wheel exists.
 REM release.yml builds the DSP-only essentia wheel (scripts\build_native_essentia_wheel.ps1)
@@ -33,9 +35,18 @@ REM here lets packaging\vibechek.spec fold them into the onefile so
 REM inference_engine="native" runs in-process (no WSL). Failure is NON-FATAL: the
 REM spec skips the bundle when essentia isn't importable, so the build still ships
 REM the lean CLI. Unset (local dev builds) -> skipped, behaviour unchanged.
+REM The DSP-only essentia wheel pins numpy<2; install that same numpy (not a
+REM resolver-picked 2.x) plus essentia's own runtime deps (pyyaml, six) so they
+REM are present for PyInstaller to fold into the onefile.
 if defined VIBECHEK_NATIVE_WHEEL (
     echo Installing native engine wheel: %VIBECHEK_NATIVE_WHEEL%
-    python -m pip install "%VIBECHEK_NATIVE_WHEEL%" onnxruntime numpy || echo WARNING: native wheel install failed - building WITHOUT native bundle
+    python -m pip install "%VIBECHEK_NATIVE_WHEEL%" onnxruntime "numpy<2" pyyaml six || echo WARNING: native wheel install failed - building WITHOUT native bundle
+    REM Only EXPECT a working native onefile if essentia actually imports in the
+    REM build venv. A failed wheel build leaves essentia uninstalled, so we ship
+    REM the lean CLI with no gate; a successful install arms the post-freeze
+    REM self-test below.
+    python -c "import essentia, essentia.standard" >nul 2>&1 && set VIBECHEK_NATIVE_BUNDLED=1
+    if not defined VIBECHEK_NATIVE_BUNDLED echo WARNING: essentia not importable after install - building WITHOUT native bundle
 ) else (
     echo VIBECHEK_NATIVE_WHEEL not set - building without the native engine bundle.
 )
@@ -46,6 +57,15 @@ pyinstaller packaging\vibechek.spec --noconfirm --clean || exit /b 1
 echo Smoke-test the built binary...
 dist\vibechek.exe --version || exit /b 1
 dist\vibechek.exe --help > nul || exit /b 1
+
+REM Loud native gate: when the native wheel was bundled (essentia imported in
+REM the build venv), the frozen exe MUST load + run it in-process. vibechek.spec
+REM swallows bundle errors, so without this a broken native bundle would ship
+REM silently as a lean CLI on a green build. Fail the build instead.
+if defined VIBECHEK_NATIVE_BUNDLED (
+    echo Self-testing the bundled native engine inside the frozen exe...
+    dist\vibechek.exe selftest-native || exit /b 1
+)
 
 echo Packaging zip...
 REM Onefile output is a single .exe rather than a folder; zip it as a one-file

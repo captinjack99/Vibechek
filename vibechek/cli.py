@@ -651,6 +651,62 @@ def system_info_cmd() -> None:
 
 
 # ---------------------------------------------------------------------------
+# selftest-native — frozen-build gate: prove the bundled native engine loads
+# ---------------------------------------------------------------------------
+
+
+@main.command("selftest-native", hidden=True)
+def selftest_native_cmd() -> None:
+    """Prove the bundled native (WSL-free) engine loads + runs in the frozen exe.
+
+    Build-time gate only — packaging/build-windows.bat runs this against the
+    frozen `dist/vibechek.exe` when the DSP-only essentia wheel was bundled.
+    The PyInstaller spec swallows bundling errors (a missing DLL or a skipped
+    bundle silently degrades to the lean CLI), so without an explicit in-process
+    check a broken native bundle would ship on a GREEN build. This imports
+    essentia inside the onefile, runs a bedrock DSP op (exercises the compiled
+    extension + its delvewheel DLLs + numpy interop), confirms the analyze-path
+    algorithms are registered, and checks onnxruntime + the bundled ONNX heads.
+    Exits non-zero on any failure so the build fails loudly instead.
+    """
+    try:
+        import essentia
+        import essentia.standard as es
+        import numpy as np
+
+        # Compiled extension + FFTW DLL + numpy interop: window + spectrum a frame.
+        frame = essentia.array(
+            0.1 * np.sin(2.0 * np.pi * 440.0 * np.arange(1024) / 44100.0)
+        )
+        spectrum = es.Spectrum()(es.Windowing(type="hann")(frame))
+        if spectrum.ndim != 1 or spectrum.shape[0] == 0:
+            raise RuntimeError(f"essentia Spectrum returned unexpected output {spectrum.shape!r}")
+
+        # The algorithms the native analyze worker instantiates must be present.
+        missing = [a for a in ("RhythmExtractor2013", "KeyExtractor", "MonoLoader")
+                   if not hasattr(es, a)]
+        if missing:
+            raise RuntimeError(f"essentia.standard missing algorithms: {missing}")
+
+        # onnxruntime + the bundled (un-hosted) ONNX classification heads.
+        import onnxruntime  # noqa: F401
+
+        from vibechek.onnx_backend import bundled_onnx_assets_dir
+
+        assets = bundled_onnx_assets_dir()
+        if assets is None:
+            raise RuntimeError("bundled ONNX assets dir not found in the frozen exe")
+    except Exception as exc:  # noqa: BLE001 — build gate: surface ANY failure loudly
+        console.print(f"[red]native self-test FAILED[/] — {type(exc).__name__}: {exc}")
+        raise click.exceptions.Exit(code=1) from exc
+
+    console.print(
+        f"[green]native self-test OK[/] — essentia "
+        f"{getattr(essentia, '__version__', '?')}, onnxruntime + ONNX heads at {assets}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # doctor — paste-friendly diagnostic report
 # ---------------------------------------------------------------------------
 

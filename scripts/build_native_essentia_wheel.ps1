@@ -50,7 +50,9 @@ New-Item -ItemType Directory -Force -Path $WorkDir, $OutDir | Out-Null
 
 Write-Host "==> Target Python: $Python"
 & $Python --version
-& $Python -m pip install -q --upgrade pip wheel setuptools numpy delvewheel
+# Pin numpy<2 to match the wheel's own declared dependency (the wo80 fork pins
+# numpy<2.0) and the freeze venv, so build-ABI == install-ABI for _essentia.pyd.
+& $Python -m pip install -q --upgrade pip wheel setuptools "numpy<2" delvewheel
 
 if (-not (Test-Path $fork)) {
     Write-Host "==> Cloning wo80/essentia ($ForkRef)"

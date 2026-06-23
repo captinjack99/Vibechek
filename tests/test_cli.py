@@ -25,6 +25,24 @@ def test_version_command() -> None:
     assert "vibechek" in result.output.lower()
 
 
+def test_selftest_native_registered_and_clean() -> None:
+    """`selftest-native` is the frozen-build native gate.
+
+    It's hidden (not in --help) but must be registered and must NEVER crash with
+    a raw traceback: it either passes (essentia bundled/importable) or exits 1
+    with a clean message (essentia absent — the normal [dev]/CI case, since
+    essentia isn't a test dependency).
+    """
+    assert "selftest-native" in main.commands  # hidden, so absent from --help
+    runner = CliRunner()
+    result = runner.invoke(main, ["selftest-native"])
+    assert result.exit_code in (0, 1), result.output
+    if result.exit_code == 1:
+        assert "native self-test FAILED" in result.output
+    # The handler converts any failure into a clean Click exit — nothing leaks.
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
 def test_dedupe_runs_without_chromaprint(tiny_library: Path, tmp_path: Path) -> None:
     runner = CliRunner()
     output = tmp_path / "dupes.json"
