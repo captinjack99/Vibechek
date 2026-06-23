@@ -58,10 +58,25 @@ Five files carry a version. They must all agree, and they must match the git tag
 | `ui/src-tauri/Cargo.toml` | Cargo semver | `0.5.0-beta` |
 | `ui/src-tauri/tauri.conf.json` | Tauri semver | `0.5.0-beta` |
 
-> **Versioning scheme (since `0.5.0-beta`):** we dropped the `-beta.N` iteration
-> counter. The `0.x` line already signals pre-1.0 / beta status, so each release
-> just bumps `MINOR` (`0.5.0-beta` → `0.6.0-beta` → …). PEP 440 maps the bare
-> `-beta` suffix to `b0`. (Earlier releases used `-beta.N` → `bN`.)
+> **Versioning scheme — standard [SemVer](https://semver.org/) for `0.x`.**
+> Vibechek is pre-1.0, so per [SemVer §4](https://semver.org/#spec-item-4) the
+> `0.x` line already signals an unstable public API. Within it we use the normal
+> SemVer increments — pick by *what changed*, not "one bump per release":
+>
+> - **PATCH** (`0.Y.Z` → `0.Y.(Z+1)`): backwards-compatible bug fixes, packaging
+>   fixes, and docs — no new user-facing features. e.g. `0.6.0-beta` → `0.6.1-beta`.
+> - **MINOR** (`0.Y.Z` → `0.(Y+1).0`): new features or breaking changes.
+>   e.g. `0.6.1-beta` → `0.7.0-beta`.
+>
+> Every pre-1.0 tag carries a bare **`-beta`** suffix: it marks the GitHub release
+> as a pre-release (`release.yml` keys on `-beta`/`-rc`) and tells users the build
+> isn't stable. PEP 440 maps the bare `-beta` to `b0`. We don't use a `-beta.N`
+> counter — each version number gets exactly one `-beta` tag; if a single version
+> ever needs more than one pre-release iteration, use `-rc.N` (PEP 440 `rcN`). At
+> `1.0.0` we drop `-beta` and follow plain SemVer. (History: through
+> `0.4.0-beta.10` we used a `-beta.N` counter; `0.5.0`→`0.6.0` then bumped MINOR
+> for *every* release, which over-signaled feature jumps for fix-only releases —
+> this PATCH/MINOR split corrects that.)
 
 Two **lockfiles** also embed the version and must be regenerated/bumped in the same commit, or a clean CI build will show a dirty tree:
 
@@ -75,7 +90,7 @@ The git tag itself is `v0.5.0-beta`. Keep these in sync — `vibechek --version`
 ### Pre-release suffix conventions
 
 - Alpha (early, broken expected): `0.3.0-alpha.1` / pyproject `0.3.0a1`
-- Beta (feature-complete, bug hunt): `0.3.0-beta` / pyproject `0.3.0b0` (the `0.x` line signals beta; the `-beta.N` counter was dropped — see the box above)
+- Beta (pre-1.0; not yet stable): `0.3.0-beta` / pyproject `0.3.0b0` (every `0.x` tag is a beta — bump PATCH for fixes, MINOR for features; see the box above)
 - Release candidate: `0.3.0-rc.1` / pyproject `0.3.0rc1`
 - Stable: `0.3.0` / pyproject `0.3.0`
 

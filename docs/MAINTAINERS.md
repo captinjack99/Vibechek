@@ -15,9 +15,11 @@ will complain:
 4. `ui/src-tauri/tauri.conf.json`
 5. `ui/package.json`
 
-The git tag form is `vMAJOR.MINOR.PATCH-beta` (e.g. `v0.5.0-beta`); PEP 440 maps the
-`-beta` suffix to `b0`. (We dropped the old `-beta.N` iteration counter — the `0.x`
-line already signals pre-1.0/beta status, so versions just bump `MINOR`.)
+The git tag form is `vMAJOR.MINOR.PATCH-beta` (e.g. `v0.6.1-beta`); PEP 440 maps the
+`-beta` suffix to `b0`. Pre-1.0 follows standard SemVer: bump **PATCH** for
+backwards-compatible fixes (`0.6.0-beta` → `0.6.1-beta`) and **MINOR** for features
+or breaking changes (`0.6.1-beta` → `0.7.0-beta`). Every `0.x` tag is a beta; the
+old `-beta.N` counter is retired. See [RELEASING.md](RELEASING.md) for the full rule.
 
 **Two lockfiles also carry the version** and must be bumped in the same commit or a
 clean CI checkout shows a dirty tree: `ui/src-tauri/Cargo.lock` (the `vibechek-desktop`
