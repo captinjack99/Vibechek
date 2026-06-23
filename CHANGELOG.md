@@ -10,18 +10,34 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+## [0.6.2-beta] — 2026-06-23
+
+### Fixed
+- **The native Windows engine now actually builds in CI.** 0.6.1-beta added the
+  installer bundling + the build-time self-test, but the essentia wheel build
+  itself failed on the GitHub `windows-latest` runner: it pinned the
+  `Visual Studio 17 2022` CMake generator, which the runner image has moved past
+  ("could not find any instance of Visual Studio"). The wheel never built, so the
+  bundle was skipped and 0.6.1-beta shipped the lean CLI after all (the
+  best-effort fall-back worked — it just meant native didn't ship). The wheel
+  build now lets CMake auto-detect the installed Visual Studio, the same way the
+  C/C++ dependency build does. Native bundling remains best-effort and
+  off-by-default; flipping the default still gates on the gold-corpus parity run.
+
 ## [0.6.1-beta] — 2026-06-23
 
 ### Added
-- **The Windows installer now bundles the native (WSL-free) engine, validated by
-  a build-time self-test.** `0.6.0-beta` wired `inference_engine="native"` and
-  exposed it in Settings, but the DSP-only essentia wheel was never folded into
-  the published Windows installer, so the engine couldn't actually run on a
-  stock Windows box. The release build now builds the cp312 essentia wheel on the
-  Windows runner and `packaging/vibechek.spec` folds essentia + onnxruntime +
-  numpy into the PyInstaller onefile, so native runs fully in-process — no WSL,
-  nothing for the user to install. The bundle stays best-effort: a wheel-build
-  failure degrades to the lean CLI and never blocks the release.
+- **Native-engine bundling for the Windows installer (build machinery + self-test
+  gate).** `0.6.0-beta` wired `inference_engine="native"` and exposed it in
+  Settings, but the DSP-only essentia wheel was never folded into the published
+  Windows installer, so the engine couldn't actually run on a stock Windows box.
+  The release build now builds the cp312 essentia wheel on the Windows runner and
+  `packaging/vibechek.spec` folds essentia + onnxruntime + numpy into the
+  PyInstaller onefile, so native runs fully in-process — no WSL, nothing for the
+  user to install. The bundle stays best-effort: a wheel-build failure degrades
+  to the lean CLI and never blocks the release. (In 0.6.1-beta the wheel build
+  itself failed on the CI runner — see 0.6.2-beta — so this release still shipped
+  the lean CLI.)
 
 ### Changed
 - **A green Windows build now *proves* the native bundle loads.** The spec

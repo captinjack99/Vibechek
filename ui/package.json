@@ -1,7 +1,7 @@
 {
   "name": "vibechek-ui",
   "private": true,
-  "version": "0.6.1-beta",
+  "version": "0.6.2-beta",
   "type": "module",
   "scripts": {
     "dev": "vite",
