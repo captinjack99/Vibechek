@@ -4,11 +4,46 @@ All notable changes to Vibechek are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps to `MAJOR.MINOR.PATCHbN` in PEP 440 (`pyproject.toml`). See [docs/RELEASING.md](docs/RELEASING.md).
+Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to `MAJOR.MINOR.PATCHb0` in PEP 440 (`pyproject.toml`). Pre-1.0 follows standard SemVer: bump PATCH for backwards-compatible fixes, MINOR for features or breaking changes. See [docs/RELEASING.md](docs/RELEASING.md).
 
 ---
 
 ## [Unreleased]
+
+## [0.6.1-beta] — 2026-06-23
+
+### Added
+- **The Windows installer now bundles the native (WSL-free) engine, validated by
+  a build-time self-test.** `0.6.0-beta` wired `inference_engine="native"` and
+  exposed it in Settings, but the DSP-only essentia wheel was never folded into
+  the published Windows installer, so the engine couldn't actually run on a
+  stock Windows box. The release build now builds the cp312 essentia wheel on the
+  Windows runner and `packaging/vibechek.spec` folds essentia + onnxruntime +
+  numpy into the PyInstaller onefile, so native runs fully in-process — no WSL,
+  nothing for the user to install. The bundle stays best-effort: a wheel-build
+  failure degrades to the lean CLI and never blocks the release.
+
+### Changed
+- **A green Windows build now *proves* the native bundle loads.** The spec
+  swallows bundling errors (a missing DLL silently degrades to the lean CLI), so
+  a green build never used to distinguish "native bundled and working" from
+  "silently fell back". `build-windows.bat` now runs a hidden `selftest-native`
+  command against the frozen `dist/vibechek.exe` whenever the wheel was bundled:
+  it imports essentia inside the onefile, runs a bedrock DSP op (exercising the
+  compiled extension + its delvewheel DLLs + numpy interop), checks the
+  analyze-path algorithms are registered, and verifies onnxruntime + the bundled
+  ONNX heads — failing the build loudly instead of shipping a broken installer.
+
+### Fixed
+- **Hardened the native wheel bundling against silent breakage.** Pin build- and
+  freeze-side numpy to `<2` (matching the wheel's own declared dependency) so the
+  compiled extension's ABI can't drift; install essentia's `pyyaml`/`six` runtime
+  deps explicitly so PyInstaller can fold them in; pin PyInstaller to 6.x so the
+  onefile staging behaviour stays reproducible; drop the compiled `_essentia*.pyd`
+  from `collect_all`'s data set so it can't collide with the explicit binary
+  entry; and print the bundled `.pyd` + `essentia.libs/*.dll` counts to the build
+  log for auditing. (Default engine stays `essentia_tf`; flipping the default to
+  native still gates on the full gold-corpus parity run.)
 
 ## [0.6.0-beta] — 2026-06-20
 
