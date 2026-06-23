@@ -67,7 +67,13 @@ if (-not (Test-Path (Join-Path $prefix "include\fftw3.h"))) { throw "Dependency 
 
 Write-Host "==> Configuring essentia (DSP-only, Python bindings)"
 $build = Join-Path $fork "build-py"
-& cmake -B $build -S $fork -G "Visual Studio 17 2022" -A x64 `
+# Don't pin the VS generator version. The GitHub windows-latest image moves
+# forward (e.g. VS 2022 -> 2026), and a hardcoded `-G "Visual Studio 17 2022"`
+# fails with "could not find any instance of Visual Studio" the moment the image
+# ships a newer VS. Omitting -G lets CMake select its default generator = the
+# newest installed VS (the same auto-detection the dependency build relies on);
+# `-A x64` still forces a 64-bit build.
+& cmake -B $build -S $fork -A x64 `
     -DCMAKE_PREFIX_PATH="$prefix" `
     -DBUILD_PYTHON_BINDINGS=ON -DUSE_TENSORFLOW=OFF -DUSE_GAIA2=OFF `
     -DBUILD_TESTS=OFF -DBUILD_VAMP_PLUGIN=OFF -DBUILD_EXAMPLES=OFF `
