@@ -188,6 +188,7 @@ export interface PreflightResult {
   native_venv: NativeVenvStatus | null;
   analyze_via: string | null;
   engine: string;
+  essentia_usable: boolean;
   readonly reasons_not_ready: string[];
 }
 

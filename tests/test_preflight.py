@@ -95,6 +95,7 @@ def test_reasons_not_ready_models_missing() -> None:
         models=ModelsCheck(models_dir="/x", missing=["effnet", "genre_discogs400"]),
         platform="Linux-5.0",
         wsl=None,
+        essentia_usable=True,  # essentia serves the engine in-process; only models missing
     )
     reasons = r.reasons_not_ready
     assert any("model" in r.lower() and "missing" in r.lower() for r in reasons)
@@ -119,6 +120,7 @@ def test_reasons_not_ready_empty_when_all_good() -> None:
         models=ModelsCheck(models_dir="/x", found=["effnet"]),
         platform="Linux-5.0",
         wsl=None,
+        essentia_usable=True,  # essentia serves the engine in-process
     )
     assert r.reasons_not_ready == []
 
@@ -305,6 +307,8 @@ def test_preflight_ready_when_native_and_models_present(monkeypatch: pytest.Monk
         "check_essentia",
         lambda: EssentiaCheck(installed=True, version="2.1"),
     )
+    # essentia_tf needs a TensorFlow-capable build to run in-process — simulate one.
+    monkeypatch.setattr(preflight_mod, "_essentia_has_tf_algos", lambda: True)
     monkeypatch.setattr(
         preflight_mod,
         "check_models",
@@ -319,6 +323,51 @@ def test_preflight_ready_when_native_and_models_present(monkeypatch: pytest.Monk
     r = preflight()
     assert r.ready is True
     assert r.analyze_via == "native"
+    assert r.essentia_usable is True
+
+
+def test_preflight_native_engine_served_by_dsp_only_wheel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """engine='native' runs in-process on a DSP-only essentia (no TF algos) — the
+    bundled Windows wheel case. The NumPy mel frontend replaces the missing
+    TensorflowInputMusiCNN, so 'native' is served even though TF algos are absent."""
+    monkeypatch.setattr(
+        preflight_mod, "check_essentia",
+        lambda: EssentiaCheck(installed=True, version="2.1b6.dev0"),
+    )
+    monkeypatch.setattr(preflight_mod, "_essentia_has_tf_algos", lambda: False)  # DSP-only wheel
+    monkeypatch.setattr(
+        preflight_mod, "check_models",
+        lambda _d=None, engine="native": ModelsCheck(models_dir="/x", found=["effnet (onnx backbone)"]),
+    )
+    monkeypatch.setattr(
+        preflight_mod, "detect_wsl",
+        lambda quick=True, venv_subdir="venv-onnx": WSLStatus(False, False, False),
+    )
+
+    r = preflight(engine="native")
+    assert r.ready is True
+    assert r.analyze_via == "native"
+    assert r.essentia_usable is True
+
+
+def test_preflight_dsp_only_wheel_does_not_hijack_essentia_tf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bundled DSP-only wheel must NOT capture the default essentia_tf path:
+    it lacks TensorFlow, so essentia_tf still routes through WSL, not in-process."""
+    monkeypatch.setattr(
+        preflight_mod, "check_essentia",
+        lambda: EssentiaCheck(installed=True, version="2.1b6.dev0"),  # DSP-only wheel present
+    )
+    monkeypatch.setattr(preflight_mod, "_essentia_has_tf_algos", lambda: False)  # no TF build
+    monkeypatch.setattr(
+        preflight_mod, "check_models",
+        lambda _d=None, engine="essentia_tf": ModelsCheck(models_dir="/x", found=["effnet"]),
+    )
+    monkeypatch.setattr(preflight_mod, "detect_wsl", lambda quick=True, venv_subdir="venv": _wsl_ready())
+
+    r = preflight(engine="essentia_tf")
+    assert r.ready is True
+    assert r.analyze_via == "wsl"          # routed to WSL, NOT in-process native
+    assert r.essentia_usable is False      # DSP-only wheel can't serve essentia_tf
 
 
 def test_preflight_not_ready_when_no_engine(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -392,6 +441,7 @@ def test_preflight_native_preferred_over_wsl(monkeypatch: pytest.MonkeyPatch) ->
         "check_essentia",
         lambda: EssentiaCheck(installed=True, version="2.1"),
     )
+    monkeypatch.setattr(preflight_mod, "_essentia_has_tf_algos", lambda: True)  # TF-capable build
     monkeypatch.setattr(
         preflight_mod,
         "check_models",
@@ -409,6 +459,7 @@ def test_preflight_models_missing_blocks_even_with_engine(monkeypatch: pytest.Mo
         "check_essentia",
         lambda: EssentiaCheck(installed=True, version="2.1"),
     )
+    monkeypatch.setattr(preflight_mod, "_essentia_has_tf_algos", lambda: True)  # TF-capable build
     monkeypatch.setattr(
         preflight_mod,
         "check_models",

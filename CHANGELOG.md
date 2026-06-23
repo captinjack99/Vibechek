@@ -67,11 +67,23 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta.N` (git tag) which maps t
   delvewheel; validated in a fresh wheel-only venv (`import essentia` + DSP run
   with no DLL path) and end-to-end: a real `analyze` of Darude FLACs ran fully
   native (preflight `analyze_via=native`, no WSL, no TensorFlow) producing
-  genre/BPM/key/energy/vocal, with the wheel's `RhythmExtractor2013`/`KeyExtractor`
-  matching WSL-essentia ground truth (**KEY 12/12, BPM 11/12 exact**). Config
-  accepts `"native"`; default stays `essentia_tf`. Not yet exposed in Settings or
-  bundled in the installer (the wheel must ship + be rebuilt per target CPython) —
-  those + the gold-corpus gate are the remaining steps to flip the default.
+  genre/BPM/key/energy/vocal. Selectable in **Settings → Engine ("Native · no
+  WSL")**. **Cross-engine parity (release Python 3.12 + cp312 wheel, in-process,
+  vs essentia ground truth, 40 tracks): genre top-1 class 40/40 (100%), key
+  40/40 (100%), BPM 39/40 (98%)** — Windows-native results match the Mac/Linux
+  path because it is the *same* ONNX model weights, a bit-exact NumPy mel
+  frontend, and the same essentia DSP algorithms (compiled as a native wheel).
+  **Installer bundling is wired (experimental):** `release.yml` builds the cp312
+  wheel on the Windows runner and `packaging/vibechek.spec` folds essentia +
+  onnxruntime + numpy into the onefile sidecar (essentia's `_essentia*.pyd` and
+  its delvewheel `essentia.libs/` DLLs placed where the runtime loader expects),
+  so the engine needs no separate setup. `preflight.essentia_serves_engine()`
+  gates the in-process route so the bundled **DSP-only** wheel serves *only*
+  `native` — the default `essentia_tf`/`onnx` paths still route through WSL
+  (they need TensorFlow, which the DSP-only wheel lacks). The bundle step is
+  best-effort: a wheel-build failure leaves the sidecar as the lean CLI, never
+  blocking the release. Config accepts `"native"`; default stays `essentia_tf`
+  pending the CI installer-build smoke + the full gold-corpus gate.
 - **Groundwork for a native-Windows (WSL-free) analyze path — opt-in, default
   unchanged.** Windows routes ML analysis through WSL only because essentia has
   no Windows wheel; the ONNX engine already moved every neural forward pass to

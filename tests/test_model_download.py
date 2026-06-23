@@ -91,6 +91,29 @@ def test_failed_download_does_not_delete_existing_models(tmp_path, monkeypatch) 
     )
 
 
+def test_download_models_stages_bundled_heads_when_mirror_unreachable(tmp_path, monkeypatch) -> None:
+    """A FRESH onnx/native install must get its classification heads from the
+    BUNDLED assets (staged), NOT the mirror — so the one-click Windows native
+    engine works on a clean box where the head .onnx mirror would 404. Without
+    staging, a fresh install silently loses every genre/mood/vocal head."""
+    def boom_dl(*_a, **_k):  # every network fetch fails — only staging can supply heads
+        raise RuntimeError("mirror unreachable (404)")
+
+    monkeypatch.setattr(model_download, "_download_from_mirrors", boom_dl)
+
+    # The backbone .onnx is NOT bundled, so its fetch still fails → final raise.
+    with pytest.raises(RuntimeError):
+        model_download.download_models(tmp_path, engine="onnx")
+
+    onnx_dir = tmp_path / model_download._ONNX_SUBDIR
+    staged = sorted(p.name for p in onnx_dir.glob("*.onnx"))
+    assert "danceability.onnx" in staged, (
+        "bundled ONNX heads must be staged offline for a fresh native/onnx install"
+    )
+    # genre_discogs400.json carries the 400 class labels and is REQUIRED.
+    assert (onnx_dir / "genre_discogs400.json").exists()
+
+
 # --- Cancellation: a multi-GB download must stop mid-stream on cancel. ---
 
 

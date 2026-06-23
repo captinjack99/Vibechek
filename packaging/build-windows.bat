@@ -26,6 +26,20 @@ echo Installing build deps...
 python -m pip install --upgrade pip wheel || exit /b 1
 python -m pip install -e . pyinstaller || exit /b 1
 
+REM --- Best-effort: bundle the native (WSL-free) engine when its wheel exists.
+REM release.yml builds the DSP-only essentia wheel (scripts\build_native_essentia_wheel.ps1)
+REM and sets VIBECHEK_NATIVE_WHEEL to its path. Installing it + onnxruntime + numpy
+REM here lets packaging\vibechek.spec fold them into the onefile so
+REM inference_engine="native" runs in-process (no WSL). Failure is NON-FATAL: the
+REM spec skips the bundle when essentia isn't importable, so the build still ships
+REM the lean CLI. Unset (local dev builds) -> skipped, behaviour unchanged.
+if defined VIBECHEK_NATIVE_WHEEL (
+    echo Installing native engine wheel: %VIBECHEK_NATIVE_WHEEL%
+    python -m pip install "%VIBECHEK_NATIVE_WHEEL%" onnxruntime numpy || echo WARNING: native wheel install failed - building WITHOUT native bundle
+) else (
+    echo VIBECHEK_NATIVE_WHEEL not set - building without the native engine bundle.
+)
+
 echo Running PyInstaller...
 pyinstaller packaging\vibechek.spec --noconfirm --clean || exit /b 1
 

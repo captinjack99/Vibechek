@@ -350,12 +350,28 @@ def download_models(
     # conversion script still needs); the head .onnx are produced by
     # scripts/convert_heads_to_onnx.py, not hosted upstream.
     if engine == "onnx":
-        from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME  # noqa: PLC0415
+        from vibechek.onnx_backend import (  # noqa: PLC0415
+            BACKBONE_ONNX_FILENAME,
+            stage_bundled_onnx_heads,
+        )
 
         # All ONNX files go in the dedicated subdir (see _ONNX_SUBDIR) so they
         # never collide with the essentia `.pb` set in the parent models dir.
         onnx_dir = model_dir / _ONNX_SUBDIR
         onnx_dir.mkdir(parents=True, exist_ok=True)
+
+        # Stage the bundled (hash-pinned) classification heads FIRST so a fresh
+        # install has them offline and the download loop below skips them
+        # (idempotent). This is what makes the one-click Windows native engine —
+        # which bundles the essentia wheel and never runs the ONNX setup flow —
+        # self-sufficient: essentia doesn't host the head .onnx, so without this
+        # they'd 404 on a clean box and genre/mood/vocal heads would be missing.
+        # No-op (source=None) on a lean dev build with no bundled assets.
+        try:
+            stage_bundled_onnx_heads(model_dir)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not stage bundled ONNX heads: %s", e)
+
         onnx_path = onnx_dir / BACKBONE_ONNX_FILENAME
         onnx_urls = _candidate_urls(
             "feature-extractors/discogs-effnet", BACKBONE_ONNX_FILENAME

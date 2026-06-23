@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import platform
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from vibechek.analyzer import _ONNX_HEAD_STEMS, _ONNX_SUBDIR, MODELS
@@ -68,14 +69,20 @@ class PreflightResult:
     #   "native_venv" — Linux/macOS + essentia inside ~/.vibechek/venv/
     analyze_via: str | None = None
     # Which inference engine this result was computed for ("essentia_tf" |
-    # "onnx"). Drives engine-accurate "not ready" messaging.
+    # "onnx" | "native"). Drives engine-accurate "not ready" messaging.
     engine: str = "essentia_tf"
+    # Whether the in-process (sidecar-Python) essentia can actually SERVE this
+    # engine — installed AND, for essentia_tf/onnx, a TensorFlow-capable build.
+    # The bundled DSP-only Windows wheel (USE_TENSORFLOW=OFF) serves only
+    # "native"; this flag keeps it from hijacking essentia_tf/onnx routing into a
+    # broken in-process path (those still fall through to WSL / the managed venv).
+    essentia_usable: bool = False
 
     @property
     def reasons_not_ready(self) -> list[str]:
         out: list[str] = []
         have_engine = (
-            self.essentia.installed
+            self.essentia_usable
             or (self.wsl and self.wsl.can_run_vibechek)
             or (
                 self.native_venv
@@ -118,6 +125,42 @@ def check_essentia() -> EssentiaCheck:
     except Exception as e:  # noqa: BLE001
         # essentia sometimes raises non-ImportError on broken installs
         return EssentiaCheck(installed=False, error=f"{type(e).__name__}: {e}")
+
+
+@lru_cache(maxsize=1)
+def _essentia_has_tf_algos() -> bool:
+    """True iff the importable essentia exposes TensorflowInputMusiCNN.
+
+    The DSP-only native Windows wheel is built ``USE_TENSORFLOW=OFF`` and lacks
+    every ``Tensorflow*`` algorithm — including the mel frontend the essentia_tf
+    and onnx engines run in-process. A full essentia / essentia-tensorflow build
+    has them. Cached because the importable build can't change within a process,
+    and importing ``essentia.standard`` for a TF build is multi-second.
+    """
+    try:
+        import essentia.standard as es  # noqa: PLC0415
+        return hasattr(es, "TensorflowInputMusiCNN")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def essentia_serves_engine(engine: str, installed: bool) -> bool:
+    """Can the in-process (sidecar-Python) essentia actually run ``engine``?
+
+    "native" needs only DSP (decode/BPM/key) plus the pure-NumPy mel frontend,
+    so ANY importable essentia — including the bundled DSP-only Windows wheel —
+    serves it. "essentia_tf"/"onnx" run essentia's TensorFlow-input mel
+    in-process, so they need a TF-capable build. This gate is what lets the
+    Windows installer BUNDLE the DSP-only wheel (making ``native`` one-click)
+    without that wheel hijacking the default essentia_tf/onnx routing: with the
+    wheel present, essentia_tf/onnx see ``essentia_serves_engine() is False``
+    and still fall through to WSL, while ``native`` runs in-process.
+    """
+    if not installed:
+        return False
+    if engine == "native":
+        return True
+    return _essentia_has_tf_algos()
 
 
 def _model_files_for_engine(
@@ -220,7 +263,7 @@ def preflight(
     wsl_status = detect_wsl(quick=quick_wsl, venv_subdir=venv_subdir)
     native_venv = probe_native_venv(engine)
 
-    have_native = essentia.installed
+    have_native = essentia_serves_engine(engine, essentia.installed)
     have_wsl = wsl_status.can_run_vibechek
     have_native_venv = native_venv.essentia_installed and native_venv.vibechek_installed
     have_engine = have_native or have_wsl or have_native_venv
@@ -251,6 +294,7 @@ def preflight(
         native_venv=native_venv,
         analyze_via=analyze_via,
         engine=engine,
+        essentia_usable=have_native,
     )
 
 

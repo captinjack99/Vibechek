@@ -73,10 +73,18 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 
 ## Platform model
 
-- **Windows:** Essentia has no Windows wheel, so analysis routes through `vibechek`
-  installed in WSL Ubuntu. Paths translate `C:\…` ↔ `/mnt/c/…` at the boundary; the
-  frontend never sees WSL. A version-drift guard refuses to dispatch when the WSL
-  install doesn't match the sidecar version (one-click repair via "Update WSL install").
+- **Windows:** Essentia has no Windows wheel, so the default path routes analysis
+  through `vibechek` installed in WSL Ubuntu. Paths translate `C:\…` ↔ `/mnt/c/…`
+  at the boundary; the frontend never sees WSL. A version-drift guard refuses to
+  dispatch when the WSL install doesn't match the sidecar version (one-click repair
+  via "Update WSL install"). An **experimental** `inference_engine="native"` runs
+  WSL-free, fully in-process: ONNX inference + a bit-exact NumPy mel frontend + a
+  DSP-only native essentia wheel (decode/BPM/key) built from the wo80 CMake fork.
+  It runs the *same* model weights as Mac/Linux — validated to identical genre
+  top-1 and key, ±2% BPM on a 40-track parity set — so Windows users take no
+  accuracy penalty. The release bundles the wheel into the sidecar (best-effort);
+  `preflight.essentia_serves_engine()` routes only this engine in-process, leaving
+  the default essentia_tf/onnx on WSL.
 - **macOS / Linux:** a managed venv at `~/.vibechek/venv/` runs Essentia directly.
 - **GPU:** NVIDIA CUDA runtime via PyPI wheels installed into the venv (works on any
   Linux/WSL distro, no apt/keyring/root). The Settings GPU row probes the *actual*

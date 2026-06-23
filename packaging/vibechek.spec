@@ -46,6 +46,7 @@ publisher reputation builds.
 """
 
 import os
+import sys
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
@@ -81,25 +82,82 @@ datas += [(os.path.join(_REPO_ROOT, "vibechek", "onnx_assets"), "onnx_assets")]
 # 2.2 GB CLAP checkpoint is NOT bundled — the in-app CLAP setup downloads it.
 datas += [(os.path.join(_REPO_ROOT, "vibechek", "clap_assets"), "clap_assets")]
 
+# --- Windows native engine: best-effort bundle of the in-process ML stack -----
+# When the DSP-only essentia wheel + onnxruntime + numpy are importable at BUILD
+# time (release.yml installs them on the Windows runner before this spec runs),
+# fold them into the onefile so `inference_engine="native"` runs FULLY
+# in-process — no WSL, no managed venv, nothing for the user to install. The
+# default essentia_tf path is unaffected: preflight.essentia_serves_engine()
+# still routes essentia_tf/onnx to WSL because the DSP-only wheel lacks the
+# TensorFlow algorithms. If ANY piece is absent (non-Windows, or the wheel
+# wasn't built) we SKIP the bundle and the binary is byte-for-byte the lean CLI
+# as before — so a native-wheel build failure can NEVER break the release.
+binaries = []
+_bundle_native = False
+if sys.platform == "win32":
+    try:
+        from pathlib import Path as _Path
+
+        from PyInstaller.utils.hooks import collect_all
+
+        import essentia as _ess  # build-time presence probe (the wheel must be installed)
+        import numpy  # noqa: F401
+        import onnxruntime  # noqa: F401
+
+        # onnxruntime + numpy have PyInstaller hooks — collect_all gets their
+        # native DLLs + data correctly.
+        for _pkg in ("onnxruntime", "numpy"):
+            _d, _b, _h = collect_all(_pkg)
+            datas += _d
+            binaries += _b
+            hiddenimports += _h
+
+        # essentia has NO PyInstaller hook, and delvewheel stows its native DLLs in
+        # a SIBLING `essentia.libs/` dir that essentia/__init__.py loads at runtime
+        # via `os.add_dll_directory(<pkg>/../essentia.libs)`. collect_all misses
+        # BOTH the compiled `_essentia*.pyd` (verified binaries=0) and that sibling
+        # dir, so add them EXPLICITLY at the exact paths the delvewheel patch
+        # expects inside the onefile temp root:
+        #   <_MEIPASS>/essentia/_essentia*.pyd   and   <_MEIPASS>/essentia.libs/*.dll
+        _ed, _eb, _eh = collect_all("essentia")  # pure-Python tree + metadata
+        datas += _ed
+        hiddenimports += _eh
+        _ess_pkg = _Path(_ess.__file__).parent
+        for _pyd in _ess_pkg.glob("_essentia*.pyd"):
+            binaries.append((str(_pyd), "essentia"))
+        _ess_libs = _ess_pkg.parent / "essentia.libs"
+        if _ess_libs.is_dir():
+            for _dll in _ess_libs.glob("*.dll"):
+                binaries.append((str(_dll), "essentia.libs"))
+
+        hiddenimports += [
+            "essentia", "essentia.standard", "essentia._essentia",
+            "onnxruntime", "numpy",
+        ]
+        # Refuse to claim a native bundle unless the compiled extension is in —
+        # without the .pyd `import essentia` fails and the engine is dead weight.
+        _bundle_native = any(dest == "essentia" for _src, dest in binaries)
+    except Exception:
+        _bundle_native = False
+
+# Heavyweight ML deps are excluded by default (users install them via WSL / the
+# managed venv). When the native bundle is active we must NOT exclude essentia /
+# numpy — they ARE the bundle. TensorFlow + SciPy stay excluded either way (the
+# DSP-only wheel has no TF; nothing in the native path needs SciPy).
+_excludes = ["tensorflow", "scipy", "pytest", "_pytest"]
+if not _bundle_native:
+    _excludes = ["essentia", "numpy", *_excludes]
+
 a = Analysis(
     ["entrypoint.py"],
     pathex=[],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[
-        # Don't pull in any heavyweight ML deps; users install those separately
-        "essentia",
-        "numpy",
-        "tensorflow",
-        "scipy",
-        # Test-only deps
-        "pytest",
-        "_pytest",
-    ],
+    excludes=_excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

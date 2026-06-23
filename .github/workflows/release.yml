@@ -78,6 +78,37 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x ${{ matrix.build_cmd }}
 
+      # --- Native (WSL-free) engine wheel (Windows, experimental) -------------
+      # essentia ships no PyPI Windows wheel, so build the DSP-only one from the
+      # wo80 CMake fork here and point build-windows.bat at it (VIBECHEK_NATIVE_WHEEL).
+      # packaging/vibechek.spec then folds essentia + onnxruntime + numpy into the
+      # onefile, so inference_engine="native" runs fully in-process — no WSL.
+      #
+      # BEST-EFFORT by design: continue-on-error means a wheel-build failure never
+      # blocks the release. When it fails (or is skipped), VIBECHEK_NATIVE_WHEEL
+      # stays unset, the spec skips the bundle, and the sidecar ships as the lean
+      # CLI exactly as before. The ~9 C/C++ deps build takes ~30 min on a cold
+      # runner (caching them is a follow-up; the step is off the critical path of
+      # correctness since it's purely additive).
+      - name: Build native essentia wheel (Windows, experimental)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & "$env:pythonLocation\python.exe" --version
+          ./scripts/build_native_essentia_wheel.ps1 `
+            -Python "$env:pythonLocation\python.exe" `
+            -WorkDir "$env:RUNNER_TEMP\vibechek-native-build" `
+            -OutDir "packaging/wheels"
+          $whl = Get-ChildItem packaging/wheels/essentia-*.whl -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          if ($whl) {
+            "VIBECHEK_NATIVE_WHEEL=$($whl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Write-Host "Native engine wheel built: $($whl.FullName)"
+          } else {
+            Write-Host "No native wheel produced — sidecar will build lean (no native bundle)."
+          }
+
       - name: Build PyInstaller CLI bundle
         run: ${{ matrix.build_cmd }}
 
