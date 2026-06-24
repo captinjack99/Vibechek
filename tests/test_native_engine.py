@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import vibechek.analyzer as az
-from vibechek.config import AnalysisConfig, _subset
+from vibechek.config import _DEFAULT_INFERENCE_ENGINE, AnalysisConfig, _subset
 from vibechek.preflight import _model_files_for_engine
 
 
@@ -23,7 +23,7 @@ def test_config_accepts_native_engine() -> None:
 
 def test_config_snaps_unknown_engine_to_default() -> None:
     cfg = _subset(AnalysisConfig, {"inference_engine": "ONNX_typo"})
-    assert cfg.inference_engine == "essentia_tf"
+    assert cfg.inference_engine == _DEFAULT_INFERENCE_ENGINE
 
 
 def test_preflight_native_checks_the_onnx_model_set(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,15 @@ MODELS_DIR = DATA_DIR / "models"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 # Pre-0.3.0 TOML file — read as one-time migration if config.json is absent.
 LEGACY_CONFIG_FILE = CONFIG_DIR / "config.toml"
+
+# Default inference engine. Windows ships the WSL-free native engine bundled in
+# the installer (essentia + ONNX folded into the PyInstaller onefile), so default
+# to it there; essentia_tf elsewhere. preflight() falls back to WSL / the managed
+# venv when native isn't actually importable (a plain pip install, or a lean
+# build whose wheel didn't bundle), so a non-bundled Windows install degrades
+# gracefully instead of breaking. Existing users keep whatever their saved
+# config already has; this only sets the default for a fresh/unset config.
+_DEFAULT_INFERENCE_ENGINE = "native" if sys.platform == "win32" else "essentia_tf"
 
 
 @dataclass
@@ -71,7 +81,7 @@ class AnalysisConfig:
     # frontend + a DSP-only native essentia wheel (decode/BPM/key) run IN-PROCESS
     # (preflight routes analyze_via="native" when essentia imports locally). On
     # Linux/macOS essentia already ships wheels, so the onnx engine is native there.
-    inference_engine: str = "essentia_tf"  # "essentia_tf" | "onnx" | "native"
+    inference_engine: str = _DEFAULT_INFERENCE_ENGINE  # "essentia_tf" | "onnx" | "native"
 
     # ----- Existing-tag vs ML reconciliation (genre/BPM/key) ----------------
     # Many libraries already carry curated genre tags (e.g. Beatport downloads)
@@ -351,9 +361,9 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
         if key == "inference_engine" and coerced not in ("essentia_tf", "onnx", "native"):
             log.warning(
                 "Config field %s.inference_engine has unknown value %r; "
-                "falling back to 'essentia_tf'", cls.__name__, coerced,
+                "falling back to the platform default", cls.__name__, coerced,
             )
-            continue  # use the dataclass default ("essentia_tf")
+            continue  # use the dataclass default (_DEFAULT_INFERENCE_ENGINE)
         # The genre enums steer model loading + reconciliation the same way —
         # a hand-edited value ("CLAP", "ml") would render Settings with neither
         # option selected and silently run default behavior. Snap back loudly.

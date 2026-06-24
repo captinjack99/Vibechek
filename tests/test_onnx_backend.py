@@ -9,7 +9,7 @@ scripts/onnx_parity.py and is run by hand in the analysis environment.
 Covered:
   * build_providers EP-chain filtering + use_gpu="off" → CPU only
   * the patch-window index math (hop 64) as a pure function
-  * the inference-engine flag defaults to the safe "essentia_tf"
+  * the inference-engine default is platform-aware (native on Windows, essentia_tf elsewhere)
   * graceful, clear errors when onnxruntime / heads / backbone are absent
 """
 
@@ -203,9 +203,10 @@ def test_make_patches_empty_mel_yields_single_zero_patch() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_inference_engine_defaults_to_essentia_tf() -> None:
-    """The default engine keeps the unchanged TF path — onnx is opt-in."""
-    assert AnalysisConfig().inference_engine == "essentia_tf"
+def test_inference_engine_default_is_platform_aware() -> None:
+    """Default engine: native on Windows (bundled, WSL-free), essentia_tf elsewhere."""
+    from vibechek.config import _DEFAULT_INFERENCE_ENGINE
+    assert AnalysisConfig().inference_engine == _DEFAULT_INFERENCE_ENGINE
 
 
 def test_inference_engine_roundtrips_in_config(tmp_path: Path) -> None:

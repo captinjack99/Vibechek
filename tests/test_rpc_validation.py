@@ -257,9 +257,10 @@ def test_active_engine_honors_request_param() -> None:
     (which can lag by the autosave debounce)."""
     assert rpc._active_engine({"inference_engine": "onnx"}) == "onnx"
     assert rpc._active_engine({"inference_engine": "essentia_tf"}) == "essentia_tf"
-    # invalid/absent falls back to the saved config (a valid engine either way)
-    assert rpc._active_engine({"inference_engine": "evil"}) in ("essentia_tf", "onnx")
-    assert rpc._active_engine({}) in ("essentia_tf", "onnx")
+    # invalid/absent falls back to the saved config (a valid engine either way;
+    # the default is platform-conditional — native on Windows, essentia_tf else)
+    assert rpc._active_engine({"inference_engine": "evil"}) in ("essentia_tf", "onnx", "native")
+    assert rpc._active_engine({}) in ("essentia_tf", "onnx", "native")
 
 
 # ---------------------------------------------------------------------------

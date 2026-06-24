@@ -664,31 +664,49 @@ def selftest_native_cmd() -> None:
     The PyInstaller spec swallows bundling errors (a missing DLL or a skipped
     bundle silently degrades to the lean CLI), so without an explicit in-process
     check a broken native bundle would ship on a GREEN build. This imports
-    essentia inside the onefile, runs a bedrock DSP op (exercises the compiled
-    extension + its delvewheel DLLs + numpy interop), confirms the analyze-path
-    algorithms are registered, and checks onnxruntime + the bundled ONNX heads.
-    Exits non-zero on any failure so the build fails loudly instead.
+    essentia inside the onefile, DECODES a synthesized clip through essentia's
+    FFmpeg/libav path (the avcodec/avformat DLLs a load-only smoke never
+    exercises — a missing one lets `import essentia` succeed but throws at the
+    first decode), runs the analyze-path feature extractors on it, and checks
+    onnxruntime + the bundled ONNX heads. Exits non-zero on any failure so the
+    build fails loudly instead of silently shipping a native engine that can't
+    decode audio.
     """
     try:
+        import os
+        import tempfile
+        import wave
+
         import essentia
         import essentia.standard as es
         import numpy as np
 
-        # Compiled extension + FFTW DLL + numpy interop: window + spectrum a frame.
-        frame = essentia.array(
-            0.1 * np.sin(2.0 * np.pi * 440.0 * np.arange(1024) / 44100.0)
-        )
-        spectrum = es.Spectrum()(es.Windowing(type="hann")(frame))
-        if spectrum.ndim != 1 or spectrum.shape[0] == 0:
-            raise RuntimeError(f"essentia Spectrum returned unexpected output {spectrum.shape!r}")
+        # 1) DECODE a real file through essentia's FFmpeg/libav path. Synthesize a
+        #    5s WAV (stdlib, no encoder dep) and decode it; essentia routes EVERY
+        #    format (WAV included) through libav, so this exercises the same
+        #    avcodec/avformat DLLs MP3/FLAC decode needs — the one runtime path
+        #    the load-only smoke could not reach.
+        sr = 44100
+        sig = (0.3 * np.sin(2.0 * np.pi * 440.0 * np.arange(sr * 5) / sr) * 32767).astype("<i2")
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            with wave.open(tmp.name, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sr)
+                w.writeframes(sig.tobytes())
+            audio = es.MonoLoader(filename=tmp.name, sampleRate=sr)()
+            if audio is None or len(audio) == 0:
+                raise RuntimeError("essentia MonoLoader decoded zero samples")
+            # 2) Run the analyze worker's feature extractors on the decoded audio —
+            #    proves the compiled extension + FFTW actually RUN, not just load.
+            es.RhythmExtractor2013(method="multifeature")(audio)
+            es.KeyExtractor()(audio)
+        finally:
+            os.unlink(tmp.name)
 
-        # The algorithms the native analyze worker instantiates must be present.
-        missing = [a for a in ("RhythmExtractor2013", "KeyExtractor", "MonoLoader")
-                   if not hasattr(es, a)]
-        if missing:
-            raise RuntimeError(f"essentia.standard missing algorithms: {missing}")
-
-        # onnxruntime + the bundled (un-hosted) ONNX classification heads.
+        # 3) onnxruntime + the bundled (un-hosted) ONNX classification heads.
         import onnxruntime  # noqa: F401
 
         from vibechek.onnx_backend import bundled_onnx_assets_dir
@@ -702,7 +720,8 @@ def selftest_native_cmd() -> None:
 
     console.print(
         f"[green]native self-test OK[/] — essentia "
-        f"{getattr(essentia, '__version__', '?')}, onnxruntime + ONNX heads at {assets}"
+        f"{getattr(essentia, '__version__', '?')} decoded + analyzed a test clip; "
+        f"onnxruntime + ONNX heads at {assets}"
     )
 
 
