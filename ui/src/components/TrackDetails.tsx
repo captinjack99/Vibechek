@@ -280,7 +280,7 @@ function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
       next: ml.ml_subgenre ?? ml.ml_genre,
       badgeColor: "purple",
     },
-    { label: "BPM", existing: existing.bpm, next: ml.ml_bpm, badgeColor: "cyan" },
+    { label: "BPM", existing: existing.bpm, next: ml.ml_bpm, badgeColor: "neutral" },
     { label: "Key", existing: existing.key, next: ml.ml_key, badgeColor: "green" },
     {
       label: "Energy",
@@ -322,6 +322,7 @@ function DiffRow({ row }: { row: DiffRowData }) {
       <div className="w-20 text-xs text-white/50">{row.label}</div>
       <div className="flex-1 flex items-center gap-2 min-w-0">
         <span
+          title={row.existing == null ? undefined : String(row.existing)}
           className={`text-xs truncate ${
             row.existing == null ? "text-white/30 italic" : "text-white/70"
           }`}

@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
-  Download, Cpu, FolderOpen, Settings as SettingsIcon, Shield,
+  Download, FolderOpen, Settings as SettingsIcon, Shield,
   Zap, AlertTriangle, RotateCcw, ChevronDown, ChevronRight,
-  FileText, Wrench, HelpCircle, Disc3, Loader2,
+  FileText, Wrench, HelpCircle, Disc3, Loader2, Gauge, Copy,
 } from "lucide-react";
 import { AnimatePresence } from "framer-motion";
 
@@ -548,7 +548,7 @@ export function Settings() {
       />
 
       <Section
-        icon={<Cpu className="w-5 h-5" />}
+        icon={<Gauge className="w-5 h-5" />}
         title="Analysis"
         subtitle="How much of your machine to use"
       >
@@ -1011,7 +1011,7 @@ export function Settings() {
       </Section>
 
       <Section
-        icon={<Cpu className="w-5 h-5" />}
+        icon={<Copy className="w-5 h-5" />}
         title="Duplicate detection"
         subtitle="What to look for, what to do"
       >

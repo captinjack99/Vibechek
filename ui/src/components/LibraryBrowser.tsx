@@ -1517,7 +1517,7 @@ function TrackRow({ track, selected, checked, onCheck, onClick }: TrackRowProps)
           <TagBadge color="purple">{ml.ml_subgenre || ml.ml_genre}</TagBadge>
         )}
         {ml?.ml_bpm && (
-          <TagBadge color="cyan">{Math.round(ml.ml_bpm)} BPM</TagBadge>
+          <TagBadge color="neutral">{Math.round(ml.ml_bpm)} BPM</TagBadge>
         )}
         {ml?.ml_key && <TagBadge color="green">{ml.ml_key}</TagBadge>}
       </div>

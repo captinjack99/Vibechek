@@ -26,6 +26,21 @@ import { useUpdater } from "../hooks/useUpdater";
 import type { EngineGpuInfo, GpuDevice, PreflightResult, SystemResources } from "../types";
 import { Hint, Row, Section, Stat } from "./SettingsPrimitives";
 
+/** Subtle animated placeholder shown while a section's data is still loading. */
+function Skeleton({ rows = 2 }: { rows?: number }) {
+  return (
+    <div className="space-y-2" aria-hidden="true">
+      {Array.from({ length: rows }, (_, i) => (
+        <div
+          key={i}
+          className="h-3 rounded bg-white/10 animate-pulse"
+          style={{ width: `${72 - i * 16}%` }}
+        />
+      ))}
+    </div>
+  );
+}
+
 /**
  * Software updates: a non-intrusive "Check for updates" affordance backed by
  * tauri-plugin-updater. No-ops cleanly outside the Tauri shell (dev browser /
@@ -128,7 +143,7 @@ export function PreflightSection({
   if (!preflight) {
     return (
       <Section icon={<Cpu className="w-5 h-5" />} title="Ready to analyze?" subtitle="checking...">
-        <div className="text-sm text-white/40">Loading preflight...</div>
+        <Skeleton rows={2} />
       </Section>
     );
   }
@@ -261,7 +276,11 @@ export function ResourcesSection({
         title="System"
         subtitle="Detecting resources..."
       >
-        <div className="text-sm text-white/40">Loading...</div>
+        <div className="grid grid-cols-3 gap-4" aria-hidden="true">
+          {Array.from({ length: 3 }, (_, i) => (
+            <div key={i} className="h-14 rounded-lg bg-white/5 animate-pulse" />
+          ))}
+        </div>
       </Section>
     );
   }
