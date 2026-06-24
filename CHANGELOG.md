@@ -10,6 +10,33 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+## [0.6.3-beta] — 2026-06-24
+
+### Changed
+- **Windows now defaults to the native (WSL-free) engine.** 0.6.2-beta bundled
+  and CI-validated the native engine; it's now the default on Windows, so a
+  fresh install analyzes fully in-process — no WSL, no managed venv, nothing to
+  set up. preflight falls back to WSL (then the managed venv) when native isn't
+  importable, so a plain `pip install` or a lean build degrades gracefully
+  rather than breaking. Existing installs keep whatever engine their saved
+  config has — this only changes the default for a fresh/unset config.
+  Linux/macOS are unchanged (default essentia_tf).
+- **UI polish:** BPM and Key badges now read distinctly (BPM neutral vs the
+  green Key); Settings section icons are no longer duplicated; Track Details
+  shows the full existing tag on hover; loading states use skeletons.
+
+### Fixed
+- **The native build self-test now decodes audio, not just loads.**
+  `selftest-native` (the release-build gate) synthesizes a clip and decodes it
+  through essentia's FFmpeg/libav path + runs the feature extractors — so a
+  release that defaults to native cannot ship unless the frozen exe can
+  actually decode + analyze, closing the gap where a missing FFmpeg DLL passes
+  a load-only smoke but fails at the first real decode.
+
+### Docs
+- README/INSTALL/USER_GUIDE/ROADMAP readability pass — removed decorative
+  emoji and formulaic headings, fixed a stray HTML entity in INSTALL.
+
 ## [0.6.2-beta] — 2026-06-23
 
 ### Fixed
