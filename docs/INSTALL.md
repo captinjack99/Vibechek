@@ -56,7 +56,7 @@ dialog appears with a one-click **Install Essentia** button. It creates a
 managed venv at `~/.vibechek/venv/`, installs `essentia-tensorflow` +
 `vibechek` into it, and routes analysis through that venv transparently.
 
-The venv is hermetic — Vibechek does *not* touch your system Python or
+The venv is hermetic. Vibechek does *not* touch your system Python or
 whatever venv you might be developing in. Delete `~/.vibechek/` to wipe the
 managed install entirely.
 
@@ -68,7 +68,7 @@ pip install essentia-tensorflow
 vibechek download-models     # one-time, ~800 MB
 ```
 
-### Windows (now fully automated)
+### Windows
 
 Essentia doesn't publish a Windows wheel, but the Vibechek desktop app handles
 that for you. The first time you click **Analyze**, a setup dialog walks you
@@ -104,14 +104,14 @@ wsl -d Ubuntu-24.04 -- bash -lc '
 ### Enabling GPU acceleration (optional, NVIDIA only)
 
 Essentia's bundled TensorFlow (2.5) can use an NVIDIA GPU to speed up
-analysis by ~3-10× — useful if you have a 5 000+ track library. The runtime
+analysis by ~3-10×. Useful if you have a 5,000+ track library. The runtime
 libraries TF needs (`libcublas`, `libcufft`, `libcudnn`, `libcusparse`) are
 **not** installed by default on WSL Ubuntu. Vibechek detects this exact
 state and exposes a one-click fix:
 
 1. Open **Settings → System**.
 2. If you have an NVIDIA GPU but the engine probe shows:
-   *"…is visible to WSL, but TensorFlow can&apos;t use it — required CUDA
+   *"…is visible to WSL, but TensorFlow can't use it — required CUDA
    libraries are missing"*, click **Enable GPU (install CUDA wheels)**.
 3. The installer downloads NVIDIA's CUDA runtime wheels from PyPI
    (`nvidia-cublas-cu11`, `nvidia-cudnn-cu11`, `nvidia-cufft-cu11`,

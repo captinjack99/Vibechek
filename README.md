@@ -2,7 +2,7 @@
 
 **Open-source ML for your DJ library.** Auto-tag genre, mood, energy, BPM, and key. Find duplicates the way your ears would. Organize 10,000 tracks in an afternoon. Keep every Rekordbox cue point intact.
 
-> **Status:** `v0.6.0-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux) — with an experimental WSL-free native-Windows analysis engine. Free forever under AGPL-3.0.
+> **Status:** `v0.6.2-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux), with an opt-in WSL-free native-Windows analysis engine now bundled into the installer. Free forever under AGPL-3.0.
 
 ---
 
@@ -49,7 +49,7 @@ The honest gaps none of them fill: **ML genre/subgenre auto-detection** and **ti
 
 ## The headline features
 
-### Machine Learning that actually knows your tracks
+### What the ML reads from each track
 
 Vibechek uses the [Discogs-EffNet model](https://essentia.upf.edu/models.html), trained on the largest electronic-music taxonomy in existence, to classify every track on:
 
@@ -64,7 +64,7 @@ Vibechek uses the [Discogs-EffNet model](https://essentia.upf.edu/models.html), 
 
 You get a tunable confidence threshold per attribute. Tracks below the bar don't get rewritten.
 
-### 🎯 Genre, your way — three classifiers + smart tag reconciliation
+### Genre: three classifiers + tag reconciliation
 
 The Discogs-EffNet head above is the default. But genre is the hardest field to get right, so Vibechek lets you pick how it's decided — and it's smart about libraries that already carry tags:
 
@@ -75,19 +75,19 @@ The Discogs-EffNet head above is the default. But genre is the hardest field to 
 
 All four feed the same reconciliation, so the **default behavior is unchanged unless you opt in** — and you can mix them (e.g. trust tags, fall back to the CLAP model, escalate to web only when unsure).
 
-### 🔍 De-duplication that doesn't lie — *and knows a remix isn't a dupe*
+### De-duplication that doesn't lie — *and knows a remix isn't a dupe*
 
 MD5 catches the same MP3 saved twice. **Chromaprint** catches the same song saved as FLAC *and* MP3 — by listening to the audio itself. But it's **variant-aware**: by default it *keeps* the versions a DJ actually wants side by side — an **Extended** vs **Radio** vs **Remix** edit, or a FLAC *Original Mix* next to an MP3 *Extended* — and only collapses true duplicates *within* the same version. Every part is configurable (collapse across versions, keep one file per format, duration tolerance for mislabeled lengths). Auto-keeper rules then pick the best file by codec → bitrate → file size → newest → shortest path (or whatever order you set), and you can override any choice before anything moves.
 
-### 🗂️ One-click organize
+### One-click organize
 
 Plan and execute a clean `Music/Genre/Subgenre/` tree from your analysis. Rare genres bucket into `Other/` (threshold you control). Dry-run before commit. Hierarchy rules let you tune subgenre handling, target root, naming.
 
-### 🛟 The tag backup nobody else ships
+### Tag backup that survives a rewrite
 
 One click snapshots every ID3, Vorbis, and MP4 tag — **including the binary GEOB and PRIV frames Rekordbox stores cue points and beat grids in.** Most tag editors silently strip these when they rewrite a file. Vibechek preserves them by default and offers full restore. Your performance data is never at risk.
 
-### 🤖 Cross-platform GPU acceleration — *and* hybrid CPU+GPU
+### Cross-platform GPU acceleration — *and* hybrid CPU+GPU
 
 Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to see if TensorFlow can really use it... AND, if your GPU is hardware-visible but missing CUDA runtime libraries, the UI says so plainly and offers a one-click "Enable GPU" install. No false promises, no silent CPU fallback you don't know about.
 
@@ -95,23 +95,23 @@ Better yet: **hybrid analysis runs your GPU and your spare CPU cores at the same
 
 There's also a selectable **ONNX Runtime inference engine** (Settings → Analysis → **Inference engine**, opt-in) that runs the same models with **cross-vendor GPU acceleration** and **drops the end-of-life TensorFlow runtime entirely** (it runs on plain Essentia + ONNX Runtime + converted heads, in a separate `~/.vibechek/venv-onnx`). **NVIDIA CUDA is validated** (the backbone runs GPU-accelerated on an RTX 4070, TF-free); **AMD (ROCm, native Linux) and Apple (CoreML) are wired** via ONNX Runtime's execution-provider chain. On Windows the ONNX path runs inside WSL too, because Essentia has no Windows wheel. Validated to match the default engine on real tracks. The default stays essentia-tensorflow; flip it in Settings and click **Set up ONNX engine** to provision it (the installer auto-picks the GPU runtime for your hardware). Extras: `vibechek[onnx]` (CPU) and `vibechek[onnx-gpu]`.
 
-### ⏪ Undo that actually undoes
+### Undo that survives a crash mid-run
 
 Organize and dedupe-move write an append-only journal as they go — one flushed line per file moved, *before* the next move. So a run that dies halfway (disk full, power loss) is recoverable, and a finished run can be reverted with one click from the **Recent operations** panel. Files go back to exactly where they came from, newest-first, never clobbering anything that's since moved into the origin.
 
-### 🎚️ Tag exactly the fields you want
+### Tag exactly the fields you want
 
 Every ML field has an independent write toggle — genre, BPM, key, energy, mood, timeslot, direction, vocal. BPM and key default *off* (Rekordbox's own detection is usually better), genre is additionally gated by a confidence threshold, and the rest write whenever you want them to. Vocal detection has a tunable sensitivity (Instrumental ≤ / Vocal ≥) that re-labels tracks **without re-analyzing**, because the raw model score is stored alongside the label.
 
-### 🎧 One global player, always in reach
+### One global player, always in reach
 
 A single persistent player bar lives at the app root. Preview any track from anywhere, and it follows you across tabs. Two previews can never overlap, every track starts cleanly at 0:00, and there's always a visible stop control.
 
-### 💿 FLAC → CDJ export (play FLAC on old Pioneer decks)
+### FLAC → CDJ export (play FLAC on old Pioneer decks)
 
 Older CDJs (CDJ-2000nexus and earlier) can't read FLAC. `vibechek cdj-export <rekordbox.xml>` transcodes your FLACs to **AIFF** — a *sample-identical* decode, so your cue points and beat grids copy across with zero drift — and rewrites a Rekordbox XML you re-import and export to USB. It never uses MP3 (encoder delay shifts the grid ~26 ms), never touches your source files, and preserves the `TEMPO`/`POSITION_MARK` data byte-for-byte. Your FLAC library plays on the club's first-gen decks with every cue intact.
 
-### 🪟 🍎 🐧 Zero-CLI setup on every platform
+### Zero-CLI setup on every platform
 
 Every other tool we benchmarked makes you set up Python or pip or some random runtime by hand on some systems. Vibechek is the only one where the GUI does it for you on **every OS**:
 

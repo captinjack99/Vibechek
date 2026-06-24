@@ -352,10 +352,10 @@ All changes auto-save 500ms after you stop typing/dragging. No "Save" button.
 
 - **Essentia · TensorFlow** (default) — the bundled, NVIDIA-only path.
 - **ONNX Runtime** — runs the *same* models through ONNX Runtime on **plain
-  Essentia with no TensorFlow at all**. Two draws: **cross-vendor GPU
-  acceleration** — NVIDIA **CUDA**, AMD **ROCm**, and Apple **CoreML**, not just
-  NVIDIA — and dropping the **end-of-life TensorFlow 2.5** runtime (the
-  migration's real motivation). Validated to match the default engine's output
+  Essentia with no TensorFlow at all**. Two draws. First, **cross-vendor GPU
+  acceleration**: NVIDIA CUDA, AMD ROCm, and Apple CoreML, not just NVIDIA.
+  Second, dropping the **end-of-life TensorFlow 2.5** runtime (the migration's
+  real motivation). Validated to match the default engine's output
   on real tracks (genre/vocal/mood/BPM/key all match; embedding cosine 0.99942).
   CUDA is verified on an RTX 4070; ROCm and CoreML are wired but
   hardware-unverified.
@@ -376,7 +376,7 @@ Genre is the hardest field to get right, so it has its own controls under **Sett
 Analysis** (BPM/key/mood are unaffected by these):
 
 - **Genre classifier** — **Discogs-EffNet** (default, bundled) or **CLAP audio** (opt-in).
-  CLAP is a modern audio-embedding model that's **~2× more accurate on pure audio** and,
+  CLAP is an audio-embedding model that's **~2× more accurate on pure audio** and,
   unlike a file tag, works on **untagged / white-label** tracks. Select it and click
   **Set up CLAP genre engine** (a one-time ~2.2 GB download), then re-analyze.
 - **Online genre lookup** (toggle) — a **fully-local LLM** reads web results for each
