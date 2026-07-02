@@ -1,22 +1,26 @@
-"""Native (essentia-free) audio decode for the Windows analyze path.
+"""Essentia-free audio decode — a VALIDATED SPIKE, currently unwired.
 
-essentia's `MonoLoader` (FFmpeg-backed) is the only thing decoding audio today,
-and it has no Windows wheel — so decode is one of the four DSP jobs pinning WSL.
-This module replaces it with native-Windows-wheel libraries:
+STATUS (honest, 2026-07): nothing in the production analyze path imports this
+module. The shipped native Windows engine decodes through the bundled DSP-only
+essentia wheel's `MonoLoader` (FFmpeg/libav folded into the installer), which
+made this replacement unnecessary for v0.6.x. It is kept because the
+validation was real and it remains the candidate FALLBACK for files the
+bundled decoder rejects:
 
   * `soundfile` (libsndfile) decodes WAV/FLAC/OGG and MP3 (libsndfile >= 1.1) with
     a native `win_amd64` wheel;
   * `soxr` does high-quality band-limited resampling (what librosa uses);
-  * `ffmpeg` (if present) is the fallback for files libsndfile can't open — some
-    MP3s with damaged frames, and AAC/M4A/WMA that libsndfile lacks — restoring
-    essentia/MonoLoader's full codec coverage without WSL.
+  * `ffmpeg` (if present) covers files libsndfile can't open — some MP3s with
+    damaged frames, and AAC/M4A/WMA that libsndfile lacks.
 
 The live spike measured this path at embedding cosine >= 0.998 + genre top-1
 match vs essentia's MonoLoader through the ONNX backbone; the one MP3 libsndfile
 rejected ("Illegal Audio-MPEG-Header") is exactly the ffmpeg-fallback case.
 
-Imports of `soundfile`/`soxr` are lazy so the module stays import-clean where the
-native path isn't installed; install them via the `[native]` extra.
+Imports of `soundfile`/`soxr` are lazy so the module stays import-clean where
+they aren't installed; the `[native]` extra installs them. If you are
+debugging a Windows decode failure: this fallback does NOT run today — wire it
+into the native engine's load path first (or check the bundled essentia).
 """
 
 from __future__ import annotations

@@ -757,6 +757,16 @@ def handle_duplicates(
                     log.warning("Move failed for %s: %s", src, e)
                     summary["errors"] += 1
                     error_messages.append(f"{src}: move failed — {e}")
+        except cancellation.CancelledError as e:
+            # A cancelled move has usually already moved SOME files and written
+            # a revert journal. Attach the partial summary (incl. the journal
+            # path) so the RPC layer can return it tagged cancelled=True —
+            # matching the organize path — instead of an error that drops the
+            # journal path and hides the one-click undo.
+            if jrnl.entries > 0:
+                summary["journal_path"] = str(jrnl.path)
+            e.partial_summary = summary  # type: ignore[attr-defined]
+            raise
         finally:
             jrnl.close()
         if jrnl.entries > 0:
@@ -793,6 +803,14 @@ def handle_duplicates(
                     log.warning("Trash failed for %s: %s", src, e)
                     summary["errors"] += 1
                     error_messages.append(f"{src}: trash failed — {e}")
+        except cancellation.CancelledError as e:
+            # Same partial-summary contract as the move branch (the trash
+            # journal is a manifest, not an auto-undo, but the user still
+            # deserves the counts + manifest path for what already happened).
+            if jrnl.entries > 0:
+                summary["journal_path"] = str(jrnl.path)
+            e.partial_summary = summary  # type: ignore[attr-defined]
+            raise
         finally:
             jrnl.close()
         if jrnl.entries > 0:

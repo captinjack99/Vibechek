@@ -128,10 +128,17 @@ def main() -> None:
 @click.option("--hybrid/--no-hybrid", default=True, show_default=True,
               help="Run GPU + CPU workers together against a shared queue "
                    "(self-balancing). --no-hybrid uses a single device pool.")
-@click.option("--engine", type=click.Choice(["essentia_tf", "onnx"]),
+@click.option("--engine", type=click.Choice(["essentia_tf", "onnx", "native"]),
               default="essentia_tf", show_default=True,
               help="Inference engine: essentia_tf (bundled TensorFlow, NVIDIA-only "
-                   "GPU) or onnx (TF-free ONNX Runtime, cross-vendor GPU).")
+                   "GPU), onnx (TF-free ONNX Runtime, cross-vendor GPU), or native "
+                   "(in-process ONNX + native essentia — the Windows GUI default; "
+                   "needs essentia importable in this Python).")
+@click.option("--skip-paths-file", type=click.Path(exists=True, dir_okay=False,
+              path_type=Path), default=None,
+              help="File with one absolute path per line to SKIP (already-analyzed "
+                   "tracks). Used by the GUI's incremental 'Analyze new tracks "
+                   "only' when it routes through WSL/the managed venv.")
 @click.option("--genre-policy",
               type=click.Choice(["prefer_tag", "prefer_ml", "tag_only", "ml_only"]),
               default="prefer_tag", show_default=True,
@@ -155,6 +162,7 @@ def main() -> None:
                    "the model to override a disagreeing specific tag.")
 def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
             output: Path, models_dir: Path | None, hybrid: bool, engine: str,
+            skip_paths_file: Path | None,
             genre_policy: str, genre_classifier: str, genre_web_lookup: bool,
             genre_llm_backend: str, genre_override_confidence: float) -> None:
     """Analyze every audio file under PATH with the ML models."""
@@ -168,6 +176,14 @@ def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
                             genre_ml_override_confidence=genre_override_confidence)
     if models_dir:
         config.models_dir = models_dir
+
+    skip_paths: set[str] | None = None
+    if skip_paths_file is not None:
+        skip_paths = {
+            line.strip()
+            for line in skip_paths_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        } or None
 
     with _progress_bar("Analyzing") as progress:
         task = progress.add_task("starting", total=None)
@@ -183,6 +199,7 @@ def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
                 output_path=output,
                 skip=skip,
                 limit=limit or None,
+                skip_paths=skip_paths,
             )
         except RuntimeError as e:
             console.print(f"[red]Error:[/] {e}")
@@ -552,9 +569,10 @@ def route(staging: Path, library_root: Path, dry_run: bool) -> None:
 @main.command("download-models")
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
               help="Where to put the models (defaults to user data dir).")
-@click.option("--engine", type=click.Choice(["essentia_tf", "onnx"]),
+@click.option("--engine", type=click.Choice(["essentia_tf", "onnx", "native"]),
               default="essentia_tf", show_default=True,
-              help="Which model set: essentia_tf (.pb) or onnx (converted .onnx heads + backbone).")
+              help="Which model set: essentia_tf (.pb), or onnx/native (the shared "
+                   "converted .onnx heads + backbone).")
 def download_models_cmd(models_dir: Path | None, engine: str) -> None:
     """Download Essentia ML models (~800MB). Run once before first analyze.
 

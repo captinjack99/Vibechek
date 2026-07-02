@@ -130,6 +130,10 @@ def test_download_models_default_engine_does_not_fetch_onnx(monkeypatch, tmp_pat
         md, "_download_from_mirrors",
         lambda urls, dest, **kw: fetched.append(str(dest)),  # noqa: ARG005
     )
+    # This test is about WHICH set gets fetched, not content integrity — the
+    # fake "already present" files don't exist on disk, so blank the pin table
+    # or the (now-populated) strict verification correctly fails every model.
+    monkeypatch.setattr(md, "MODEL_SHA256", {})
     # Pretend the .pb/.json already exist so the loop records descriptors only.
     descriptors = md.download_models(tmp_path, engine="essentia_tf")
     assert "effnet_onnx" not in descriptors

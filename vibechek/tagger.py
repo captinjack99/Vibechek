@@ -397,6 +397,13 @@ def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
     frame from the live file sitting alongside the restored one. (Text frames
     are already overwritten by key; only the keyed-by-description binary frames
     needed the explicit clear.)
+
+    Also DELETES Vibechek-managed frames the snapshot does not carry:
+    apply_ml_tags ADDS frames (TXXX:ENERGY/MOOD/…, TCON/TIT1/TBPM/TKEY) to
+    files that may have lacked them, and a restore that only re-writes
+    snapshot-present fields would leave every one of those additions behind —
+    making the advertised "restore undoes a bad apply" false for added frames.
+    Only Vibechek's own managed set is cleared; all other frames are untouched.
     """
     text_frame_writers = {
         "title": (TIT2, "TIT2"),
@@ -410,6 +417,21 @@ def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
     for field_name, (frame_cls, frame_id) in text_frame_writers.items():
         if field_name in tags:
             id3[frame_id] = frame_cls(encoding=enc, text=str(tags[field_name]))
+        elif frame_id in id3 and field_name in ("genre", "bpm", "key", "subgenre"):
+            # Managed frame absent from the snapshot = the file didn't have it
+            # at backup time; a later apply added it. Undo the addition.
+            # (title/artist/album are never written by apply — leave them.)
+            del id3[frame_id]
+
+    snapshot_txxx_descs = {
+        (val.get("desc", key[5:]) if isinstance(val, dict) else key[5:]).upper()
+        for key, val in tags.items()
+        if key.startswith("txxx_")
+    }
+    for tag_name in CUSTOM_TAGS:
+        desc = tag_name.upper()
+        if desc not in snapshot_txxx_descs:
+            id3.delall(f"TXXX:{desc}")
 
     # Pre-clear existing GEOB/PRIV so the snapshot's frames fully replace
     # whatever is on disk rather than accumulating duplicates.
@@ -431,7 +453,13 @@ def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
             else:
                 desc = key[5:]
                 text = val
-            id3.add(TXXX(encoding=enc, desc=desc, text=str(text)))
+            # Multi-valued sources (FLAC Vorbis comments crossing into ID3 via
+            # the CDJ-export tag copy) must become a real multi-value TXXX —
+            # str() on a list would write the literal "['A', 'B']".
+            if isinstance(text, list):
+                id3.add(TXXX(encoding=enc, desc=desc, text=[str(v) for v in text]))
+            else:
+                id3.add(TXXX(encoding=enc, desc=desc, text=str(text)))
         elif key.startswith("geob_"):
             id3.add(GEOB(
                 encoding=val["encoding"],
@@ -456,6 +484,23 @@ def _write_flac_tags(filepath: Path, tags: dict[str, Any]) -> None:
     for field_name, vorbis_key in field_map.items():
         if field_name in tags:
             audio[vorbis_key] = str(tags[field_name])
+
+    # Undo apply-time ADDITIONS the snapshot doesn't carry (see _write_id3_tags):
+    # _apply_flac writes GENRE/CONTENTGROUP/BPM/INITIALKEY + the derived-field
+    # comments; if the snapshot lacks the corresponding entry the file didn't
+    # have it at backup time, so a restore must remove it.
+    snapshot_comment_keys = {k[5:].lower() for k in tags if k.startswith("txxx_")}
+    managed = {
+        "genre": "genre" in tags,
+        "bpm": "bpm" in tags,
+        "initialkey": "key" in tags or "initialkey" in snapshot_comment_keys,
+        "contentgroup": "subgenre" in tags or "contentgroup" in snapshot_comment_keys,
+    }
+    managed.update({t: t in snapshot_comment_keys for t in CUSTOM_TAGS})
+    for vorbis_key, in_snapshot in managed.items():
+        if not in_snapshot and vorbis_key in audio:
+            del audio[vorbis_key]
+
     for key, val in tags.items():
         if key.startswith("txxx_"):
             # Preserve multi-valued Vorbis comments: a list snapshot is written
@@ -479,6 +524,17 @@ def _write_m4a_tags(filepath: Path, tags: dict[str, Any]) -> None:
         audio["\xa9alb"] = [tags["album"]]
     if "genre" in tags:
         audio["\xa9gen"] = [tags["genre"]]
+
+    # Undo apply-time ADDITIONS the snapshot doesn't carry (see _write_id3_tags):
+    # _apply_m4a writes ©gen/©grp/tmpo/initialkey + freeform derived fields.
+    managed_atoms = ["\xa9gen", "\xa9grp", "tmpo",
+                     "----:com.apple.iTunes:initialkey"]
+    managed_atoms += [f"----:com.apple.iTunes:{t.upper()}" for t in CUSTOM_TAGS]
+    canonical = {"\xa9gen": "genre" in tags, "tmpo": "bpm" in tags}
+    for atom in managed_atoms:
+        in_snapshot = canonical.get(atom, False) or f"mp4atom_{atom}" in tags
+        if not in_snapshot and atom in audio:
+            del audio[atom]
     if "bpm" in tags:
         # `tmpo` is an int atom. A backup value like "128 BPM" or "" would
         # raise ValueError and fail the whole file restore — skip a
@@ -552,10 +608,29 @@ def backup_tag_files(
     track paths, not a library root), so the backup scope matches the change and
     no broad tree walk happens. Same on-disk format as `backup_tags`, so the
     normal restore paths read it.
+
+    Paths resolve with the SAME Unicode-normalization tolerance as
+    apply_ml_tags (`resolve_existing_path`) — a raw `.exists()` filter here
+    silently dropped NFC/NFD-divergent paths from the backup while apply went
+    on to mutate them, leaving those files with no restorable snapshot. A path
+    that doesn't resolve at all is counted in `errors` (visible in stats)
+    instead of vanishing from `total`.
     """
-    files = [Path(p) for p in paths if Path(p).exists()]
+    from vibechek.utils import resolve_existing_path
+
+    stats_prefix_errors: list[str] = []
+    files: list[Path] = []
+    for p in paths:
+        resolved = resolve_existing_path(p)
+        if resolved is not None:
+            files.append(resolved)
+        else:
+            stats_prefix_errors.append(f"{Path(p).name}: not found (not backed up)")
     source = str(files[0].parent) if files else ""
-    return _snapshot_tags_to_file(files, source, output_path, on_progress)
+    stats = _snapshot_tags_to_file(files, source, output_path, on_progress)
+    stats.total += len(stats_prefix_errors)
+    stats.errors.extend(stats_prefix_errors)
+    return stats
 
 
 def _snapshot_tags_to_file(
@@ -594,9 +669,11 @@ def _snapshot_tags_to_file(
                 pass
             backup["files"][str(filepath)] = entry
             stats.backed_up += 1
-            # A format we have no reader for carries NO tags — count it so the
-            # caller can warn instead of treating it as a real safety net.
-            if entry.get("_unsupported"):
+            # A format we have no reader for carries NO tags, and a file whose
+            # tags failed to READ carries only an error marker — count both so
+            # the caller can warn instead of treating them as a real safety
+            # net (restore skips `_error` entries, so nothing comes back).
+            if entry.get("_unsupported") or entry.get("_error"):
                 stats.not_fully_backed_up += 1
         except Exception as e:  # noqa: BLE001
             stats.errors.append(f"{filepath.name}: {e}")
@@ -1143,6 +1220,8 @@ def restore_tags_with_remap(
     `library_root` is marked `ambiguous` (skipped) — restoring to the wrong
     file would silently corrupt tags.
     """
+    from vibechek import cancellation
+
     files = _load_backup_files(backup_path)
     stats = RemapRestoreStats(total=len(files))
 
@@ -1169,6 +1248,9 @@ def restore_tags_with_remap(
         return sizes[path]
 
     for i, (filepath_str, tags) in enumerate(files.items()):
+        # Registered cancellable ("restore" kind) — same per-entry check as
+        # restore_tags, so Cancel actually stops a 12k-file remap restore.
+        cancellation.check()
         original = Path(filepath_str)
         report_progress(on_progress, i + 1, stats.total, original.name)
 

@@ -30,7 +30,7 @@ def _isolate_user_dirs(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
     config_dir.mkdir(parents=True, exist_ok=True)
 
     # Import lazily so we don't pay the cost when these modules aren't loaded.
-    from vibechek import backup_history, config, library_state, logging_setup
+    from vibechek import backup_history, config, journal, library_state, logging_setup
 
     monkeypatch.setattr(config, "DATA_DIR", data_dir, raising=True)
     monkeypatch.setattr(config, "CONFIG_DIR", config_dir, raising=True)
@@ -40,6 +40,10 @@ def _isolate_user_dirs(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
     monkeypatch.setattr(library_state, "ANALYSES_DIR", data_dir / "analyses", raising=True)
     monkeypatch.setattr(library_state, "STATE_FILE", config_dir / "library_state.json", raising=True)
     monkeypatch.setattr(backup_history, "HISTORY_FILE", config_dir / "backup_history.json", raising=True)
+    # Undo journals too — tests exercising organize/dedupe used to write real
+    # journals into the user's data dir, polluting the GUI's "Recent
+    # operations" list with test entries.
+    monkeypatch.setattr(journal, "JOURNALS_DIR", data_dir / "journals", raising=True)
 
     log_dir = data_dir / "logs"
     monkeypatch.setattr(logging_setup, "LOG_DIR", log_dir, raising=True)

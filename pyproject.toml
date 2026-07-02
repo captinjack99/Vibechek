@@ -30,6 +30,11 @@ dependencies = [
     "rich>=13.7",
     "platformdirs>=4.2",
     "psutil>=5.9",
+    # The dedupe "Trash duplicates" action ships in the frozen GUI, so this
+    # must be a REAL dependency — a user cannot pip-install into the packaged
+    # exe (as an optional import, the shipped action could only ever error).
+    # Pure-python, tiny, cross-platform.
+    "send2trash>=1.8",
     # TOML write support — tomllib is stdlib for reads only
     "tomli-w>=1.0",
     # `tomllib` (stdlib TOML reader) only exists on Python 3.11+. On 3.10 we

@@ -494,6 +494,11 @@ export function Settings() {
       // via cfgRef so we don't ship a stale value from the original render.
       await rpc("download_models", {
         models_dir: cfgRef.current.analysis.models_dir || undefined,
+        // The active engine decides WHICH model set to fetch (onnx/native →
+        // the ONNX backbone + heads; essentia_tf → the .pb set). Omitting it
+        // downloaded the essentia_tf set regardless, so this button could
+        // never remediate a missing-models preflight on the other engines.
+        engine: cfgRef.current.analysis.inference_engine || undefined,
         op_id: opId,
       });
       finish();

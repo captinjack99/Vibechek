@@ -102,19 +102,46 @@ MODELS: dict[str, tuple[str, str, str]] = {
 # Schema: MODEL_SHA256[name][suffix] -> hex digest of the file.
 # `suffix` is "pb" (weights) or "json" (metadata).
 #
-# Fields are POPULATED on the next release-build pass (`scripts/pin_model_
-# hashes.py` downloads each .pb / .json from the canonical mirror, computes
-# the SHA256, and rewrites this dict). Until then the dict is empty and
-# `verify_model_sha256` no-ops — preserving the current "warn on size
-# mismatch only" behaviour. When the dict is populated, EVERY download is
-# strictly verified and a mismatch raises with a `vibechek verify-models`
-# remediation hint.
+# Pinned 2026-07-02 from the canonical essentia.upf.edu set (digests computed
+# over the exact files this downloader fetched and every accuracy/parity run
+# validated — the upstream filenames are version-suffixed `-1` and have been
+# stable for years). Weights (.pb) verify STRICTLY: a mismatch deletes the
+# file and raises with a `vibechek verify-models` remediation hint. Metadata
+# (.json) mismatches warn only — class-label files can drift harmlessly, and
+# a hostile graph can only ride in the weights.
 MODEL_SHA256: dict[str, dict[str, str]] = {
-    # "effnet": {
-    #     "pb": "0000000000000000000000000000000000000000000000000000000000000000",
-    #     "json": "0000000000000000000000000000000000000000000000000000000000000000",
-    # },
-    # ... one entry per model in MODELS ...
+    "effnet": {
+        "pb": "3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1",
+        "json": "a35003202384735c33154e20264267f9941705218a7b93202b655a1d408d4ff6",
+    },
+    "genre_discogs400": {
+        "pb": "3885ba078a35249af94b8e5e4247689afac40deca4401a4bc888daf5a579c01c",
+        "json": "2d367319d9b782ffa10f69abf0e805b3ac4e10899025e5bdbaceda3919b243e0",
+    },
+    "danceability": {
+        "pb": "e1251f02cdc846445e2bc1fb3fe9963e32728c5c000e009188ae47c8963cb4c4",
+        "json": "589e61dc05f0d7935be4b5fa7ab4341e5dc7cfecc6898f83503558564790cd75",
+    },
+    "voice_instrumental": {
+        "pb": "c8033548e17c292874265db62e82a051247768d10375a35a769e7bf695f16acf",
+        "json": "43ac2c3b055dfaed20f6232e0f10636c287f1c5a6e5bd02c5585860031964c8f",
+    },
+    "aggressive": {
+        "pb": "7705284e3a67f23f04d3f2fd75e18a82c0e70db8875b7b6f7061f2432de80858",
+        "json": "81773e95d78db1b93283d73b2d06344d1ff79685b57d9428a40d47fdfcf537b8",
+    },
+    "happy": {
+        "pb": "de322aee7f4da29ecbd149c86e7964bd6fabe41ca85698a0be40a39d49e88633",
+        "json": "ed4601bc396b23367d29cf45aa327366cdfdbd3e2baeb7a3f7893237f1ffd9e6",
+    },
+    "relaxed": {
+        "pb": "2c5aa6666b58fe80429a2dc677a135e9995922889b5a399af87d1c15f0ebb71d",
+        "json": "86c0fe1c2c6d49bf08537bc2d3a602204feaede011ed119c1fc6c36270f60e6a",
+    },
+    "sad": {
+        "pb": "4865cba49968b6ec295db3e8af6b4a7bb506b1a646628b9f07ee9910d52df82c",
+        "json": "7f2c00099ad8255af33e43ab77d1ac2c86a1dd9f46d3e5ea2a9a52246f5033d9",
+    },
 }
 
 # Converted ONNX classification heads. Filenames match what
@@ -227,12 +254,12 @@ def download_models(
     Idempotent: existing valid files are skipped. A file whose size doesn't
     match the server's Content-Length is treated as missing and re-fetched.
 
-    `engine`: when "onnx", ALSO fetch the official EffNet backbone `.onnx`
-    (`discogs-effnet-bsdynamic-1.onnx`) into `model_dir`. The `.pb` download is
-    kept intact so the default essentia path is unaffected and so the heads' .pb
-    (needed by the one-off conversion in scripts/convert_heads_to_onnx.py) are
-    still fetched. essentia does NOT host the head `.onnx` files — those are
-    produced by that conversion script, not by this download.
+    `engine`: when "onnx" or "native" (both run inference on ONNX Runtime and
+    share one model set), skip the `.pb` set and fetch the official EffNet
+    backbone `.onnx` (`discogs-effnet-bsdynamic-1.onnx`) into `model_dir`'s
+    onnx subdir + stage the bundled classification heads. essentia does NOT
+    host the head `.onnx` files — those come from the bundled assets
+    (produced once by scripts/convert_heads_to_onnx.py).
     """
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -242,10 +269,17 @@ def download_models(
     # Two parts per model (weights + metadata) so the overall progress bar
     # has 2*N steps. We emit bytes-within-current-file as a fractional step
     # for smooth UX during big downloads.
-    # The ONNX engine is TF-free and never loads the essentia `.pb` set, so skip
-    # it entirely for engine="onnx" (no ~200 MB of unused TF weights, and no
+    # The ONNX and native engines are TF-free and never load the essentia `.pb`
+    # set, so skip it entirely for them (no ~200 MB of unused TF weights, and no
     # essentia `.json` metadata to collide with the converted-head class labels).
-    items = [] if engine == "onnx" else list(MODELS.items())
+    # "native" MUST take the onnx branch: it runs the same ONNX backbone+heads
+    # (load_models normalizes it, but this function is also reached directly via
+    # the download_models RPC/CLI with the active engine — treating "native" as
+    # the default here used to download the whole unused .pb set and never stage
+    # the ONNX files, dead-ending the Windows-default engine's preflight
+    # remediation).
+    onnx_like = engine in ("onnx", "native")
+    items = [] if onnx_like else list(MODELS.items())
     total_steps = len(items) * 2 or 1
 
     def emit(step_idx: int, byte_progress: tuple[int, int] | None, label: str) -> None:
@@ -298,6 +332,12 @@ def download_models(
             errors.append(f"{name}.pb: {e}")
             weights_path.unlink(missing_ok=True)
             continue
+        except OSError as e:
+            # File vanished between download and verify (or a lying
+            # _needs_download): a per-model failure, not a loop-aborting crash.
+            log.error("Could not read %s for verification: %s", name, e)
+            errors.append(f"{name}.pb: unreadable for verification: {e}")
+            continue
         emit(weights_step, None, f"{name} weights ready")
 
         # ---- metadata ----
@@ -344,12 +384,12 @@ def download_models(
 
         descriptors[name] = desc
 
-    # ---- ONNX backbone (only when the onnx engine is selected) ----
+    # ---- ONNX backbone (onnx + native engines) ----
     # The official EffNet backbone ONNX lives at the same essentia.upf.edu
     # subdir as its .pb. We fetch it alongside the .pb files (which the head
     # conversion script still needs); the head .onnx are produced by
     # scripts/convert_heads_to_onnx.py, not hosted upstream.
-    if engine == "onnx":
+    if onnx_like:
         from vibechek.onnx_backend import (  # noqa: PLC0415
             BACKBONE_ONNX_FILENAME,
             stage_bundled_onnx_heads,

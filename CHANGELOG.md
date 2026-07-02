@@ -42,6 +42,57 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
   `manifest.json`.
 
 ### Fixed
+- **Incremental "Analyze new tracks only" no longer destroys the saved
+  analysis.** The new-tracks-only report used to be persisted as the WHOLE
+  library's analysis — one click replaced a 12k-track analysis on disk with
+  just the new tracks, and the UI dropped the rest of the library from view.
+  The previously analyzed records are now re-attached (with user-resolved
+  review decisions preserved) before saving, deleted files still drop out,
+  and the skip list is forwarded to the WSL/managed-venv routes so
+  incremental runs stop silently re-analyzing everything there.
+- **Imported Rekordbox priors now survive WSL/managed-venv analyzes** — the
+  sidecar re-applies the priors sidecar to the subprocess report (it only
+  reached the in-process engine before).
+- **"Download models" now downloads the right set for the active engine.**
+  The native (Windows-default) and ONNX engines' model downloads used to
+  fetch the unused TensorFlow set and never stage the ONNX backbone/heads —
+  the preflight remediation button could never fix a missing-models error.
+  The CLI gained `--engine native` for both `analyze` and `download-models`.
+- **Restore-from-backup now undoes frames a tag apply ADDED.** Restore was
+  merge-only: ENERGY/MOOD/TIMESLOT/DIRECTION/VOCAL (and genre/BPM/key frames
+  added to files that had none) survived a restore on every format. The
+  Vibechek-managed frame set is now cleared when the snapshot lacks it —
+  other frames are untouched. Backups also follow the same Unicode path
+  resolution as apply (NFC/NFD-divergent files were mutated without being
+  backed up) and unreadable-tag files are counted as not-fully-backed-up.
+- **Model downloads are integrity-pinned.** The essentia_tf `.pb` set now has
+  real SHA256 pins (verified against the canonical set) — a corrupted or
+  poisoned mirror download is deleted and refused instead of silently loaded
+  into TensorFlow.
+- **A worker dying mid-track (OOM) no longer aborts the whole analyze.** The
+  hybrid pool re-enqueues the dead worker's in-flight track (bounded retries,
+  then an error record) instead of stalling 5 minutes and discarding every
+  result; cancelled runs also no longer leak the input queue's feeder thread.
+- **Cancel works everywhere it's offered:** the fast scan, remap restores, and
+  mid-move dedupe cancels now actually stop — and a cancelled dedupe move
+  returns its partial summary with the undo-journal path (matching organize).
+- **"Trash duplicates" works in the packaged app** — send2trash is now a real
+  dependency (it was optional, and a user can't pip-install into the frozen
+  exe, so the shipped action always errored).
+- **Forgetting a library removes its saved analysis + imported priors** — the
+  analysis path is derived from the library path, so re-opening the folder
+  used to silently resurrect months-old results and a priors import the user
+  believed discarded.
+- **Organize targets are validated sidecar-side before planning/moving**
+  (same-as-source, writability) and the writability probe no longer leaves
+  behind directories for paths the user typed and abandoned.
+- **An RPC result that fails to serialize now returns a structured error**
+  instead of leaving the GUI's request hanging forever with no reply.
+- **Misc:** multi-valued FLAC comments no longer garble into stringified
+  Python lists on CDJ-export AIFF tag copies; SECURITY.md points at GitHub
+  private vulnerability reporting (the old security@ address was
+  undeliverable) and the supported-versions table covers 0.6.x; test runs no
+  longer write undo journals into the real user profile.
 - **AIFF/WAV/M4A custom tags now read back.** Vibechek writes ENERGY/MOOD/
   TIMESLOT/DIRECTION/VOCAL (and the subgenre grouping) to AIFF/WAV ID3 chunks
   and M4A freeform atoms, but only ever read them back from MP3/FLAC — so its

@@ -103,8 +103,7 @@ def validate_organize_target(
     *,
     source_library: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Check that `target_root` is safe to write into. Pure read-only inspect
-    plus a single tempfile probe.
+    """Check that `target_root` is safe to write into.
 
     Returns a dict with keys:
       - `ok` (bool): True if the path is usable. False blocks the UI.
@@ -112,9 +111,11 @@ def validate_organize_target(
       - `warnings` (list[str]): non-blocking concerns (cloud-sync paths etc.).
       - `resolved` (str | None): the absolute path we actually probed.
 
-    The UI calls this on blur / before Preview. The sidecar can also call it
-    inside `_plan_organization` to fail-fast before any planning work. Cheap
-    enough (one mkdir + touch + unlink) to run synchronously on input change.
+    Called by the sidecar inside `_plan_organization` and `_organize` to
+    fail-fast before any planning/moving work (the GUI additionally runs its
+    own client-side checks on blur). The writability probe creates + removes a
+    marker file and cleans up any directories it had to create — validation
+    must not persist a tree the user merely typed and abandoned.
     """
     result: dict[str, Any] = {
         "ok": True,
@@ -156,8 +157,17 @@ def validate_organize_target(
             )
             return result
 
-    # Writability probe: ensure we can mkdir + create a file. Don't actually
-    # require the folder to pre-exist — many users will type a new path.
+    # Writability probe: ensure we can mkdir + create a file. Don't require
+    # the folder to pre-exist — many users type a new path — but remove
+    # whatever directories the probe itself created afterwards: a validation
+    # call must not persist a tree for a path the user typed and abandoned.
+    created: list[Path] = []
+    probe_ancestor = resolved
+    while not probe_ancestor.exists():
+        created.append(probe_ancestor)  # deepest first — rmdir order below
+        if probe_ancestor.parent == probe_ancestor:
+            break
+        probe_ancestor = probe_ancestor.parent
     try:
         resolved.mkdir(parents=True, exist_ok=True)
         probe = resolved / ".vibechek_write_probe"
@@ -170,6 +180,12 @@ def validate_organize_target(
             "permission to write to."
         )
         return result
+    finally:
+        for d in created:
+            try:
+                d.rmdir()  # only ever removes empty dirs the probe created
+            except OSError:
+                break
 
     # Warn — don't block — if the path is inside a cloud-sync virtual FS.
     # Some users intentionally organize into Google Drive; we just want them

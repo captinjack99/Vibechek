@@ -305,6 +305,10 @@ def _scan_only(params: dict) -> dict:
     total = len(files)
     tracks: list[dict] = []
     for i, fp in enumerate(files):
+        # Registered cancellable ("analyze" kind): without this check the
+        # Cancel button is inert AND the claimed kind blocks every other long
+        # op until the scan finishes (minutes on a big/networked library).
+        cancellation.check()
         _emit_progress(i + 1, total, fp.name)
         try:
             # Pass models=None so analyze_track only does the cheap pass
@@ -398,6 +402,32 @@ def _analyze_directory(params: dict) -> dict:
         tag_priors=tag_priors_map,
     )
 
+    # The WSL / managed-venv routes reconcile inside the subprocess from file
+    # tags only — the priors sidecar never reaches them. Re-applying here is
+    # idempotent (the in-process route already merged them pre-reconcile), so
+    # every route returns the same priors-aware report.
+    if tag_priors_map:
+        try:
+            from vibechek.tag_priors import apply_priors_to_report  # noqa: PLC0415
+
+            apply_priors_to_report(
+                report, tag_priors_map,
+                config.genre_source_policy, config.genre_ml_override_confidence,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not apply tag priors to the analyze report: %s", e)
+
+    # Incremental runs ("Analyze new tracks only") return a report containing
+    # ONLY the newly analyzed tracks. Re-attach the previously saved records
+    # for the skipped paths so the returned AND persisted report always covers
+    # the full library — without this, record_analysis() below would REPLACE a
+    # 12k-track analysis with just the new tracks (silent loss of the whole
+    # library's ML results on disk), and the GUI's merge — whose contract is
+    # "a path missing from report.tracks no longer exists on disk" — would
+    # drop every previously analyzed track from view.
+    if skip_set:
+        report = _reattach_skipped_records(report, skip_set, str(library_path))
+
     if bool(params.get("auto_save", True)):
         try:
             library_state.record_analysis(library_path, report)
@@ -405,6 +435,47 @@ def _analyze_directory(params: dict) -> dict:
             log.warning("Could not auto-save analysis state: %s", e)
 
     return report
+
+
+def _reattach_skipped_records(
+    report: dict, skip_set: set[str], library_path: str
+) -> dict:
+    """Merge the previously saved records for skipped paths back into an
+    incremental analyze report, rebuilding the summary/statistics over the
+    full set.
+
+    Skipped records are re-attached as-is (already final-reconciled;
+    re-reconciling would clobber user-resolved review decisions), records for
+    files that vanished from disk are dropped (preserving the GUI's
+    missing-path-means-deleted contract), and the new tracks keep whatever the
+    fresh analyze produced. Best-effort: with no previous analysis there is
+    nothing to re-attach.
+    """
+    from vibechek import library_state  # noqa: PLC0415
+    from vibechek.analyzer import _build_report  # noqa: PLC0415
+
+    state = library_state.load_state()
+    rec = next((r for r in state.recent if r.path == library_path), None)
+    prev = library_state.load_analysis(rec) if rec else None
+    if not prev:
+        return report
+
+    new_paths = {t.get("path") for t in report.get("tracks") or []}
+    reattached = [
+        t for t in prev.get("tracks") or []
+        if t.get("path") in skip_set
+        and t.get("path") not in new_paths
+        and os.path.exists(t.get("path") or "")
+    ]
+    if not reattached:
+        return report
+
+    merged = reattached + list(report.get("tracks") or [])
+    # in_progress=True skips the reconcile pass (see docstring), so rebuild
+    # only the summary/statistics — then restore the true status.
+    rebuilt = _build_report(merged, total=len(merged), in_progress=True)
+    rebuilt["status"] = report.get("status", "complete")
+    return rebuilt
 
 
 def _system_info(_params: dict) -> dict:
@@ -657,7 +728,18 @@ def _handle_duplicates(params: dict) -> dict:
     )
     # Reconstruct the report from its dict form
     report = _rebuild_report(params["report"])
-    summary = handle_duplicates(report, config, on_progress=_emit_progress)
+    try:
+        summary = handle_duplicates(report, config, on_progress=_emit_progress)
+    except cancellation.CancelledError as e:
+        # Same contract as _organize: a cancelled move/trash has usually
+        # already acted on SOME files and journaled them — return the partial
+        # summary (incl. journal_path for one-click undo) tagged cancelled=True
+        # instead of an error that strands the half-moved files.
+        partial = getattr(e, "partial_summary", None)
+        if partial is not None:
+            partial["cancelled"] = True
+            return partial
+        raise
     return summary
 
 
@@ -700,7 +782,16 @@ def _rebuild_report(d: dict) -> Any:
 
 
 def _plan_organization(params: dict) -> dict:
-    from vibechek.organizer import plan_organization
+    from vibechek.organizer import plan_organization, validate_organize_target
+
+    # Fail fast on an unusable target BEFORE planning: the GUI has its own
+    # client-side checks, but the sidecar is the enforcement point (writability
+    # can only be probed here, and non-GUI clients get the same guard).
+    check = validate_organize_target(
+        params.get("target_root"), source_library=params.get("library_path"),
+    )
+    if not check["ok"]:
+        raise ValueError(check["error"])
 
     config = OrganizationConfig(
         use_subgenres=bool(params.get("use_subgenres", True)),
@@ -728,7 +819,15 @@ def _plan_organization(params: dict) -> dict:
 
 
 def _organize(params: dict) -> dict:
-    from vibechek.organizer import organize_from_analysis
+    from vibechek.organizer import organize_from_analysis, validate_organize_target
+
+    # Same fail-fast as _plan_organization — the EXECUTE path especially must
+    # not start moving files toward an unwritable/same-as-source target.
+    check = validate_organize_target(
+        params.get("target_root"), source_library=params.get("library_path"),
+    )
+    if not check["ok"]:
+        raise ValueError(check["error"])
 
     config = OrganizationConfig(
         use_subgenres=bool(params.get("use_subgenres", True)),
@@ -1882,7 +1981,21 @@ def _dispatch(request: dict[str, Any]) -> None:
             _err(req_id, APP_ERROR, str(e), data={"traceback": traceback.format_exc()})
     else:
         if req_id is not None:
-            _ok(req_id, result)
+            try:
+                _ok(req_id, result)
+            except Exception as e:  # noqa: BLE001
+                # A result that fails to SERIALIZE (a set/bytes json.dumps
+                # can't handle, NaN with a strict encoder, …) used to escape
+                # into the fire-and-forget executor future — no response frame,
+                # no log line, and the GUI's promise for this id hung forever.
+                # Always answer: fall back to a structured error (itself
+                # guarded — if even that fails there is nothing more we can do
+                # beyond logging).
+                log.exception("Result serialization failed for method %s", method)
+                try:
+                    _err(req_id, APP_ERROR, f"Result not serializable: {e}")
+                except Exception:  # noqa: BLE001
+                    log.exception("Could not send the serialization-error reply")
     finally:
         if kind is not None:
             cancellation.end()

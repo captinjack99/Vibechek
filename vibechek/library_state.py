@@ -198,13 +198,29 @@ def record_analysis(library_path: Path | str, report: dict[str, Any]) -> Library
 
 
 def forget(library_path: Path | str) -> bool:
-    """Drop a library from the recent list. Returns True if it was there."""
+    """Drop a library from the recent list. Returns True if it was there.
+
+    Also deletes the saved analysis JSON and its tag-priors sidecar: the
+    analysis path is a pure hash of the library path, so a later re-open of
+    the same folder would otherwise silently resurrect a months-old analysis
+    AND a Rekordbox-priors import the user believed was discarded (the
+    sidecar is re-merged into every future analyze).
+    """
     with _STATE_LOCK:
         state = load_state()
         path_str = str(library_path)
         before = len(state.recent)
+        removed = [r for r in state.recent if r.path == path_str]
         state.recent = [r for r in state.recent if r.path != path_str]
         save_state(state)
+        for rec in removed:
+            try:
+                from vibechek.tag_priors import priors_path_for  # noqa: PLC0415
+
+                Path(rec.analysis_path).unlink(missing_ok=True)
+                priors_path_for(rec.analysis_path).unlink(missing_ok=True)
+            except OSError as e:
+                log.warning("Could not remove a forgotten library's files: %s", e)
         return len(state.recent) < before
 
 

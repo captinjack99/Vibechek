@@ -8,7 +8,7 @@ If you think you've found a vulnerability, please do **not** open a public GitHu
 
 ## How to report
 
-Email **security@vibechek.app** with:
+Use **[GitHub private vulnerability reporting](https://github.com/captinjack99/Vibechek/security/advisories/new)** ("Report a vulnerability" on the repo's Security tab). Include:
 
 - A description of the issue (what it lets an attacker do, not just what it is)
 - The version you reproduced on (`vibechek --version` plus the installer / source you used)
@@ -16,9 +16,9 @@ Email **security@vibechek.app** with:
 - Any proof-of-concept code or sample files
 - Your name / handle for the credit line, or "anonymous" if you prefer
 
-PGP is not currently required. If you want an encrypted channel before sending the details, email us first and we'll set one up.
+If you can't use GitHub, open a normal issue saying only "security report — need a private channel" (no details) and we'll arrange one.
 
-We'll acknowledge receipt within **7 days**. If you haven't heard back by day 8, please poke us — your email may have ended up in a spam folder.
+We'll acknowledge receipt within **7 days**. If you haven't heard back by day 8, please poke us.
 
 ---
 
@@ -43,9 +43,9 @@ Security fixes are backported to the latest minor release line only. Everything 
 
 | Version          | Status                | Notes |
 |------------------|-----------------------|-------|
-| `0.5.x`          | Supported (current)   | Active development line. |
-| `0.4.x`          | Supported for 90 days | Critical-severity fixes only. |
-| `0.3.x` or older | Not supported         | Please upgrade. |
+| `0.6.x`          | Supported (current)   | Active development line. |
+| `0.5.x`          | Supported for 90 days | Critical-severity fixes only. |
+| `0.4.x` or older | Not supported         | Please upgrade. |
 
 "Supported" means we will ship a tagged release with the fix on the supported branch. Unsupported versions may still receive a fix on `main`, but we make no commitments.
 

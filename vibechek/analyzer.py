@@ -1360,6 +1360,15 @@ def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks, en
         if item is None:
             break
         idx, path = item
+        # Claim marker BEFORE analyzing: if this process is killed mid-track
+        # (the OOM-kill case), the parent knows which item died with it and
+        # re-enqueues it — otherwise the item is lost and the run can never
+        # reach `total` results (it used to stall-abort after 5 idle minutes,
+        # discarding everything).
+        try:
+            out_q.put(("__claim__", os.getpid(), idx, path))
+        except Exception:  # noqa: BLE001
+            pass
         t0 = _time.monotonic()
         if fake:
             _time.sleep(0.003)  # cheap, deterministic stand-in for analysis
@@ -1408,6 +1417,13 @@ class _HybridPool:
         # Per-device throughput accounting (track count + summed seconds).
         self.device_counts: dict[str, int] = {"0": 0, "-1": 0}
         self.device_seconds: dict[str, float] = {"0": 0.0, "-1": 0.0}
+        # In-flight tracking for crash recovery: pid → (idx, path) recorded
+        # from the worker's "__claim__" marker, cleared when its result lands.
+        # _reap_and_respawn re-enqueues a dead worker's claimed item (bounded
+        # by _retries — a track that kills its worker repeatedly gets an error
+        # record instead of an infinite respawn loop).
+        self._claims: dict[int, tuple[int, str]] = {}
+        self._retries: dict[int, int] = {}
 
         self._in_q = ctx.Queue()
         self._out_q = ctx.Queue()
@@ -1435,12 +1451,42 @@ class _HybridPool:
         return p
 
     def _reap_and_respawn(self):
-        """Replace workers that exited (recycle/crash) while work remains."""
+        """Replace workers that exited (recycle/crash) while work remains.
+
+        A worker that died MID-TRACK (OOM-kill between claiming and posting the
+        result) takes its item with it — re-enqueue it so the run can still
+        reach `total` results instead of stall-aborting hours later with
+        everything discarded. Two retries per item, then a synthesized error
+        record: a track that reliably kills its worker must not respawn-loop
+        forever. (Tiny residual race: a claim marker the parent hasn't consumed
+        yet when the death is noticed is invisible here — the marker is posted
+        before the seconds-long analyze, so in practice it has long been read.)
+        """
         if self._done_event.is_set():
             return
         for i, p in enumerate(list(self._procs)):
             if not p.is_alive():
                 p.join(timeout=0.1)
+                claim = self._claims.pop(p.pid, None) if p.pid is not None else None
+                if claim is not None and self._results_out < self.total:
+                    idx, path = claim
+                    self._retries[idx] = self._retries.get(idx, 0) + 1
+                    if self._retries[idx] <= 2:
+                        log.warning(
+                            "Worker died mid-track (pid %s) — re-enqueueing %s "
+                            "(attempt %d)", p.pid, path, self._retries[idx] + 1,
+                        )
+                        self._in_q.put((idx, path))
+                    else:
+                        pp = Path(path)
+                        self._out_q.put((idx, {
+                            "path": path,
+                            "filename": pp.name,
+                            "extension": pp.suffix.lower(),
+                            "size_mb": 0.0,
+                            "error": "analysis worker died repeatedly on this "
+                                     "track (likely out of memory) — skipped",
+                        }, getattr(p, "_vibechek_device", "-1"), 0.0))
                 if self._results_out < self.total:
                     device = getattr(p, "_vibechek_device", "-1")
                     self._procs[i] = self._spawn(device)
@@ -1467,7 +1513,15 @@ class _HybridPool:
                     f"Worker init failed on device "
                     f"{'GPU' if item[1] == '0' else 'CPU'}: {item[2]}"
                 )
+            if item and item[0] == "__claim__":
+                # A worker started analyzing (idx, path) — remember it so a
+                # mid-track death can re-enqueue the item (see _reap_and_respawn).
+                _, pid, cidx, cpath = item
+                self._claims[pid] = (cidx, cpath)
+                continue
             idx, rec, device, seconds = item
+            # The item completed — drop whichever worker's claim carried it.
+            self._claims = {p: c for p, c in self._claims.items() if c[0] != idx}
             self._results_out += 1
             self.device_counts[device] = self.device_counts.get(device, 0) + 1
             self.device_seconds[device] = self.device_seconds.get(device, 0.0) + seconds
@@ -1497,6 +1551,26 @@ class _HybridPool:
                 p.terminate()
             except Exception:  # noqa: BLE001
                 pass
+        # Release the input queue: with all readers dead, its feeder thread
+        # would block forever flushing the remaining items into a full pipe —
+        # pinning the queued path strings, a thread, and a pipe pair inside
+        # the long-lived sidecar for EVERY cancelled/failed run. Drain what we
+        # can, then cancel_join_thread() so nothing waits on the flush.
+        import queue as _queue  # noqa: PLC0415
+        try:
+            while True:
+                self._in_q.get_nowait()
+        except (_queue.Empty, OSError, ValueError):
+            pass
+        for q in (self._in_q, self._out_q):
+            try:
+                q.cancel_join_thread()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            self._in_q.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def join(self, timeout=5):  # type: ignore[no-untyped-def]
         for p in self._procs:
@@ -1760,6 +1834,7 @@ def analyze_directory(
             distro=wsl_distro,
             wsl_vibechek_version=wsl_version,
             on_track=on_track,
+            skip_paths=skip_paths,
         )
 
     # If native essentia is missing but the managed Linux/macOS venv has it,
@@ -1771,6 +1846,7 @@ def analyze_directory(
         return _analyze_via_native_venv(
             library_path, config, on_progress, output_path, skip, limit,
             on_track=on_track,
+            skip_paths=skip_paths,
         )
 
     file_strs = [str(f) for f in files]
@@ -2138,12 +2214,15 @@ def _analyze_via_native_venv(
     skip: int,
     limit: int | None,
     on_track: TrackCallback | None = None,
+    skip_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     """Route analyze to the managed `~/.vibechek/venv/bin/vibechek` on Linux/macOS.
 
     No path translation needed (unlike `_analyze_via_wsl`) — the venv runs in
     the host filesystem. We just shell out, stream progress, and read the
-    result JSON back.
+    result JSON back. `skip_paths` (incremental "analyze new tracks only") is
+    forwarded via a temp file + `--skip-paths-file` so the subprocess doesn't
+    re-analyze the whole library.
     """
     import json as _json
     import tempfile
@@ -2158,6 +2237,16 @@ def _analyze_via_native_venv(
         local_output = Path(tmp.name)
     else:
         local_output = Path(output_path)
+
+    skip_paths_file: Path | None = None
+    if skip_paths:
+        spf = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".txt",
+            prefix="vibechek-skip-", delete=False,
+        )
+        spf.write("\n".join(sorted(skip_paths)))
+        spf.close()
+        skip_paths_file = Path(spf.name)
 
     workers = config.workers if config.workers and config.workers > 0 else 0
 
@@ -2181,6 +2270,8 @@ def _analyze_via_native_venv(
         args += ["--limit", str(limit)]
     if not config.hybrid_cpu_gpu:
         args += ["--no-hybrid"]
+    if skip_paths_file is not None:
+        args += ["--skip-paths-file", str(skip_paths_file)]
 
     # Shared handler — parses both the structured VIBECHEK_EVENT channel
     # (stage transitions, per-track records) AND the legacy Rich-progress
@@ -2190,7 +2281,11 @@ def _analyze_via_native_venv(
         on_track=on_track,
     )
 
-    result = run_vibechek_in_native_venv(args, on_stderr_line=on_line, engine=config.inference_engine)
+    try:
+        result = run_vibechek_in_native_venv(args, on_stderr_line=on_line, engine=config.inference_engine)
+    finally:
+        if skip_paths_file is not None:
+            skip_paths_file.unlink(missing_ok=True)
 
     if result.returncode != 0:
         raise RuntimeError(
@@ -2235,12 +2330,16 @@ def _analyze_via_wsl(
     distro: str,
     wsl_vibechek_version: str | None = None,
     on_track: TrackCallback | None = None,
+    skip_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     """Route the analyze to vibechek-inside-WSL.
 
     All file paths get translated: Windows `C:\\foo` ↔ WSL `/mnt/c/foo`. The
     resulting analysis.json comes back with WSL paths in it; we rewrite them
     to Windows paths before returning so the GUI sees a consistent view.
+    `skip_paths` (incremental analyze) is forwarded via a temp file +
+    `--skip-paths-file`, each entry translated to its /mnt/... form so the
+    WSL-side scan filter matches.
     """
     import json as _json
     import re
@@ -2267,6 +2366,16 @@ def _analyze_via_wsl(
     # nothing, and either re-download (slow) or fail silently.
     wsl_models_dir = win_to_wsl_path(str(config.models_dir))
 
+    skip_paths_file: Path | None = None
+    if skip_paths:
+        spf = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".txt",
+            prefix="vibechek-skip-", delete=False,
+        )
+        spf.write("\n".join(sorted(win_to_wsl_path(p) for p in skip_paths)))
+        spf.close()
+        skip_paths_file = Path(spf.name)
+
     workers = config.workers if config.workers and config.workers > 0 else 0
 
     args = [
@@ -2289,6 +2398,8 @@ def _analyze_via_wsl(
         args += ["--limit", str(limit)]
     if not config.hybrid_cpu_gpu:
         args += ["--no-hybrid"]
+    if skip_paths_file is not None:
+        args += ["--skip-paths-file", win_to_wsl_path(str(skip_paths_file))]
 
     # Route to the venv matching the engine: "venv-onnx" (plain essentia +
     # onnxruntime) for the TF-free ONNX path, "venv" (essentia-tensorflow)
@@ -2416,6 +2527,10 @@ def _analyze_via_wsl(
         # If the upgrade failed we fall through: the generic error below shows
         # the "No such option" stderr tail, which is an honest description.
 
+    # The subprocess (and its one retry) has consumed the skip-paths file.
+    if skip_paths_file is not None:
+        skip_paths_file.unlink(missing_ok=True)
+
     if result.returncode != 0:
         stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"
         raise RuntimeError(
@@ -2521,6 +2636,12 @@ def _reconcile_record_genre(
     """
     ml = r.get("ml_analysis")
     if not ml:
+        return
+    # A conflict the user explicitly resolved from the review queue
+    # (resolve_genre_conflicts "approve") is a final human decision — an
+    # offline re-reconcile (priors import, incremental-analyze record merge)
+    # must not recompute it back into a machine verdict and re-open the queue.
+    if ml.get("ml_genre_source") == "approved":
         return
     audio_genre = ml.get("ml_genre_audio", ml.get("ml_genre"))
     audio_sub = ml.get("ml_subgenre_audio", ml.get("ml_subgenre"))

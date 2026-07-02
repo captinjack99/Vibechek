@@ -58,8 +58,9 @@ def test_render_markdown_contains_all_top_level_sections() -> None:
     assert "## Models" in md
     assert "## Log tail" in md
     # Either WSL (Windows) or Native venv (Linux/macOS) section is present;
-    # the doctor only emits the one applicable to this platform.
-    assert ("## WSL" in md) or ("## Native venv" in md) or True
+    # the doctor only emits the one applicable to this platform. (A trailing
+    # `or True` used to make this assertion unable to fail.)
+    assert ("## WSL" in md) or ("## Native venv" in md)
 
 
 def test_model_integrity_unverified_surfaced_when_sha_table_empty(monkeypatch) -> None:

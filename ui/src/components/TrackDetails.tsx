@@ -380,6 +380,18 @@ function DiffRow({ row }: { row: DiffRowData }) {
 function KeyTagHint({ ml }: { ml: MLResult }) {
   const prov = keyProvenance(ml);
   if (!prov) return null;
+  if (!prov.audio) {
+    // No audio key to agree WITH — claiming "matches your tag" here would be
+    // a false confirmation. Show the tag value neutrally instead.
+    return (
+      <span
+        className="text-[10px] text-white/40 flex-none ml-auto"
+        title="Your file's key tag (no audio key was detected for this track)"
+      >
+        tag: {prov.tag}
+      </span>
+    );
+  }
   if (!prov.conflict) {
     return (
       <span
