@@ -10,6 +10,18 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+### Added
+- **Gold-corpus accuracy gate in CI.** Three openly-licensed 45s reference
+  clips (CC0/CC-BY, attribution in `tests/fixtures/gold/ATTRIBUTION.md`) are
+  committed with the genre/BPM/key the production pipeline is known to produce
+  for them — pinned identically on the essentia_tf and native engines. The
+  Windows release build (`selftest-native --gold-dir`) and the native-smoke
+  full tier (rpc_smoke step 11) now analyze them for real and fail on any
+  drift, so a silent result regression (wrong genre/BPM/key with no crash) can
+  no longer ship. Shared checker in `vibechek/gold_gate.py`; the assertion
+  tiers (exact / tolerance / floor / presence) live in the fixtures'
+  `manifest.json`.
+
 ## [0.6.3-beta] — 2026-06-24
 
 ### Changed

@@ -30,6 +30,11 @@ machine, all through the same live sidecar:
  10. analyze_directory  -> a real ML analyze of the fixtures via the managed
                            venv: 2/2 track records, ml_bpm/ml_key/ml_energy
                            populated, zero per-track or summary errors
+ 11. gold-corpus gate   -> analyze the committed reference clips
+                           (tests/fixtures/gold) and assert the exact
+                           genre/BPM/key pinned in their manifest.json via
+                           vibechek.gold_gate — an accuracy regression fails
+                           the smoke even when nothing crashes
 
 Exits non-zero on the first failed expectation, printing the offending frame.
 
@@ -398,6 +403,41 @@ def _run_full_tier(sc: Sidecar, lib: Path) -> None:
     print(
         f"ok: full ML analyze via the managed venv ({engine}): "
         "2/2 tracks, bpm/key/energy populated, 0 errors"
+    )
+
+    # 11. Gold-corpus ACCURACY gate: the committed reference clips must come
+    #     back with the exact genre/BPM/key pinned in their manifest — steps
+    #     7-10 prove the engine RUNS; this proves it still gets the right
+    #     answers. Shares vibechek.gold_gate with `selftest-native --gold-dir`
+    #     (the Windows release gate) so there is one source of truth for the
+    #     assertions. A missing fixtures dir is a FAILURE, not a skip — a
+    #     silently skipped gate is exactly the class of bug this smoke exists
+    #     to prevent.
+    from vibechek.gold_gate import check_gold_report, load_manifest
+
+    fixtures = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "gold"
+    if not fixtures.is_dir():
+        _fail(f"gold fixtures dir missing: {fixtures}")
+    manifest = load_manifest(fixtures)
+    gold_lib = lib.parent / "gold"
+    gold_lib.mkdir(parents=True, exist_ok=True)
+    for name in manifest["tracks"]:
+        shutil.copy2(fixtures / name, gold_lib / name)
+    resp = sc.call(
+        "analyze_directory",
+        {"path": str(gold_lib), "workers": 1, "inference_engine": engine},
+        timeout=ANALYZE_GAP_TIMEOUT_SEC, echo_progress=True,
+    )
+    if "result" not in resp:
+        _fail(f"analyze_directory (gold): {resp.get('error')}")
+    failures = check_gold_report(resp["result"], manifest)
+    if failures:
+        for f in failures:
+            print(f"  gold-gate FAIL: {f}", file=sys.stderr)
+        _fail(f"gold-corpus gate: {len(failures)} assertion(s) failed")
+    print(
+        f"ok: gold-corpus gate ({engine}): {len(manifest['tracks'])} reference "
+        "clips reproduced their pinned genre/BPM/key"
     )
 
 

@@ -62,9 +62,13 @@ REM Loud native gate: when the native wheel was bundled (essentia imported in
 REM the build venv), the frozen exe MUST load + run it in-process. vibechek.spec
 REM swallows bundle errors, so without this a broken native bundle would ship
 REM silently as a lean CLI on a green build. Fail the build instead.
+REM --gold-dir adds the ACCURACY gate: the frozen exe analyzes the committed
+REM openly-licensed reference clips and must reproduce the genre/BPM/key pinned
+REM in tests\fixtures\gold\manifest.json — a result regression fails the build
+REM even when nothing crashes. (cwd is the repo root; see `cd` at the top.)
 if defined VIBECHEK_NATIVE_BUNDLED (
     echo Self-testing the bundled native engine inside the frozen exe...
-    dist\vibechek.exe selftest-native || exit /b 1
+    dist\vibechek.exe selftest-native --gold-dir tests\fixtures\gold || exit /b 1
 )
 
 echo Packaging zip...

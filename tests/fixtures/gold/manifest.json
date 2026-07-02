@@ -1,0 +1,50 @@
+{
+  "_comment": "Gold-corpus accuracy gate. Expected values were pinned 2026-07-02 from the production pipeline on BOTH engines (WSL essentia_tf and the native Windows engine) — identical genre/subgenre/BPM/key/energy/mood/vocal, confidences within 0.01. The gate asserts these so a result regression (not just a crash) fails CI. Tolerances: bpm/energy 'close' absorb decode/rounding jitter; genre/key are exact. gold_house has NO genre assertion on purpose — its audio read is a genuinely ambiguous low-confidence label (Chiptune @ 0.35) and pinning it would make the gate flap; it contributes BPM/key/decode coverage and is the CC0-licensed file of the set.",
+  "tracks": {
+    "gold_melodic_ede_say_you_will.mp3": {
+      "expect": { "ml_genre": "House", "ml_key": "5B" },
+      "close": {
+        "ml_bpm": { "value": 119.9, "tol": 1.0 },
+        "ml_energy": { "value": 1, "tol": 1 }
+      },
+      "min": { "ml_danceability": 0.85 },
+      "present": ["ml_mood", "ml_vocal"],
+      "attribution": {
+        "artist": "ED.E",
+        "title": "Say You Will",
+        "source": "https://archive.org/details/say-you-will",
+        "license": "CC BY 4.0"
+      }
+    },
+    "gold_trance_moonwalk_lights_out.mp3": {
+      "expect": { "ml_genre": "Trance", "ml_subgenre": "Trance", "ml_key": "1A" },
+      "close": {
+        "ml_bpm": { "value": 139.9, "tol": 1.0 },
+        "ml_energy": { "value": 3, "tol": 1 }
+      },
+      "min": { "ml_danceability": 0.85 },
+      "present": ["ml_mood", "ml_vocal"],
+      "attribution": {
+        "artist": "Moonwalk",
+        "title": "Lights Out (EDM Trance Dance)",
+        "source": "https://archive.org/details/jamendo-525562",
+        "license": "CC BY 3.0"
+      }
+    },
+    "gold_house_ninjeh_stay_tuned.mp3": {
+      "expect": { "ml_key": "2A" },
+      "close": {
+        "ml_bpm": { "value": 129.2, "tol": 1.0 },
+        "ml_energy": { "value": 2, "tol": 1 }
+      },
+      "min": { "ml_danceability": 0.85 },
+      "present": ["ml_mood", "ml_vocal"],
+      "attribution": {
+        "artist": "Ninjeh",
+        "title": "Stay Tuned",
+        "source": "https://archive.org/details/ninjeh-stay-tuned",
+        "license": "CC0 1.0"
+      }
+    }
+  }
+}

@@ -656,7 +656,13 @@ def system_info_cmd() -> None:
 
 
 @main.command("selftest-native", hidden=True)
-def selftest_native_cmd() -> None:
+@click.option("--gold-dir", type=click.Path(path_type=Path, exists=True,
+              file_okay=False), default=None,
+              help="Also run the gold-corpus ACCURACY gate: analyze the "
+                   "openly-licensed fixture clips in this directory through "
+                   "the native engine and assert the genre/BPM/key values "
+                   "pinned in its manifest.json (tests/fixtures/gold).")
+def selftest_native_cmd(gold_dir: Path | None) -> None:
     """Prove the bundled native (WSL-free) engine loads + runs in the frozen exe.
 
     Build-time gate only — packaging/build-windows.bat runs this against the
@@ -671,6 +677,12 @@ def selftest_native_cmd() -> None:
     onnxruntime + the bundled ONNX heads. Exits non-zero on any failure so the
     build fails loudly instead of silently shipping a native engine that can't
     decode audio.
+
+    With --gold-dir it additionally runs the gold-corpus gate (vibechek.gold_gate):
+    a REAL analyze of committed reference clips with the values the production
+    pipeline is known to produce for them, so a silent accuracy regression (wrong
+    genre/BPM/key, not a crash) also fails the build. Runs in-process (workers=1);
+    models self-provision via load_models (bundled heads + hosted backbone).
     """
     try:
         import os
@@ -722,6 +734,26 @@ def selftest_native_cmd() -> None:
         f"[green]native self-test OK[/] — essentia "
         f"{getattr(essentia, '__version__', '?')} decoded + analyzed a test clip; "
         f"onnxruntime + ONNX heads at {assets}"
+    )
+
+    if gold_dir is None:
+        return
+    try:
+        from vibechek.gold_gate import run_gold_gate
+
+        console.print(f"Running the gold-corpus accuracy gate on [cyan]{gold_dir}[/]…")
+        failures = run_gold_gate(gold_dir, engine="native")
+    except Exception as exc:  # noqa: BLE001 — build gate: surface ANY failure loudly
+        console.print(f"[red]gold-corpus gate FAILED to run[/] — {type(exc).__name__}: {exc}")
+        raise click.exceptions.Exit(code=1) from exc
+    if failures:
+        console.print(f"[red]gold-corpus gate FAILED[/] — {len(failures)} assertion(s):")
+        for f in failures:
+            console.print(f"  [red]✗[/] {f}")
+        raise click.exceptions.Exit(code=1)
+    console.print(
+        "[green]gold-corpus gate OK[/] — reference clips analyzed with the "
+        "expected genre/BPM/key"
     )
 
 
