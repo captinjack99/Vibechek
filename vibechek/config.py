@@ -49,6 +49,45 @@ LEGACY_CONFIG_FILE = CONFIG_DIR / "config.toml"
 _DEFAULT_INFERENCE_ENGINE = "native" if sys.platform == "win32" else "essentia_tf"
 
 
+def engine_venv_subdir(engine: str) -> str:
+    """Managed/WSL venv subdir (`~/.vibechek/<subdir>`) that serves `engine`.
+
+    "onnx" AND "native" both run the ONNX stack (plain essentia + onnxruntime
+    — native is the same backbone/heads in-process), so both map to
+    "venv-onnx"; "essentia_tf" uses the default "venv" (essentia-tensorflow).
+    The two essentia builds can't share a venv (both ship the ``essentia``
+    module).
+
+    Every component that picks a venv for an engine — preflight, the analyze
+    dispatch, the WSL install/upgrade scripts, the GUI status probe — MUST
+    route through this one mapping. They used to hand-roll
+    ``"venv-onnx" if engine == "onnx" else "venv"``, which predates "native":
+    preflight validated venv-onnx while install/dispatch/upgrade targeted
+    "venv", so a native→WSL fallback install dead-ended ("not ready" after a
+    10-minute install) and analyze crashed after preflight said READY.
+    """
+    return "venv-onnx" if engine in ("onnx", "native") else "venv"
+
+
+def vibechek_pip_source() -> str:
+    """pip requirement installing the EXACT release matching this build.
+
+    Pinned to this build's version tag rather than `main` HEAD: the WSL /
+    managed-venv engine install — and the analyzer's transparent version-drift
+    auto-update that reuses it — is a de-facto auto-updater, and tracking
+    `main` meant (a) a compromised branch would silently execute on every
+    user's next analyze with no integrity anchor beyond one GitHub account,
+    and (b) the "keep WSL in sync with the sidecar" drift guard could install
+    code NEWER than the sidecar with an incompatible wire schema (unreviewed
+    WIP shipping instantly to all users). The `v<version>` tag exists for
+    every shipped build (docs/RELEASING.md); dev/CI installs bypass this via
+    the `vibechek_source` local-directory override on the install RPCs.
+    """
+    from vibechek import __version__  # noqa: PLC0415
+
+    return f"git+https://github.com/captinjack99/Vibechek.git@v{__version__}"
+
+
 @dataclass
 class AnalysisConfig:
     """Controls for the ML analysis pass.
@@ -362,6 +401,22 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
             log.warning(
                 "Config field %s.inference_engine has unknown value %r; "
                 "falling back to the platform default", cls.__name__, coerced,
+            )
+            continue  # use the dataclass default (_DEFAULT_INFERENCE_ENGINE)
+        # "native" is the bundled-Windows-installer engine; on Linux/macOS the
+        # onnx engine IS the in-process path and the managed venvs have no
+        # "native" flavor — a saved config carrying it (e.g. copied from a
+        # Windows box) would preflight against one venv and analyze against
+        # another. Snap back to the platform default rather than misroute.
+        if (
+            key == "inference_engine"
+            and coerced == "native"
+            and sys.platform != "win32"
+        ):
+            log.warning(
+                "Config field %s.inference_engine=native is Windows-only "
+                "(the onnx engine is the in-process path on this platform); "
+                "falling back to the platform default", cls.__name__,
             )
             continue  # use the dataclass default (_DEFAULT_INFERENCE_ENGINE)
         # The genre enums steer model loading + reconciliation the same way —

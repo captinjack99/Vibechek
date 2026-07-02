@@ -30,6 +30,37 @@ permissions:
   contents: read
 
 jobs:
+  # The model-mirror failover silently rotted once: the models-v1 release
+  # didn't exist (and the URL layout for release assets was wrong), which only
+  # surfaced when essentia.upf.edu timed out and took the weekly smoke down
+  # with it. HEAD one asset per mirror so a missing release/asset is loud even
+  # in weeks when UPF is healthy. Our GitHub mirror missing → hard fail; a UPF
+  # flake alone is a warning (that is exactly what the failover exists for).
+  mirror-health:
+    name: Model mirror health
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: HEAD one asset per mirror
+        run: |
+          set -u
+          fail=0
+          check() {
+            url="$1"; hard="$2"
+            if curl -sfIL --max-time 30 "$url" >/dev/null; then
+              echo "OK   $url"
+            elif [ "$hard" = hard ]; then
+              echo "FAIL $url — our mirror is missing this asset"; fail=1
+            else
+              echo "WARN $url — upstream flake; the mirror failover covers users"
+            fi
+          }
+          check "https://essentia.upf.edu/models/classification-heads/danceability/danceability-discogs-effnet-1.json" soft
+          check "https://github.com/captinjack99/Vibechek/releases/download/models-v1/danceability-discogs-effnet-1.json" hard
+          check "https://github.com/captinjack99/Vibechek/releases/download/models-v1/discogs-effnet-bsdynamic-1.onnx" hard
+          check "https://github.com/captinjack99/Vibechek/releases/download/models-onnx-v1/danceability.json" hard
+          exit $fail
+
   rpc-smoke:
     name: RPC smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

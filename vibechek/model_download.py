@@ -25,18 +25,24 @@ log = logging.getLogger(__name__)
 
 # Where to fetch ML models from. essentia.upf.edu is the academic source
 # maintained by UPF Barcelona's MTG — stable for years, but academic
-# infrastructure is famously fragile. A URL change or outage there would
-# break every Vibechek install until we shipped an update. So:
+# infrastructure is famously fragile (its timeouts have flunked real CI
+# runs). A URL change or outage there would break every Vibechek install
+# until we shipped an update. So:
 #
 #   1. `VIBECHEK_MODELS_URL` env var wins (power users + self-hosters).
-#   2. Otherwise we try the UPF source first, then a GitHub Release mirror
-#      as a hot-swappable fallback. `_download_with_progress` walks the
-#      tuple, trying each URL in turn — a single domain outage no longer
-#      breaks the install.
+#   2. Otherwise we try the UPF source first, then the GitHub Release mirror
+#      as a fallback. `_download_from_mirrors` walks the candidate URLs in
+#      turn — a single domain outage no longer breaks the install.
 #
-# When publishing a new mirror, upload the .pb + .json files to
-# https://github.com/captinjack99/Vibechek/releases/download/models-v1/ and bump
-# the tag below.
+# GitHub release assets are FLAT (no directories), so `_candidate_urls`
+# emits `<base>/<fname>` for release bases and `<base>/<subdir>/<fname>` for
+# the UPF layout — the old nested form for GitHub could never resolve, which
+# made the advertised failover fictional until 2026-07-02.
+#
+# The `models-v1` release must hold every MODELS weights/metadata file under
+# its UPSTREAM filename plus the EffNet ONNX backbone; re-publish via the
+# staging/verify recipe in scripts (all assets must match the MODEL_SHA256 /
+# BACKBONE_ONNX_SHA256 pins below).
 _DEFAULT_MODEL_BASE_URLS = (
     "https://essentia.upf.edu/models",
     "https://github.com/captinjack99/Vibechek/releases/download/models-v1",
@@ -188,6 +194,34 @@ MODEL_SHA256_ONNX: dict[str, str] = {
 }
 
 
+# EffNet ONNX backbone (`discogs-effnet-bsdynamic-1.onnx`) content pin.
+# Pinned 2026-07-02 from the locally-validated copy every parity/accuracy run
+# used, independently confirmed byte-identical to the essentia.upf.edu
+# original the same day. Verified strictly after download and on cached
+# reuse, exactly like the .pb weights above.
+BACKBONE_ONNX_SHA256 = (
+    "a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c"
+)
+
+
+def candidate_model_urls(subdir: str, fname: str) -> list[str]:
+    """URL fallback chain for one model file across all mirror bases.
+
+    UPF-style bases keep the upstream directory layout
+    (`<base>/<subdir>/<fname>`); GitHub release bases are FLAT — release
+    assets have no directories, so `releases/download/<tag>/<subdir>/<fname>`
+    404s unconditionally. Emitting the flat form for them is what makes the
+    mirror failover real (the nested form shipped broken and the weekly smoke
+    died whenever UPF flaked).
+    """
+    return [
+        f"{base}/{fname}"
+        if "/releases/download/" in base
+        else f"{base}/{subdir}/{fname}"
+        for base in MODEL_BASE_URLS
+    ]
+
+
 def _onnx_head_bases() -> list[str]:
     """Mirror base URL(s) for the converted ONNX heads (flat filenames).
 
@@ -293,8 +327,14 @@ def download_models(
         report_progress(on_progress, int(current * 100), total_steps * 100, label)
 
     def _candidate_urls(subdir: str, fname: str) -> list[str]:
-        """Build the URL fallback chain for one file across all mirror bases."""
-        return [f"{base}/{subdir}/{fname}" for base in MODEL_BASE_URLS]
+        """Build the URL fallback chain for one file across all mirror bases.
+
+        GitHub release assets are flat — `releases/download/<tag>/<subdir>/…`
+        can never resolve — so release bases drop the subdir. (Module-level
+        `candidate_model_urls` is the testable seam; this closure keeps the
+        historical local name.)
+        """
+        return candidate_model_urls(subdir, fname)
 
     for i, (name, (subdir, weights_name, metadata_name)) in enumerate(items):
         weights_path = model_dir / f"{name}.pb"
@@ -416,7 +456,7 @@ def download_models(
         onnx_urls = _candidate_urls(
             "feature-extractors/discogs-effnet", BACKBONE_ONNX_FILENAME
         )
-        if _needs_download(onnx_path, onnx_urls[0], None):
+        if _needs_download(onnx_path, onnx_urls[0], BACKBONE_ONNX_SHA256):
             try:
                 _download_from_mirrors(
                     onnx_urls,
@@ -432,6 +472,15 @@ def download_models(
                 errors.append(f"{BACKBONE_ONNX_FILENAME}: {e}")
                 # Keep any existing backbone — never delete a good cached file on
                 # a failed download (the `.partial` is cleaned downstream).
+        # Same content-hash story as the .pb weights: verify freshly-downloaded
+        # AND cached copies; a mismatch deletes the file and errors.
+        if onnx_path.exists():
+            try:
+                verify_model_sha256(onnx_path, BACKBONE_ONNX_SHA256)
+            except RuntimeError as e:
+                log.error("SHA256 verification failed for the ONNX backbone: %s", e)
+                errors.append(f"{BACKBONE_ONNX_FILENAME}: {e}")
+                onnx_path.unlink(missing_ok=True)
         descriptors["effnet_onnx"] = {"weights": str(onnx_path)}
 
         # ---- converted classification heads (.onnx + .json) ----

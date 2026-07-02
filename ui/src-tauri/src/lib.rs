@@ -43,6 +43,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::rpc_call,
             commands::sidecar_status,
+            commands::drain_startup_notifications,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -67,24 +67,30 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 | **Undo journal** | Organize + dedupe-move write an append-only JSONL journal (one flushed line per move). Partial runs are recoverable; finished runs revert with one click. |
 | **DJ profiles** | One-click setting presets for different workflows. |
 | **FLAC → CDJ export** | `vibechek cdj-export <rekordbox.xml> --out <dir>` transcodes a FLAC library to sample-identical 16-bit **AIFF** and rewrites the Rekordbox XML so beat grids + cues copy across with zero offset math — lets older Pioneer CDJs play a FLAC collection. Strictly additive (sources never touched); never MP3 (its encoder delay shifts the grid). CLI-only; optional `[cdj]` extra (soundfile) with an ffmpeg fallback. |
-| **Inference engine (opt-in ONNX)** | Analysis runs on the bundled essentia-TensorFlow path by default (`inference_engine = "essentia_tf"`). An opt-in, GPU-accelerated **ONNX Runtime** backend (`"onnx"`) runs every neural forward pass off the EOL TF 2.5 runtime with a cross-vendor GPU EP chain (CUDA → ROCm → CoreML → CPU); validated to match the TF path end-to-end. **NVIDIA CUDA is hardware-validated** (RTX 4070, TF-free); ROCm + CoreML are wired but hardware-unverified. Provisioned via Settings → "Set up ONNX engine" into a separate `~/.vibechek/venv-onnx` (extras `[onnx]` / `[onnx-gpu]`); on Windows it runs inside WSL like the default path. Essentia stays for DSP either way. |
+| **Inference engine (native / essentia_tf / opt-in ONNX)** | Default is `native` on Windows (WSL-free, in-process) and `essentia_tf` on macOS/Linux. An opt-in, GPU-accelerated **ONNX Runtime** backend (`"onnx"`) runs every neural forward pass off the EOL TF 2.5 runtime with a cross-vendor GPU EP chain (CUDA → ROCm → CoreML → CPU); validated to match the TF path end-to-end. **NVIDIA CUDA is hardware-validated** (RTX 4070, TF-free); ROCm + CoreML are wired but hardware-unverified. Provisioned via Settings → "Set up ONNX engine" into a separate `~/.vibechek/venv-onnx` (extras `[onnx]` / `[onnx-gpu]`); on Windows the `essentia_tf` and `onnx` engines run inside WSL (the native default does not). Essentia stays for DSP either way. |
 | **In-app auto-update** | Opt-in `tauri-plugin-updater`: Settings → "Software updates" → check / download / install / relaunch. CI signs artifacts + publishes `latest.json` when a signing key is configured; ships inert until one is enrolled. |
-| **Zero-CLI setup** | Windows auto-installs WSL Ubuntu (UAC) + Essentia and routes analysis through it with transparent path translation; macOS/Linux create a hermetic `~/.vibechek/venv/`. Optional one-click GPU (CUDA pip wheels). |
+| **Zero-CLI setup** | Windows desktop installs analyze in-process via the bundled native engine (no setup); the WSL fallback (CLI zip / essentia_tf / onnx) auto-installs WSL Ubuntu (UAC) + Essentia and routes through it with transparent path translation. macOS/Linux create a hermetic `~/.vibechek/venv/`. Optional one-click GPU (CUDA pip wheels). |
 
 ## Platform model
 
-- **Windows:** Essentia has no Windows wheel, so the default path routes analysis
-  through `vibechek` installed in WSL Ubuntu. Paths translate `C:\…` ↔ `/mnt/c/…`
-  at the boundary; the frontend never sees WSL. A version-drift guard refuses to
-  dispatch when the WSL install doesn't match the sidecar version (one-click repair
-  via "Update WSL install"). An **experimental** `inference_engine="native"` runs
-  WSL-free, fully in-process: ONNX inference + a bit-exact NumPy mel frontend + a
-  DSP-only native essentia wheel (decode/BPM/key) built from the wo80 CMake fork.
-  It runs the *same* model weights as Mac/Linux — validated to identical genre
-  top-1 and key, ±2% BPM on a 40-track parity set — so Windows users take no
-  accuracy penalty. The release bundles the wheel into the sidecar (best-effort);
-  `preflight.essentia_serves_engine()` routes only this engine in-process, leaving
-  the default essentia_tf/onnx on WSL.
+- **Windows:** a fresh install uses the **bundled native engine**
+  (`inference_engine="native"`, the default since v0.6.3-beta) — WSL-free and fully
+  in-process: ONNX inference + a bit-exact NumPy mel frontend + a DSP-only native
+  essentia wheel (decode/BPM/key) built from the wo80 CMake fork, folded into the
+  PyInstaller sidecar. It runs the *same* model weights as Mac/Linux — validated to
+  identical genre top-1 and key, ±2% BPM on a 40-track parity set — so Windows users
+  take no accuracy penalty; it ships CPU-only ONNX Runtime.
+  `preflight.essentia_serves_engine()` routes this engine in-process. When the native
+  bundle is absent (the lean CLI zip, a pip install) or the user picks
+  `essentia_tf`/`onnx`, preflight **falls back to WSL**: `vibechek` in a WSL venv,
+  paths translated `C:\…` ↔ `/mnt/c/…` at the boundary (the frontend never sees WSL).
+  On that WSL path, when the WSL install is strictly older than the sidecar the
+  analyzer **auto-upgrades it in place** on the next analyze (engine-aware, one-time,
+  with a progress step) instead of refusing to dispatch; a newer WSL venv is left
+  alone, a same-version "no such option" code drift triggers one in-place update +
+  retry, and it hard-errors only if the automatic update itself fails. The pip source
+  is pinned to the sidecar's own release tag (`git+…@v<version>`, not `main`), so the
+  update converges WSL onto exactly the sidecar's version.
 - **macOS / Linux:** a managed venv at `~/.vibechek/venv/` runs Essentia directly.
 - **GPU:** NVIDIA CUDA runtime via PyPI wheels installed into the venv (works on any
   Linux/WSL distro, no apt/keyring/root). The Settings GPU row probes the *actual*
@@ -121,8 +127,8 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
    generated TS types carry them; defaulting `None` keeps them off the wire until
    reconciliation, so the raw record shape is unchanged.)
 8. **Opt-in heavy deps stay out of the core install.** The inference engine is config-gated
-   (`inference_engine`: `essentia_tf` default | `onnx` | `native`) and imports
-   `onnxruntime`/`essentia` lazily. `native` (experimental) is the WSL-free Windows path —
+   (`inference_engine`: `native` default on Windows | `essentia_tf` default on macOS/Linux |
+   `onnx`) and imports `onnxruntime`/`essentia` lazily. `native` is the WSL-free Windows path —
    ONNX inference + a pure-NumPy mel frontend + an in-process native essentia wheel for
    decode/BPM/key (built via `scripts/build_native_essentia_wheel.ps1`); default unchanged.
    CDJ export's `soundfile` lives in the optional `[cdj]` extra (ffmpeg fallback otherwise).
@@ -135,7 +141,7 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 <!-- These mirror the README stats line. NOTE: scripts/update_readme_stats.py
      only rewrites README.md — refresh this copy by hand when it drifts. -->
 - **929 Python tests**, **48 JSON-RPC methods**, **32 Python modules**
-- **98 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+- **104 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
 - Production-tested against a ~12,000-track personal DJ library
 
 ## Roadmap

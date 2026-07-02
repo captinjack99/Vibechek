@@ -227,7 +227,11 @@ def revert_journal(
     user to restore them manually from the recycle bin.
 
     Returns a summary: {reverted, skipped, errors, trashed_not_reverted,
-    error_messages}. Honors cancellation between entries.
+    error_messages, reverted_pairs}. `reverted_pairs` is [(current, restored)]
+    — i.e. (dst, src) — for every move actually undone, so the GUI can rewrite
+    its in-memory track paths back (mirroring organize's moved_pairs; without
+    it every post-undo Preview / tag-apply targeted paths that no longer
+    exist). Honors cancellation between entries.
     """
     from vibechek import cancellation
 
@@ -249,12 +253,14 @@ def revert_journal(
     trashed = [e for e in entries if e.get("action") == "trash"]
 
     error_messages: list[str] = []
+    reverted_pairs: list[tuple[str, str]] = []
     summary: dict[str, Any] = {
         "reverted": 0,
         "skipped": 0,
         "errors": 0,
         "trashed_not_reverted": len(trashed),
         "error_messages": error_messages,
+        "reverted_pairs": reverted_pairs,
     }
 
     # Reverse order: if organize created nested folders (Genre/Subgenre/x.mp3),
@@ -279,6 +285,7 @@ def revert_journal(
             src.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(dst), str(src))
             summary["reverted"] += 1
+            reverted_pairs.append((str(dst), str(src)))
         except OSError as e:
             summary["errors"] += 1
             error_messages.append(f"{dst} -> {src}: {e}")

@@ -60,10 +60,52 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
         run: python scripts/update_readme_stats.py --check
 
+      - name: Verify generated TS types match the Python dataclasses
+        # The frontend types every RPC payload off the COMMITTED generated.ts /
+        # keeperConstants.ts. Without this check, editing a dataclass without
+        # re-running the generator ships a frontend that type-checks cleanly
+        # against a stale wire contract (a bug class this repo has already hit).
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: python scripts/generate_ts_types.py --check
+
       - name: Smoke-test the CLI
         run: |
           vibechek --version
           vibechek --help
+
+  rust:
+    # The Tauri shell (ui/src-tauri, ~600 lines incl. the sidecar process
+    # manager) previously compiled for the FIRST time inside tauri-action on
+    # tag push — a Rust compile error merged green and only surfaced at
+    # release time. `cargo clippy -D warnings` closes that gap the same way
+    # the frontend job's tsc step does for TypeScript.
+    name: Rust (Tauri shell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # Same deliberate moving-branch exception as release.yml: dtolnay's
+      # channel refs have no version tags; pinning a SHA would freeze the
+      # toolchain and defeat the purpose.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ui/src-tauri
+
+      - name: Linux system deps for Tauri
+        run: |
+          sudo apt update
+          sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+                              librsvg2-dev patchelf libssl-dev
+
+      - name: cargo clippy (deny warnings)
+        working-directory: ui/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
 
   frontend:
     name: Frontend (Node 20)

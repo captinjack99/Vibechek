@@ -42,6 +42,24 @@ from vibechek.config import (
 console = Console()
 
 
+def _resolve_default_engine() -> str:
+    """The engine an --engine-less command should use.
+
+    The saved config's engine (what the GUI runs with), falling back to the
+    platform default (native on Windows, essentia_tf elsewhere). A hardcoded
+    essentia_tf click-default used to send a stock Windows box — whose GUI
+    default is the bundled native engine — down the WSL route that was never
+    set up, breaking the documented "anything the GUI can do, the CLI can do"
+    contract.
+    """
+    from vibechek.config import _DEFAULT_INFERENCE_ENGINE, VibechekConfig  # noqa: PLC0415
+
+    try:
+        return VibechekConfig.load().analysis.inference_engine
+    except Exception:  # noqa: BLE001 — a broken config file must not kill the CLI
+        return _DEFAULT_INFERENCE_ENGINE
+
+
 def _progress_bar(description: str) -> Progress:
     """Construct the standard Vibechek progress display."""
     return Progress(
@@ -129,11 +147,13 @@ def main() -> None:
               help="Run GPU + CPU workers together against a shared queue "
                    "(self-balancing). --no-hybrid uses a single device pool.")
 @click.option("--engine", type=click.Choice(["essentia_tf", "onnx", "native"]),
-              default="essentia_tf", show_default=True,
+              default=None,
               help="Inference engine: essentia_tf (bundled TensorFlow, NVIDIA-only "
                    "GPU), onnx (TF-free ONNX Runtime, cross-vendor GPU), or native "
                    "(in-process ONNX + native essentia — the Windows GUI default; "
-                   "needs essentia importable in this Python).")
+                   "needs essentia importable in this Python). Omitted → the saved "
+                   "config's engine, then the platform default (native on Windows, "
+                   "essentia_tf elsewhere) — same resolution as the GUI.")
 @click.option("--skip-paths-file", type=click.Path(exists=True, dir_okay=False,
               path_type=Path), default=None,
               help="File with one absolute path per line to SKIP (already-analyzed "
@@ -161,13 +181,14 @@ def main() -> None:
               help="With --genre-policy prefer_tag: minimum ML confidence for "
                    "the model to override a disagreeing specific tag.")
 def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
-            output: Path, models_dir: Path | None, hybrid: bool, engine: str,
+            output: Path, models_dir: Path | None, hybrid: bool, engine: str | None,
             skip_paths_file: Path | None,
             genre_policy: str, genre_classifier: str, genre_web_lookup: bool,
             genre_llm_backend: str, genre_override_confidence: float) -> None:
     """Analyze every audio file under PATH with the ML models."""
     from vibechek.analyzer import analyze_directory
 
+    engine = engine or _resolve_default_engine()
     config = AnalysisConfig(workers=workers, use_gpu=gpu, hybrid_cpu_gpu=hybrid,
                             inference_engine=engine, genre_source_policy=genre_policy,
                             genre_classifier=genre_classifier,
@@ -570,10 +591,11 @@ def route(staging: Path, library_root: Path, dry_run: bool) -> None:
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
               help="Where to put the models (defaults to user data dir).")
 @click.option("--engine", type=click.Choice(["essentia_tf", "onnx", "native"]),
-              default="essentia_tf", show_default=True,
+              default=None,
               help="Which model set: essentia_tf (.pb), or onnx/native (the shared "
-                   "converted .onnx heads + backbone).")
-def download_models_cmd(models_dir: Path | None, engine: str) -> None:
+                   "converted .onnx heads + backbone). Omitted → the saved config's "
+                   "engine, then the platform default.")
+def download_models_cmd(models_dir: Path | None, engine: str | None) -> None:
     """Download Essentia ML models (~800MB). Run once before first analyze.
 
     Models are downloaded to a per-user directory so they survive Vibechek
@@ -583,6 +605,7 @@ def download_models_cmd(models_dir: Path | None, engine: str) -> None:
     from vibechek.analyzer import download_models
     from vibechek.config import MODELS_DIR
 
+    engine = engine or _resolve_default_engine()
     target = models_dir or MODELS_DIR
     target.mkdir(parents=True, exist_ok=True)
     console.print(f"Downloading {engine} models to [cyan]{target}[/]")

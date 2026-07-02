@@ -485,3 +485,62 @@ def test_handle_duplicates_error_messages_surface_to_caller(tmp_path: Path) -> N
     assert any("ghost-b.mp3" in m for m in summary["error_messages"])
     # All "not found" since the source paths didn't exist
     assert all("not found" in m for m in summary["error_messages"])
+
+
+def test_send2trash_is_a_real_dependency() -> None:
+    """The GUI ships a Trash action (DuplicatesView -> handle_duplicates
+    action='trash'); its backend late-imports send2trash. That import failing
+    at runtime means a shipped button that always errors — which happened once
+    because send2trash wasn't declared anywhere. CI installs [dev] on top of
+    the base deps, so this import failing here = the dependency regressed."""
+    import send2trash  # noqa: F401
+    import tomllib
+    deps = tomllib.loads(
+        (Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["dependencies"]
+    assert any(d.startswith("send2trash") for d in deps), (
+        "send2trash must be in [project.dependencies] — the GUI Trash action "
+        "needs it at runtime, not just in the dev venv"
+    )
+
+
+def test_handle_duplicates_trash_action(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The permanent-removal branch, previously entirely untested: keeper
+    guard holds, dupes go to send2trash, the manifest journal records them,
+    summary counts deleted, and a missing file is an error not a crash."""
+    from vibechek import journal as journal_mod
+    from vibechek.duplicates import DuplicateGroup, DuplicateReport
+
+    monkeypatch.setattr(journal_mod, "JOURNALS_DIR", tmp_path / "journals")
+
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        (tmp_path / name).write_bytes(b"x" * 1000)
+    a, b, c = (_fi(str(tmp_path / n)) for n in ("a.mp3", "b.mp3", "c.mp3"))
+    gone = _fi(str(tmp_path / "gone.mp3"))  # never created on disk
+    report = DuplicateReport()
+    # b is a DUPLICATE in group 1 but the KEEPER of group 2 — the keeper guard
+    # must protect it from trashing exactly as it protects it from moving.
+    report.audio_duplicates = [
+        DuplicateGroup(method="chromaprint", key="g1", keep=a, duplicates=[b], recoverable_mb=0.0),
+        DuplicateGroup(method="chromaprint", key="g2", keep=b, duplicates=[c, gone], recoverable_mb=0.0),
+    ]
+
+    trashed: list[str] = []
+    import send2trash as send2trash_mod
+    monkeypatch.setattr(send2trash_mod, "send2trash", lambda p: trashed.append(p))
+
+    cfg = DuplicateConfig(action="trash", use_md5=False, use_chromaprint=True)
+    summary = handle_duplicates(report, cfg)
+
+    assert trashed == [str(tmp_path / "c.mp3")]
+    assert summary["deleted"] == 1
+    assert summary["errors"] == 1  # the missing file
+    assert any("gone.mp3" in m for m in summary["error_messages"])
+    # Keepers untouched on disk.
+    assert (tmp_path / "a.mp3").exists()
+    assert (tmp_path / "b.mp3").exists()
+    # The transparency manifest exists and records the trashed file.
+    jp = summary.get("journal_path")
+    assert jp, "trash must write a manifest journal"
+    text = Path(jp).read_text(encoding="utf-8")
+    assert "c.mp3" in text and "trash" in text

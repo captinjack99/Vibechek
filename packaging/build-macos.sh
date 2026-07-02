@@ -25,7 +25,10 @@ source .venv/bin/activate
 
 echo "Installing build deps..."
 python -m pip install --upgrade pip wheel
-python -m pip install -e . pyinstaller
+# Pin the PyInstaller major so collect_all()/onefile staging behaviour in
+# vibechek.spec stays reproducible across runs (same pin + rationale as
+# build-windows.bat; all three scripts feed the same spec).
+python -m pip install -e . "pyinstaller>=6,<7"
 
 echo "Running PyInstaller..."
 pyinstaller packaging/vibechek.spec --noconfirm --clean

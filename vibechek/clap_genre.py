@@ -33,9 +33,21 @@ _SEG_SECONDS = 20
 _SEG_FRACS = (0.25, 0.5, 0.75)
 _AMODEL = "HTSAT-base"
 _CHECKPOINT_NAME = "music_clap.pt"
+# Pinned to an IMMUTABLE HF revision + content hash. The checkpoint is a
+# PyTorch pickle loaded via torch.load (executable on load), hosted on a
+# third-party HF account — a mutable `main` ref was a remote-code-execution
+# path: whoever moves that branch replaces the file behind the same URL for
+# every user who runs setup. The SHA256 is verified after download (native +
+# WSL setup) AND before every load (load_clap_model). Both pins verified
+# 2026-07-02: the locally-validated checkpoint used by every accuracy run
+# matches HF's LFS oid for this revision byte-for-byte.
+_CHECKPOINT_REVISION = "b3708341862f581175dba5c356a4ebf74a9b6651"
 _CHECKPOINT_URL = (
-    "https://huggingface.co/lukewys/laion_clap/resolve/main/"
+    f"https://huggingface.co/lukewys/laion_clap/resolve/{_CHECKPOINT_REVISION}/"
     "music_audioset_epoch_15_esc_90.14.pt"
+)
+_CHECKPOINT_SHA256 = (
+    "fae3e9c087f2909c28a09dc31c8dfcdacbc42ba44c70e972b58c1bd1caf6dedd"
 )
 _DEFAULT_K = 15
 
@@ -176,6 +188,23 @@ def load_clap_model(checkpoint: Path | None = None, use_gpu: str = "auto") -> An
         raise RuntimeError(
             f"CLAP checkpoint not found at {ckpt}. Run the CLAP genre setup first."
         )
+    # The checkpoint is a pickle — torch.load executes what it deserializes —
+    # so verify the content hash on EVERY load, not just after download; a
+    # poisoned cached file must not ride in on reuse. load_ckpt is about to
+    # read the file in full anyway, so the extra sequential pass costs a few
+    # seconds and stays page-cached for sibling workers. An explicit
+    # `checkpoint` override (tests / power users bringing their own model)
+    # skips the pin — it only guards the managed default path.
+    if checkpoint is None:
+        from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
+
+        try:
+            verify_model_sha256(ckpt, _CHECKPOINT_SHA256)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"CLAP checkpoint failed its integrity check ({e}). Delete "
+                f"{ckpt} and re-run the CLAP genre setup to re-download it."
+            ) from e
     try:
         import laion_clap  # noqa: PLC0415
     except ImportError as e:

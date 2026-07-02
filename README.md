@@ -38,10 +38,12 @@ _Verified 2026-05-29 — sources + caveats in [docs/COMPETITORS.md](docs/COMPETI
 | Preserves Rekordbox GEOB/PRIV cue frames | ✅ | n/a | sync only | native | — | n/a |
 | Works offline, no account | ✅ | online+acct | paid acct | acct | ✅ | web app |
 | Open source | **AGPL-3.0** | — | — | — | — | — |
-| GPU acceleration | ✅ | — | — | — | — | — |
+| GPU acceleration | ✅² | — | — | — | — | — |
 | Price | **$0** | $58 once | $10-20/mo or $199-399 once | $0-36/mo | €34.95 once | freemium |
 
 ¹ Rekordbox's HIGH/MID/LOW is a track-structure label, not an energy rating.
+
+² NVIDIA CUDA is validated (WSL/Linux, both the essentia-tensorflow and ONNX engines). AMD (ROCm) and Apple (CoreML) are wired via the opt-in ONNX engine but hardware-unverified. The Windows-default native engine bundles CPU-only ONNX Runtime — switch to the ONNX engine for GPU there.
 
 The honest gaps none of them fill: **ML genre/subgenre auto-detection** and **timeslot tagging** — no tool here does either — plus being **local-first, open source, and $0**. Several do more than they're sometimes credited for (Lexicon and beaTunes both have acoustic de-dup; Lexicon organizes into genre folders too), so Vibechek's pitch is the *combination*, run locally and for free, not a checklist nobody else can touch.
 
@@ -94,7 +96,7 @@ Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to s
 
 Better yet: **hybrid analysis runs your GPU and your spare CPU cores at the same time.** A modest laptop GPU might only fit ~3 analysis workers in VRAM, which used to leave 16 CPU cores idle. Now Vibechek runs GPU workers *and* CPU workers against one shared work queue that self-balances — whichever device finishes a track grabs the next. On an RTX 4070 Laptop + i9, a 50-track run split GPU 9 / CPU 41 and used every resource at once. Toggle it in Settings.
 
-There's also a selectable **ONNX Runtime inference engine** (Settings → Analysis → **Inference engine**, opt-in) that runs the same models with **cross-vendor GPU acceleration** and **drops the end-of-life TensorFlow runtime entirely** (it runs on plain Essentia + ONNX Runtime + converted heads, in a separate `~/.vibechek/venv-onnx`). **NVIDIA CUDA is validated** (the backbone runs GPU-accelerated on an RTX 4070, TF-free); **AMD (ROCm, native Linux) and Apple (CoreML) are wired** via ONNX Runtime's execution-provider chain. On Windows the ONNX path runs inside WSL too, because Essentia has no Windows wheel. Validated to match the default engine on real tracks. The default stays essentia-tensorflow; flip it in Settings and click **Set up ONNX engine** to provision it (the installer auto-picks the GPU runtime for your hardware). Extras: `vibechek[onnx]` (CPU) and `vibechek[onnx-gpu]`.
+There's also a selectable **ONNX Runtime inference engine** (Settings → Analysis → **Inference engine**, opt-in) that runs the same models with **cross-vendor GPU acceleration** and **drops the end-of-life TensorFlow runtime entirely** (it runs on plain Essentia + ONNX Runtime + converted heads, in a separate `~/.vibechek/venv-onnx`). **NVIDIA CUDA is validated** (the backbone runs GPU-accelerated on an RTX 4070, TF-free); **AMD (ROCm, native Linux) and Apple (CoreML) are wired** via ONNX Runtime's execution-provider chain. On Windows the ONNX path runs inside WSL, because Essentia has no Windows wheel — the WSL-free native default is a separate, CPU-only path. Validated to match the default engine on real tracks. The default engine is the bundled native engine on Windows and essentia-tensorflow on macOS/Linux; flip to ONNX in Settings and click **Set up ONNX engine** to provision it (the installer auto-picks the GPU runtime for your hardware). Extras: `vibechek[onnx]` (CPU) and `vibechek[onnx-gpu]`.
 
 ### Undo that survives a crash mid-run
 
@@ -116,9 +118,9 @@ Older CDJs (CDJ-2000nexus and earlier) can't read FLAC. `vibechek cdj-export <re
 
 Every other tool we benchmarked makes you set up Python or pip or some random runtime by hand on some systems. Vibechek is the only one where the GUI does it for you on **every OS**:
 
-- **Windows.** Essentia has no Windows wheel. Vibechek detects that, auto-installs WSL Ubuntu via UAC, creates a venv inside WSL, installs Essentia, and routes analysis through it — paths get translated `C:\Music` ↔ `/mnt/c/Music` under the hood. You click *Install Essentia*; the right thing happens.
+- **Windows.** The desktop installer bundles a WSL-free native engine (essentia + ONNX Runtime folded into the sidecar) and defaults to it, so a fresh install analyzes fully in-process — no WSL, nothing to set up. Click *Analyze* and it runs. WSL is only the fallback: a lean CLI zip / pip install, or the essentia-tensorflow and ONNX engines, still auto-install WSL Ubuntu via UAC and route through it with transparent path translation (`C:\Music` ↔ `/mnt/c/Music`).
 - **macOS & Linux.** Vibechek creates a hermetic Python venv at `~/.vibechek/venv/`, installs `essentia-tensorflow + vibechek` into it, and routes analysis through that venv. Doesn't touch your system Python. Click *Install Essentia* in the Preflight dialog; ~3-5 minutes later it's running.
-- **GPU on any of the above.** Full GPU support across all OS platforms.
+- **GPU where it's available.** NVIDIA CUDA is validated on Linux and (via WSL) Windows, on both engines. AMD (ROCm) and Apple (CoreML) run through the opt-in ONNX engine but are hardware-unverified. The Windows-default native engine is CPU-only — switch to the ONNX engine in Settings for GPU there.
 
 No terminal required. On any platform.
 
@@ -147,10 +149,10 @@ vibechek revert <journal>        # undo an organize/dedupe move
 
 **End users.** Grab the installer for your OS from the [Releases page](https://github.com/captinjack99/Vibechek/releases). The first time you click *Analyze*, the in-app setup walks you through everything missing:
 
-- **Windows** → auto-installs WSL Ubuntu (UAC prompt), Vibechek + Essentia inside it, then optionally CUDA libs for GPU acceleration.
+- **Windows** → nothing to install. The desktop installer bundles the WSL-free native engine and defaults to it, so *Analyze* runs in-process on a fresh install. (Fallback for the CLI zip / pip installs, or the essentia-tensorflow / ONNX engines: the in-app setup auto-installs WSL Ubuntu (UAC prompt), Vibechek + Essentia inside it, then optionally CUDA libs for GPU.)
 - **macOS / Linux** → creates a managed venv at `~/.vibechek/venv/` and installs Essentia + Vibechek into it. Doesn't touch your system Python.
 
-Either way: ~5-10 minutes total, no terminal, no `pip` to remember. Full walkthrough: [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
+macOS/Linux setup is ~5-10 minutes total, no terminal, no `pip` to remember; Windows is instant. Full walkthrough: [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
 
 > **macOS (beta builds are unsigned):** the `.dmg` isn't notarized yet, so on first launch macOS says *"Vibechek is damaged / can't be verified."* It isn't — it's just unsigned. Right-click **Vibechek.app → Open → Open**, or run `xattr -dr com.apple.quarantine /Applications/Vibechek.app` once. Signed + notarized builds land with the stable release.
 
@@ -222,10 +224,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**1034 Python tests** · **49 JSON-RPC methods** · **36 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**1052 Python tests** · **49 JSON-RPC methods** · **36 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 98 frontend tests across 14 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
+- 104 frontend tests across 14 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 

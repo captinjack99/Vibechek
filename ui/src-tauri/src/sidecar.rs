@@ -116,6 +116,19 @@ struct Inner {
     /// All subsequent `call()`s fail fast instead of hanging until the
     /// per-method timeout deadline (`timeout_for`).
     dead: AtomicBool,
+    /// One-shot trigger telling the wait task to kill a still-running child.
+    /// Fired by `mark_dead_and_drain`: once we've declared the sidecar dead
+    /// and told the user "in-flight request aborted", the process must not
+    /// keep running (and possibly keep mutating the user's files).
+    kill_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    /// `ready`/`notify` fire at sidecar startup, typically BEFORE the webview
+    /// has mounted and registered its event listeners — and Tauri events are
+    /// not queued for late subscribers, so a fast sidecar start silently
+    /// dropped the install-path hang warning. Buffer them here until the
+    /// frontend's one-time drain (`drain_startup_notifications`); after the
+    /// drain, notifications emit live (the frontend is listening by then).
+    startup_events: Mutex<Vec<Value>>,
+    startup_drained: AtomicBool,
 }
 
 impl Inner {
@@ -206,6 +219,16 @@ impl SidecarHandle {
             },
         }
     }
+
+    /// Return (and clear) the buffered startup notifications, flipping the
+    /// buffer into live-emit mode. Called once by the frontend after mount.
+    /// The flag flips under the buffer lock so an event arriving concurrently
+    /// is either included in the drain or emitted live — never lost.
+    pub async fn drain_startup_notifications(&self) -> Vec<Value> {
+        let mut buf = self.inner.startup_events.lock().await;
+        self.inner.startup_drained.store(true, Ordering::Release);
+        std::mem::take(&mut *buf)
+    }
 }
 
 /// Spawn the sidecar and start its background reader task.
@@ -233,6 +256,11 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
         // Belt-and-suspenders: also force stdio encoding for any sub-process
         // the sidecar spawns (PyInstaller may not honor PYTHONUTF8 itself).
         .env("PYTHONIOENCODING", "utf-8")
+        // Backstop: if the wait task is ever dropped with the child still
+        // running (tokio runtime shutdown at app exit), kill the child rather
+        // than leak a live Python process that keeps running ML jobs — and
+        // possibly writing tags — with nobody draining its pipes.
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -252,45 +280,79 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
         .take()
         .ok_or_else(|| anyhow!("sidecar stderr was not captured"))?;
 
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
     let inner = Arc::new(Inner {
         next_id: AtomicU64::new(1),
         pending: Mutex::new(HashMap::new()),
         stdin: Mutex::new(stdin),
         binary_path: binary,
         dead: AtomicBool::new(false),
+        kill_tx: std::sync::Mutex::new(Some(kill_tx)),
+        startup_events: Mutex::new(Vec::new()),
+        startup_drained: AtomicBool::new(false),
     });
 
-    // stderr reader: just log everything so users can diagnose Python errors
+    // stderr reader: log everything so users can diagnose Python errors.
+    // Read RAW bytes and lossy-decode instead of `lines()`: tokio's `lines()`
+    // returns Err(InvalidData) on a non-UTF-8 line — and stderr is exactly
+    // where native TF/CUDA/essentia code printf's raw bytes — after which the
+    // old `while let Ok(Some(..))` loop exited and NOTHING drained the pipe.
+    // The OS pipe buffer then filled and the sidecar's next stderr write
+    // blocked forever (a silent wedge). Lossy decoding can never error the
+    // loop out; we keep consuming stderr for as long as the child lives.
     tauri::async_runtime::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            eprintln!("[sidecar] {line}");
+        let mut reader = BufReader::new(stderr);
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) => break, // EOF — child closed stderr
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    eprintln!("[sidecar] {}", line.trim_end_matches(['\r', '\n']));
+                }
+                Err(e) => {
+                    // A genuine I/O error (not bad UTF-8 — lossy decoding
+                    // can't fail): the pipe itself is gone, nothing left to
+                    // drain.
+                    eprintln!("[sidecar] stderr read error: {e}");
+                    break;
+                }
+            }
         }
     });
 
     // stdout reader: demux responses + re-emit notifications. When the stream
-    // hits EOF (Ok(None)) the sidecar is dead — flip the dead flag and drain
-    // all pending oneshots so in-flight calls fail immediately instead of
-    // hanging until the 1-hour RPC timeout.
+    // hits EOF the sidecar is dead — flip the dead flag and drain all pending
+    // oneshots so in-flight calls fail immediately instead of hanging until
+    // the 1-hour RPC timeout. Raw bytes + lossy decode for the same reason as
+    // stderr above: native code occasionally writes raw (possibly non-UTF-8)
+    // bytes to fd 1, and a `lines()` Err aborted this loop — killing response
+    // demuxing for the rest of the app's life while the sidecar lived on. A
+    // lossy-decoded noise line simply fails JSON parsing and is skipped; real
+    // JSON-RPC frames from the sidecar are always valid UTF-8.
     {
         let inner = inner.clone();
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
+            let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
             loop {
-                match reader.next_line().await {
-                    Ok(Some(line)) => {
-                        if let Err(e) = handle_message(&inner, &app, &line).await {
-                            eprintln!("dispatch error on '{line}': {e}");
-                        }
-                    }
-                    Ok(None) => {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => {
                         eprintln!(
                             "sidecar stdout EOF — process is dead (binary: {})",
                             inner.binary_path
                         );
                         mark_dead_and_drain(&inner).await;
                         break;
+                    }
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&buf).into_owned();
+                        if let Err(e) = handle_message(&inner, &app, &line).await {
+                            eprintln!("dispatch error on '{line}': {e}");
+                        }
                     }
                     Err(e) => {
                         eprintln!(
@@ -307,19 +369,34 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
 
     // Wait task: log when child exits (so users see it in dev). Also flip the
     // dead flag in case the child exited without closing stdout cleanly (rare,
-    // but belt-and-suspenders).
+    // but belt-and-suspenders). The `select!` doubles as the kill path: when
+    // `mark_dead_and_drain` fires `kill_tx` (stdout error/EOF with the process
+    // still alive), we terminate the child — a sidecar we've told the user is
+    // dead ("in-flight request aborted; restart the app") must not keep
+    // running its long op and mutating files, and with its stdout no longer
+    // drained it would eventually wedge on a full pipe anyway.
     {
         let inner = inner.clone();
         tauri::async_runtime::spawn(async move {
-            match child.wait().await {
-                Ok(status) => eprintln!(
-                    "sidecar exited with {status} (binary: {})",
-                    inner.binary_path
-                ),
-                Err(e) => eprintln!(
-                    "sidecar wait failed: {e} (binary: {})",
-                    inner.binary_path
-                ),
+            tokio::select! {
+                status = child.wait() => match status {
+                    Ok(status) => eprintln!(
+                        "sidecar exited with {status} (binary: {})",
+                        inner.binary_path
+                    ),
+                    Err(e) => eprintln!(
+                        "sidecar wait failed: {e} (binary: {})",
+                        inner.binary_path
+                    ),
+                },
+                _ = kill_rx => {
+                    eprintln!(
+                        "killing sidecar that was declared dead (binary: {})",
+                        inner.binary_path
+                    );
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
             }
             mark_dead_and_drain(&inner).await;
         });
@@ -333,6 +410,12 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
 /// path; the second call's drain just finds an empty map.
 async fn mark_dead_and_drain(inner: &Arc<Inner>) {
     inner.mark_dead();
+    // Ask the wait task to kill the child if it's still running (no-op when
+    // the child already exited — the select's wait branch consumed the
+    // receiver and this send just fails). take() makes it one-shot.
+    if let Some(tx) = inner.kill_tx.lock().expect("kill_tx lock poisoned").take() {
+        let _ = tx.send(());
+    }
     // Take ownership of the pending map under the lock, then drop the lock
     // before iterating so handlers calling back into call() don't deadlock.
     let drained: HashMap<u64, oneshot::Sender<Value>> = {
@@ -429,8 +512,27 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
     // Notification: emit as Tauri event. Includes `progress` (long ops),
     // `ready` (startup), and `notify` (startup warnings).
     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
-        let event_name = format!("sidecar:{method}");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        // Startup notifications (`ready`/`notify`) fire before the webview has
+        // registered its listeners; Tauri does not queue events for late
+        // subscribers, so emitting them live would drop them on a fast sidecar
+        // start. Buffer until the frontend's one-time drain. The flag is
+        // re-checked under the buffer lock so a drain racing this push either
+        // includes the event or leaves us to emit it live — never both/neither.
+        if (method == "ready" || method == "notify")
+            && !inner.startup_drained.load(Ordering::Acquire)
+        {
+            let mut buf = inner.startup_events.lock().await;
+            if !inner.startup_drained.load(Ordering::Acquire) {
+                if buf.len() < 64 {
+                    buf.push(json!({ "method": method, "params": params }));
+                }
+                return Ok(());
+            }
+        }
+
+        let event_name = format!("sidecar:{method}");
         app.emit(&event_name, params)
             .with_context(|| format!("emit {event_name}"))?;
     }
@@ -446,11 +548,15 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
 fn log_native_noise(line: &str) {
     // Truncate long lines so a giant stack dump or binary blob doesn't fill
     // the user's terminal. 200 chars is enough to identify the source.
-    let truncated = if line.len() > 200 {
-        format!("{}…", &line[..200])
-    } else {
-        line.to_string()
-    };
+    // Truncate by CHARS, not bytes: `&line[..200]` panics when byte 200 is
+    // not a UTF-8 char boundary — and native noise is exactly where non-ASCII
+    // (Cyrillic/CJK/accented track paths) shows up. That panic unwound the
+    // stdout reader task, silently killing response demuxing for the rest of
+    // the app's life.
+    let mut truncated: String = line.chars().take(200).collect();
+    if truncated.len() < line.len() {
+        truncated.push('…');
+    }
     eprintln!("[sidecar stdout noise, ignored] {truncated}");
 }
 

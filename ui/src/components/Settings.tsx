@@ -691,7 +691,20 @@ export function Settings() {
               { id: "essentia_tf", label: "Essentia · TensorFlow" },
               { id: "onnx", label: "ONNX Runtime" },
               { id: "native", label: "Native · no WSL" },
-            ] as const).map(({ id, label }) => (
+            ] as const)
+              // "Native" is the Windows-installer engine (bundled essentia
+              // wheel, in-process). On Linux/macOS the onnx engine IS the
+              // in-process path and the backend snaps a saved "native" back
+              // to the platform default — offering the button there let users
+              // select an engine whose venvs don't exist. UA check answers
+              // immediately; the preflight result confirms it once loaded.
+              .filter(
+                ({ id }) =>
+                  id !== "native" ||
+                  (preflightResult?.wsl?.is_windows ??
+                    navigator.userAgent.includes("Windows")),
+              )
+              .map(({ id, label }) => (
               <button
                 key={id}
                 onClick={() => updateAnalysis({ inference_engine: id })}

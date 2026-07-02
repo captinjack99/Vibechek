@@ -53,9 +53,15 @@ You get two big buttons:
 - **Just show me my library** — instant. Reads filenames and any existing tags. No ML, no waiting. Use this if you mostly want to browse, dedupe, or organize.
 - **Analyze with ML** — the full ML pass. Reads every file, runs all the models, gives you genre / mood / energy / BPM / key / direction / vocal for every track. On a 12k-track library this takes roughly 1-3 hours on CPU, much less with a GPU — and Vibechek can run **hybrid CPU+GPU** to use both at once. Tracks stream into the list as they finish, and it's cancellable any time.
 
-### Step 2 — (Windows only) Auto-setup if needed
+### Step 2 — (Windows) Setup, only if needed
 
-The first time you click **Analyze with ML** on Windows, a dialog appears showing what's missing:
+On Windows the desktop app ships a **bundled native analysis engine** and uses it by
+default, so a fresh install just starts analyzing — nothing to install. Skip to Step 3.
+
+Setup only appears on a fallback path: the CLI zip, or after you switch to the
+essentia-tensorflow / ONNX engine, or turn on the opt-in CLAP / online-resolver genre
+engines (which still run through WSL on Windows). Then the first time you click
+**Analyze with ML** a dialog shows what's missing:
 
 - **WSL not installed?** → click "Install WSL + Ubuntu". You'll get a UAC prompt (this is Windows enabling a system feature). 5-15 minutes.
 - **Vibechek + Essentia not in WSL?** → click "Install in Ubuntu". 3-5 minutes. No prompts.
@@ -350,7 +356,15 @@ All changes auto-save 500ms after you stop typing/dragging. No "Save" button.
 
 **Settings → Analysis → Inference engine** picks how the ML models run:
 
-- **Essentia · TensorFlow** (default) — the bundled, NVIDIA-only path.
+- **Native** (default on Windows) — a WSL-free, fully in-process engine: a DSP-only
+  native Essentia wheel (decode/BPM/key) + a pure-NumPy mel frontend + ONNX Runtime
+  inference. Bundled into the Windows desktop installer, so a fresh Windows install
+  analyzes with zero setup. CPU-only (the bundle ships CPU ONNX Runtime); switch to
+  ONNX for GPU. macOS/Linux don't need it — they're already native via the ONNX
+  engine. (The opt-in CLAP / online-resolver genre engines aren't supported on the
+  native engine; switch to ONNX or essentia-tensorflow to use them.)
+- **Essentia · TensorFlow** (default on macOS/Linux; runs in WSL on Windows) — the
+  bundled, NVIDIA-only path.
 - **ONNX Runtime** — runs the *same* models through ONNX Runtime on **plain
   Essentia with no TensorFlow at all**. Two draws. First, **cross-vendor GPU
   acceleration**: NVIDIA CUDA, AMD ROCm, and Apple CoreML, not just NVIDIA.
@@ -421,7 +435,11 @@ displays alongside Vibechek's energy without being mixed into it.
 
 ### Analyze fails with "essentia not installed" on Windows
 
-The Preflight dialog should be handling this for you. If you closed it, click Analyze again — it'll re-open. The dialog will walk you through:
+A fresh desktop install shouldn't see this — it uses the bundled native engine with
+no setup. It appears on a fallback path (the CLI zip, or after switching to the
+essentia-tensorflow / ONNX engine, or the CLAP / online-resolver genre engines).
+The Preflight dialog should be handling it for you. If you closed it, click Analyze
+again — it'll re-open. The dialog will walk you through:
 1. Installing WSL Ubuntu (one-time, ~5-15 min, UAC prompt)
 2. Installing Vibechek + Essentia inside WSL (3-5 min, no prompts)
 3. Downloading the ML models (~800 MB, a couple of minutes)

@@ -32,7 +32,7 @@ ui/
 ┌────────────────────────────────────────────────────────┐
 │  React frontend (Vite)                                 │
 │  - Zustand stores, virtualized track list, settings UI │
-│  - 98 vitest tests (Tauri APIs mocked in setup)        │
+│  - 104 vitest tests (Tauri APIs mocked in setup)        │
 └──────────────────────────┬─────────────────────────────┘
                            │ Tauri invoke("rpc_call", method, params)
                            ▼
@@ -141,7 +141,7 @@ First Tauri compile is 10-15 minutes (downloads + builds ~400 MB of crates). Sub
 
 ```bash
 cd ui
-npm test           # vitest run — 98 tests
+npm test           # vitest run — 104 tests
 npm run test:watch # watch mode
 npm run test:ui    # web UI for tests
 ```
@@ -212,6 +212,7 @@ JSON-RPC 2.0, one message per line on stdin/stdout. 49 methods. See [`vibechek/r
 | `find_duplicates`, `handle_duplicates` | Dedup scan + execute |
 | `plan_organization`, `organize` | Genre-folder reorganization |
 | `list_journals`, `revert_journal` | Operation undo (organize/dedupe) |
+| `resolve_genre_conflicts`, `import_tag_priors` | Trust-UX review queue — batch approve/revert reviewed genre conflicts; import a Rekordbox collection XML as tag-tier priors (both persist to the saved analysis, never write file tags) |
 | `apply_ml_tags` | Write ML results to file tags (per-field toggles + vocal cutoffs) |
 | `backup_tags`, `restore_tags`, `restore_tags_with_remap` | Snapshot + replay |
 | `rename_library`, `tag_library` | Recent-library maintenance |

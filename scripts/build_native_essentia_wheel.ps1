@@ -57,12 +57,22 @@ Write-Host "==> Target Python: $Python"
 if (-not (Test-Path $fork)) {
     Write-Host "==> Cloning wo80/essentia ($ForkRef)"
     git clone --depth 1 -b $ForkRef https://github.com/wo80/essentia.git $fork
+    # $ErrorActionPreference='Stop' does NOT apply to native commands — an
+    # unchecked failed clone left an empty/partial dir that every later step
+    # tripped over with misleading errors.
+    if ($LASTEXITCODE -ne 0) { throw "git clone of wo80/essentia ($ForkRef) failed (exit $LASTEXITCODE)" }
 }
 
 Write-Host "==> Building C/C++ dependencies (Release)"
 $bat = Join-Path $fork "packaging\build-dependencies-msvc.bat"
 $p = Start-Process -FilePath cmd.exe -ArgumentList "/c `"$bat`" --build-type Release" `
     -WorkingDirectory (Join-Path $fork "packaging") -NoNewWindow -Wait -PassThru
+# The exit code is the primary gate. The header probe alone let a warm WorkDir
+# pass on fftw3.h from a PREVIOUS run even when a later dependency (TagLib,
+# Chromaprint, the FFmpeg fetch) just failed — proceeding then either died
+# later with a misleading cmake/link error or silently linked stale cached
+# libs into the shipped wheel.
+if ($p.ExitCode -ne 0) { throw "Dependency build failed (exit $($p.ExitCode)) — see the log above" }
 if (-not (Test-Path (Join-Path $prefix "include\fftw3.h"))) { throw "Dependency build incomplete: $prefix missing headers" }
 
 Write-Host "==> Configuring essentia (DSP-only, Python bindings)"

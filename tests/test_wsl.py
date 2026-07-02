@@ -27,7 +27,7 @@ from vibechek.wsl import (
 )
 
 
-@pytest.mark.parametrize("engine", ["essentia_tf", "onnx"])
+@pytest.mark.parametrize("engine", ["essentia_tf", "onnx", "native"])
 def test_user_bootstrap_force_reinstalls_vibechek(engine: str) -> None:
     """Re-running 'Set up WSL' must clear version drift. A plain
     `pip install --upgrade git+...` does NOT re-pull a VCS install once a
@@ -42,6 +42,61 @@ def test_user_bootstrap_force_reinstalls_vibechek(engine: str) -> None:
     # Force-reinstall is scoped to the package (deps handled by the prior line)
     # so a re-run doesn't drag essentia-tensorflow down again.
     assert "--no-deps" in script
+
+
+def test_user_bootstrap_pins_vibechek_to_this_builds_release_tag() -> None:
+    """The engine install (and the drift auto-update that reuses it) is a
+    de-facto auto-updater. It must install THIS build's release tag, never
+    `main` HEAD: tracking main was a supply-chain hole AND could install code
+    newer than the sidecar with an incompatible wire schema."""
+    from vibechek import __version__
+
+    for engine in ("essentia_tf", "onnx", "native"):
+        script = _user_bootstrap(engine)
+        assert f"Vibechek.git@v{__version__}" in script
+        # No unpinned form anywhere in the script.
+        assert "Vibechek.git\n" not in script
+        assert "Vibechek.git " not in script
+
+
+def test_upgrade_script_pins_vibechek_to_this_builds_release_tag() -> None:
+    """Same pin for the fast drift-repair path: the guard's goal is 'WSL ==
+    sidecar', so the upgrade must converge on exactly the sidecar's version."""
+    from vibechek import __version__
+    from vibechek.wsl import _vibechek_upgrade_script
+
+    script = _vibechek_upgrade_script("venv-onnx")
+    assert f"Vibechek.git@v{__version__}" in script
+
+
+@pytest.mark.parametrize(
+    ("engine", "expected"),
+    [
+        ("essentia_tf", "venv"),
+        ("onnx", "venv-onnx"),
+        ("native", "venv-onnx"),
+    ],
+)
+def test_engine_venv_subdir_single_mapping(engine: str, expected: str) -> None:
+    """ONE shared engine→venv mapping. The native engine's WSL fallback was
+    split-brained: preflight validated venv-onnx while install/dispatch/
+    upgrade/status hand-rolled `== "onnx"` and targeted "venv" — so installs
+    dead-ended and analyze crashed after preflight said READY. Every venv
+    chooser must route through config.engine_venv_subdir."""
+    from vibechek.config import engine_venv_subdir
+
+    assert engine_venv_subdir(engine) == expected
+
+
+def test_user_bootstrap_native_installs_the_onnx_stack_into_venv_onnx() -> None:
+    """engine="native" (WSL fallback) runs the same ONNX stack as "onnx":
+    plain essentia + onnxruntime in venv-onnx. Installing essentia-tensorflow
+    into "venv" for it produced an install preflight(native) ignores — a
+    10-minute setup that still reported 'not ready'."""
+    script = _user_bootstrap("native")
+    assert ".vibechek/venv-onnx" in script
+    assert "onnxruntime" in script
+    assert "essentia-tensorflow" not in script
 
 
 def test_upgrade_rpc_forwards_selected_engine() -> None:

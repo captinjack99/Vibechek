@@ -51,6 +51,19 @@ if defined VIBECHEK_NATIVE_WHEEL (
     echo VIBECHEK_NATIVE_WHEEL not set - building without the native engine bundle.
 )
 
+REM Release gate: the native engine is the WINDOWS DEFAULT since v0.6.3, so a
+REM tagged release build must not silently ship without it. release.yml sets
+REM VIBECHEK_REQUIRE_NATIVE=1 on tag refs; when set, a missing/unimportable
+REM native bundle fails the build here (fast, before the PyInstaller freeze)
+REM instead of degrading to the lean CLI. Local/dispatch builds leave it unset
+REM and keep the best-effort behaviour above.
+if defined VIBECHEK_REQUIRE_NATIVE if not defined VIBECHEK_NATIVE_BUNDLED (
+    echo ERROR: VIBECHEK_REQUIRE_NATIVE is set but the native engine did not bundle
+    echo ^(wheel missing or essentia not importable^). Native is the Windows default
+    echo engine - refusing to build a release without it.
+    exit /b 1
+)
+
 echo Running PyInstaller...
 pyinstaller packaging\vibechek.spec --noconfirm --clean || exit /b 1
 

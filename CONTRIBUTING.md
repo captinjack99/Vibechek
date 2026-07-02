@@ -47,8 +47,11 @@ pytest -v                          # all tests
 pytest tests/test_organizer.py -v  # single file
 pytest --cov=vibechek              # with coverage
 
-# Lint + format check
+# Lint (CI-enforced)
 ruff check vibechek tests
+
+# Format check (optional, local only — CI does NOT run ruff format, so
+# formatting stays non-blocking)
 ruff format --check vibechek tests
 
 # Frontend
@@ -58,7 +61,7 @@ npm run typecheck                  # tsc --noEmit
 npm run build                      # production bundle
 ```
 
-CI runs all of the above. A PR with red CI will not be reviewed until it's green or you've explained why a failure is unrelated.
+CI runs everything above except `ruff format --check` — formatting is deliberately non-blocking, so that step is a local convenience only. A PR with red CI will not be reviewed until it's green or you've explained why a failure is unrelated.
 
 ---
 

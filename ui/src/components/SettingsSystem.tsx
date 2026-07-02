@@ -19,6 +19,7 @@ import {
   Wrench,
   Zap,
 } from "lucide-react";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { useNotificationStore } from "../stores";
 import { newOpId, progressMatches } from "../stores/operation";
 import { isCancellation, rpc, useSidecarProgress } from "../hooks/useSidecar";
@@ -42,11 +43,62 @@ function Skeleton({ rows = 2 }: { rows?: number }) {
 }
 
 /**
+ * In-app auto-update is DELIBERATELY OFF until release signing is funded:
+ * tauri.conf.json ships `createUpdaterArtifacts: false` and a placeholder
+ * updater pubkey, and no latest.json is published — so tauri-plugin-updater's
+ * check() 404s on EVERY click, including when a newer release genuinely
+ * exists. While that's the case, the live check UI is a lie; render an honest
+ * "download from GitHub Releases" affordance instead. Flip this flag together
+ * with the three enablement steps in docs/RELEASING.md ("Auto-update +
+ * signing setup") — all of them are required for the live section to work.
+ */
+const UPDATER_ENABLED = false;
+
+const RELEASES_URL = "https://github.com/captinjack99/Vibechek/releases";
+
+/**
  * Software updates: a non-intrusive "Check for updates" affordance backed by
  * tauri-plugin-updater. No-ops cleanly outside the Tauri shell (dev browser /
  * tests) — the button simply reports "up to date".
  */
 export function UpdatesSection() {
+  if (!UPDATER_ENABLED) return <UpdatesSectionGated />;
+  return <UpdatesSectionLive />;
+}
+
+/** The honest OFF state: no always-failing button, just where updates live. */
+function UpdatesSectionGated() {
+  return (
+    <Section
+      icon={<RefreshCw className="w-5 h-5" />}
+      title="Software updates"
+      subtitle=""
+    >
+      <div className="text-sm text-white/60">
+        Automatic in-app updates aren't enabled for beta builds yet — new
+        versions are published on GitHub Releases.
+      </div>
+      <div className="mt-2">
+        <button
+          className="btn-ghost"
+          onClick={() => void openUrl(RELEASES_URL)}
+          title={RELEASES_URL}
+        >
+          <Download className="w-4 h-4" />
+          Open GitHub Releases
+        </button>
+      </div>
+      <Hint>
+        Auto-update ships once release signing is set up — the updater refuses
+        anything it can't cryptographically verify, and beta builds aren't
+        signed yet. Until then: download the new installer and run it over the
+        old one. Your settings, saved analyses, and backups are kept.
+      </Hint>
+    </Section>
+  );
+}
+
+function UpdatesSectionLive() {
   const { state, supported, checkForUpdate, downloadAndInstall } = useUpdater();
   const busy = state.phase === "checking"
     || state.phase === "downloading"

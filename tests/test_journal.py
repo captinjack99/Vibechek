@@ -86,6 +86,10 @@ def test_revert_moves_files_back(_isolate_journals, tmp_path) -> None:
     assert summary["errors"] == 0
     assert src.exists() and not dst.exists()
     assert src.read_bytes() == b"audio"
+    # (current, restored) pairs let the GUI rewrite its in-memory track paths
+    # back — without them every post-undo Preview/tag-apply pointed at the
+    # dead destination path until a manual re-scan.
+    assert summary["reverted_pairs"] == [(str(dst), str(src))]
 
 
 def test_revert_skips_when_origin_occupied(_isolate_journals, tmp_path) -> None:
@@ -109,6 +113,8 @@ def test_revert_skips_when_origin_occupied(_isolate_journals, tmp_path) -> None:
     # Neither file clobbered.
     assert src.read_bytes() == b"NEW FILE at original path"
     assert dst.read_bytes() == b"moved"
+    # A skipped move must NOT claim a path rewrite — the file didn't move.
+    assert summary["reverted_pairs"] == []
 
 
 def test_revert_skips_missing_destination(_isolate_journals, tmp_path) -> None:

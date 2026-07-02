@@ -62,9 +62,12 @@ def _venv_dir(engine: str = "essentia_tf") -> Path:
     "essentia_tf" → ``~/.vibechek/venv`` (essentia-tensorflow). "onnx" →
     ``~/.vibechek/venv-onnx`` (plain essentia + onnxruntime). The two essentia
     builds can't coexist in one venv (both ship the ``essentia`` module), so
-    the ONNX engine gets its own.
+    the ONNX engine gets its own. "native" (Windows-only; config snaps it back
+    to the platform default on Linux/macOS) maps to venv-onnx defensively —
+    it runs the same ONNX stack, so probing/validating the essentia_tf venv
+    for it would approve an environment that can't serve the engine.
     """
-    return VENV_DIR.parent / "venv-onnx" if engine == "onnx" else VENV_DIR
+    return VENV_DIR.parent / "venv-onnx" if engine in ("onnx", "native") else VENV_DIR
 
 
 @dataclass
@@ -365,7 +368,11 @@ def install_essentia_native(
     # ---- Step 4: vibechek itself ----
     if on_progress:
         on_progress(85, 100, "Installing vibechek...")
-    source = vibechek_source or "git+https://github.com/captinjack99/Vibechek.git"
+    # Pinned to this build's release tag (see config.vibechek_pip_source) —
+    # the managed-venv install must not silently track `main` HEAD.
+    from vibechek.config import vibechek_pip_source  # noqa: PLC0415
+
+    source = vibechek_source or vibechek_pip_source()
     rc, tail = _run_with_progress(
         [*venv_pip, "install", "--upgrade", source],
         on_progress=lambda line: on_progress and on_progress(90, 100, line[:120]),
@@ -734,25 +741,28 @@ def run_vibechek_in_native_venv(
 _CLAP_MIN_CKPT_BYTES = 1_500_000_000
 
 
-def _ollama_tarball() -> tuple[str, str]:
-    """(url, kind) of the pinned no-sudo Ollama tarball for this OS/arch.
+def _ollama_tarball() -> tuple[str, str, str | None]:
+    """(url, kind, sha256) of the pinned no-sudo Ollama tarball for this OS/arch.
 
-    Single-sources the release pin from `vibechek.wsl` (the WSL setup installs
-    the same build). Linux ships `.tar.zst` (CUDA/ROCm libs bundled; extracts
-    `bin/ollama` + `lib/` into ~/ollama); macOS ships a plain `.tgz` holding
-    the bare universal `ollama` binary at the tar root (verified against the
-    v0.30.4 asset), which we land at ~/ollama/bin/ollama ourselves.
+    Single-sources the release pin + per-asset SHA256 from `vibechek.wsl` (the
+    WSL setup installs the same build). Linux ships `.tar.zst` (CUDA/ROCm libs
+    bundled; extracts `bin/ollama` + `lib/` into ~/ollama); macOS ships a
+    plain `.tgz` holding the bare universal `ollama` binary at the tar root
+    (verified against the v0.30.4 asset), which we land at ~/ollama/bin/ollama
+    ourselves.
     """
     import platform as _platform  # noqa: PLC0415
 
-    from vibechek.wsl import _OLLAMA_RELEASE  # noqa: PLC0415
+    from vibechek.wsl import _OLLAMA_RELEASE, _OLLAMA_TARBALL_SHA256  # noqa: PLC0415
 
     base = f"https://github.com/ollama/ollama/releases/download/{_OLLAMA_RELEASE}"
     if IS_MAC:
-        return f"{base}/ollama-darwin.tgz", "tgz"
+        name = "ollama-darwin.tgz"
+        return f"{base}/{name}", "tgz", _OLLAMA_TARBALL_SHA256.get(name)
     machine = _platform.machine().lower()
     arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
-    return f"{base}/ollama-linux-{arch}.tar.zst", "tar.zst"
+    name = f"ollama-linux-{arch}.tar.zst"
+    return f"{base}/{name}", "tar.zst", _OLLAMA_TARBALL_SHA256.get(name)
 
 
 def _genre_venv_python(engine: str) -> tuple[Path | None, str | None]:
@@ -862,6 +872,20 @@ def setup_clap_native(
             ckpt.unlink(missing_ok=True)
             return {"ok": False,
                     "error": f"CLAP checkpoint download incomplete ({size} bytes)"}
+        # Content-hash gate: the checkpoint is a torch pickle (executable on
+        # load), so a size floor alone is not integrity. Mismatch → delete +
+        # fail the setup loudly instead of staging a poisoned file for
+        # load_clap_model to trip on mid-analyze.
+        from vibechek.clap_genre import _CHECKPOINT_SHA256  # noqa: PLC0415
+        from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
+
+        _step(92, "Verifying checkpoint SHA256…")
+        try:
+            verify_model_sha256(ckpt, _CHECKPOINT_SHA256)
+        except RuntimeError as e:
+            ckpt.unlink(missing_ok=True)
+            return {"ok": False,
+                    "error": f"CLAP checkpoint failed SHA256 verification: {e}"}
 
     # ---- 3. verify
     _step(95, "[3/3] Verifying...")
@@ -922,9 +946,10 @@ def setup_resolver_native(
     # ---- 2. the no-sudo Ollama under ~/ollama (idempotent)
     ollama_bin = Path.home() / "ollama" / "bin" / "ollama"
     if not ollama_bin.is_file():
-        url, kind = _ollama_tarball()
+        url, kind, expected_sha = _ollama_tarball()
         _step(15, f"[2/4] Installing Ollama (no-sudo, {kind})...")
         from vibechek.analyzer import _download_from_mirrors  # noqa: PLC0415
+        from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
 
         with tempfile.TemporaryDirectory(prefix="vibechek-ollama-") as td:
             archive = Path(td) / f"ollama.{kind}"
@@ -939,6 +964,15 @@ def setup_resolver_native(
                 return {"ok": False, "error": "Cancelled by user", "cancelled": True}
             except RuntimeError as e:
                 return {"ok": False, "error": f"Ollama download failed: {e}"}
+
+            # Content-hash gate: the tarball is unpacked and executed as a
+            # long-lived local server; the release is version-pinned, so pin
+            # the bytes too (same story as the CLAP checkpoint).
+            try:
+                verify_model_sha256(archive, expected_sha)
+            except RuntimeError as e:
+                return {"ok": False,
+                        "error": f"Ollama tarball failed SHA256 verification: {e}"}
 
             _step(42, "Unpacking Ollama...")
             target = Path.home() / "ollama"

@@ -380,6 +380,11 @@ def emit_shared_constants() -> str:
 
 
 def main() -> int:
+    # `--check` renders to memory and diffs against the committed files instead
+    # of writing — CI runs this so a dataclass edit can't silently drift from
+    # the committed generated.ts/keeperConstants.ts wire contract.
+    check_only = "--check" in sys.argv[1:]
+
     classes = collect_dataclasses(MODULES)
     known = {c.__name__ for c in classes} | EXTERNAL_TYPES
 
@@ -390,6 +395,31 @@ def main() -> int:
     for cls in classes:
         blocks.append(emit_interface(cls, known))
     output = "\n\n".join(blocks) + "\n"
+    constants_output = emit_shared_constants()
+
+    if check_only:
+        stale: list[str] = []
+        for path, rendered in (
+            (OUTPUT_PATH, output),
+            (CONSTANTS_OUTPUT_PATH, constants_output),
+        ):
+            committed = (
+                path.read_text(encoding="utf-8") if path.exists() else ""
+            )
+            if committed != rendered:
+                stale.append(str(path))
+        if stale:
+            print(
+                "STALE generated TS types: "
+                + ", ".join(stale)
+                + "\nRe-run `python scripts/generate_ts_types.py` and commit "
+                "the result (the Python dataclasses changed without a regen).",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"OK: generated TS types are current ({len(classes)} dataclasses, "
+              f"{len(SHARED_CONSTANTS)} constants)")
+        return 0
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_PATH.write_text(output, encoding="utf-8")
@@ -397,7 +427,6 @@ def main() -> int:
     print(f"Wrote {OUTPUT_PATH} ({len(classes)} dataclasses, "
           f"{output.count(chr(10)) + 1} lines)")
 
-    constants_output = emit_shared_constants()
     CONSTANTS_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONSTANTS_OUTPUT_PATH.write_text(constants_output, encoding="utf-8")
     print(f"Wrote {CONSTANTS_OUTPUT_PATH} ({len(SHARED_CONSTANTS)} constants)")

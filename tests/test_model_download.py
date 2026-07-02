@@ -227,3 +227,43 @@ def test_stage_bundled_onnx_heads_cleans_partial_leftovers(tmp_path) -> None:
     (onnx_dir / "danceability.onnx.partial").write_bytes(b"junk")
     onnx_backend.stage_bundled_onnx_heads(tmp_path)
     assert not list(onnx_dir.glob("*.partial")), "stale .partial files not cleaned"
+
+
+def test_candidate_model_urls_flatten_github_release_bases(monkeypatch) -> None:
+    """GitHub release assets are flat: `releases/download/<tag>/<subdir>/<f>`
+    404s unconditionally, which made the advertised mirror failover fictional
+    (the weekly smoke died whenever UPF timed out). Release bases must emit
+    the flat form; directory-style bases keep the upstream layout."""
+    monkeypatch.setattr(
+        model_download, "MODEL_BASE_URLS",
+        (
+            "https://essentia.upf.edu/models",
+            "https://github.com/captinjack99/Vibechek/releases/download/models-v1",
+        ),
+    )
+    urls = model_download.candidate_model_urls(
+        "feature-extractors/discogs-effnet", "discogs-effnet-bs64-1.pb"
+    )
+    assert urls == [
+        "https://essentia.upf.edu/models/feature-extractors/discogs-effnet/"
+        "discogs-effnet-bs64-1.pb",
+        "https://github.com/captinjack99/Vibechek/releases/download/models-v1/"
+        "discogs-effnet-bs64-1.pb",
+    ]
+
+
+def test_candidate_model_urls_user_override_keeps_directory_layout(monkeypatch) -> None:
+    """A VIBECHEK_MODELS_URL self-hosted mirror serves the upstream tree."""
+    monkeypatch.setattr(
+        model_download, "MODEL_BASE_URLS", ("https://mirror.example/models",),
+    )
+    urls = model_download.candidate_model_urls("classification-heads/x", "x-1.pb")
+    assert urls == ["https://mirror.example/models/classification-heads/x/x-1.pb"]
+
+
+def test_backbone_onnx_sha256_is_pinned() -> None:
+    """The ONNX backbone is fetched over the network and fed to onnxruntime —
+    it must carry a content pin like every other downloaded model file."""
+    pin = model_download.BACKBONE_ONNX_SHA256
+    assert isinstance(pin, str) and len(pin) == 64
+    int(pin, 16)  # valid hex

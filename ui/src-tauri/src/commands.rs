@@ -24,10 +24,9 @@ pub async fn rpc_call(
 
     // JSON-RPC: response has either `result` or `error`
     if let Some(error) = response.get("error") {
-        return Err(format!(
-            "{}",
+        return Err(
             serde_json::to_string(error).unwrap_or_else(|_| "<unrepresentable>".into())
-        ));
+        );
     }
     Ok(response
         .get("result")
@@ -40,4 +39,18 @@ pub fn sidecar_status(state: State<'_, AppState>) -> Value {
     serde_json::json!({
         "binary": state.sidecar.binary_path(),
     })
+}
+
+/// Drain the sidecar's buffered startup notifications (`ready` / `notify`).
+///
+/// Those fire at sidecar startup — typically before the webview has mounted
+/// and registered its `sidecar:*` listeners, and Tauri events are not queued
+/// for late subscribers. The shell buffers them; the frontend collects them
+/// here once after mount. Each entry is `{"method": ..., "params": ...}`.
+/// After the first drain, subsequent notifications emit live as events.
+#[tauri::command]
+pub async fn drain_startup_notifications(
+    state: State<'_, AppState>,
+) -> Result<Vec<Value>, String> {
+    Ok(state.sidecar.drain_startup_notifications().await)
 }

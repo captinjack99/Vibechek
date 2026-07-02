@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from vibechek.analyzer import _ONNX_HEAD_STEMS, _ONNX_SUBDIR, MODELS
-from vibechek.config import MODELS_DIR
+from vibechek.config import MODELS_DIR, engine_venv_subdir
 from vibechek.native_install import NativeVenvStatus, probe_native_venv
 from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
 from vibechek.wsl import WSLStatus, detect_wsl
@@ -257,7 +257,7 @@ def preflight(
     should pass `quick_wsl=False` so they don't false-fail when WSL has
     essentia but quick mode couldn't see it.
     """
-    venv_subdir = "venv-onnx" if engine in ("onnx", "native") else "venv"
+    venv_subdir = engine_venv_subdir(engine)
     essentia = check_essentia()
     models = check_models(models_dir, engine=engine)
     wsl_status = detect_wsl(quick=quick_wsl, venv_subdir=venv_subdir)

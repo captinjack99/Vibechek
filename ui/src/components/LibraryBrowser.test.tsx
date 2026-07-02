@@ -540,4 +540,66 @@ describe("<LibraryBrowser /> — Import Rekordbox XML (tag priors)", () => {
       expect(merged?.existing_tags.genre_origin).toBe("rekordbox");
     });
   });
+
+  it("does NOT merge into a different library opened while the import was in flight", async () => {
+    // Regression: handleImportPriors awaited a slow RPC with the library
+    // switcher still enabled; mergeAnalyzedTracks APPENDS unknown paths, so
+    // library A's records were spliced into whichever library was open when
+    // the RPC resolved (then swept into select-all / Apply-ML-tags / organize
+    // fingerprints). The import must detect the switch and drop the merge —
+    // the sidecar already persisted it to library A's saved analysis.
+    (openDialog as ReturnType<typeof vi.fn>).mockResolvedValue("D:/rekordbox.xml");
+
+    const updated = track("D:/LibraryA/one.mp3", {
+      existing_tags: { genre: "Melodic Techno", genre_origin: "rekordbox" },
+      ml_analysis: ml({ ml_genre: "Melodic Techno", ml_genre_source: "tag" }),
+    });
+
+    // Hold the import RPC open so we can switch libraries mid-flight.
+    let resolveImport!: (v: unknown) => void;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "import_tag_priors":
+            return new Promise((res) => { resolveImport = res; });
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/one.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(
+      await screen.findByRole("button", { name: /import rekordbox xml/i }),
+    );
+    await waitFor(() => expect(resolveImport).toBeTypeOf("function"));
+
+    // The user switches to library B while the import is still running.
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryB",
+      tracks: [track("D:/LibraryB/other.mp3")],
+    });
+
+    resolveImport({ ok: true, xml_tracks: 12, matched: 1, updated: 1, tracks: [updated] });
+
+    // The import button leaves its busy state (the handler finished)…
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: /import rekordbox xml/i }),
+      ).not.toBeDisabled();
+    });
+    // …and library A's record was NOT appended into library B's list.
+    const paths = useLibraryStore.getState().tracks.map((t) => t.path);
+    expect(paths).toEqual(["D:/LibraryB/other.mp3"]);
+  });
 });

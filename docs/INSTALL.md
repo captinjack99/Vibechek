@@ -24,7 +24,7 @@ See [USER_GUIDE.md](USER_GUIDE.md) for an end-to-end walkthrough of the desktop 
 | Goal | What to install |
 |---|---|
 | Dedupe, organize, backup, restore, route | **Just Vibechek.** No ML needed. |
-| Run `vibechek analyze` (ML genre/mood/energy detection) | Vibechek + Essentia (see below). On Windows the desktop app installs Essentia for you. |
+| Run `vibechek analyze` (ML genre/mood/energy detection) | Vibechek + Essentia (see below). On Windows the desktop app bundles a native, WSL-free engine and needs no setup; the CLI / fallback engines use WSL Essentia. |
 
 ## Installing Vibechek
 
@@ -70,9 +70,19 @@ vibechek download-models     # one-time, ~800 MB
 
 ### Windows
 
-Essentia doesn't publish a Windows wheel, but the Vibechek desktop app handles
-that for you. The first time you click **Analyze**, a setup dialog walks you
-through the whole thing — no terminal required:
+**Since v0.6.3-beta the desktop installer bundles a native, WSL-free analysis
+engine and defaults to it.** A fresh install of the desktop app analyzes fully
+in-process — no WSL, no separate Python, nothing to set up. Click **Analyze** and
+it runs immediately. The native engine is a DSP-only native essentia wheel
+(decode/BPM/key) + a pure-NumPy mel frontend + ONNX Runtime inference, all
+in-process; it ships CPU-only (see the GPU section for the ONNX-engine GPU path).
+
+Essentia itself has no Windows wheel, so the fallback path below is used when the
+native bundle isn't present — the lean CLI `.zip`, a `pip install`, or when you
+switch to the **essentia-tensorflow** or **ONNX** engines (or the opt-in CLAP /
+online-resolver genre engines, which still run through WSL on Windows). On a
+fallback path the desktop app sets everything up for you; the first time you click
+**Analyze** there, a setup dialog walks you through it — no terminal required:
 
 1. **Install WSL + Ubuntu** — one click, triggers a UAC prompt, ~5-15 min
    download (Windows handles the install itself).
@@ -83,13 +93,13 @@ through the whole thing — no terminal required:
    See the GPU section below. Vibechek can also run **hybrid CPU+GPU**, using your
    GPU and spare CPU cores at the same time.
 
-After setup, when you analyze a library on `C:\Music\Tracks` the app
+On a WSL fallback, when you analyze a library on `C:\Music\Tracks` the app
 automatically routes that analyze through WSL, translates the path to
 `/mnt/c/Music/Tracks`, runs essentia inside the Linux environment, and
 returns Windows paths in the resulting `analysis.json`. You never see WSL.
 
-If you'd rather do it by hand (e.g. running on a server), the manual
-equivalents are:
+If you'd rather set up the WSL fallback by hand (e.g. running on a server), the
+manual equivalents are:
 
 ```powershell
 wsl --install -d Ubuntu-24.04
@@ -158,9 +168,9 @@ Then set `LD_LIBRARY_PATH` to include the resulting `~/.vibechek/venv/lib/python
 > `vibechek download-models --engine onnx`.
 > See [docs/ONNX_MIGRATION.md](ONNX_MIGRATION.md).
 >
-> *(Note: on Windows there is no DirectML/Intel path — Essentia has no Windows
-> wheel, so ML always runs in WSL, where the GPU providers are CUDA / ROCm /
-> CoreML.)*
+> *(Note: on Windows there is no DirectML/Intel path. The default native engine
+> runs in-process but CPU-only; the ONNX engine runs in WSL — Essentia has no
+> Windows wheel — where the GPU providers are CUDA / ROCm / CoreML.)*
 
 ### Skipping analyze entirely
 
@@ -206,7 +216,10 @@ you're installing into your own environment.
 
 Both run inside the same analysis environment as Essentia (WSL on Windows, the managed
 `~/.vibechek` venv on Linux/macOS), so one worker does BPM/key/mood *and* the new genre
-source. See the [user guide](USER_GUIDE.md#genre-classifier--online-lookup).
+source. They are **not** supported with the Windows-default native engine — the backend
+refuses the setup with a clear error; switch to the ONNX or essentia-tensorflow engine
+(both run in WSL on Windows) to enable them. See the
+[user guide](USER_GUIDE.md#genre-classifier--online-lookup).
 
 ## Installing fpcalc (for `dedupe`'s audio fingerprinting)
 
@@ -238,7 +251,7 @@ vibechek download-models   # one-time, ~800 MB
 - Windows: System Properties → Environment Variables → User Path
 - macOS / Linux: add `export PATH="$PATH:/path/to/vibechek"` to your shell rc
 
-**"essentia-tensorflow not installed"** when running `vibechek analyze` — that's expected on Windows. See "Installing Essentia" above.
+**"essentia-tensorflow not installed"** when running `vibechek analyze` — expected on the Windows CLI zip or a fallback (essentia-tensorflow / ONNX) engine; the desktop app's bundled native engine needs no Essentia. See "Installing Essentia" above.
 
 **Models download is slow / fails** — `essentia.upf.edu` occasionally rate-limits. Retry, or download the `.pb` files manually from [the model index](https://essentia.upf.edu/models.html) into the directory `vibechek download-models` prints on startup.
 

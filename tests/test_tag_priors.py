@@ -73,6 +73,25 @@ class TestParseRekordboxCollection:
         priors = tag_priors.parse_rekordbox_collection(_write_xml(tmp_path))
         assert tag_priors.norm_path("/home/dj/music/track.flac") in priors
 
+    def test_network_location_keeps_the_host_as_unc(self) -> None:
+        """file://<server>/… is a NAS library (a real DJ setup). Dropping the
+        host yielded "/music/x.mp3", which can never match the analyzed
+        ``\\\\MYNAS\\music`` paths — every NAS track silently failed to match
+        ("matched 0 of N") with no hint why."""
+        assert tag_priors._location_to_path("file://MYNAS/music/track.mp3") == (
+            "//MYNAS/music/track.mp3"
+        )
+        # The UNC form must land on the same norm_path as the analyzed
+        # backslash form, or matching still fails after the rebuild.
+        assert tag_priors.norm_path("//MYNAS/music/track.mp3") == (
+            tag_priors.norm_path(r"\\MYNAS\music\track.mp3")
+        )
+
+    def test_localhost_location_still_strips_the_host(self) -> None:
+        assert tag_priors._location_to_path(
+            "file://localhost/D:/My%20Music/x.flac"
+        ) == "D:/My Music/x.flac"
+
     def test_not_rekordbox_xml_raises(self, tmp_path: Path) -> None:
         p = tmp_path / "other.xml"
         p.write_text("<root/>", encoding="utf-8")
@@ -217,6 +236,52 @@ class TestApplyPriorsToReport:
         )
         assert matched == 0 and updated == []
         assert t["ml_analysis"]["ml_genre"] == "Techno"
+
+    def test_key_only_prior_does_not_reopen_a_reverted_decision(self) -> None:
+        """A user's Revert-to-tag is the highest-trust data in the system. A
+        key-only prior used to re-run the GENRE reconcile (merge reported one
+        bool for any change), which recomputed the reverted record back to
+        `ml_override` — flipping the genre to the ML value and re-opening the
+        review queue for a track whose genre the import never touched."""
+        t = _analyzed_track("D:/e.mp3", tag_genre="House")
+        ml = t["ml_analysis"]
+        # State after resolve_genre_conflicts "revert": tag won, conflict
+        # cleared — but the stashed audio read would override again on a
+        # from-scratch reconcile (confidence above the 0.90 gate).
+        ml.update({
+            "ml_genre": "House", "ml_subgenre": "House",
+            "ml_genre_source": "tag", "ml_genre_conflict": False,
+            "ml_genre_raw_confidence": 0.97, "ml_genre_confidence": 0.97,
+        })
+        report = {"tracks": [t]}
+        priors = {tag_priors.norm_path("D:/e.mp3"): {"key": "2d"}}
+        updated, matched = tag_priors.apply_priors_to_report(
+            report, priors, "prefer_tag", 0.90,
+        )
+        assert matched == 1 and len(updated) == 1
+        assert ml["ml_genre"] == "House"            # revert honored
+        assert ml["ml_genre_source"] == "tag"
+        assert ml["ml_genre_conflict"] is False     # NOT back in the queue
+        assert ml["ml_key_tag"] == "9B"             # the key DID surface
+
+    def test_key_only_prior_leaves_an_approved_decision_alone(self) -> None:
+        """Same contract for Approve: _reconcile_record_genre's guard, but the
+        field-level merge means the genre reconcile isn't even invoked."""
+        t = _analyzed_track("D:/f.mp3", tag_genre="House")
+        ml = t["ml_analysis"]
+        ml.update({"ml_genre_source": "approved", "ml_genre_conflict": False})
+        report = {"tracks": [t]}
+        priors = {tag_priors.norm_path("D:/f.mp3"): {"key": "2d"}}
+        tag_priors.apply_priors_to_report(report, priors, "prefer_tag", 0.90)
+        assert ml["ml_genre_source"] == "approved"
+        assert ml["ml_genre_conflict"] is False
+
+    def test_merge_reports_changed_fields(self) -> None:
+        rec = {"existing_tags": {"genre": "Electro"}}
+        assert tag_priors.merge_prior_into_record(
+            rec, {"genre": "Tech House", "key": "2d", "energy_mik": 7}
+        ) == {"genre", "key", "energy_mik"}
+        assert tag_priors.merge_prior_into_record(rec, {"key": "3d"}) == set()
 
 
 class TestMergeIntoResults:

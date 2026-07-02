@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from vibechek.config import engine_venv_subdir
 from vibechek.platform import IS_WINDOWS
 
 # Distros that aren't real Linux environments — probing them with bash will
@@ -1444,20 +1445,26 @@ def _user_bootstrap(engine: str = "essentia_tf") -> str:
     """Phase-2 (pip-as-user) install script for the given inference engine.
 
     "essentia_tf" → ``~/.vibechek/venv`` with **essentia-tensorflow** (the
-    default; NVIDIA-only GPU). "onnx" → ``~/.vibechek/venv-onnx`` with **plain
-    essentia + onnxruntime** (the TF-free engine; cross-vendor GPU). The two
-    essentia builds can't share a venv (both ship the ``essentia`` module), so
-    the ONNX engine gets its own venv. `run_vibechek_in_wsl(venv_subdir=...)`
-    routes analyze to whichever the user picked.
+    default; NVIDIA-only GPU). "onnx" AND "native" → ``~/.vibechek/venv-onnx``
+    with **plain essentia + onnxruntime** (the TF-free stack; native is the
+    same ONNX backbone/heads, so its WSL fallback runs the identical venv —
+    installing essentia-tensorflow into "venv" for it left preflight, which
+    correctly gates native on venv-onnx, reporting "not ready" after a
+    10-minute install). The two essentia builds can't share a venv (both ship
+    the ``essentia`` module). `run_vibechek_in_wsl(venv_subdir=...)` routes
+    analyze to whichever the user picked.
 
     Re-running "Set up" is an idempotent version-drift fix: the vibechek package
-    is force-reinstalled from the GitHub head (a plain ``--upgrade`` does NOT
-    re-pull a ``git+`` install once any version is present), so every code-side
-    bump becomes available without deleting the venv.
+    is force-reinstalled from this build's release tag (a plain ``--upgrade``
+    does NOT re-pull a ``git+`` install once any version is present), so every
+    code-side bump becomes available without deleting the venv.
     """
-    subdir = "venv-onnx" if engine == "onnx" else "venv"
+    from vibechek.config import vibechek_pip_source  # noqa: PLC0415
+
+    src = vibechek_pip_source()
+    subdir = engine_venv_subdir(engine)
     pip = f'"$HOME/.vibechek/{subdir}/bin/pip"'
-    if engine == "onnx":
+    if subdir == "venv-onnx":
         # GPU acceleration is the whole point of the ONNX engine. When an NVIDIA
         # GPU is visible (nvidia-smi), install onnxruntime-gpu + the CUDA 12
         # runtime wheels — the CUDA EP's libs, loaded at runtime via
@@ -1485,10 +1492,10 @@ def _user_bootstrap(engine: str = "essentia_tf") -> str:
     else:
         ml_line = f'{pip} install --quiet essentia-tensorflow'
         label = "essentia-tensorflow"
-    # The ~/.local/bin symlink only tracks the DEFAULT venv; the ONNX engine is
-    # invoked by its explicit venv path (run_vibechek_in_wsl), so we don't
-    # repoint the shared symlink for it.
-    if engine == "onnx":
+    # The ~/.local/bin symlink only tracks the DEFAULT venv; the onnx/native
+    # engines are invoked by their explicit venv path (run_vibechek_in_wsl),
+    # so we don't repoint the shared symlink for them.
+    if subdir == "venv-onnx":
         symlink_block = ""
     else:
         symlink_block = (
@@ -1510,14 +1517,14 @@ fi
 echo "[4/4] Installing Vibechek + {label} (this is the slow part)..."
 {pip} install --upgrade --quiet pip wheel
 {ml_line}
-{pip} install --upgrade --quiet git+https://github.com/captinjack99/Vibechek.git
+{pip} install --upgrade --quiet {src}
 # `--upgrade` alone does NOT re-pull a git+ (VCS) install when a version is
 # already present — pip treats the URL requirement as satisfied without cloning
 # to compare. So re-running "Set up WSL" on a drifted install would silently
 # leave the stale package and never clear the analyzer's version-drift guard.
 # Force-reinstall just the vibechek package (its deps were handled above) so a
-# re-run always lands on the current GitHub head. Matches upgrade_vibechek_in_wsl.
-{pip} install --upgrade --force-reinstall --no-deps --quiet git+https://github.com/captinjack99/Vibechek.git
+# re-run always lands on this build's release tag. Matches upgrade_vibechek_in_wsl.
+{pip} install --upgrade --force-reinstall --no-deps --quiet {src}
 
 {symlink_block}
 echo "DONE"
@@ -1709,9 +1716,12 @@ def _vibechek_upgrade_script(venv_subdir: str = "venv") -> str:
     """Fast vibechek-package-only upgrade script for `~/.vibechek/<venv_subdir>`.
 
     `venv_subdir` is "venv" (essentia-tensorflow engine) or "venv-onnx" (the
-    TF-free ONNX engine) so the auto-update targets whichever venv the analyze
-    will actually use.
+    TF-free stack shared by the onnx and native engines) so the auto-update
+    targets whichever venv the analyze will actually use.
     """
+    from vibechek.config import vibechek_pip_source  # noqa: PLC0415
+
+    src = vibechek_pip_source()
     return f"""
 set -e
 
@@ -1722,12 +1732,15 @@ if [ ! -x "$VENV/bin/pip" ]; then
 fi
 
 echo "[1/1] Upgrading vibechek package (essentia + apt unchanged)..."
-# --force-reinstall guarantees we get the latest GitHub head even when pip's
-# resolver sees the existing version as satisfying ">=" requirements. --no-deps
-# keeps us from touching essentia/numpy/tensorflow, which is the whole point
-# of the fast path.
-"$VENV/bin/pip" install --upgrade --force-reinstall --no-deps --quiet \
-    git+https://github.com/captinjack99/Vibechek.git
+# Pinned to THIS build's release tag so the drift guard converges the WSL
+# install onto exactly the sidecar's version — installing `main` HEAD here
+# could land code newer than the sidecar with an incompatible wire schema.
+# --force-reinstall guarantees the re-pull even when pip's resolver sees the
+# existing version as satisfying the requirement. --no-deps keeps us from
+# touching essentia/numpy/tensorflow, which is the whole point of the fast
+# path.
+"$VENV/bin/pip" install --upgrade --force-reinstall --no-deps --quiet \\
+    {src}
 
 echo "DONE"
 "$VENV/bin/vibechek" --version
@@ -1742,8 +1755,8 @@ def upgrade_vibechek_in_wsl(
     """Re-install vibechek inside `distro` from GitHub, skipping apt + essentia.
 
     `engine` selects the venv to upgrade: "essentia_tf" → ~/.vibechek/venv,
-    "onnx" → ~/.vibechek/venv-onnx (so auto-update targets the venv the analyze
-    actually uses).
+    "onnx"/"native" → ~/.vibechek/venv-onnx (so auto-update targets the venv
+    the analyze actually uses).
 
     This is the fast repair path for version drift: when the sidecar is on
     v0.4.0-beta.3 but the WSL install is stuck on v0.4.0-beta.1, the user can
@@ -1775,7 +1788,7 @@ def upgrade_vibechek_in_wsl(
         f"vibechek-wsl-upgrade-pid-{os.getpid()}.txt"
     )
     wsl_token = win_to_wsl_path(str(token_file))
-    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    venv_subdir = engine_venv_subdir(engine)
     inner_script = _stage_script_for_wsl(_vibechek_upgrade_script(venv_subdir))
     inner_wsl = win_to_wsl_path(str(inner_script))
     launcher = (
@@ -1847,9 +1860,22 @@ _OLLAMA_TARBALL_URL = (
     f"https://github.com/ollama/ollama/releases/download/{_OLLAMA_RELEASE}/"
     "ollama-linux-amd64.tar.zst"
 )
+# Per-asset SHA256 for the pinned release, from the release's own asset
+# digests (also in its sha256sum.txt). Bump together with _OLLAMA_RELEASE.
+# Verified after download in both the WSL script and the native setup — the
+# tarball is unpacked and EXECUTED as a long-lived local server, so it gets
+# the same content pinning as every other fetched artifact.
+_OLLAMA_TARBALL_SHA256 = {
+    "ollama-linux-amd64.tar.zst":
+        "78e317889c907d9853336c8d834f424c7dc6ccd8958772f44fadf78f421ea907",
+    "ollama-linux-arm64.tar.zst":
+        "877981499ab2ccc8ffd674a5c2fe1788ebd67a4c31df8d399fca3a488072e551",
+    "ollama-darwin.tgz":
+        "fa36a0e6fbf5716a5cc85ad15454862a987adbc2bed9e9ef82f1e9d77e082554",
+}
 
 
-def _clap_setup_script(venv_subdir: str, ckpt_url: str) -> str:
+def _clap_setup_script(venv_subdir: str, ckpt_url: str, ckpt_sha256: str) -> str:
     """Install the CLAP deps into the analysis venv + fetch the checkpoint."""
     return f"""
 set -e
@@ -1875,6 +1901,14 @@ if [ ! -s "$CKPT" ]; then
     echo "ERROR: checkpoint download incomplete ($SIZE bytes)" >&2
     exit 3
   fi
+  # Content-hash gate (the checkpoint is a torch pickle — executable on
+  # load): a size floor alone is not integrity. Mirrors the SHA256 pin the
+  # native setup + load_clap_model enforce.
+  echo "Verifying checkpoint SHA256..."
+  echo "{ckpt_sha256}  $CKPT.partial" | sha256sum -c - >/dev/null || {{
+    echo "ERROR: checkpoint failed SHA256 verification — refusing to install it" >&2
+    exit 4
+  }}
   mv "$CKPT.partial" "$CKPT"
 fi
 echo "[3/3] Verifying..."
@@ -1895,6 +1929,11 @@ echo "[2/4] Installing Ollama (no-sudo)..."
 trap 'rm -f "$HOME/ollama.tar.zst" "$HOME/ollama.tar"' EXIT
 if [ ! -x "$HOME/ollama/bin/ollama" ]; then
   curl -fSL --speed-limit 1024 --speed-time 60 "{_OLLAMA_TARBALL_URL}" -o "$HOME/ollama.tar.zst"
+  # Content-hash gate: this tarball is unpacked and run as a local server.
+  echo "{_OLLAMA_TARBALL_SHA256["ollama-linux-amd64.tar.zst"]}  $HOME/ollama.tar.zst" | sha256sum -c - >/dev/null || {{
+    echo "ERROR: Ollama tarball failed SHA256 verification — refusing to install it" >&2
+    exit 4
+  }}
   "$VENV/bin/python" -c "import zstandard,sys; fi=open('$HOME/ollama.tar.zst','rb'); fo=open('$HOME/ollama.tar','wb'); zstandard.ZstdDecompressor().copy_stream(fi,fo)"
   mkdir -p "$HOME/ollama"; tar -xf "$HOME/ollama.tar" -C "$HOME/ollama"
   rm -f "$HOME/ollama.tar" "$HOME/ollama.tar.zst"
@@ -2002,13 +2041,14 @@ def _run_managed_wsl_script(
 def setup_clap_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
                       engine: str = "essentia_tf") -> dict:
     """Install the CLAP genre student into the analysis venv inside `distro`."""
-    from vibechek.clap_genre import _CHECKPOINT_URL  # noqa: PLC0415
-    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    from vibechek.clap_genre import _CHECKPOINT_SHA256, _CHECKPOINT_URL  # noqa: PLC0415
+    venv_subdir = engine_venv_subdir(engine)
     # 2 h wall clock: these are multi-GB downloads on arbitrary connections.
     # Real stalls die fast via curl --speed-limit, so the generous ceiling only
     # bounds genuinely slow-but-progressing links instead of aborting them.
     return _run_managed_wsl_script(
-        distro, _clap_setup_script(venv_subdir, _CHECKPOINT_URL), on_progress,
+        distro, _clap_setup_script(venv_subdir, _CHECKPOINT_URL, _CHECKPOINT_SHA256),
+        on_progress,
         timeout_s=60 * 120, start_msg=f"Setting up the CLAP genre engine in {distro}…",
     )
 
@@ -2016,7 +2056,7 @@ def setup_clap_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
 def setup_resolver_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
                           engine: str = "essentia_tf", model: str = "qwen2.5:7b") -> dict:
     """Install the online genre resolver (ddgs + Ollama + model) inside `distro`."""
-    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    venv_subdir = engine_venv_subdir(engine)
     return _run_managed_wsl_script(
         distro, _resolver_setup_script(venv_subdir, model), on_progress,
         timeout_s=60 * 120, start_msg=f"Setting up the online genre resolver in {distro}…",

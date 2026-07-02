@@ -30,7 +30,7 @@ from mutagen.flac import FLAC
 from mutagen.id3 import ID3
 
 from vibechek import cancellation
-from vibechek.config import AnalysisConfig
+from vibechek.config import AnalysisConfig, engine_venv_subdir
 from vibechek.filename import extract_from_filename
 from vibechek.genres import GenreResult, get_best_genre
 from vibechek.io import atomic_write_json
@@ -2401,10 +2401,12 @@ def _analyze_via_wsl(
     if skip_paths_file is not None:
         args += ["--skip-paths-file", win_to_wsl_path(str(skip_paths_file))]
 
-    # Route to the venv matching the engine: "venv-onnx" (plain essentia +
-    # onnxruntime) for the TF-free ONNX path, "venv" (essentia-tensorflow)
-    # otherwise. run_vibechek_in_wsl uses ONLY that venv's binary for onnx.
-    venv_subdir = "venv-onnx" if config.inference_engine == "onnx" else "venv"
+    # Route to the venv matching the engine via the ONE shared mapping
+    # (config.engine_venv_subdir): "venv-onnx" for onnx AND native (both run
+    # the ONNX stack), "venv" (essentia-tensorflow) otherwise. This must agree
+    # with preflight's probe — a hand-rolled `== "onnx"` here once sent
+    # engine="native" to the essentia_tf venv that preflight never validated.
+    venv_subdir = engine_venv_subdir(config.inference_engine)
 
     # Drop high-volume essentia / TF noise lines from the bounded tail
     # buffer so an 80-line window survives the per-worker spam and actually

@@ -204,9 +204,17 @@ def test_make_patches_empty_mel_yields_single_zero_patch() -> None:
 
 
 def test_inference_engine_default_is_platform_aware() -> None:
-    """Default engine: native on Windows (bundled, WSL-free), essentia_tf elsewhere."""
-    from vibechek.config import _DEFAULT_INFERENCE_ENGINE
-    assert AnalysisConfig().inference_engine == _DEFAULT_INFERENCE_ENGINE
+    """Default engine: native on Windows (bundled, WSL-free), essentia_tf elsewhere.
+
+    Asserts the CONCRETE per-platform value, not `default == its own constant`
+    — the old tautology stayed green if config.py's platform condition was
+    inverted or the value typo'd, so nothing in the 1000+-test suite actually
+    gated the v0.6.3 flagship default flip. CI's windows-latest and
+    ubuntu/macos legs each pin their own platform's value here.
+    """
+    import sys
+    expected = "native" if sys.platform == "win32" else "essentia_tf"
+    assert AnalysisConfig().inference_engine == expected
 
 
 def test_inference_engine_roundtrips_in_config(tmp_path: Path) -> None:

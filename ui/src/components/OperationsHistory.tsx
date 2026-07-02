@@ -16,7 +16,7 @@ import {
   X, Undo2, FolderTree, Copy, Trash2, Loader2, AlertCircle, History,
 } from "lucide-react";
 
-import { useUIStore, useOperationStore, useNotificationStore } from "../stores";
+import { useUIStore, useOperationStore, useNotificationStore, useLibraryStore } from "../stores";
 import { listJournals, revertJournal } from "../api/rpc";
 import type { JournalSummary } from "../api/methods";
 import { isCancellation } from "../hooks/useSidecar";
@@ -112,6 +112,17 @@ export function OperationsHistory() {
     try {
       const summary = await revertJournal({ journal_path: j.path }, opId);
       finish();
+      // Follow the files back in the in-memory library — exactly like
+      // organize's post-execute updateTrackPaths, in reverse. Without this,
+      // every post-undo Preview / "Apply ML tags" / re-organize targeted the
+      // now-nonexistent destination paths until a manual re-scan.
+      if (summary.reverted_pairs?.length) {
+        const pathMap: Record<string, string> = {};
+        for (const [current, restored] of summary.reverted_pairs) {
+          pathMap[current] = restored;
+        }
+        useLibraryStore.getState().updateTrackPaths(pathMap);
+      }
       const parts = [`Restored ${summary.reverted}`];
       if (summary.skipped) parts.push(`skipped ${summary.skipped}`);
       if (summary.errors) parts.push(`${summary.errors} error${summary.errors === 1 ? "" : "s"}`);

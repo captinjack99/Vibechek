@@ -16,9 +16,19 @@ from vibechek.config import _DEFAULT_INFERENCE_ENGINE, AnalysisConfig, _subset
 from vibechek.preflight import _model_files_for_engine
 
 
-def test_config_accepts_native_engine() -> None:
+def test_config_native_engine_is_windows_only() -> None:
+    """"native" is the bundled-Windows-installer engine. On Linux/macOS the
+    onnx engine IS the in-process path and the managed venvs have no native
+    flavor, so a saved config carrying "native" (e.g. copied from a Windows
+    box) snaps back to the platform default instead of preflighting one venv
+    and analyzing against another. CI's three OS legs exercise both branches
+    for real."""
+    import sys
     cfg = _subset(AnalysisConfig, {"inference_engine": "native"})
-    assert cfg.inference_engine == "native"
+    if sys.platform == "win32":
+        assert cfg.inference_engine == "native"
+    else:
+        assert cfg.inference_engine == "essentia_tf"
 
 
 def test_config_snaps_unknown_engine_to_default() -> None:

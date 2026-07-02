@@ -187,8 +187,11 @@ export function LibraryBrowser() {
   // banner empty rather than blocking the load.
   const handleOpenRecent = async (record: LibraryRecord) => {
     // Switching libraries: drop any in-flight analyze's live-merge token so its
-    // still-streaming events don't phantom-merge into the library we're loading.
+    // still-streaming events don't phantom-merge into the library we're loading,
+    // and bump the generation counter so an in-flight analyze/scan's final
+    // setTracks is invalidated as well (see handleOpenFolder).
     invalidateAnalyzeRun();
+    analyzeGen.current++;
     begin("analyze");
     try {
       const result = await rpc<{ loaded: boolean; report?: AnalysisReport; reason?: string }>(
@@ -475,12 +478,23 @@ export function LibraryBrowser() {
   );
 
   const handleOpenFolder = async () => {
+    // A running long op owns the operation store: begin("analyze") below
+    // would clobber its opId (freezing its progress overlay) and the final
+    // commit of an in-flight analyze could paint the OLD folder's report
+    // into the NEW folder's view. The visible buttons are disabled during an
+    // op, but guard the handler itself too (the empty-state button wasn't).
+    if (active !== null) return;
     const selected = await openDialog({ directory: true, multiple: false });
     if (typeof selected !== "string") return;
+    if (useOperationStore.getState().active !== null) return; // op started while dialog was open
 
     // New folder = library switch: invalidate any in-flight analyze's
-    // live-merge token before we swap the path + tracks out from under it.
+    // live-merge token before we swap the path + tracks out from under it,
+    // AND bump the generation counter so a still-running analyze/scan's
+    // FINAL setTracks (which only checks its own generation) is invalidated
+    // too — invalidateAnalyzeRun alone only stops the streamed live-merge.
     invalidateAnalyzeRun();
+    analyzeGen.current++;
     setLibraryPath(selected);
     // New folder = library switch → clear the prior library's filters (see
     // handleOpenRecent). Otherwise stale genre/key/energy chips carry over.
@@ -648,6 +662,13 @@ export function LibraryBrowser() {
       return;
     }
     setResolving(true);
+    // Snapshot the library this resolve runs against: the RPC does disk
+    // writes and can be slow, the library switcher stays enabled meanwhile
+    // (resolve doesn't set the operation store's `active`), and
+    // mergeAnalyzedTracks APPENDS unknown paths — so a mid-flight switch
+    // would splice this library's tracks into whichever library is open when
+    // the RPC resolves. Same pattern as the analyzeRun token.
+    const lib = libraryPath;
     try {
       const result = await rpc<{
         ok: boolean;
@@ -660,6 +681,12 @@ export function LibraryBrowser() {
       });
       if (!result.ok) {
         fail(result.reason ?? "Could not resolve the selected conflicts");
+        return;
+      }
+      if (useLibraryStore.getState().libraryPath !== lib) {
+        // Library switched mid-flight. The resolve DID persist to the old
+        // library's saved analysis — it will show correctly on next open —
+        // but merging (or toasting counts) into the now-open library lies.
         return;
       }
       // Merge the authoritative persisted records back (one state update). Their
@@ -700,6 +727,11 @@ export function LibraryBrowser() {
     });
     if (typeof selected !== "string") return;
     setImportingPriors(true);
+    // Snapshot for the same mid-flight library-switch hazard as
+    // runResolveConflicts: the import re-reconciles + persists a whole
+    // library and can take a while, and mergeAnalyzedTracks would append
+    // this library's records into whichever library is open on resolve.
+    const lib = libraryPath;
     try {
       const result = await importTagPriors({
         library_path: libraryPath,
@@ -711,6 +743,12 @@ export function LibraryBrowser() {
       });
       if (!result.ok) {
         fail(result.reason ?? "Could not import the Rekordbox XML");
+        return;
+      }
+      if (useLibraryStore.getState().libraryPath !== lib) {
+        // Import persisted to the old library's saved analysis + priors
+        // sidecar; it loads correctly on next open. Don't merge or toast
+        // against the library now on screen.
         return;
       }
       // Merge the authoritative persisted records back (one state update).
@@ -744,6 +782,14 @@ export function LibraryBrowser() {
     if (!libraryPath) return;
     if (active !== null) return;       // long op already running — be safe
     if (preflightInFlight) return;     // already probing, don't double-fire
+    // Snapshot the library this click targets: the full probe takes 5-10s,
+    // the library switcher stays enabled meanwhile, and runAnalyze is a
+    // closure over the OLD libraryPath — its own generation token can't save
+    // us because runAnalyze bumps analyzeGen at its own start. A switch
+    // completed during the probe must abort the launch, not analyze the old
+    // library into the new one's view.
+    const lib = libraryPath;
+    const libUnchanged = () => useLibraryStore.getState().libraryPath === lib;
     setPreflightInFlight(true);
     try {
       // Quick probe first — if it says ready, we're done immediately. Pass the
@@ -753,7 +799,7 @@ export function LibraryBrowser() {
       // Re-check the long-op lock: it can flip between us starting the
       // probe and the probe finishing (e.g. user kicked off a different
       // operation while we were waiting). Don't trample an active op.
-      if (useOperationStore.getState().active !== null) return;
+      if (useOperationStore.getState().active !== null || !libUnchanged()) return;
       if (quick.ready) {
         runAnalyze();
         return;
@@ -762,7 +808,7 @@ export function LibraryBrowser() {
       // distros, so "not ready" is uninformative. Do the full probe before
       // showing the dialog so the user sees the real state, not a stale one.
       const full = await rpc<PreflightResult>("preflight", { quick: false, engine: analysisCfg.inference_engine });
-      if (useOperationStore.getState().active !== null) return;
+      if (useOperationStore.getState().active !== null || !libUnchanged()) return;
       if (full.ready) {
         // Full probe revealed we're actually ready (quick mode missed it
         // because the WSL distro probe wasn't run). Skip the dialog.
@@ -901,8 +947,13 @@ export function LibraryBrowser() {
                   </div>
                   <div>
                     <button
-                      className="text-xs text-white/40 hover:text-white"
+                      className="text-xs text-white/40 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed"
                       onClick={handleOpenFolder}
+                      // The empty state persists through the first minutes of
+                      // a fresh full analyze (until the first streamed track
+                      // arrives) — switching folders mid-analyze from here
+                      // clobbered the running op. Disabled like its siblings.
+                      disabled={active !== null}
                     >
                       Choose a different folder
                     </button>

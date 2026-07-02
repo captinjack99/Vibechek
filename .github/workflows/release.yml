@@ -13,8 +13,13 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Default to read-only. Only the `release` job (which creates the GitHub
+# Release) gets `contents: write` — the build jobs run `npm ci`, third-party
+# actions, and a C++ fork build, none of which should hold a write-capable
+# token (a compromised dependency there could otherwise rewrite repo contents
+# or published release assets).
 permissions:
-  contents: write  # needed to create a release
+  contents: read
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -84,15 +89,19 @@ jobs:
       # packaging/vibechek.spec then folds essentia + onnxruntime + numpy into the
       # onefile, so inference_engine="native" runs fully in-process — no WSL.
       #
-      # BEST-EFFORT by design: continue-on-error means a wheel-build failure never
-      # blocks the release. When it fails (or is skipped), VIBECHEK_NATIVE_WHEEL
-      # stays unset, the spec skips the bundle, and the sidecar ships as the lean
-      # CLI exactly as before. The ~9 C/C++ deps build takes ~30 min on a cold
-      # runner (caching them is a follow-up; the step is off the critical path of
-      # correctness since it's purely additive).
-      - name: Build native essentia wheel (Windows, experimental)
+      # REQUIRED on tag builds, best-effort otherwise. The native engine is the
+      # Windows DEFAULT since v0.6.3 (config._DEFAULT_INFERENCE_ENGINE), so a
+      # tagged release without the bundle would silently ship every fresh
+      # Windows user a default engine that isn't in the installer. On tag refs
+      # the step therefore hard-fails the job; on non-tag runs (workflow_dispatch
+      # smoke builds) a wheel failure still degrades to the lean CLI. A second
+      # gate lives in build-windows.bat (VIBECHEK_REQUIRE_NATIVE) to catch the
+      # "script exited 0 but produced no wheel / essentia won't import" case.
+      # The ~9 C/C++ deps build takes ~30 min on a cold runner (caching them is
+      # a follow-up).
+      - name: Build native essentia wheel (Windows)
         if: runner.os == 'Windows'
-        continue-on-error: true
+        continue-on-error: ${{ !startsWith(github.ref, 'refs/tags/') }}
         shell: pwsh
         run: |
           & "$env:pythonLocation\python.exe" --version
@@ -110,6 +119,13 @@ jobs:
           }
 
       - name: Build PyInstaller CLI bundle
+        env:
+          # On tag builds, build-windows.bat hard-fails when the native engine
+          # did not actually bundle (wheel missing or essentia unimportable in
+          # the build venv) — native is the Windows default engine and must not
+          # silently ship absent. Empty on non-tag runs => batch `if defined`
+          # treats it as unset and the build stays best-effort.
+          VIBECHEK_REQUIRE_NATIVE: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '' }}
         run: ${{ matrix.build_cmd }}
 
       - name: Upload CLI archive
@@ -276,11 +292,13 @@ jobs:
           fi
           # Updater signing (tauri-plugin-updater). Same opt-in gate as the
           # codesign certs above: only export the key when the secret is
-          # non-empty. Without it, tauri-action still builds the bundles +
-          # updater artifacts but does NOT produce the `.sig` signatures, so
-          # in-app auto-update verification (plugins.updater.pubkey) won't work
-          # until TAURI_SIGNING_PRIVATE_KEY is configured. The password var is
-          # only meaningful alongside the key. See docs/RELEASING.md.
+          # non-empty. NOTE: tauri.conf.json ships `createUpdaterArtifacts:
+          # false`, so NO updater bundles (*.nsis.zip / *.app.tar.gz) or *.sig
+          # files are produced at all right now — enabling auto-update needs
+          # this secret AND the createUpdaterArtifacts flip AND a real pubkey
+          # in tauri.conf.json, together (docs/RELEASING.md "Auto-update +
+          # signing setup"). The password var is only meaningful alongside the
+          # key.
           if [ -n "${IN_TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
             echo "Updater: signing key present — updater artifacts will be SIGNED."
             emit TAURI_SIGNING_PRIVATE_KEY          "${IN_TAURI_SIGNING_PRIVATE_KEY:-}"
@@ -311,19 +329,31 @@ jobs:
           #     *.AppImage (Linux, same file as the installer) — plus a *.sig
           #     detached signature next to each (only present when
           #     TAURI_SIGNING_PRIVATE_KEY was set in the opt-in step above).
+          # The `! -name` prunes exclude the .deb builder's INTERNAL members
+          # (control.tar.gz / data.tar.gz sit in the bundle tree next to the
+          # finished .deb and are junk on a release page — they shipped on
+          # v0.6.3-beta before this exclusion).
           find ui/src-tauri/target/release/bundle -maxdepth 3 -type f \
               \( -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \
                  -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \
                  -o -name "*.sig" -o -name "*.nsis.zip" -o -name "*.tar.gz" \) \
-              -exec cp {} tauri-out/ \; || true
-          ls -la tauri-out/ || true
+              ! -name "control.tar.gz" ! -name "data.tar.gz" \
+              -exec cp {} tauri-out/ \;
+          ls -la tauri-out/
+          # A desktop build that produced ZERO bundles is a broken build, not a
+          # shippable one — fail here instead of letting an empty artifact ride
+          # to the release job.
+          if [ -z "$(ls -A tauri-out/)" ]; then
+            echo "ERROR: no Tauri bundles found under target/release/bundle" >&2
+            exit 1
+          fi
 
       - name: Upload Tauri bundles
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vibechek-desktop-${{ matrix.os }}
           path: tauri-out/*
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   # 3) Aggregate all artifacts into a draft release
@@ -332,11 +362,17 @@ jobs:
     name: Publish GitHub Release
     needs: [build-cli, build-tauri]
     runs-on: ubuntu-latest
-    # `always()` lets the release run even when an experimental matrix entry
-    # (Intel Mac today) failed — we still ship whatever artifacts succeeded.
-    # The `cancelled()` guard prevents a release when the workflow is cancelled.
+    # The only job that needs a write-capable token (workflow default is read).
+    permissions:
+      contents: write  # create the release + upload assets
+    # Implicit success(): the release runs ONLY when every build job succeeded,
+    # so a hard build failure can never publish a release with missing
+    # installers. (An earlier `always()` guard existed for `experimental`
+    # matrix entries — the Intel Mac — but no entry sets experimental anymore,
+    # so it purely masked real failures. If a best-effort platform returns,
+    # run it as a separate job that nothing `needs:`.)
     # `startsWith` keeps manual `workflow_dispatch` runs from publishing.
-    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -352,13 +388,19 @@ jobs:
           # and the per-platform updater bundles: *.nsis.zip / *.app.tar.gz).
           # The *.sig files are what the in-app updater verifies against the
           # pubkey in tauri.conf.json — they MUST ride along to the release.
+          # Don't ship the raw sidecar binaries — they're inside the Tauri
+          # bundles. The `! -path` prune is load-bearing: the sidecar artifact
+          # (vibechek-sidecar-*.exe, whose inner file is a bare `vibechek.exe`)
+          # otherwise matches '*.exe' and lands on the release page next to the
+          # real installer, where users mistake it for the app (happened on
+          # v0.6.3-beta).
           find artifacts -type f \
+              ! -path '*vibechek-sidecar*' \
               \( -name '*.tar.gz' -o -name '*.zip' \
                  -o -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \
                  -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
                  -o -name '*.sig' \) \
               -exec cp {} release/ \;
-          # Don't ship the raw sidecar binaries — they're inside the Tauri bundles
           ls -la release/
 
       # Build the updater manifest (`latest.json`) that plugins.updater.endpoints
@@ -490,14 +532,18 @@ jobs:
 
             ### ML analysis (`vibechek analyze`)
 
-            Install Essentia separately on Linux/macOS:
+            **Windows desktop installer: nothing to set up.** The native
+            analysis engine is bundled and is the default — a fresh install
+            analyzes fully in-process (no WSL, no separate Python). WSL remains
+            available as a fallback for the `essentia_tf`/`onnx` engines — see
+            [docs/INSTALL.md](https://github.com/captinjack99/Vibechek/blob/main/docs/INSTALL.md).
+
+            Linux/macOS (and the Windows CLI zip): install Essentia separately:
 
             ```
             pip install essentia-tensorflow
             vibechek download-models
             ```
-
-            Windows: see [docs/INSTALL.md](https://github.com/captinjack99/Vibechek/blob/main/docs/INSTALL.md) for the WSL workaround.
 
             ### What's new
             <!-- generate_release_notes fills this in from commits since last tag -->

@@ -591,6 +591,10 @@ export interface RevertJournalResult {
    * restore manually from the OS recycle bin. */
   trashed_not_reverted: number;
   error_messages: string[];
+  /** [(current, restored)] — i.e. (dst, src) — for every move actually
+   * undone. Feed to useLibraryStore.updateTrackPaths so the in-memory
+   * library follows the files back (mirrors organize's moved_pairs). */
+  reverted_pairs: Array<[string, string]>;
 }
 
 // --- diagnostics / models ---

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, MotionConfig } from "framer-motion";
 
 import { Sidebar } from "./components/Sidebar";
@@ -116,6 +117,31 @@ export default function App() {
       detail: payload.detail,
     });
   });
+
+  // Collect the startup notifications the Rust shell BUFFERED for us.
+  // `ready`/`notify` fire at sidecar startup — usually before this component
+  // mounted its listeners, and Tauri events are not queued for late
+  // subscribers — so on a fast sidecar start the install-path hang warning
+  // was silently dropped. The shell buffers those events until this one-time
+  // drain; anything after the drain emits live to the listener above.
+  useEffect(() => {
+    invoke<{ method: string; params: NotifyPayload | null }[]>(
+      "drain_startup_notifications",
+    )
+      .then((events) => {
+        for (const evt of events ?? []) {
+          if (evt?.method !== "notify" || !evt.params?.message) continue;
+          useNotificationStore.getState().notify(evt.params.message, {
+            kind: evt.params.level === "warning" ? "warning" : "info",
+            detail: evt.params.detail,
+          });
+        }
+      })
+      .catch(() => {
+        // Non-fatal (e.g. a test harness without the command); the live
+        // listener above still covers slow-startup runs.
+      });
+  }, []);
 
   // Load config from disk on startup, then auto-save (debounced) on change.
   useConfigPersistence();

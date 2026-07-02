@@ -41,14 +41,27 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
 
 ## Architecture landmines (the non-obvious ones)
 
-- **Windows analysis runs in WSL.** Essentia has no Windows wheel, so `analyze` routes
-  through `vibechek` installed in a WSL venv (`~/.vibechek/venv/`). Paths translate
-  `C:\…` ↔ `/mnt/c/…` and that translation lives **only** in `vibechek/wsl.py` — the
-  frontend never sees `/mnt/c`.
-- **Version-drift guard.** The analyzer refuses to dispatch to WSL when the WSL install's
-  `__version__` ≠ the sidecar's. A stale WSL install is the #1 "analyze silently fails"
-  cause. The fix is the one-click "Update WSL install" (`upgrade_vibechek_in_wsl`) or
-  re-running setup (which `pip install --upgrade`s).
+- **Windows default is the native engine; WSL is the fallback.** Since v0.6.3-beta
+  `config._DEFAULT_INFERENCE_ENGINE = "native"` on Windows, and the desktop installer
+  bundles the DSP-only native essentia wheel into the PyInstaller sidecar
+  (`packaging/build-windows.bat`), so a fresh desktop install analyzes fully in-process
+  — no WSL. `preflight.essentia_serves_engine()` routes `analyze_via="native"` when the
+  bundled essentia imports; when it doesn't (the lean CLI zip, a pip install) or the user
+  picks `essentia_tf`/`onnx`, preflight **falls back to WSL** — `analyze` routes through
+  `vibechek` in a WSL venv (`~/.vibechek/venv/`). Paths translate `C:\…` ↔ `/mnt/c/…` and
+  that translation lives **only** in `vibechek/wsl.py` — the frontend never sees `/mnt/c`.
+  (The opt-in CLAP / online-resolver genre engines still route through WSL on Windows;
+  the backend refuses their setup on the native engine.)
+- **Version-drift guard = auto-upgrade in place, not refusal.** On the WSL fallback, when
+  the WSL install's `__version__` is strictly *older* than the sidecar's, the analyzer
+  auto-upgrades the WSL venv in place on the next analyze (engine-aware — it targets the
+  venv the analyze uses — one-time, with a progress step) rather than aborting; a *newer*
+  WSL venv is left alone; a same-version "no such option" click error (code drift without a
+  version bump) triggers one in-place update + retry; it hard-errors only if the automatic
+  update itself fails (`analyzer.py` ~L2470, `upgrade_vibechek_in_wsl`). The pip source is
+  pinned to *this build's release tag* (`config.vibechek_pip_source()` →
+  `git+…/Vibechek.git@v<version>`), not `main` HEAD, so the auto-update converges the WSL
+  install onto exactly the sidecar's version instead of pulling unreviewed newer code.
 - **`setsid -w` in the WSL launchers.** Both the install path and the run path wrap the
   WSL process in `setsid -w` so cancellation can kill the whole process group, AND so the
   parent waits instead of fork-and-exit. Dropping the `-w` makes the GUI report "done"
@@ -74,7 +87,8 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
   runtime dependency surface while ensuring a clean `[dev]`-only CI install doesn't error
   at test collection. Don't move it to core, and don't drop it from `[dev]`.
 - **ONNX inference engine (`vibechek/onnx_backend.py`).** A complete, user-selectable
-  TF-free engine (`AnalysisConfig.inference_engine = "onnx"`; default stays `essentia_tf`).
+  TF-free engine (`AnalysisConfig.inference_engine = "onnx"`; opt-in — the platform
+  default is `native` on Windows / `essentia_tf` on macOS/Linux).
   Picked via the Settings toggle / `analyze --engine onnx` / the `inference_engine` config
   field. It mirrors `analyzer.load_models`'s dict + callable signatures exactly so the
   analyzer's downstream logic is byte-unchanged, and imports `onnxruntime`/`essentia`

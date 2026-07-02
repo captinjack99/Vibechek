@@ -92,6 +92,13 @@ def _location_to_path(location: str) -> str | None:
     if location.startswith("file:"):
         parsed = urlparse(location)
         path = unquote(parsed.path)
+        # A non-localhost host is a network location (NAS/UNC library —
+        # ``file://MYNAS/music/x.mp3``). Dropping it yielded "/music/x.mp3",
+        # which can never match the analyzed ``\\\\MYNAS\\music`` paths, so
+        # every track of a NAS library silently failed to match. Rebuild the
+        # UNC form; norm_path handles slash direction downstream.
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            return f"//{parsed.netloc}{path}" if path else None
         if _DRIVE_PREFIX_RE.match(path):
             path = path[1:]  # "/D:/Music/…" → "D:/Music/…"
         return path or None
@@ -134,32 +141,41 @@ def parse_rekordbox_collection(xml_path: Path | str) -> dict[str, dict[str, Any]
     return out
 
 
-def merge_prior_into_record(record: dict[str, Any], prior: dict[str, Any]) -> bool:
+def merge_prior_into_record(
+    record: dict[str, Any], prior: dict[str, Any]
+) -> set[str]:
     """Merge one prior into a track record's existing_tags, in place.
 
     Genre replaces the tag-tier value when it differs (a deliberate Rekordbox
     edit supersedes the file tag; provenance recorded in ``genre_origin``).
     Key and energy_mik only FILL — the file's own tag wins when present.
-    Returns True when anything changed (drives idempotent re-imports).
+
+    Returns the SET of changed field names ({"genre", "key", "energy_mik"},
+    empty = no change — still falsy, so truthiness call sites keep working).
+    Field-level reporting matters: the import re-reconciles ONLY what actually
+    changed. When this was a single bool, a key-only fill re-ran the genre
+    reconcile, which recomputed a user-REVERTED review decision back into
+    `ml_override` — flipping the genre to the ML value and re-opening the
+    review queue for a track whose genre the import never touched.
     """
     et = record.setdefault("existing_tags", {})
-    changed = False
+    changed: set[str] = set()
 
     genre = (prior.get("genre") or "").strip()
     if genre and (et.get("genre") or "").strip().casefold() != genre.casefold():
         et["genre"] = genre
         et["genre_origin"] = "rekordbox"
-        changed = True
+        changed.add("genre")
 
     key = (prior.get("key") or "").strip()
     if key and not et.get("key"):
         et["key"] = key
-        changed = True
+        changed.add("key")
 
     mik = prior.get("energy_mik")
     if mik is not None and et.get("energy_mik") is None:
         et["energy_mik"] = mik
-        changed = True
+        changed.add("energy_mik")
 
     return changed
 
@@ -203,8 +219,18 @@ def apply_priors_to_report(
         if not prior:
             continue
         matched += 1
-        if merge_prior_into_record(t, prior):
+        changed = merge_prior_into_record(t, prior)
+        if not changed:
+            continue
+        # Re-reconcile ONLY the fields the prior actually changed. Re-running
+        # the genre reconcile on a key/energy-only fill recomputed the user's
+        # explicit review decisions from scratch: "approved" is guarded inside
+        # _reconcile_record_genre, but a REVERTED track (source back to "tag")
+        # would flip to `ml_override` again and re-enter the review queue —
+        # for an import that never touched its genre.
+        if "genre" in changed:
             _reconcile_record_genre(t, policy, override_conf)
+        if "key" in changed:
             _reconcile_record_key(t)
-            updated.append(t)
+        updated.append(t)
     return updated, matched

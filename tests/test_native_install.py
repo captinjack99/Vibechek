@@ -237,6 +237,14 @@ def test_setup_clap_native_happy_path(
 
     import vibechek.analyzer as analyzer_mod
     monkeypatch.setattr(analyzer_mod, "_download_from_mirrors", _fake_download)
+    # The setup verifies the download against the real checkpoint pin; point
+    # the pin at the fake bytes so the flow-under-test proceeds.
+    import hashlib
+
+    import vibechek.clap_genre as clap_mod
+    monkeypatch.setattr(
+        clap_mod, "_CHECKPOINT_SHA256", hashlib.sha256(b"x" * 64).hexdigest(),
+    )
 
     out = native_install.setup_clap_native()
 
@@ -246,7 +254,39 @@ def test_setup_clap_native_happy_path(
     assert "torch" in pip_calls[0]
     assert any("laion-clap" in c for c in pip_calls[1])
     assert "huggingface.co" in downloaded["url"]
+    # The URL must reference an immutable revision, never the mutable `main`
+    # ref (the checkpoint is a torch pickle — executable on load).
+    assert "/resolve/main/" not in downloaded["url"]
     assert (tmp_path / ".vibechek" / "clap" / "music_clap.pt").is_file()
+
+
+def test_setup_clap_native_rejects_checkpoint_with_wrong_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A downloaded checkpoint whose SHA256 doesn't match the pin must fail the
+    setup AND be deleted — a torch pickle is executable on load, so a size
+    floor alone must never admit it."""
+    _genre_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(native_install, "_CLAP_MIN_CKPT_BYTES", 10)
+    monkeypatch.setattr(
+        native_install, "_run_with_progress", lambda *a, **k: (0, []),
+    )
+    monkeypatch.setattr(
+        native_install, "_run_subprocess_cancellable",
+        lambda args, timeout: (0, "clap import ok", "", False),
+    )
+
+    import vibechek.analyzer as analyzer_mod
+    monkeypatch.setattr(
+        analyzer_mod, "_download_from_mirrors",
+        lambda urls, dest, label, on_progress=None: Path(dest).write_bytes(b"evil" * 16),
+    )
+    # Real pin left in place — the fake bytes cannot match it.
+
+    out = native_install.setup_clap_native()
+    assert out["ok"] is False
+    assert "sha256" in out["error"].lower()
+    assert not (tmp_path / ".vibechek" / "clap" / "music_clap.pt").exists()
 
 
 def test_setup_clap_native_reuses_existing_checkpoint(
@@ -300,6 +340,12 @@ def test_setup_clap_native_falls_back_to_default_index(
     monkeypatch.setattr(
         analyzer_mod, "_download_from_mirrors",
         lambda urls, dest, label, on_progress=None: Path(dest).write_bytes(b"x" * 64),
+    )
+    import hashlib
+
+    import vibechek.clap_genre as clap_mod
+    monkeypatch.setattr(
+        clap_mod, "_CHECKPOINT_SHA256", hashlib.sha256(b"x" * 64).hexdigest(),
     )
 
     out = native_install.setup_clap_native()
@@ -392,10 +438,15 @@ def test_ollama_tarball_picks_platform_asset(
     monkeypatch.setattr(native_install, "IS_MAC", is_mac)
     monkeypatch.setattr(platform_stdlib, "machine", lambda: machine)
 
-    url, kind = native_install._ollama_tarball()
+    url, kind, sha256 = native_install._ollama_tarball()
     assert expected_fragment in url
     assert kind == expected_kind
     # The pin must match the WSL setup's release so both paths install the
     # same build.
-    from vibechek.wsl import _OLLAMA_RELEASE
+    from vibechek.wsl import _OLLAMA_RELEASE, _OLLAMA_TARBALL_SHA256
     assert _OLLAMA_RELEASE in url
+    # Every selectable asset must carry a content pin — the tarball is
+    # unpacked and executed, so an unpinned platform would silently skip
+    # verification.
+    assert sha256 == _OLLAMA_TARBALL_SHA256[expected_fragment]
+    assert sha256 and len(sha256) == 64

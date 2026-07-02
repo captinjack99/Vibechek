@@ -43,6 +43,7 @@ from vibechek.config import (
     OrganizationConfig,
     TaggingConfig,
     VibechekConfig,
+    engine_venv_subdir,
 )
 
 log = logging.getLogger(__name__)
@@ -533,7 +534,10 @@ def _wsl_status(params: dict) -> dict:
     from vibechek.wsl import detect_wsl, to_dict
     quick = bool(params.get("quick", False))
     engine = _valid_engine(params.get("engine"))
-    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    # Shared mapping (native → venv-onnx): this status must describe the SAME
+    # venv preflight gates on and the dispatch runs, or the Settings screen
+    # contradicts the preflight rendered next to it.
+    venv_subdir = engine_venv_subdir(engine)
     return to_dict(detect_wsl(quick=quick, venv_subdir=venv_subdir))
 
 
@@ -1181,7 +1185,7 @@ def _active_engine(params: dict) -> str:
     load()` never raises, so a config-based fallback-on-exception was dead
     code that silently ignored the param)."""
     explicit = params.get("inference_engine")
-    if explicit in ("essentia_tf", "onnx"):
+    if explicit in ("essentia_tf", "onnx", "native"):
         return explicit
     try:
         return _valid_engine(VibechekConfig.load().analysis.inference_engine)
@@ -1201,6 +1205,25 @@ def _setup_genre_engine(params: dict, *, kind: str) -> dict:
     from vibechek.platform import IS_WINDOWS  # noqa: PLC0415
 
     engine = _active_engine(params)
+    # The native engine analyzes IN-PROCESS in the frozen sidecar on Windows —
+    # a Python that can never import the torch/laion-clap (or reach the Ollama
+    # server) this setup would install into a WSL venv. Without this guard the
+    # user sat through a multi-GB "successful" setup whose feature then
+    # silently never activated (_maybe_load_clap swallows the ImportError and
+    # falls back to Discogs). Refuse honestly instead.
+    if IS_WINDOWS and engine == "native":
+        return {
+            "ok": False, "ready": False,
+            "error": (
+                "The CLAP / web-resolver genre engines aren't supported with "
+                "the native (in-process) engine yet: their extras install "
+                "into a WSL environment the native analyzer can't use. "
+                "Switch the inference engine to ONNX Runtime or "
+                "Essentia·TensorFlow (both analyze via WSL on Windows) to "
+                "use them."
+            ),
+            "cancelled": False,
+        }
     if not IS_WINDOWS:
         from vibechek.native_install import (  # noqa: PLC0415
             setup_clap_native,
@@ -1223,7 +1246,7 @@ def _setup_genre_engine(params: dict, *, kind: str) -> dict:
         setup_resolver_in_wsl,
     )
 
-    venv_subdir = "venv-onnx" if engine == "onnx" else "venv"
+    venv_subdir = engine_venv_subdir(engine)
     st = detect_wsl(quick=False, venv_subdir=venv_subdir)
     distro = _validate_distro(params.get("distro"), "") or st.usable_distro
     if not distro and st.distros:

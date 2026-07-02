@@ -894,12 +894,25 @@ function OrganizeResultPanel({
       const summary = await revertJournal({ journal_path: result.journalPath }, opId);
       ops.finish();
       setUndone(true);
+      // Follow the files back in the in-memory library (reverse of the
+      // post-execute updateTrackPaths above) so Preview / tag-apply keep
+      // working without a re-scan.
+      if (summary.reverted_pairs?.length) {
+        const pathMap: Record<string, string> = {};
+        for (const [current, restored] of summary.reverted_pairs) {
+          pathMap[current] = restored;
+        }
+        useLibraryStore.getState().updateTrackPaths(pathMap);
+      }
       const parts = [`Restored ${summary.reverted}`];
       if (summary.skipped) parts.push(`skipped ${summary.skipped}`);
       if (summary.errors) parts.push(`${summary.errors} error(s)`);
       notify(`Undo complete — ${parts.join(", ")}`, {
         kind: summary.errors > 0 ? "info" : "success",
-        detail: "Re-open or re-scan the library to refresh paths.",
+        detail:
+          summary.skipped > 0 || summary.errors > 0
+            ? "Some files could not be restored — re-scan the library if paths look stale."
+            : undefined,
       });
     } catch (e) {
       useOperationStore.getState().fail(e);
