@@ -44,8 +44,12 @@ if defined VIBECHEK_NATIVE_WHEEL (
     REM Only EXPECT a working native onefile if essentia actually imports in the
     REM build venv. A failed wheel build leaves essentia uninstalled, so we ship
     REM the lean CLI with no gate; a successful install arms the post-freeze
-    REM self-test below.
-    python -c "import essentia, essentia.standard" >nul 2>&1 && set VIBECHEK_NATIVE_BUNDLED=1
+    REM self-test below. Do NOT silence the import: a wheel that installs but
+    REM fails to import (e.g. a CRT/toolset skew — the .pyd built against a
+    REM newer msvcp140 than the runtime redist) must show its real error here,
+    REM not just "not importable". The wheel-build script already fresh-venv
+    REM import-tests the repaired wheel, so on a tag build this rarely trips.
+    python -c "import essentia, essentia.standard" && set VIBECHEK_NATIVE_BUNDLED=1
     if not defined VIBECHEK_NATIVE_BUNDLED echo WARNING: essentia not importable after install - building WITHOUT native bundle
 ) else (
     echo VIBECHEK_NATIVE_WHEEL not set - building without the native engine bundle.
