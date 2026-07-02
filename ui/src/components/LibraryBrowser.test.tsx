@@ -17,6 +17,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { LibraryBrowser } from "./LibraryBrowser";
 import { useLibraryStore } from "../stores";
@@ -48,6 +49,8 @@ function ml(overrides: Partial<MLResult> = {}): MLResult {
     ml_genre_conflict: null,
     ml_vocal_audio: null,
     ml_vocal_source: null,
+    ml_key_tag: null,
+    ml_key_conflict: null,
     ...overrides,
   };
 }
@@ -463,5 +466,78 @@ describe("<LibraryBrowser /> — review (genre conflict) filter", () => {
     await user.click(await screen.findByRole("option", { name: /LibraryB/ }));
 
     await waitFor(() => expect(screen.getByText("2 / 2")).toBeInTheDocument());
+  });
+});
+
+describe("<LibraryBrowser /> — Import Rekordbox XML (tag priors)", () => {
+  it("imports priors: picks a file, calls the RPC, merges the returned tracks", async () => {
+    // The file picker resolves to an XML path (mocked plugin-dialog from
+    // src/test/setup.ts).
+    (openDialog as ReturnType<typeof vi.fn>).mockResolvedValue("D:/rekordbox.xml");
+
+    // What the sidecar returns post-import: the same track with the XML genre
+    // merged in at the tag tier and the record re-reconciled.
+    const updated = track("D:/LibraryA/one.mp3", {
+      existing_tags: { genre: "Melodic Techno", genre_origin: "rekordbox" },
+      ml_analysis: ml({
+        ml_genre: "Melodic Techno",
+        ml_subgenre: "Melodic Techno",
+        ml_genre_source: "tag",
+        ml_genre_conflict: false,
+      }),
+    });
+
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string; params?: unknown }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "import_tag_priors":
+            return { ok: true, xml_tracks: 12, matched: 1, updated: 1, tracks: [updated] };
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/one.mp3")], // genre "House" pre-import
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+
+    await user.click(
+      await screen.findByRole("button", { name: /import rekordbox xml/i }),
+    );
+
+    // The RPC was called with the current library + the picked XML path.
+    await waitFor(() => {
+      const call = (invoke as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c) => (c[1] as { method: string }).method === "import_tag_priors",
+      );
+      expect(call).toBeTruthy();
+      const params = (call![1] as {
+        params: { library_path: string; xml_path: string };
+      }).params;
+      expect(params.library_path).toBe("D:/LibraryA");
+      expect(params.xml_path).toBe("D:/rekordbox.xml");
+    });
+
+    // The returned record was merged into the store — the genre changed from
+    // the pre-import "House" to the XML's "Melodic Techno", marked as a
+    // Rekordbox-origin tag. (Row DOM isn't assertable here: Virtuoso renders
+    // no items under jsdom, so like the batch-approve test we assert the
+    // store the rows render from.)
+    await waitFor(() => {
+      const merged = useLibraryStore
+        .getState()
+        .tracks.find((t) => t.path === "D:/LibraryA/one.mp3");
+      expect(merged?.ml_analysis?.ml_genre).toBe("Melodic Techno");
+      expect(merged?.existing_tags.genre_origin).toBe("rekordbox");
+    });
   });
 });

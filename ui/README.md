@@ -48,7 +48,7 @@ ui/
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │  `vibechek rpc` (Python sidecar)                       │
-│  - 48 RPC methods, threadpool dispatch (8 workers)     │
+│  - 49 RPC methods, threadpool dispatch (8 workers)     │
 │  - Stdout lock keeps concurrent JSON frames atomic     │
 │  - Cooperative cancellation token                      │
 │  - All real work: analyzer, tagger, dedup, organize    │
@@ -198,7 +198,7 @@ beta builds ship without them (the updater is inert until a key is enrolled). Se
 
 ## Sidecar protocol
 
-JSON-RPC 2.0, one message per line on stdin/stdout. 48 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
+JSON-RPC 2.0, one message per line on stdin/stdout. 49 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
 
 | Method | What |
 |---|---|

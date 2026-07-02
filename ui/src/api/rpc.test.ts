@@ -70,6 +70,7 @@ const PYTHON_METHODS = [
   "forget_library",
   "load_recent_analysis",
   "resolve_genre_conflicts",
+  "import_tag_priors",
   "rename_library",
   "tag_library",
   "count_new_tracks",

@@ -35,13 +35,40 @@ from vibechek.keys import (
         ("F# min", "11A"),
         ("Eb maj", "5B"),
         ("c minor", "5A"),  # case-insensitive prefix
+        # Zero-padded Camelot (Mixed In Key writes "01A".."12B" in some versions)
+        ("01A", "1A"),
+        ("09B", "9B"),
+        # Open Key notation (Traktor / Rekordbox / Beatport exports):
+        # 1d = C major = 8B; d ("dur") → major/B, m ("moll") → minor/A
+        ("1d", "8B"),
+        ("1m", "8A"),
+        ("2d", "9B"),
+        ("5m", "12A"),
+        ("6d", "1B"),   # wheel wrap: 6+7 → 13 → 1
+        ("12m", "7A"),
+        ("07d", "2B"),  # zero-padded open key
+        ("10M", "5A"),  # case-insensitive letter
+        # Trailing parenthetical (web/DJ-tool exports like "8B (C major)")
+        ("8B (C major)", "8B"),
+        ("2d (G major)", "9B"),
+        ("C major (8B)", "8B"),
     ],
 )
 def test_key_to_camelot_known(key_input: str, expected: str) -> None:
     assert key_to_camelot(key_input) == expected
 
 
-@pytest.mark.parametrize("key_input", [None, "", "Q minor", "12345", "  ", "Z#m"])
+@pytest.mark.parametrize(
+    "key_input",
+    [
+        None, "", "Q minor", "12345", "  ", "Z#m",
+        "0d", "13d", "13A", "0A",       # out-of-range wheel numbers
+        # Real words that a bare prefix-parse used to misread as keys
+        # ("Ambient" → A minor, "Emotional" → E minor): must be unknown.
+        "Ambient", "Emotional", "Dark", "Deep House",
+        "8A - Energy 7",                 # combined MIK comment, not a key field
+    ],
+)
 def test_key_to_camelot_unknown(key_input) -> None:
     assert key_to_camelot(key_input) is None
 

@@ -9,11 +9,16 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 (the authoritative method list), and the "Sidecar protocol" section of
 [`ui/README.md`](../ui/README.md).
 
-> **The method surface is 48.** The one-click engine setups added three methods —
+> **The method surface is 49.** The one-click engine setups added three methods —
 > `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` (all cancellable,
 > progress-emitting) — while FLAC → CDJ export stayed CLI-only (`vibechek cdj-export`).
 > The trust-UX review queue added `resolve_genre_conflicts` (batch approve/revert of
 > reviewed genre conflicts; persists to the saved analysis, never writes file tags).
+> Trust-UX #3 added `import_tag_priors` (parse a Rekordbox collection XML into
+> tag-tier priors: genre supersedes at the tag tier with
+> `existing_tags.genre_origin="rekordbox"`, key/MIK-energy only fill; re-reconciles +
+> persists the saved analysis and a `<analysis>.priors.json` sidecar that
+> `analyze_directory` re-merges on every future run; never writes file tags).
 > The genre setups route per platform behind the same wire shape: Windows → the WSL
 > scripts, Linux/macOS → `native_install.setup_clap_native`/`setup_resolver_native`
 > (same venv + artifact paths, so analyze-time consumers don't care which ran).
@@ -85,12 +90,16 @@ This is how new optional fields stay backwards-safe: declaring them on the datac
 with a `None` default makes the generator emit them (type-safe for the UI) while keeping
 them off the wire until something sets them — the raw record shape is unchanged.
 
-Concretely, the genre/vocal **reconciliation-provenance** fields on `MLResult`
+Concretely, the genre/vocal/key **reconciliation-provenance** fields on `MLResult`
 (`ml_genre_source`, `ml_genre_conflict`, `ml_genre_audio`, `ml_subgenre_audio`,
-`ml_genre_web`, `ml_genre_web_grounded`, `ml_vocal_audio`, `ml_vocal_source`) are
-stamped only on the **final** report (in `_reconcile_record_genre` / `_reconcile_record_vocal`),
-so they're absent on the raw per-track `track_analyzed` notifications that stream during
+`ml_genre_web`, `ml_genre_web_grounded`, `ml_vocal_audio`, `ml_vocal_source`,
+`ml_key_tag`, `ml_key_conflict`) are stamped only on the **final** report (in
+`_reconcile_record_genre` / `_reconcile_record_vocal` / `_reconcile_record_key`), so
+they're absent on the raw per-track `track_analyzed` notifications that stream during
 analyze. The library UI's conflict surfacing keys off them with truthy checks accordingly.
+The key pair is read-only surfacing: `ml_key` itself stays the audio read (embedded tag
+keys measured 49% exact vs audio's 63% on the gold corpus, wrong 10:1 on disagreement —
+`internal/bughunt/score_tag_priors.py`), so tags flag for review, never override.
 
 ## The five steps
 

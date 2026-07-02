@@ -167,7 +167,8 @@ def test_analyze_directory_clamps_negative_workers(monkeypatch) -> None:
     captured = {}
 
     def fake_analyze(library_path, config=None, on_progress=None, on_track=None,
-                     output_path=None, skip=0, limit=None, skip_paths=None):
+                     output_path=None, skip=0, limit=None, skip_paths=None,
+                     tag_priors=None):
         captured["workers"] = config.workers
         captured["skip"] = skip
         captured["limit"] = limit

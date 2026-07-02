@@ -2,7 +2,7 @@
 
 **Open-source ML for your DJ library.** Auto-tag genre, mood, energy, BPM, and key. Find duplicates the way your ears would. Organize 10,000 tracks in an afternoon. Keep every Rekordbox cue point intact.
 
-> **Status:** `v0.6.2-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux), with an opt-in WSL-free native-Windows analysis engine now bundled into the installer. Free forever under AGPL-3.0.
+> **Status:** `v0.6.3-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux); on Windows the WSL-free native analysis engine bundled into the installer is now the default. Free forever under AGPL-3.0.
 
 ---
 
@@ -72,8 +72,9 @@ The Discogs-EffNet head above is the default. But genre is the hardest field to 
 - **CLAP audio classifier (opt-in).** A modern audio-embedding model matched against a curated reference library — **roughly 2× the genre accuracy** of the Discogs head on pure audio, and unlike a tag it works on **untagged / white-label** tracks. One-click *Set up CLAP genre engine* in Settings (a ~2.2 GB model, downloaded once). BPM/key/mood are unchanged.
 - **Online genre lookup (opt-in).** A fully-local LLM reads web results for the track's artist + title and synthesizes the specific subgenre — distrusting commercial chart buckets and verifying the match — then layers it in as **tag › grounded web › audio**. The most accurate option on tagged libraries, fully private (a local model, no API key). One-click *Set up online resolver*.
 - **Conflicts surfaced, never silently resolved.** When your tag, the audio model, and the web lookup disagree, Vibechek flags the track for **one-click review** instead of quietly picking a winner — an "N to review" toolbar filter and a per-row marker, plus a **Genre sources** panel in Track Details showing all three reads, which one won, and why ("Changed your tag *Tech House* → *Trance* — the audio model disagreed"). It augments your curation; it never overwrites it behind your back.
+- **Import your Rekordbox tags.** Rekordbox keeps your genre edits in its own database — they never reach the files. Import its collection XML and the genre you curated there joins the reconciliation at the trusted "your tag" tier (labelled *Your tag (Rekordbox)*), remembered across re-analyses. Embedded key tags and Mixed In Key *Energy N* comments surface too — as context, not overrides: measured on real libraries, tag keys from other tools' analyzers are simply less accurate than Vibechek's audio read (49% vs 63% exact), so a disagreeing tag key flags the track instead of silently replacing the better value.
 
-All four feed the same reconciliation, so the **default behavior is unchanged unless you opt in** — and you can mix them (e.g. trust tags, fall back to the CLAP model, escalate to web only when unsure).
+All of it feeds the same reconciliation, so the **default behavior is unchanged unless you opt in** — and you can mix them (e.g. trust tags, fall back to the CLAP model, escalate to web only when unsure).
 
 ### De-duplication that doesn't lie — *and knows a remix isn't a dupe*
 
@@ -185,7 +186,7 @@ Full developer setup + the platform-specific bits: [docs/INSTALL.md](docs/INSTAL
 React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]──► Python sidecar
                                                                           │
                               ┌───────────────────────────────────────────┴───────────┐
-                              │ vibechek package (48 RPC methods)                     │
+                              │ vibechek package (49 RPC methods)                     │
                               │  analyzer · tagger · duplicates · organizer · genres  │
                               │  clap_genre · genre_web · journal · profiles · config  │
                               │  cancellation · onnx_backend                           │
@@ -221,7 +222,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**965 Python tests** · **48 JSON-RPC methods** · **35 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**1034 Python tests** · **49 JSON-RPC methods** · **36 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
 - 98 frontend tests across 14 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)

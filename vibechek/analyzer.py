@@ -168,6 +168,13 @@ class MLResult:
     ml_genre_conflict: bool | None = None  # tag and audio/web disagreed on family
     ml_vocal_audio: str | None = None      # pure-audio vocal label, pre-reconcile
     ml_vocal_source: str | None = None     # audio|feat_credit
+    # Key tag surfacing (trust-UX #3, stamped by _reconcile_record_key). The
+    # effective ml_key stays the AUDIO read on purpose: measured on the gold
+    # corpus, embedded key tags are other tools' algorithmic reads — 49% exact
+    # vs audio's 63% on the same tracks, and when they disagree the audio is
+    # right 10:1. So tags are surfaced for review, never preferred.
+    ml_key_tag: str | None = None          # file's key tag, normalized to Camelot
+    ml_key_conflict: bool | None = None    # parseable tag key != audio key
 
 
 @dataclass
@@ -870,12 +877,44 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 # ---------------------------------------------------------------------------
 
 
+# Mixed In Key's "Energy N" (1-10) — written into the comment (default) or the
+# grouping field depending on the user's MIK settings. Word-bounded and range-
+# checked; deliberately NOT merged into "energy" (Vibechek's own 0-5 scale).
+_MIK_ENERGY_RE = re.compile(r"\benergy\s*[:=]?\s*(10|[1-9])\b", re.IGNORECASE)
+
+
+def _parse_mik_energy(text: Any) -> int | None:
+    if not text:
+        return None
+    m = _MIK_ENERGY_RE.search(str(text))
+    return int(m.group(1)) if m else None
+
+
+def _absorb_grouping(tags: dict[str, Any], grouping: Any) -> None:
+    """Route a grouping/contentgroup value to subgenre and/or MIK energy.
+
+    Vibechek writes the subgenre there; Mixed In Key can be configured to
+    write "Energy N" there instead. A pure "Energy 7" grouping is an energy
+    prior, not a subgenre; a grouping that merely CONTAINS an energy marker
+    keeps the original string as subgenre and still yields the prior.
+    """
+    if not grouping:
+        return
+    grouping = str(grouping)
+    mik = _parse_mik_energy(grouping)
+    if mik is not None and tags.get("energy_mik") is None:
+        tags["energy_mik"] = mik
+    if mik is None or _MIK_ENERGY_RE.sub("", grouping).strip(" -/|") != "":
+        tags["subgenre"] = grouping
+
+
 def _read_existing_tags(filepath: Path) -> dict[str, Any]:
     """Return a compact dict of existing tags for diff/comparison purposes."""
     tags: dict[str, Any] = {
         "artist": None, "title": None, "album": None, "genre": None,
         "bpm": None, "key": None, "subgenre": None,
         "energy": None, "mood": None, "timeslot": None, "direction": None, "vocal": None,
+        "energy_mik": None,
     }
 
     try:
@@ -910,21 +949,38 @@ def _read_existing_tags(filepath: Path) -> dict[str, Any]:
                     break
 
         ext = filepath.suffix.lower()
-        if ext == ".mp3":
+        if ext in (".mp3", ".aiff", ".aif", ".wav"):
+            # All three carry the same ID3v2 frames — and the tagger WRITES
+            # them to all three (_apply_aiff_wav), so the read side must match
+            # or Vibechek's own AIFF/WAV tags vanish on re-scan.
             try:
-                id3 = ID3(filepath)
-                for txxx in id3.getall("TXXX"):
-                    desc = txxx.desc.upper()
-                    if desc == "ENERGY":
-                        try:
-                            tags["energy"] = int(txxx.text[0])
-                        except (TypeError, ValueError):
-                            tags["energy"] = txxx.text[0]
-                    elif desc in ("MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
-                        tags[desc.lower()] = txxx.text[0]
-                tit1 = id3.get("TIT1")
-                if tit1:
-                    tags["subgenre"] = tit1.text[0]
+                if ext == ".mp3":
+                    id3 = ID3(filepath)
+                else:
+                    from mutagen.aiff import AIFF  # noqa: PLC0415
+                    from mutagen.wave import WAVE  # noqa: PLC0415
+
+                    container = AIFF(filepath) if ext in (".aiff", ".aif") else WAVE(filepath)
+                    id3 = container.tags
+                if id3 is not None:
+                    for txxx in id3.getall("TXXX"):
+                        desc = txxx.desc.upper()
+                        if desc == "ENERGY":
+                            try:
+                                tags["energy"] = int(txxx.text[0])
+                            except (TypeError, ValueError):
+                                tags["energy"] = txxx.text[0]
+                        elif desc in ("MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
+                            tags[desc.lower()] = txxx.text[0]
+                    tit1 = id3.get("TIT1")
+                    if tit1:
+                        _absorb_grouping(tags, tit1.text[0])
+                    if tags["energy_mik"] is None:
+                        for comm in id3.getall("COMM"):
+                            mik = _parse_mik_energy(comm.text[0] if comm.text else None)
+                            if mik is not None:
+                                tags["energy_mik"] = mik
+                                break
             except Exception as e:  # noqa: BLE001
                 log.debug("ID3 read failed for %s: %s", filepath, e)
         elif ext == ".flac":
@@ -940,12 +996,51 @@ def _read_existing_tags(filepath: Path) -> dict[str, Any]:
                                 tags[k] = val
                         else:
                             tags[k] = val
-                tags["subgenre"] = (
+                _absorb_grouping(
+                    tags,
                     flac.get("CONTENTGROUP", [None])[0]
-                    or flac.get("GROUPING", [None])[0]
+                    or flac.get("GROUPING", [None])[0],
                 )
+                if tags["energy_mik"] is None:
+                    for field_name in ("COMMENT", "DESCRIPTION"):
+                        mik = _parse_mik_energy(flac.get(field_name, [None])[0])
+                        if mik is not None:
+                            tags["energy_mik"] = mik
+                            break
             except Exception as e:  # noqa: BLE001
                 log.debug("FLAC read failed for %s: %s", filepath, e)
+        elif ext in (".m4a", ".mp4"):
+            # Mirror _apply_m4a: derived fields live in freeform iTunes atoms.
+            try:
+                from mutagen.mp4 import MP4  # noqa: PLC0415
+
+                mp4 = MP4(filepath)
+                m4 = mp4.tags or {}
+
+                def _ff(name: str) -> str | None:
+                    val = m4.get(f"----:com.apple.iTunes:{name}")
+                    if not val:
+                        return None
+                    raw = val[0]
+                    return bytes(raw).decode("utf-8", "replace") if not isinstance(raw, str) else raw
+
+                for k in ("ENERGY", "MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
+                    val = _ff(k)
+                    if val is not None:
+                        if k == "ENERGY":
+                            try:
+                                tags["energy"] = int(val)
+                            except (TypeError, ValueError):
+                                tags["energy"] = val
+                        else:
+                            tags[k.lower()] = val
+                if tags["key"] is None:
+                    tags["key"] = _ff("initialkey")
+                _absorb_grouping(tags, (m4.get("\xa9grp") or [None])[0])
+                if tags["energy_mik"] is None:
+                    tags["energy_mik"] = _parse_mik_energy((m4.get("\xa9cmt") or [None])[0])
+            except Exception as e:  # noqa: BLE001
+                log.debug("MP4 read failed for %s: %s", filepath, e)
     except Exception as e:  # noqa: BLE001
         tags["_error"] = str(e)
 
@@ -1572,6 +1667,7 @@ def analyze_directory(
     limit: int | None = None,
     skip_paths: set[str] | None = None,
     on_track: TrackCallback | None = None,
+    tag_priors: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Analyze every audio file under `library_path`.
 
@@ -1587,6 +1683,12 @@ def analyze_directory(
     becomes available — the RPC layer uses this to stream `track_analyzed`
     notifications to the GUI so analyzed tracks appear live instead of after
     the whole batch finishes. Pass None to opt out (CLI does this).
+
+    `tag_priors` (imported DJ-tool metadata keyed by tag_priors.norm_path — the
+    Rekordbox XML sidecar) is merged into each record's existing_tags right
+    before the final reconcile pass, so an imported genre participates at the
+    tag tier exactly like a file tag would. The RPC layer loads the library's
+    sidecar and passes it; the CLI passes None.
     """
     if config is None:
         config = AnalysisConfig()
@@ -1923,6 +2025,13 @@ def analyze_directory(
                         _write_partial(output_path, results, total, in_progress=(i + 1) < total)
                     except OSError as e:
                         log.warning("Partial checkpoint write failed (continuing): %s", e)
+
+    if tag_priors:
+        from vibechek.tag_priors import merge_priors_into_results  # noqa: PLC0415
+
+        merged = merge_priors_into_results(results, tag_priors)
+        if merged:
+            log.info("Applied imported tag priors to %d of %d records", merged, total)
 
     report = _build_report(
         results, total, in_progress=False,
@@ -2423,6 +2532,13 @@ def _reconcile_record_genre(
 
     web_genre = ""
     web_grounded = False
+    if not (web_cfg and web_cfg.get("enabled")):
+        # Offline re-reconcile (conflict resolution, priors import): keep the
+        # web tier a previous ONLINE pass already fetched instead of silently
+        # dropping it — the stashed fields are this function's own output, so
+        # feeding them back preserves idempotency. Fresh records have neither.
+        web_genre = ml.get("ml_genre_web") or ""
+        web_grounded = bool(ml.get("ml_genre_web_grounded"))
     if web_cfg and web_cfg.get("enabled"):
         artist, title = _record_artist_title(r)
         key = (artist.lower(), title.lower())
@@ -2459,6 +2575,35 @@ def _reconcile_record_genre(
     ml["ml_genre_conflict"] = rec.conflict
     if rec.source != "ml":
         ml["ml_genre_confidence"] = round(rec.confidence, 3)
+
+
+def _reconcile_record_key(r: dict[str, Any]) -> None:
+    """Surface the file's key tag against the audio key read, in place.
+
+    Read-only trust-UX: `ml_key` (the effective value) is NEVER changed — the
+    gold corpus measured tag keys at 49% exact vs audio's 63% on the same
+    tracks (they're other tools' algorithmic writes, wrong 10:1 against audio
+    on disagreement), so preferring them would cost real accuracy. Instead the
+    normalized tag lands in `ml_key_tag` and `ml_key_conflict` flags an exact
+    mismatch for the UI to display — agreement doubles as a cheap trust badge.
+
+    Handles every notation `key_to_camelot` does (Camelot, zero-padded, Open
+    Key "2d"/"10m", full names). Unparseable/absent tags leave both fields
+    unset (None → omitted on the wire). Idempotent: re-derives from
+    existing_tags + the audio read every time.
+    """
+    ml = r.get("ml_analysis")
+    if not ml:
+        return
+    tag_camelot = key_to_camelot((r.get("existing_tags") or {}).get("key"))
+    if not tag_camelot:
+        # Stale-field hygiene for re-reconciles after a tag was cleared.
+        ml.pop("ml_key_tag", None)
+        ml.pop("ml_key_conflict", None)
+        return
+    ml["ml_key_tag"] = tag_camelot
+    audio_key = ml.get("ml_key")
+    ml["ml_key_conflict"] = bool(audio_key) and tag_camelot != audio_key
 
 
 # A featured-artist credit in the title/artist means the track HAS vocals — a
@@ -2545,6 +2690,7 @@ def _build_report(
                             message=f"Resolving genres online ({i + 1}/{n})…")
             _reconcile_record_genre(r, pol, override, web_cfg, web_cache)
             _reconcile_record_vocal(r)
+            _reconcile_record_key(r)
 
     genres: dict[str, int] = defaultdict(int)
     energies: dict[int, int] = defaultdict(int)

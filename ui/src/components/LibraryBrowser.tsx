@@ -4,7 +4,7 @@ import { AnimatePresence } from "framer-motion";
 import {
   FolderOpen, Sparkles, Search, Music, AlertCircle, AlertTriangle, CheckSquare,
   Square, Tag, Eye, RefreshCw, Clock, Loader2, X, ChevronDown, Compass, Pencil,
-  Check, Undo2,
+  Check, Undo2, Import,
 } from "lucide-react";
 import { clsx as cx } from "clsx";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -17,6 +17,7 @@ import {
   useNotificationStore,
 } from "../stores";
 import { rpc } from "../hooks/useSidecar";
+import { importTagPriors } from "../api/rpc";
 import { useApplyTags } from "../hooks/useApplyTags";
 import type {
   AnalysisReport, LibraryRecord, LibraryState, PreflightResult, TrackAnalysis,
@@ -135,6 +136,8 @@ export function LibraryBrowser() {
   // True while a resolve_genre_conflicts RPC is in flight, so the Approve/Revert
   // buttons disable and can't double-fire on a slow disk write.
   const [resolving, setResolving] = useState(false);
+  // Same guard for the import_tag_priors RPC (the Import Rekordbox XML button).
+  const [importingPriors, setImportingPriors] = useState(false);
   const [recentLibraries, setRecentLibraries] = useState<LibraryRecord[]>([]);
   // Tracks whether `handleAnalyze`'s slow preflight probe is in flight. The
   // probe can take 5-10s and used to block silently; we surface a spinner
@@ -683,6 +686,50 @@ export function LibraryBrowser() {
     }
   };
 
+  // Trust-UX #3: import a Rekordbox collection XML as tag-tier priors. Genre
+  // lands at the tag tier (marked genre_origin="rekordbox"), key/MIK-energy
+  // only fill gaps, and the sidecar re-reconciles + persists the saved
+  // analysis. NEVER writes file tags; idempotent, so re-importing an updated
+  // export is safe. The component owns the RPC and hands the returned records
+  // to the store (stores stay rpc-free) — same shape as runResolveConflicts.
+  const handleImportPriors = async () => {
+    if (!libraryPath || importingPriors || active !== null) return;
+    const selected = await openDialog({
+      multiple: false,
+      filters: [{ name: "Rekordbox XML", extensions: ["xml"] }],
+    });
+    if (typeof selected !== "string") return;
+    setImportingPriors(true);
+    try {
+      const result = await importTagPriors({
+        library_path: libraryPath,
+        xml_path: selected,
+        // Same reconciliation knobs the analyze call sends, so the re-run
+        // matches what a fresh analyze of this library would decide.
+        genre_source_policy: analysisCfg.genre_source_policy,
+        genre_ml_override_confidence: analysisCfg.genre_ml_override_confidence,
+      });
+      if (!result.ok) {
+        fail(result.reason ?? "Could not import the Rekordbox XML");
+        return;
+      }
+      // Merge the authoritative persisted records back (one state update).
+      mergeAnalyzedTracks(result.tracks);
+      notify(
+        `Imported priors from Rekordbox XML: matched ${result.matched} of ${result.xml_tracks} tracks, updated ${result.updated}.`,
+        {
+          kind: "success",
+          detail:
+            "Genres joined at the tag tier; key and MIK energy filled gaps. Nothing was written to your files.",
+        },
+      );
+    } catch (e) {
+      fail(e);
+    } finally {
+      setImportingPriors(false);
+    }
+  };
+
   // Gate analyze behind preflight. The previous version did a quick=true
   // probe first then maybe upgraded — but on Windows that meant the dialog
   // first appeared with stale per-distro data, falsely claiming "WSL not
@@ -1094,6 +1141,19 @@ export function LibraryBrowser() {
                 <RefreshCw className="w-4 h-4" />
               )}
               {preflightInFlight ? "Checking…" : "Re-analyze all"}
+            </button>
+            <button
+              className="btn-ghost"
+              onClick={handleImportPriors}
+              disabled={active !== null || importingPriors || !libraryPath}
+              title="Import genre / key / MIK-energy priors from a Rekordbox collection XML (never writes file tags)"
+            >
+              {importingPriors ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Import className="w-4 h-4" />
+              )}
+              Import Rekordbox XML
             </button>
           </>
         )}

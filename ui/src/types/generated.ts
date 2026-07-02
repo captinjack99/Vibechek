@@ -216,6 +216,8 @@ export interface MLResult {
   ml_genre_conflict: boolean | null;
   ml_vocal_audio: string | null;
   ml_vocal_source: string | null;
+  ml_key_tag: string | null;
+  ml_key_conflict: boolean | null;
 }
 
 export interface TrackAnalysis {

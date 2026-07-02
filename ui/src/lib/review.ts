@@ -150,6 +150,36 @@ export function genreProvenance(
   };
 }
 
+export interface KeyProvenance {
+  /** The file's key tag, normalized to Camelot (e.g. "9B"). */
+  tag: string;
+  /** The audio analysis read (`ml_key`) — always the EFFECTIVE key. */
+  audio: string | null;
+  /** Whether the tag and the audio read disagree. */
+  conflict: boolean;
+}
+
+/**
+ * Key provenance for the detail panel — read-only surfacing, deliberately NOT
+ * part of needsReview/reviewSeverity (the review queue stays genre-only). Tag
+ * keys are other tools' algorithmic writes, and they measured WORSE than the
+ * audio read (49% exact vs 63%; wrong 10:1 on disagreement), so the audio read
+ * always stays effective and there's nothing to approve or revert — we just
+ * tell the user when their tag agrees, and when to trust their ears.
+ *
+ * Returns null unless the track has a parseable key tag (`ml_key_tag`).
+ */
+export function keyProvenance(
+  ml: MLResult | null | undefined,
+): KeyProvenance | null {
+  if (!ml?.ml_key_tag) return null;
+  return {
+    tag: ml.ml_key_tag,
+    audio: ml.ml_key ?? null,
+    conflict: ml.ml_key_conflict === true,
+  };
+}
+
 /**
  * Whether the genre breakdown is worth showing in the detail panel. We hide it
  * for the boring case (tag kept and audio agreed, no web lookup) where the

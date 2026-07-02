@@ -50,6 +50,7 @@ import type {
   GetLogTailRequest,
   GetLogTailResult,
   HandleDuplicatesRequest,
+  ImportTagPriorsRequest,
   InstallCudaLibsInWSLRequest,
   InstallResultPayload,
   InstallVibechekInWSLRequest,
@@ -229,6 +230,23 @@ export function resolveGenreConflicts(
   params: ResolveGenreConflictsRequest,
 ): Promise<{ ok: boolean; updated: number; tracks: AnalysisReport["tracks"] }> {
   return rpc("resolve_genre_conflicts", params);
+}
+
+/** Import a Rekordbox collection XML as tag-tier priors: genre lands at the
+ *  tag tier (marked `genre_origin="rekordbox"`), key/MIK-energy fill gaps, the
+ *  matched records re-reconcile, and the saved analysis persists. Never writes
+ *  file tags; idempotent. Returns the updated track records to sync the store. */
+export function importTagPriors(
+  params: ImportTagPriorsRequest,
+): Promise<{
+  ok: boolean;
+  reason?: string;
+  xml_tracks: number;
+  matched: number;
+  updated: number;
+  tracks: AnalysisReport["tracks"];
+}> {
+  return rpc("import_tag_priors", params);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +623,7 @@ const api = {
   forgetLibrary,
   loadRecentAnalysis,
   resolveGenreConflicts,
+  importTagPriors,
   renameLibrary,
   tagLibrary,
   countNewTracks,

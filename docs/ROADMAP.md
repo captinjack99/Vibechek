@@ -49,7 +49,7 @@ Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 
 Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI required.
 
-- ✅ **JSON-RPC sidecar** ([`vibechek/rpc.py`](../vibechek/rpc.py)): 48 methods (28 at first ship, grown since), threadpool dispatch (8 workers), stdout lock, progress + per-track notifications, structured error codes.
+- ✅ **JSON-RPC sidecar** ([`vibechek/rpc.py`](../vibechek/rpc.py)): 49 methods (28 at first ship, grown since), threadpool dispatch (8 workers), stdout lock, progress + per-track notifications, structured error codes.
 - ✅ **Async sidecar**: long ops don't block fast ones. Fast endpoints (system_info, preflight) interleave with running analyze/dedupe/organize.
 - ✅ **Cancellation** ([`vibechek/cancellation.py`](../vibechek/cancellation.py)): cooperative token; multiprocessing pool terminates cleanly on cancel; WSL subprocess gets SIGTERM+SIGKILL.
 - ✅ **Auto-saved analysis state** ([`vibechek/library_state.py`](../vibechek/library_state.py)): analysis result writes to `<data_dir>/analyses/...` automatically; recent libraries index surfaces them on the Library tab's empty state.

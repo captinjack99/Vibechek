@@ -4,6 +4,7 @@ import type { ExistingTags, MLResult } from "../types";
 import {
   genreProvenance,
   hasInterestingProvenance,
+  keyProvenance,
   needsReview,
   reviewReason,
   reviewSeverity,
@@ -22,6 +23,9 @@ function ml(overrides: Partial<MLResult>): MLResult {
     ml_genre_web_grounded: null,
     ml_genre_source: null,
     ml_genre_conflict: null,
+    ml_key: null,
+    ml_key_tag: null,
+    ml_key_conflict: null,
     ...overrides,
   } as MLResult;
 }
@@ -168,6 +172,35 @@ describe("reviewReason", () => {
       ml_subgenre: "Tech House",
     });
     expect(reviewReason(m, tags("Tech House"))).toBe("Sources disagree on the genre.");
+  });
+});
+
+describe("keyProvenance", () => {
+  it("returns null when there's no ml result", () => {
+    expect(keyProvenance(null)).toBeNull();
+    expect(keyProvenance(undefined)).toBeNull();
+  });
+
+  it("returns null when the track has no parseable key tag", () => {
+    // ml_key_tag is OMITTED (undefined) on the wire when unparseable — the
+    // helper keys off truthiness, never `=== null`.
+    expect(keyProvenance(ml({ ml_key: "9B" }))).toBeNull();
+    expect(keyProvenance(ml({ ml_key: "9B", ml_key_tag: null }))).toBeNull();
+  });
+
+  it("reports agreement when the tag matches the audio read", () => {
+    const p = keyProvenance(
+      ml({ ml_key: "9B", ml_key_tag: "9B", ml_key_conflict: false }),
+    );
+    expect(p).toEqual({ tag: "9B", audio: "9B", conflict: false });
+  });
+
+  it("flags a disagreeing tag but keeps it OUT of the genre review queue", () => {
+    const m = ml({ ml_key: "9B", ml_key_tag: "4A", ml_key_conflict: true });
+    expect(keyProvenance(m)).toEqual({ tag: "4A", audio: "9B", conflict: true });
+    // Read-only surfacing by design — a key conflict must NOT flag the track
+    // for review (needsReview stays genre-only; there's no approve/revert).
+    expect(needsReview(m)).toBe(false);
   });
 });
 

@@ -370,6 +370,21 @@ def _analyze_directory(params: dict) -> dict:
     skip_set: set[str] | None = set(skip_paths) if skip_paths else None
     library_path = Path(params["path"])
 
+    # Imported tag priors (Rekordbox XML — import_tag_priors) live in a sidecar
+    # next to the library's saved analysis; re-merge them on every analyze so a
+    # re-scan doesn't lose the import. Best-effort: a broken sidecar must never
+    # block analyze.
+    tag_priors_map = None
+    try:
+        from vibechek.tag_priors import load_priors  # noqa: PLC0415
+
+        state = library_state.load_state()
+        rec = next((r for r in state.recent if r.path == str(library_path)), None)
+        if rec:
+            tag_priors_map = load_priors(rec.analysis_path) or None
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not load the tag-priors sidecar: %s", e)
+
     report = analyze_directory(
         library_path,
         config=config,
@@ -380,6 +395,7 @@ def _analyze_directory(params: dict) -> dict:
         skip=_nonneg_int(params.get("skip", 0), 0),
         limit=_nonneg_int(params.get("limit") or 0, 0) or None,
         skip_paths=skip_set,
+        tag_priors=tag_priors_map,
     )
 
     if bool(params.get("auto_save", True)):
@@ -1521,6 +1537,66 @@ def _resolve_genre_conflicts(params: dict) -> dict:
     return {"ok": True, "updated": len(updated), "tracks": updated}
 
 
+def _import_tag_priors(params: dict) -> dict:
+    """Import a Rekordbox collection XML as tag-tier priors for a library.
+
+    params: {"library_path": str, "xml_path": str, "genre_source_policy"?: str,
+             "genre_ml_override_confidence"?: float}
+
+    Parses the XML (genre / Tonality / MIK "Energy N" in Comments), merges the
+    values into the saved analysis records' existing_tags (genre supersedes at
+    the tag tier with genre_origin="rekordbox"; key/energy only fill), re-runs
+    the genre + key reconciliation on the affected records, persists the
+    analysis in place, and saves the priors to a sidecar so every future
+    analyze of this library re-applies them (see tag_priors module docstring).
+    NEVER writes file tags.
+
+    Returns {"ok", "xml_tracks", "matched", "updated", "tracks": [updated
+    TrackAnalysis...]} so the GUI can sync exactly what changed.
+    """
+    from vibechek import library_state, tag_priors  # noqa: PLC0415
+    from vibechek.cdj_export import CdjExportError  # noqa: PLC0415
+
+    library_path = str(params.get("library_path") or "")
+    xml_path = str(params.get("xml_path") or "")
+    if not library_path or not xml_path:
+        return {"ok": False, "reason": "missing library_path or xml_path",
+                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
+
+    state = library_state.load_state()
+    record = next((r for r in state.recent if r.path == library_path), None)
+    if not record:
+        return {"ok": False, "reason": "library not in recents",
+                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
+    report = library_state.load_analysis(record)
+    if not report:
+        return {"ok": False, "reason": "no saved analysis for library",
+                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
+
+    try:
+        priors = tag_priors.parse_rekordbox_collection(xml_path)
+    except CdjExportError as e:
+        return {"ok": False, "reason": str(e),
+                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
+    except OSError as e:
+        return {"ok": False, "reason": f"could not read XML: {e}",
+                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
+
+    policy = _valid_genre_policy(params.get("genre_source_policy"))
+    override = _clamp01(params.get("genre_ml_override_confidence", 0.90), 0.90)
+    updated, matched = tag_priors.apply_priors_to_report(report, priors, policy, override)
+
+    if updated:
+        library_state.save_analysis(record, report)
+    # Persist (merge over any earlier import) even when nothing changed NOW —
+    # the sidecar is what makes future re-analyzes keep the import.
+    merged_sidecar = {**tag_priors.load_priors(record.analysis_path), **priors}
+    tag_priors.save_priors(record.analysis_path, merged_sidecar)
+
+    return {"ok": True, "xml_tracks": len(priors), "matched": matched,
+            "updated": len(updated), "tracks": updated}
+
+
 # ---------------------------------------------------------------------------
 # Undo journals (organize / dedupe-move / dedupe-trash)
 # ---------------------------------------------------------------------------
@@ -1644,6 +1720,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "forget_library": _forget_library,
     "load_recent_analysis": _load_recent_analysis,
     "resolve_genre_conflicts": _resolve_genre_conflicts,
+    "import_tag_priors": _import_tag_priors,
     "rename_library": _rename_library,
     "tag_library": _tag_library,
     "count_new_tracks": _count_new_tracks,

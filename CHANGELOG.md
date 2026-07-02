@@ -11,6 +11,25 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 ## [Unreleased]
 
 ### Added
+- **Import your Rekordbox library's tags as priors (trust-UX #3).** A new
+  "Import Rekordbox XML" action reads a Rekordbox collection export and feeds
+  the genre you curated there into the same tag-tier reconciliation your file
+  tags get (labelled "Your tag (Rekordbox)" in the Genre sources panel). The
+  import persists in a sidecar and re-applies on every future analyze; it
+  never writes file tags. Key (Tonality) and Mixed In Key "Energy N" comments
+  are imported too — as read-only context, not overrides (see below).
+- **Key tags surfaced, never trusted blindly.** Tracks whose embedded key tag
+  disagrees with the audio analysis now show it in Track Details. Measured on
+  the gold corpus first (the measure-first rule): embedded key tags are other
+  tools' algorithmic reads — 49% exact vs the audio path's 63% on the same
+  tracks, and wrong 10:1 when they disagree — so the audio key stays
+  effective, and the tag becomes a review signal (agreement shows as a quiet
+  confirmation). Open Key notation ("2d"/"10m"), zero-padded Camelot ("01A"),
+  and parenthetical forms ("8B (C major)") now all parse; dirty tag words like
+  "Ambient" no longer misread as A minor.
+- **Mixed In Key energy is read from your files.** "Energy N" in comments or
+  the grouping field (MP3/FLAC/AIFF/WAV/M4A) surfaces as MIK energy (1-10) in
+  Track Details, kept separate from Vibechek's own 0-5 energy scale.
 - **Gold-corpus accuracy gate in CI.** Three openly-licensed 45s reference
   clips (CC0/CC-BY, attribution in `tests/fixtures/gold/ATTRIBUTION.md`) are
   committed with the genre/BPM/key the production pipeline is known to produce
@@ -21,6 +40,12 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
   no longer ship. Shared checker in `vibechek/gold_gate.py`; the assertion
   tiers (exact / tolerance / floor / presence) live in the fixtures'
   `manifest.json`.
+
+### Fixed
+- **AIFF/WAV/M4A custom tags now read back.** Vibechek writes ENERGY/MOOD/
+  TIMESLOT/DIRECTION/VOCAL (and the subgenre grouping) to AIFF/WAV ID3 chunks
+  and M4A freeform atoms, but only ever read them back from MP3/FLAC — so its
+  own tags on those formats vanished from the diff view on re-scan.
 
 ## [0.6.3-beta] — 2026-06-24
 

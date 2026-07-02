@@ -49,8 +49,23 @@ KEY_SHORTHAND: dict[str, str] = {
     "B": "B major", "Bm": "B minor",
 }
 
-_CAMELOT_RE = re.compile(r"^([1-9]|1[0-2])([AB])$", re.IGNORECASE)
-_KEY_PARSE_RE = re.compile(r"^([A-Ga-g][#b]?)\s*(maj|min|major|minor|m)?", re.IGNORECASE)
+# Leading zero accepted ("01A") — Mixed In Key zero-pads Camelot in some
+# versions, and those tags flow in via _read_existing_tags.
+_CAMELOT_RE = re.compile(r"^0?([1-9]|1[0-2])([AB])$", re.IGNORECASE)
+# Open Key notation (Traktor, and Rekordbox/Beatport exports): 1d-12d major
+# ("dur"), 1m-12m minor ("moll"). 1d = C major = Camelot 8B, so
+# camelot_number = ((n + 7 - 1) % 12) + 1 with d→B / m→A. The letters never
+# collide with Camelot's A/B, so both notations can share one parser.
+_OPEN_KEY_RE = re.compile(r"^0?([1-9]|1[0-2])\s*([dm])$", re.IGNORECASE)
+# Anchored at both ends: a bare prefix match would read "Ambient" as A minor
+# and "Emotional" as E minor — real words that show up in dirty key tags.
+# Suffixed-but-valid forms ("C major (8B)") come back via the parenthetical
+# strip below instead.
+_KEY_PARSE_RE = re.compile(
+    r"^([A-Ga-g][#b]?)\s*(maj|min|major|minor|m)?\s*$", re.IGNORECASE
+)
+# A trailing parenthetical like "8B (C major)" — strip and re-parse the prefix.
+_PAREN_SUFFIX_RE = re.compile(r"\s*\([^()]*\)\s*$")
 
 # Valid harmonic-mixing modes. Each picks a different set of "compatible"
 # Camelot wheels relative to a starting key. Order roughly: tightest to loosest.
@@ -60,15 +75,22 @@ COMPATIBLE_MODES = ("strict", "harmonic", "energy", "energy-boost")
 def key_to_camelot(key_str: str | None) -> str | None:
     """Normalize any key representation to Camelot (e.g. '8A', '11B').
 
-    Accepts already-Camelot input, full names ('C major'), shorthand ('Cm'),
-    and free-form like 'F# min'. Returns None for inputs that don't parse.
+    Accepts already-Camelot input (incl. zero-padded '01A'), Open Key notation
+    ('2d'/'10m' — what Traktor and Rekordbox/Beatport exports write), full
+    names ('C major'), shorthand ('Cm'), free-form like 'F# min', and a
+    trailing parenthetical ('8B (C major)'). Returns None for inputs that
+    don't parse.
     """
     if not key_str:
         return None
     s = str(key_str).strip()
 
     if m := _CAMELOT_RE.match(s):
-        return f"{m.group(1)}{m.group(2).upper()}"
+        return f"{int(m.group(1))}{m.group(2).upper()}"
+
+    if m := _OPEN_KEY_RE.match(s):
+        n = ((int(m.group(1)) + 7 - 1) % 12) + 1
+        return f"{n}{'B' if m.group(2).lower() == 'd' else 'A'}"
 
     if s in KEY_TO_CAMELOT:
         return KEY_TO_CAMELOT[s]
@@ -93,6 +115,11 @@ def key_to_camelot(key_str: str | None) -> str | None:
             # rather than a confidently-wrong Camelot.
             return None
         return KEY_TO_CAMELOT.get(full)
+
+    # "8B (C major)" and friends: strip ONE trailing parenthetical and retry.
+    stripped = _PAREN_SUFFIX_RE.sub("", s)
+    if stripped and stripped != s:
+        return key_to_camelot(stripped)
 
     return None
 

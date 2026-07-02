@@ -35,6 +35,11 @@ export interface ExistingTags {
   timeslot?: string | null;
   direction?: string | null;
   vocal?: string | null;
+  /** Mixed In Key's 1-10 energy read from comments/grouping. A DIFFERENT scale
+   *  from Vibechek's 0-5 `energy` — display as "7/10", never compare or merge. */
+  energy_mik?: number | null;
+  /** "rekordbox" when the genre tag came from an XML import (tag priors). */
+  genre_origin?: string | null;
 }
 
 export interface TrackAnalysis {

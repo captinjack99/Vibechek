@@ -29,6 +29,7 @@ import {
 import {
   genreProvenance,
   hasInterestingProvenance,
+  keyProvenance,
   reviewReason,
   type GenreProvenance,
 } from "../lib/review";
@@ -267,6 +268,9 @@ interface DiffRowData {
   renderNext?: (v: string | number) => React.ReactNode;
   /** Faint provenance hint shown after the value (e.g. how it was derived). */
   note?: string;
+  /** Inline affordance rendered at the row's end regardless of diff state
+   *  (unlike `note`, which only accompanies a changed value). */
+  hint?: React.ReactNode;
 }
 
 function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
@@ -281,7 +285,13 @@ function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
       badgeColor: "purple",
     },
     { label: "BPM", existing: existing.bpm, next: ml.ml_bpm, badgeColor: "neutral" },
-    { label: "Key", existing: existing.key, next: ml.ml_key, badgeColor: "green" },
+    {
+      label: "Key",
+      existing: existing.key,
+      next: ml.ml_key,
+      badgeColor: "green",
+      hint: <KeyTagHint ml={ml} />,
+    },
     {
       label: "Energy",
       existing: existing.energy as number | string | null | undefined,
@@ -294,6 +304,16 @@ function buildDiffRows(existing: ExistingTags, ml: MLResult): DiffRowData[] {
         const n = Number(v);
         return <EnergyBar level={Number.isFinite(n) ? n : 0} />;
       },
+      // Mixed In Key's 1-10 energy, when the file's tags carry one. A different
+      // scale from Vibechek's 0-5 — surfaced for reference, never merged.
+      hint: existing.energy_mik ? (
+        <span
+          className="text-[10px] text-white/40 flex-none ml-auto"
+          title="Mixed In Key energy from your file's tags (1-10 scale, separate from Vibechek's 0-5)"
+        >
+          MIK energy {existing.energy_mik}/10
+        </span>
+      ) : undefined,
     },
     { label: "Mood", existing: existing.mood, next: ml.ml_mood, badgeColor: "purple" },
     { label: "Timeslot", existing: existing.timeslot, next: ml.ml_timeslot },
@@ -344,8 +364,43 @@ function DiffRow({ row }: { row: DiffRowData }) {
             )}
           </>
         )}
+        {row.hint}
       </div>
     </div>
+  );
+}
+
+/**
+ * Key-tag provenance affordance (trust-UX #3) — read-only surfacing next to
+ * the Key diff row. When the file carries a parseable key tag we say whether
+ * the audio read agrees. The audio read is ALWAYS the effective key (measured
+ * substantially more accurate than embedded tag keys), so unlike genre there's
+ * nothing to approve or revert here — see `keyProvenance` in lib/review.
+ */
+function KeyTagHint({ ml }: { ml: MLResult }) {
+  const prov = keyProvenance(ml);
+  if (!prov) return null;
+  if (!prov.conflict) {
+    return (
+      <span
+        className="text-[10px] text-white/40 flex-none ml-auto"
+        title="Your file's key tag agrees with the audio analysis"
+      >
+        matches your tag
+      </span>
+    );
+  }
+  return (
+    <span
+      className="text-[10px] text-accent-yellow flex-none ml-auto"
+      title={
+        `Your file's key tag reads ${prov.tag}, the audio analysis reads ${prov.audio ?? "(none)"}. ` +
+        "Audio keys measured substantially more accurate than embedded tag keys, " +
+        "so Vibechek keeps the audio read — trust your ears on conflicts."
+      }
+    >
+      tag says {prov.tag}
+    </span>
   );
 }
 
@@ -446,7 +501,13 @@ function GenreSourcesSection({
           <div>{reason}</div>
         </div>
       )}
-      <SourceRow label="Your tag" value={p.tag} won={winnerIsTag} />
+      <SourceRow
+        // An XML-imported genre still sits at the tag tier, but it came from
+        // the user's Rekordbox collection rather than the file — say so.
+        label={existing.genre_origin === "rekordbox" ? "Your tag (Rekordbox)" : "Your tag"}
+        value={p.tag}
+        won={winnerIsTag}
+      />
       <SourceRow label="Audio model" value={p.audio} won={winnerIsAudio} />
       {p.web && (
         <SourceRow

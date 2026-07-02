@@ -100,6 +100,7 @@ export const RPC_METHODS = [
   "forget_library",
   "load_recent_analysis",
   "resolve_genre_conflicts",
+  "import_tag_priors",
   "rename_library",
   "tag_library",
   "count_new_tracks",
@@ -178,6 +179,19 @@ export interface InstallCudaLibsInWSLRequest {
 export interface ResolveGenreConflictsRequest {
   library_path: string;
   items: { path: string; action: "approve" | "revert" }[];
+}
+
+/** Import a Rekordbox collection XML as tag-tier priors: genre supersedes at
+ *  the tag tier (marked `genre_origin="rekordbox"`), key/MIK-energy only fill
+ *  gaps, then the matched records re-reconcile and persist. Never writes file
+ *  tags; idempotent (re-importing the same XML is safe). */
+export interface ImportTagPriorsRequest {
+  library_path: string;
+  xml_path: string;
+  /** Existing-tag vs ML genre reconciliation policy (server default if omitted). */
+  genre_source_policy?: string;
+  /** prefer_tag: min ML confidence to override a disagreeing specific tag. */
+  genre_ml_override_confidence?: number;
 }
 
 export interface RepairWSLShimRequest {

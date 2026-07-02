@@ -398,6 +398,23 @@ the Library tab (the "N to review" filter + a per-row ⚠ marker), and Track Det
 which source won and why. So a policy like **Prefer ML** that lets the model overrule a tag
 never does it silently — you can see, and reverse, every change. (See Workflow 2.)
 
+### Importing your Rekordbox tags (priors)
+
+Rekordbox keeps the genre and comment edits you make in its **own database** — they never
+reach your audio files, so no file-tag reader can see them. Export your collection from
+Rekordbox (**File → Export Collection in xml format**), then use **Import Rekordbox XML**
+on the Library tab: the genre you curated there joins the reconciliation at the same
+trusted "your tag" tier as a file tag (Track Details labels it "Your tag (Rekordbox)").
+The import is remembered for that library and re-applied on every future analyze. Nothing
+is ever written to your files by an import.
+
+Keys and Mixed In Key energy come along too, but deliberately as **context, not
+overrides**: measured on real libraries, embedded key tags (from Rekordbox/Traktor/MIK's
+own analyzers) are simply *less accurate* than Vibechek's audio read — so a disagreeing
+tag key shows up in Track Details as a flag ("tag says 9B") instead of silently replacing
+the better value, and agreement shows as a quiet confirmation. MIK's "Energy N" (1-10)
+displays alongside Vibechek's energy without being mixed into it.
+
 ---
 
 ## Troubleshooting
