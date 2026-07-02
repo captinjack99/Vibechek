@@ -80,6 +80,16 @@ REM openly-licensed reference clips and must reproduce the genre/BPM/key pinned
 REM in tests\fixtures\gold\manifest.json — a result regression fails the build
 REM even when nothing crashes. (cwd is the repo root; see `cd` at the top.)
 if defined VIBECHEK_NATIVE_BUNDLED (
+    REM Provision the ML models FIRST, through the same path a real user's
+    REM preflight remediation runs: stages the bundled ONNX heads out of the
+    REM frozen exe and downloads the SHA256-pinned EffNet backbone (~18 MB,
+    REM UPF with the GitHub models-v1 release as fallback). On a clean CI
+    REM runner the models dir is EMPTY — the first tag build to run the gold
+    REM gate failed here with "8 ML model file(s) missing" because nothing
+    REM staged them (it passed locally only because the dev box's models dir
+    REM was already populated). Idempotent: present+pinned files are skipped.
+    echo Provisioning ML models for the native gold gate...
+    dist\vibechek.exe download-models --engine native || exit /b 1
     echo Self-testing the bundled native engine inside the frozen exe...
     dist\vibechek.exe selftest-native --gold-dir tests\fixtures\gold || exit /b 1
 )
