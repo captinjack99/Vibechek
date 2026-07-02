@@ -8,7 +8,11 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ---
 
-## [Unreleased]
+## [0.7.0-beta] — 2026-07-02
+
+Two review rounds in one release: the 17 adversarially-confirmed fixes from
+the takeover review, then the remaining 39 findings verified against the code
+and every confirmed one fixed.
 
 ### Added
 - **Import your Rekordbox library's tags as priors (trust-UX #3).** A new
@@ -41,7 +45,78 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
   tiers (exact / tolerance / floor / presence) live in the fixtures'
   `manifest.json`.
 
+### Security
+- **The CLAP checkpoint is revision- and content-pinned.** The opt-in CLAP
+  genre engine's 2.2 GB PyTorch checkpoint (a pickle — executable on load)
+  was fetched from a mutable third-party `main` ref with only a size check.
+  It now downloads from an immutable Hugging Face revision, and its SHA256
+  (verified byte-identical between the locally-validated copy and HF's LFS
+  record) is enforced after download in both setups AND before every load.
+- **Engine installs no longer track GitHub `main`.** The WSL/managed-venv
+  vibechek install — and the version-drift auto-update that reuses it — was a
+  de-facto unsigned auto-updater pulling whatever `main` HEAD was at that
+  moment. It now installs this build's own release tag
+  (`git+…@v<version>`), so the engine converges on exactly the sidecar's
+  version and unreviewed commits can no longer ship silently to users.
+- **The Ollama tarball and the ONNX backbone now have SHA256 pins**, verified
+  after download (backbone also on cached reuse) — closing the last unpinned
+  fetched-and-executed/loaded artifacts.
+- **CI tokens are least-privilege:** release.yml build jobs now run with a
+  read-only GITHUB_TOKEN (only the publish job gets `contents: write`), and
+  codeql.yml's actions are pinned to commit SHAs like every other workflow.
+
 ### Fixed
+- **The native engine's WSL fallback works end-to-end.** Everything that
+  picks a WSL/managed venv for an engine now routes through one shared
+  mapping (`native` shares the ONNX stack's `venv-onnx`). Previously,
+  preflight validated venv-onnx while the install put essentia-tensorflow
+  into `venv` (a 10-minute setup that still said "not ready"), the dispatch
+  ran a venv that couldn't serve the engine (crash after preflight said
+  READY), and the auto-update repaired a different venv than the one probed.
+  On Linux/macOS, a saved `native` engine (e.g. a config copied from Windows)
+  snaps back to the platform default instead of misrouting; the Settings
+  button is Windows-only.
+- **CLAP / web-resolver setup refuses the native engine honestly.** On the
+  Windows-default native engine, the multi-GB setup used to install into a
+  WSL venv the in-process analyzer can never import — reporting success while
+  the feature silently never activated.
+- **The sidecar can't be wedged by native print noise anymore (3 crash
+  paths).** A non-UTF-8 byte on stdout/stderr, or a >200-byte line splitting
+  a multibyte character, could kill the desktop shell's reader tasks: RPC
+  demuxing died while the sidecar lived on (every call "timed out", analyze
+  hung forever), or stderr stopped draining until the sidecar blocked on a
+  full pipe. Both readers now lossy-decode raw bytes, truncation is
+  char-safe — and when the shell declares the sidecar dead, it now actually
+  kills the process instead of leaking it to keep mutating files after the
+  UI said "aborted".
+- **Startup warnings can't be lost to a fast sidecar start.** The install-path
+  hang warning (My Drive/OneDrive/long paths) fired before the UI had mounted
+  its listeners and was dropped; the shell now buffers startup notifications
+  until the frontend collects them.
+- **A Rekordbox import can't re-open your resolved review decisions.** The
+  import re-reconciles only the fields it actually changed — a key/energy-only
+  fill no longer recomputes the genre decision, so a track you Reverted stays
+  reverted (Approved was already guarded) and the review queue stays drained.
+- **Rekordbox network (NAS) libraries match.** `file://<server>/…` locations
+  kept only the path and matched zero tracks; the UNC host is now preserved.
+- **Undo follows the files back in the UI.** Reverting an organize/dedupe
+  journal now rewrites the in-memory track paths (as organize does forward),
+  so post-undo Preview, tag apply, and re-organize stop targeting paths that
+  no longer exist.
+- **Cross-library race guards.** Switching libraries while a Rekordbox
+  import, batch Approve/Revert, or the pre-analyze preflight probe was in
+  flight could merge one library's tracks (or a whole stale report) into the
+  other library's view; all three now detect the switch and drop the stale
+  commit. The empty state's "Choose a different folder" is disabled during an
+  active run like its siblings.
+- **`vibechek analyze` / `download-models` without `--engine` now use the
+  saved config's engine** (falling back to the platform default) instead of a
+  hardcoded essentia_tf — a stock Windows box no longer routes into a WSL
+  that was never set up.
+- **"Check for updates" no longer pretends.** Auto-update is deliberately
+  disabled until release signing is funded, but Settings shipped a live
+  button that failed on every click; it now says so and links to GitHub
+  Releases instead.
 - **Incremental "Analyze new tracks only" no longer destroys the saved
   analysis.** The new-tracks-only report used to be persisted as the WHOLE
   library's analysis — one click replaced a 12k-track analysis on disk with
@@ -97,6 +172,47 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
   TIMESLOT/DIRECTION/VOCAL (and the subgenre grouping) to AIFF/WAV ID3 chunks
   and M4A freeform atoms, but only ever read them back from MP3/FLAC — so its
   own tags on those formats vanished from the diff view on re-scan.
+
+### CI / packaging
+- **A build failure can no longer publish a release.** The release job ran
+  under a stale `always()` guard, so a hard failure in any build job still
+  published — v0.6.3-beta shipped with `.deb` internals (control/data.tar.gz)
+  and the raw sidecar `vibechek.exe` as release assets, and a failed desktop
+  build would have shipped with the installer simply missing. The release now
+  requires every build to succeed, empty bundle sets fail loudly, and the
+  artifact globs exclude deb internals + sidecar binaries.
+- **The native engine is release-gated on Windows.** Native is the Windows
+  default, but its wheel build was best-effort — a transient failure shipped
+  a green release whose default engine wasn't in the installer. Tag builds
+  now hard-require the bundled native engine (non-tag builds stay
+  best-effort).
+- **The model-mirror failover is real now.** The advertised GitHub fallback
+  pointed at a release that didn't exist, with a URL layout that could never
+  resolve — every UPF outage broke installs (and took the weekly smoke down).
+  Mirror URLs are now built flat for release bases, the backbone is pinned,
+  and the weekly smoke HEAD-checks every mirror so the failover can't
+  silently rot. (The `models-v1`/`models-onnx-v1` releases carry the
+  verified assets.)
+- **The Rust shell is in CI.** `cargo clippy -D warnings` now runs on every
+  push/PR — the Tauri shell previously compiled for the first time on tag
+  push, so a Rust compile error merged green and killed every desktop build
+  at release time. The dataclass→TypeScript codegen is CI-checked too
+  (`generate_ts_types.py --check`), and the gold-corpus pins are now verified
+  on all three engines (essentia_tf, native, and ONNX on real
+  ubuntu/macos runners). PyInstaller is version-pinned on all three build
+  scripts, and the native wheel dependency build fails on the first broken
+  step instead of trusting a warm cache.
+
+### Docs
+- Windows setup docs (INSTALL, USER_GUIDE, README, PROJECT_SUMMARY,
+  MAINTAINERS) now lead with the bundled native engine — a fresh install
+  needs no WSL; the WSL walkthrough is the clearly-labelled fallback. README's
+  GPU claims are qualified to what's actually validated (NVIDIA CUDA) vs
+  wired-but-unverified (AMD/Apple via ONNX; the Windows native default is
+  CPU). ROADMAP marks the native default + trust-UX #3 shipped. The release
+  workflow's notes template, CONTRIBUTING's lint claims, and ui/README's RPC
+  table (49 methods incl. `resolve_genre_conflicts` / `import_tag_priors`)
+  are current.
 
 ## [0.6.3-beta] — 2026-06-24
 
@@ -916,7 +1032,12 @@ First public beta. Feature-complete, headed for stable.
 
 ---
 
-[Unreleased]: https://github.com/captinjack99/Vibechek/compare/v0.5.0-beta...HEAD
+[Unreleased]: https://github.com/captinjack99/Vibechek/compare/v0.7.0-beta...HEAD
+[0.7.0-beta]: https://github.com/captinjack99/Vibechek/compare/v0.6.3-beta...v0.7.0-beta
+[0.6.3-beta]: https://github.com/captinjack99/Vibechek/compare/v0.6.2-beta...v0.6.3-beta
+[0.6.2-beta]: https://github.com/captinjack99/Vibechek/compare/v0.6.1-beta...v0.6.2-beta
+[0.6.1-beta]: https://github.com/captinjack99/Vibechek/compare/v0.6.0-beta...v0.6.1-beta
+[0.6.0-beta]: https://github.com/captinjack99/Vibechek/compare/v0.5.0-beta...v0.6.0-beta
 [0.5.0-beta]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.10...v0.5.0-beta
 [0.4.0-beta.10]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.9...v0.4.0-beta.10
 [0.4.0-beta.9]: https://github.com/captinjack99/Vibechek/compare/v0.4.0-beta.8...v0.4.0-beta.9
