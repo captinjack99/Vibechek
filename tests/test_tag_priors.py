@@ -11,6 +11,7 @@ Rekordbox XML genre participates there, marked genre_origin="rekordbox".
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -82,10 +83,14 @@ class TestParseRekordboxCollection:
             "//MYNAS/music/track.mp3"
         )
         # The UNC form must land on the same norm_path as the analyzed
-        # backslash form, or matching still fails after the rebuild.
-        assert tag_priors.norm_path("//MYNAS/music/track.mp3") == (
-            tag_priors.norm_path(r"\\MYNAS\music\track.mp3")
-        )
+        # backslash form, or matching still fails after the rebuild. Windows
+        # only: norm_path is deliberately platform-semantic (os.path.normpath
+        # — backslash is not a separator on POSIX), and backslashed UNC
+        # analyzed-paths only occur on Windows anyway.
+        if sys.platform == "win32":
+            assert tag_priors.norm_path("//MYNAS/music/track.mp3") == (
+                tag_priors.norm_path(r"\\MYNAS\music\track.mp3")
+            )
 
     def test_localhost_location_still_strips_the_host(self) -> None:
         assert tag_priors._location_to_path(

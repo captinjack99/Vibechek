@@ -494,14 +494,24 @@ def test_send2trash_is_a_real_dependency() -> None:
     because send2trash wasn't declared anywhere. CI installs [dev] on top of
     the base deps, so this import failing here = the dependency regressed."""
     import send2trash  # noqa: F401
-    import tomllib
-    deps = tomllib.loads(
-        (Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8")
-    )["project"]["dependencies"]
-    assert any(d.startswith("send2trash") for d in deps), (
-        "send2trash must be in [project.dependencies] — the GUI Trash action "
-        "needs it at runtime, not just in the dev venv"
+
+    pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text(
+        encoding="utf-8"
     )
+    try:
+        import tomllib  # stdlib only on Python 3.11+; CI also runs 3.10
+    except ModuleNotFoundError:
+        import re
+
+        assert re.search(r'^\s*"send2trash', pyproject, re.MULTILINE), (
+            "send2trash must be in [project.dependencies]"
+        )
+    else:
+        deps = tomllib.loads(pyproject)["project"]["dependencies"]
+        assert any(d.startswith("send2trash") for d in deps), (
+            "send2trash must be in [project.dependencies] — the GUI Trash "
+            "action needs it at runtime, not just in the dev venv"
+        )
 
 
 def test_handle_duplicates_trash_action(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
