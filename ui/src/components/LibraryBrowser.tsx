@@ -591,6 +591,45 @@ export function LibraryBrowser() {
       } else {
         setTracks(report.tracks);
       }
+      // Completion toast. Analyze is the most-run, most-consequential op in the
+      // app, yet it was the only long op here that never reported its outcome —
+      // a run where 300 of 2,000 tracks failed looked identical to a clean one.
+      // The sidecar already computes honest counts; surface them (mirrors
+      // runBulkTag). We're past the generation-token guard above, so this only
+      // fires for the still-current run.
+      const errors = report.summary?.errors ?? 0;
+      const analyzed = report.summary?.analyzed ?? report.tracks.length;
+      const total = report.summary?.total_files ?? report.tracks.length;
+      if (report.persist_error) {
+        // Loudest failure: the work is on screen but was NOT saved, so it
+        // vanishes on next launch. A warning toast, not a cheerful success.
+        notify("Analysis completed but could NOT be saved", {
+          kind: "warning",
+          detail:
+            `Analyzed ${analyzed}/${total}` +
+            (errors > 0 ? ` — ${errors} error${errors === 1 ? "" : "s"}` : "") +
+            `.\nThe results on screen were NOT written to disk (${report.persist_error}).\n` +
+            `Re-run analyze or export before closing — they will be lost otherwise.`,
+        });
+      } else {
+        const detailLines: string[] = [];
+        if (errors > 0) {
+          detailLines.push(
+            `${errors} track${errors === 1 ? "" : "s"} failed — open the "Errors" filter to see them.`,
+          );
+        }
+        if (report.priors_warning) detailLines.push(report.priors_warning);
+        const headline =
+          errors > 0
+            ? `Analyzed ${analyzed}/${total} — ${errors} error${errors === 1 ? "" : "s"}`
+            : `Analyzed ${analyzed}/${total}`;
+        notify(headline, {
+          // A dropped Rekordbox import is a caution (warning); per-track errors
+          // are informational; a clean run is a success.
+          kind: report.priors_warning ? "warning" : errors > 0 ? "info" : "success",
+          detail: detailLines.length > 0 ? detailLines.join("\n") : undefined,
+        });
+      }
       finish();
     } catch (e) {
       if (analyzeGen.current === myGen) fail(e);

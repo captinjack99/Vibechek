@@ -71,6 +71,17 @@ export interface AnalysisReport {
     mood_distribution: Record<string, number>;
   };
   tracks: TrackAnalysis[];
+  /** Set by the sidecar when the analyze SUCCEEDED but the report could NOT be
+   *  written to disk (disk full, a cloud-sync/antivirus lock). The results are
+   *  correct on screen but will vanish on next launch — the GUI raises a
+   *  persistent warning so the user re-runs or exports before closing. */
+  persist_error?: string | null;
+  /** Where the sidecar tried to save the report — shown alongside persist_error. */
+  persist_path?: string | null;
+  /** Set when a Rekordbox tag-priors import existed but was dropped this run —
+   *  an unreadable sidecar, or 0 tracks matched because the library moved. The
+   *  curated genre edits weren't applied; the GUI warns the DJ to re-import. */
+  priors_warning?: string | null;
 }
 
 // ---------------------------------------------------------------------------

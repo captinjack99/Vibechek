@@ -223,11 +223,30 @@ def test_load_analysis_missing_file_returns_none() -> None:
     assert library_state.load_analysis(record) is None
 
 
-def test_load_analysis_corrupted_file_returns_none(tmp_path: Path) -> None:
+def test_load_analysis_corrupted_file_raises_unreadable(tmp_path: Path) -> None:
+    # A file that EXISTS but can't be parsed must NOT masquerade as "absent"
+    # (returning None) — that conflation is what lets an incremental analyze
+    # silently truncate the whole saved library. It raises so callers on the
+    # data-loss path abort instead of proceeding as if never-analyzed.
     bad = tmp_path / "bad.json"
     bad.write_text("{not json", encoding="utf-8")
     record = library_state.LibraryRecord(path="/lib", analysis_path=str(bad))
-    assert library_state.load_analysis(record) is None
+    with pytest.raises(library_state.AnalysisUnreadable) as excinfo:
+        library_state.load_analysis(record)
+    # The exception carries the path + cause so the RPC message is actionable.
+    assert excinfo.value.path == str(bad)
+
+
+def test_load_analysis_unreadable_file_raises(tmp_path: Path) -> None:
+    # A present-but-unreadable path (an OSError on read — e.g. an AV/cloud-sync
+    # sharing violation, distinct from bad JSON) also raises, not returns None.
+    # A directory whose name matches the analysis path exists but can't be
+    # read_text()'d — a portable stand-in for that read failure.
+    d = tmp_path / "adir.json"
+    d.mkdir()
+    record = library_state.LibraryRecord(path="/lib", analysis_path=str(d))
+    with pytest.raises(library_state.AnalysisUnreadable):
+        library_state.load_analysis(record)
 
 
 # ---------------------------------------------------------------------------

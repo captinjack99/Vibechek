@@ -32,6 +32,25 @@ MAX_RECENT = 10
 STATE_FILE = CONFIG_DIR / "library_state.json"
 ANALYSES_DIR = DATA_DIR / "analyses"
 
+
+class AnalysisUnreadable(Exception):
+    """The saved analysis file EXISTS but could not be read/parsed.
+
+    Deliberately distinct from load_analysis() returning None (the file is
+    genuinely absent). The difference is load-bearing for incremental analyze:
+    if a transient read failure (an antivirus / OneDrive-Google-Drive lock, a
+    crash-truncated 32 MB JSON, a hand-edit) is treated as "never analyzed",
+    _reattach_skipped_records re-attaches nothing and record_analysis() then
+    overwrites the good-but-unreadable file with ONLY the newly scanned tracks
+    — a silent, whole-library data loss. Callers that would otherwise conflate
+    "absent" with "unreadable" must abort loudly instead of proceeding empty.
+    """
+
+    def __init__(self, path: Path | str, cause: Exception | str) -> None:
+        self.path = str(path)
+        self.cause = cause
+        super().__init__(f"Could not read the saved analysis at {self.path}: {cause}")
+
 # Serializes every load-modify-save of the index. The RPC dispatch pool runs
 # several mutators (record_open, record_analysis, forget, rename_library,
 # tag_library) concurrently, each doing an unsynchronized read-then-write — a
@@ -279,7 +298,16 @@ def tag_library(library_path: Path | str, tags: list[str]) -> LibraryRecord | No
 
 
 def load_analysis(record: LibraryRecord) -> dict[str, Any] | None:
-    """Read the analysis JSON for a library record, or None if missing."""
+    """Read the analysis JSON for a library record.
+
+    Returns None only when the file is genuinely ABSENT (never analyzed, or the
+    saved report was removed). Raises `AnalysisUnreadable` when the file EXISTS
+    but can't be read/parsed — see that exception for why the two cases must not
+    be conflated (a transient lock treated as "never analyzed" silently
+    destroys the whole library on the next incremental analyze). Read-only
+    callers that only need "is there a usable report" can catch
+    AnalysisUnreadable and fall back to their missing-file branch.
+    """
     p = Path(record.analysis_path)
     if not p.exists():
         return None
@@ -287,7 +315,7 @@ def load_analysis(record: LibraryRecord) -> dict[str, Any] | None:
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
         log.warning("Could not load analysis at %s: %s", p, e)
-        return None
+        raise AnalysisUnreadable(p, e) from e
 
 
 def save_analysis(record: LibraryRecord, report: dict[str, Any]) -> None:
@@ -335,6 +363,7 @@ def _truncate(state: LibraryState) -> None:
 
 
 __all__ = [
+    "AnalysisUnreadable",
     "LibraryRecord",
     "LibraryState",
     "load_state",

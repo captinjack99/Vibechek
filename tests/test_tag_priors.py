@@ -171,6 +171,31 @@ class TestSidecar:
         )
         assert tag_priors.load_priors(analysis) == {"a": {"genre": "House"}}
 
+    # load_priors_status distinguishes "no import ever done" (silent, correct)
+    # from "an import is here but we just dropped it" (must warn) — without it a
+    # corrupt sidecar silently reverts every curated Rekordbox genre on re-analyze.
+    def test_status_absent_no_warning(self, tmp_path: Path) -> None:
+        priors, warning = tag_priors.load_priors_status(tmp_path / "none.json")
+        assert priors == {}
+        assert warning is None
+
+    def test_status_good_no_warning(self, tmp_path: Path) -> None:
+        analysis = tmp_path / "abc.json"
+        want = {tag_priors.norm_path("D:/x.mp3"): {"genre": "House"}}
+        tag_priors.save_priors(analysis, want)
+        priors, warning = tag_priors.load_priors_status(analysis)
+        assert priors == want
+        assert warning is None
+
+    def test_status_corrupt_warns_but_stays_soft(self, tmp_path: Path) -> None:
+        analysis = tmp_path / "abc.json"
+        tag_priors.priors_path_for(analysis).write_text("{broken", encoding="utf-8")
+        priors, warning = tag_priors.load_priors_status(analysis)
+        assert priors == {}                       # still fail-SOFT
+        assert warning and "could not be read" in warning  # but not fail-SILENT
+        # The plain wrapper keeps its historical fail-soft signature.
+        assert tag_priors.load_priors(analysis) == {}
+
 
 # ---------------------------------------------------------------------------
 # re-reconcile on a saved report
@@ -566,3 +591,72 @@ class TestAnalyzeTimeSidecarHook:
         monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
         rpc._analyze_directory({"path": str(tmp_path / "fresh"), "auto_save": False})
         assert captured["tag_priors"] is None
+
+    def test_moved_library_warns_zero_match(self, tmp_path: Path, monkeypatch) -> None:
+        # Priors imported at the OLD paths; the library has since moved, so the
+        # analyze report carries the NEW paths and 0 of N priors match. The one
+        # field the product trusts over the model silently stops applying — the
+        # response must carry a warning telling the DJ to re-import.
+        from vibechek import rpc
+
+        lib = str(tmp_path / "lib")
+        _seed(lib, [_analyzed_track(str(tmp_path / "lib" / "a.mp3"))])
+        record = next(r for r in library_state.load_state().recent if r.path == lib)
+        # Prior keyed on a path that no longer exists (the "old" location).
+        tag_priors.save_priors(
+            record.analysis_path,
+            {tag_priors.norm_path("D:/OldDrive/a.mp3"): {"genre": "House"}},
+        )
+
+        def fake_analyze(library_path, config=None, **kw):
+            # The report the sidecar returns after the move: new paths.
+            return {"summary": {"total_files": 1, "analyzed": 1, "errors": 0},
+                    "tracks": [{"path": str(tmp_path / "lib" / "a.mp3"),
+                                "ml_analysis": {"ml_genre": "Techno"}}]}
+
+        monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+        report = rpc._analyze_directory({"path": lib, "auto_save": False})
+        assert "priors_warning" in report
+        assert "no longer match" in report["priors_warning"]
+
+    def test_matching_priors_no_warning(self, tmp_path: Path, monkeypatch) -> None:
+        # Sanity: when the priors DO match, no false "library moved" warning.
+        from vibechek import rpc
+
+        lib = str(tmp_path / "lib")
+        track_path = str(tmp_path / "lib" / "a.mp3")
+        _seed(lib, [_analyzed_track(track_path)])
+        record = next(r for r in library_state.load_state().recent if r.path == lib)
+        tag_priors.save_priors(
+            record.analysis_path,
+            {tag_priors.norm_path(track_path): {"genre": "House"}},
+        )
+
+        def fake_analyze(library_path, config=None, **kw):
+            return {"summary": {"total_files": 1, "analyzed": 1, "errors": 0},
+                    "tracks": [_analyzed_track(track_path)]}
+
+        monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+        report = rpc._analyze_directory({"path": lib, "auto_save": False})
+        assert report.get("priors_warning") is None
+
+    def test_corrupt_sidecar_warns(self, tmp_path: Path, monkeypatch) -> None:
+        # A corrupt sidecar drops the entire import on every re-analyze. It must
+        # never block analyze (fail-soft) but must surface a warning (not silent).
+        from vibechek import rpc
+
+        lib = str(tmp_path / "lib")
+        _seed(lib, [_analyzed_track(str(tmp_path / "lib" / "a.mp3"))])
+        record = next(r for r in library_state.load_state().recent if r.path == lib)
+        tag_priors.priors_path_for(record.analysis_path).write_text(
+            "{broken json", encoding="utf-8"
+        )
+
+        def fake_analyze(library_path, config=None, **kw):
+            return {"summary": {"total_files": 1, "analyzed": 1, "errors": 0},
+                    "tracks": []}
+
+        monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+        report = rpc._analyze_directory({"path": lib, "auto_save": False})
+        assert "priors_warning" in report
+        assert "could not be read" in report["priors_warning"]

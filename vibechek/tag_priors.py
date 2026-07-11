@@ -56,23 +56,49 @@ def priors_path_for(analysis_path: Path | str) -> Path:
     return p.with_name(p.stem + PRIORS_SUFFIX)
 
 
-def load_priors(analysis_path: Path | str) -> dict[str, dict[str, Any]]:
-    """The persisted priors map for a library (empty when absent/corrupt).
+def load_priors_status(
+    analysis_path: Path | str,
+) -> tuple[dict[str, dict[str, Any]], str | None]:
+    """Load the priors map AND report why it's empty when that matters.
 
-    Corrupt is WARN-and-empty rather than raise: a broken sidecar must never
-    make the library unanalyzable — the user can simply re-import.
+    Returns ``(priors, warning)``. ``warning`` is ``None`` on the normal paths
+    (no sidecar, or a good sidecar) and a user-facing string ONLY when the
+    sidecar EXISTS but could not be read. That distinction is the whole point:
+    "no import was ever done" is silent-and-correct, but "the import is right
+    there and we just dropped it" must be surfaced — otherwise a corrupt sidecar
+    silently reverts every curated Rekordbox genre edit on every future analyze,
+    with nothing but a server log line to show for it.
+
+    Still fail-SOFT (the returned map is always usable, never raises), just not
+    fail-SILENT.
     """
     path = priors_path_for(analysis_path)
     if not path.exists():
-        return {}
+        return {}, None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("priors sidecar is not an object")
-        return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        return {str(k): v for k, v in data.items() if isinstance(v, dict)}, None
     except (OSError, ValueError, json.JSONDecodeError) as e:
         log.warning("Ignoring unreadable priors sidecar %s: %s", path, e)
-        return {}
+        return {}, (
+            "Your imported Rekordbox priors could not be read "
+            f"({e}); this analyze ran without them. Re-import the Rekordbox XML "
+            "to restore them."
+        )
+
+
+def load_priors(analysis_path: Path | str) -> dict[str, dict[str, Any]]:
+    """The persisted priors map for a library (empty when absent/corrupt).
+
+    Corrupt is WARN-and-empty rather than raise: a broken sidecar must never
+    make the library unanalyzable — the user can simply re-import. Callers that
+    also need to TELL the user an import was dropped should use
+    ``load_priors_status`` (this wrapper discards that signal).
+    """
+    priors, _warning = load_priors_status(analysis_path)
+    return priors
 
 
 def save_priors(analysis_path: Path | str, priors: dict[str, dict[str, Any]]) -> Path:

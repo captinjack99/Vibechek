@@ -20,7 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { LibraryBrowser } from "./LibraryBrowser";
-import { useLibraryStore } from "../stores";
+import { useLibraryStore, useNotificationStore, useOperationStore } from "../stores";
 import { useLibraryFiltersStore } from "./LibraryFilters";
 import type { LibraryRecord, MLResult, TrackAnalysis } from "../types";
 
@@ -466,6 +466,108 @@ describe("<LibraryBrowser /> — review (genre conflict) filter", () => {
     await user.click(await screen.findByRole("option", { name: /LibraryB/ }));
 
     await waitFor(() => expect(screen.getByText("2 / 2")).toBeInTheDocument());
+  });
+});
+
+describe("<LibraryBrowser /> — analyze completion toast", () => {
+  beforeEach(() => {
+    // The toast is a notification; reset both stores so each case is clean.
+    useNotificationStore.setState({ items: [] });
+    useOperationStore.setState({ active: null, opId: null, progress: null, startedAt: null, error: null });
+  });
+
+  // Drive a full re-analyze through the toolbar "Re-analyze all" button:
+  // handleAnalyze does a preflight probe (mocked ready) then runAnalyze, which
+  // hits analyze_directory (mocked to return `report`). Returns after the toast
+  // has been pushed.
+  async function reanalyzeWith(report: Record<string, unknown>) {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "preflight":
+            return { ready: true };
+          case "analyze_directory":
+            return report;
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/a.mp3"), track("D:/LibraryA/b.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(await screen.findByRole("button", { name: /re-analyze all/i }));
+  }
+
+  it("shows a success toast with the analyzed count on a clean run", async () => {
+    await reanalyzeWith({
+      summary: { total_files: 3, analyzed: 3, errors: 0 },
+      tracks: [track("D:/LibraryA/a.mp3")],
+    });
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      expect(items[0].message).toBe("Analyzed 3/3");
+      expect(items[0].kind).toBe("success");
+    });
+  });
+
+  it("shows an error-aware info toast when some tracks failed", async () => {
+    await reanalyzeWith({
+      summary: { total_files: 3, analyzed: 2, errors: 1 },
+      tracks: [track("D:/LibraryA/a.mp3")],
+    });
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      expect(items[0].message).toBe("Analyzed 2/3 — 1 error");
+      expect(items[0].kind).toBe("info");
+      // The detail points the user at the Errors filter (they'd otherwise have
+      // to scroll the table hunting for red icons).
+      expect(items[0].detail).toMatch(/Errors/);
+    });
+  });
+
+  it("shows a persistent WARNING toast when the run could not be saved", async () => {
+    await reanalyzeWith({
+      summary: { total_files: 3, analyzed: 3, errors: 0 },
+      tracks: [track("D:/LibraryA/a.mp3")],
+      persist_error: "No space left on device",
+    });
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      expect(items[0].message).toMatch(/could NOT be saved/);
+      expect(items[0].kind).toBe("warning");
+      expect(items[0].detail).toMatch(/No space left on device/);
+    });
+  });
+
+  it("folds a dropped Rekordbox priors warning into the completion toast", async () => {
+    await reanalyzeWith({
+      summary: { total_files: 3, analyzed: 3, errors: 0 },
+      tracks: [track("D:/LibraryA/a.mp3")],
+      priors_warning: "Your imported Rekordbox priors no longer match this library — re-import the XML.",
+    });
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      expect(items[0].kind).toBe("warning");
+      expect(items[0].detail).toMatch(/Rekordbox priors no longer match/);
+    });
   });
 });
 

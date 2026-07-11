@@ -380,15 +380,28 @@ def _analyze_directory(params: dict) -> dict:
     # re-scan doesn't lose the import. Best-effort: a broken sidecar must never
     # block analyze.
     tag_priors_map = None
+    # Carries any non-silent priors problem (unreadable sidecar, or a 0-match
+    # run because the library moved) back to the GUI. Attached to the report at
+    # the end so a re-scan never drops a Rekordbox import without a word.
+    priors_warning: str | None = None
     try:
-        from vibechek.tag_priors import load_priors  # noqa: PLC0415
+        from vibechek.tag_priors import load_priors_status  # noqa: PLC0415
 
         state = library_state.load_state()
         rec = next((r for r in state.recent if r.path == str(library_path)), None)
         if rec:
-            tag_priors_map = load_priors(rec.analysis_path) or None
+            # load_priors_status stays fail-soft (a broken sidecar never blocks
+            # analyze) but, unlike load_priors, tells us WHEN it dropped an
+            # import it could see — so we can warn instead of failing silent.
+            loaded_priors, priors_warning = load_priors_status(rec.analysis_path)
+            tag_priors_map = loaded_priors or None
     except Exception as e:  # noqa: BLE001
         log.warning("Could not load the tag-priors sidecar: %s", e)
+        priors_warning = (
+            "Your imported Rekordbox priors could not be read "
+            f"({e}); this analyze ran without them. Re-import the Rekordbox XML "
+            "to restore them."
+        )
 
     report = analyze_directory(
         library_path,
@@ -411,12 +424,33 @@ def _analyze_directory(params: dict) -> dict:
         try:
             from vibechek.tag_priors import apply_priors_to_report  # noqa: PLC0415
 
-            apply_priors_to_report(
+            _updated, matched = apply_priors_to_report(
                 report, tag_priors_map,
                 config.genre_source_policy, config.genre_ml_override_confidence,
             )
+            # The priors sidecar keys on absolute path. If the DJ moved their
+            # library (new drive/reorg) every key misses, merge matches 0 of N,
+            # and the curated Rekordbox genre edits silently stop applying —
+            # the one field the product trusts over the audio model. Warn so
+            # they know to re-import, instead of the import quietly evaporating.
+            # Only on a FULL run: an incremental run's report holds just the
+            # newly scanned tracks, which legitimately may not be in an older
+            # Rekordbox export, so 0 matches there isn't evidence of a move.
+            if matched == 0 and not skip_set and not priors_warning:
+                priors_warning = (
+                    f"Your imported Rekordbox priors ({len(tag_priors_map)} "
+                    "tracks) no longer match any track in this library — it was "
+                    "likely moved or renamed. Re-import the Rekordbox XML to "
+                    "restore them."
+                )
         except Exception as e:  # noqa: BLE001
             log.warning("Could not apply tag priors to the analyze report: %s", e)
+            if not priors_warning:
+                priors_warning = (
+                    "Your imported Rekordbox priors could not be applied to "
+                    f"this run ({e}). Re-import the Rekordbox XML if the genres "
+                    "look wrong."
+                )
 
     # Incremental runs ("Analyze new tracks only") return a report containing
     # ONLY the newly analyzed tracks. Re-attach the previously saved records
@@ -433,7 +467,26 @@ def _analyze_directory(params: dict) -> dict:
         try:
             library_state.record_analysis(library_path, report)
         except Exception as e:  # noqa: BLE001
+            # The analyze itself SUCCEEDED (potentially 30+ min of GPU/CPU work)
+            # but persisting it failed — disk full, a OneDrive/Google-Drive or
+            # antivirus lock on the analyses JSON, a permissions error. The
+            # report we return is correct and the GUI will render it as done,
+            # but on the next launch load_analysis() reads the OLD/absent file
+            # and the whole run looks like it vanished. A log.warning the user
+            # never sees is exactly the silent data loss this audit targets, so
+            # thread the failure back on the report; the GUI raises a persistent
+            # warning telling the user to re-run or export before closing.
             log.warning("Could not auto-save analysis state: %s", e)
+            report["persist_error"] = str(e)
+            report["persist_path"] = str(
+                library_state._analysis_path_for(str(library_path))
+            )
+
+    if priors_warning:
+        # A non-empty Rekordbox priors import that matched nothing (library
+        # moved) or an unreadable sidecar — surfaced so the GUI can warn the DJ
+        # their curated genre edits weren't applied this run (see above).
+        report["priors_warning"] = priors_warning
 
     return report
 
@@ -457,7 +510,24 @@ def _reattach_skipped_records(
 
     state = library_state.load_state()
     rec = next((r for r in state.recent if r.path == library_path), None)
-    prev = library_state.load_analysis(rec) if rec else None
+    try:
+        prev = library_state.load_analysis(rec) if rec else None
+    except library_state.AnalysisUnreadable as e:
+        # ABORT the incremental merge. The saved analysis EXISTS but we can't
+        # read it right now (a transient antivirus / cloud-sync sharing
+        # violation, a crash-truncated JSON). Proceeding would re-attach
+        # nothing, and the caller's record_analysis() would then overwrite the
+        # good-but-unreadable file with ONLY the handful of newly scanned
+        # tracks — silently wiping every previously analyzed track. Fail loudly
+        # so the user's prior results stay untouched and they can retry once
+        # the lock clears (or run a full re-analyze) instead of losing them.
+        raise RuntimeError(
+            "Incremental analyze was stopped to protect your data: this "
+            f"library's saved analysis exists but could not be read ({e.cause}). "
+            "Your previous results were NOT changed. Close anything that may be "
+            "locking the file (antivirus, OneDrive/Google Drive sync) and try "
+            "again, or run a full re-analyze."
+        ) from e
     if not prev:
         return report
 
@@ -1552,7 +1622,14 @@ def _count_new_tracks(params: dict) -> dict:
         return {"new_count": 0, "total_count": total, "analyzed_count": 0,
                 "reason": "no prior analysis"}
 
-    report = library_state.load_analysis(record)
+    try:
+        report = library_state.load_analysis(record)
+    except library_state.AnalysisUnreadable as e:
+        # Present-but-unreadable (locked/corrupt): don't claim the file is
+        # simply "missing" (which reads as "never analyzed") — say why the
+        # banner can't be computed so the number isn't silently wrong.
+        return {"new_count": 0, "total_count": total, "analyzed_count": 0,
+                "reason": f"analysis file unreadable: {e.cause}"}
     if not report:
         return {"new_count": 0, "total_count": total, "analyzed_count": 0,
                 "reason": "analysis file missing"}
@@ -1586,7 +1663,10 @@ def _load_recent_analysis(params: dict) -> dict:
         )
         if not record:
             return {"loaded": False, "reason": "library not in recents"}
-        report = library_state.load_analysis(record)
+        try:
+            report = library_state.load_analysis(record)
+        except library_state.AnalysisUnreadable as e:
+            return {"loaded": False, "reason": f"analysis file unreadable: {e.cause}"}
     elif "analysis_path" in params:
         path = Path(params["analysis_path"])
         if not path.exists():
@@ -1632,7 +1712,16 @@ def _resolve_genre_conflicts(params: dict) -> dict:
     record = next((r for r in state.recent if r.path == library_path), None)
     if not record:
         return {"ok": False, "reason": "library not in recents", "updated": 0, "tracks": []}
-    report = library_state.load_analysis(record)
+    try:
+        report = library_state.load_analysis(record)
+    except library_state.AnalysisUnreadable as e:
+        # Don't clobber a locked/corrupt saved analysis with a partial resolve —
+        # and tell the user why, so they retry once the lock clears instead of
+        # thinking their whole analysis is gone.
+        return {"ok": False,
+                "reason": f"saved analysis is unreadable ({e.cause}) — could not "
+                          "resolve; retry once any lock on it clears",
+                "updated": 0, "tracks": []}
     if not report:
         return {"ok": False, "reason": "no saved analysis for library", "updated": 0, "tracks": []}
 
@@ -1690,7 +1779,16 @@ def _import_tag_priors(params: dict) -> dict:
     if not record:
         return {"ok": False, "reason": "library not in recents",
                 "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
-    report = library_state.load_analysis(record)
+    try:
+        report = library_state.load_analysis(record)
+    except library_state.AnalysisUnreadable as e:
+        # Same guard as _resolve_genre_conflicts: a locked/corrupt saved
+        # analysis must not be silently overwritten by the import, and the user
+        # deserves an actionable reason rather than "no saved analysis".
+        return {"ok": False,
+                "reason": f"saved analysis is unreadable ({e.cause}) — import "
+                          "not applied; retry once any lock on it clears",
+                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
     if not report:
         return {"ok": False, "reason": "no saved analysis for library",
                 "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}

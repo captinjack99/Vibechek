@@ -203,6 +203,73 @@ def test_valid_llm_backend(value, expected) -> None:
     assert rpc._valid_llm_backend(value) == expected
 
 
+def test_analyze_directory_surfaces_persist_failure(monkeypatch) -> None:
+    """A successful analyze whose save fails must NOT report a silent success:
+    the report carries a structured persist_error/persist_path so the GUI can
+    warn the user their run wasn't written to disk (rpc.py:432 finding)."""
+    from vibechek import library_state
+
+    def fake_analyze(library_path, config=None, **kw):
+        return {"summary": {"total_files": 3, "analyzed": 3, "errors": 0}, "tracks": []}
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+    # No recents / no sidecar work — keep the priors block a no-op.
+    monkeypatch.setattr(library_state, "load_state", lambda: library_state.LibraryState())
+
+    def boom(*_a, **_k):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(library_state, "record_analysis", boom)
+
+    # auto_save defaults True → record_analysis is attempted and fails.
+    report = rpc._analyze_directory({"path": "/tmp/lib"})
+    assert "No space left on device" in report["persist_error"]
+    assert report["persist_path"]  # non-empty: where the save was attempted
+
+
+def test_incremental_abort_does_not_overwrite_on_unreadable(monkeypatch) -> None:
+    """Incremental analyze against an UNREADABLE prior must abort loudly and
+    never call record_analysis — otherwise the truncated report overwrites the
+    whole saved library (rpc.py:460 finding)."""
+    from pathlib import Path
+
+    from vibechek import library_state
+
+    # The RPC normalizes params["path"] via Path(); match that so the recents
+    # lookup finds our record (str(Path("/lib")) is "\\lib" on Windows).
+    lib = str(Path("/lib"))
+    rec = library_state.LibraryRecord(path=lib, analysis_path="/lib/a.json")
+    monkeypatch.setattr(
+        library_state, "load_state",
+        lambda: library_state.LibraryState(recent=[rec]),
+    )
+
+    def fake_analyze(library_path, config=None, **kw):
+        # Incremental run returns ONLY the newly scanned track.
+        return {"summary": {"total_files": 1, "analyzed": 1, "errors": 0},
+                "tracks": [{"path": "/lib/new.mp3"}]}
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+
+    # The prior EXISTS but can't be read (transient lock / crash-truncated JSON).
+    def unreadable(_record):
+        raise library_state.AnalysisUnreadable("/lib/a.json", "sharing violation")
+
+    monkeypatch.setattr(library_state, "load_analysis", unreadable)
+
+    saved: list = []
+    monkeypatch.setattr(library_state, "record_analysis",
+                        lambda *a, **k: saved.append(a))
+
+    with pytest.raises(RuntimeError, match="protect your data"):
+        rpc._analyze_directory({
+            "path": lib,
+            "skip_paths": ["/lib/old.mp3"],  # incremental
+        })
+    # Critical: the good-but-unreadable saved analysis was NOT overwritten.
+    assert saved == []
+
+
 def test_analyze_directory_threads_genre_options(monkeypatch) -> None:
     captured = {}
 
