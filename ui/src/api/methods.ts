@@ -41,6 +41,7 @@ export type {
   PreflightResult,
   SystemResources,
   VibechekConfig,
+  WorkerBudget,
   WSLStatus,
 } from "../types";
 
@@ -55,6 +56,7 @@ export const RPC_METHODS = [
   "version",
   "system_info",
   "engine_gpu_status",
+  "worker_budget",
   "preflight",
   "wsl_status",
   "native_venv_status",
@@ -136,6 +138,20 @@ export interface EngineGpuStatusRequest {
   distro?: string | null;
   /** Force a fresh probe, bypassing the 5-min cache. */
   force?: boolean;
+}
+
+/** Compute the worker plan (slider max + per-worker RAM) for the given engine +
+ *  genre classifier. For WSL-routed engines pass the usable `distro` so the VM's
+ *  RAM (the real ceiling) is measured instead of the host total. */
+export interface WorkerBudgetRequest {
+  /** "essentia_tf" | "onnx" | "native". */
+  engine?: string;
+  /** "discogs" | "clap" — CLAP's ~4.5 GB/worker is what shrinks the max. */
+  genre_classifier?: string;
+  /** The user's current slider value; 0 = auto. */
+  workers?: number;
+  /** Usable WSL distro (from preflight) so the VM RAM pool is measured. */
+  distro?: string | null;
 }
 
 export interface PreflightRequest {

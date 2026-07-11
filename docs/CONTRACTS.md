@@ -9,7 +9,12 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 (the authoritative method list), and the "Sidecar protocol" section of
 [`ui/README.md`](../ui/README.md).
 
-> **The method surface is 49.** The one-click engine setups added three methods —
+> **The method surface is 50.** `worker_budget` computes the effective worker plan
+> (slider max + per-worker RAM + which RAM pool was measured) for a given engine ×
+> genre classifier, so the Settings slider binds its max to what actually fits and can
+> never disagree with the run — both call the one pure `resources.compute_worker_budget`.
+> For WSL-routed engines it measures the WSL VM's RAM (the pool workers draw from), not
+> the host total. The one-click engine setups added three methods —
 > `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` (all cancellable,
 > progress-emitting) — while FLAC → CDJ export stayed CLI-only (`vibechek cdj-export`).
 > The trust-UX review queue added `resolve_genre_conflicts` (batch approve/revert of
@@ -45,6 +50,7 @@ runs in-process when essentia imports locally:
 | `install_essentia_native` | `engine` | Native (Linux/macOS) counterpart. |
 | `install_essentia_native`, `setup_onnx_engine` | `vibechek_source` | Optional, CI/dev only: an **existing local directory** that pip installs vibechek from, instead of the hard-coded GitHub default (`rpc._valid_vibechek_source`; anything else → `INVALID_PARAMS`). Honored by the native (Linux/macOS) install only — the WSL branch ignores it. The native-smoke full tier passes the checkout so CI tests the commit under test. The GUI never sends it. |
 | `engine_gpu_status` | `engine` | The ONNX path probes onnxruntime's live ExecutionProviders in `venv-onnx`; the TF path probes TensorFlow. |
+| `worker_budget` | `engine`, `genre_classifier`, `workers`, `distro` | Returns a `WorkerBudget` (max_workers, per_worker_mb, ram_pool, cap/refusal reasons). CLAP's ~4.5 GB/worker shrinks the max; pass the usable `distro` so the WSL VM's RAM is measured instead of the host total. |
 | `native_venv_status` | `engine` | Reports what's installed in the engine's managed venv. |
 | `wsl_status` | `engine` | Selects which venv subdir (`venv` / `venv-onnx`) the per-distro probe inspects. |
 

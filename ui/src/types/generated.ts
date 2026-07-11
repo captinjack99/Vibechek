@@ -34,6 +34,22 @@ export interface SystemResources {
   readonly recommended_workers: number;
 }
 
+export interface WorkerBudget {
+  max_workers: number;
+  effective_workers: number;
+  per_worker_mb: number;
+  ram_seen_mb: number;
+  reserve_mb: number;
+  gpu_workers: number;
+  cpu_workers: number;
+  cap_reason: string | null;
+  gpu_reason: string | null;
+  refusal_reason: string | null;
+  ram_pool: string;
+  requested_workers: number;
+  ram_measured: boolean;
+}
+
 export interface AnalysisConfig {
   workers: number;
   models_dir: string;
@@ -131,6 +147,7 @@ export interface EngineGpuInfo {
   probed_at: number;
   provider: string | null;
   runtime: string | null;
+  note: string | null;
 }
 
 export interface WSLStatus {

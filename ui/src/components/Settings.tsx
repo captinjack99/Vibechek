@@ -12,10 +12,12 @@ import { isCancellation, rpc, sidecarStatus } from "../hooks/useSidecar";
 import { setupOnnxEngine, setupClapEngine, setupGenreResolver } from "../api/rpc";
 import {
   listProfiles, loadProfile, doctor as runDoctor, verifyModels,
-  upgradeVibechekInWSL,
+  upgradeVibechekInWSL, workerBudget as fetchWorkerBudget,
 } from "../api/rpc";
 import type { ListProfilesResult } from "../api/methods";
-import type { EngineGpuInfo, PreflightResult, SystemResources, VibechekConfig } from "../types";
+import type {
+  EngineGpuInfo, PreflightResult, SystemResources, VibechekConfig, WorkerBudget,
+} from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 import { LogsViewer } from "./LogsViewer";
 import { PreflightDialog } from "./PreflightDialog";
@@ -95,6 +97,11 @@ export function Settings() {
   // engineProbing=true means "asking, ~10s wait".
   const [engineGpu, setEngineGpu] = useState<EngineGpuInfo | null>(null);
   const [engineProbing, setEngineProbing] = useState(false);
+  // Backend-computed worker plan for the CURRENT engine × genre_classifier ×
+  // measured RAM pool. Drives the slider MAX + hint so the slider can never let
+  // the user pick more workers than actually fit (the 16→2 CLAP/WSL bug). Re-
+  // fetched when engine or genre_classifier changes (see the effect below).
+  const [budget, setBudget] = useState<WorkerBudget | null>(null);
 
   const notify = useNotificationStore((s) => s.notify);
 
@@ -378,6 +385,7 @@ export function Settings() {
           nvidia_smi_available: false,
           provider: null,
           runtime: null,
+          note: null,
           // Unwrap RpcError.message (which String(e) would render as
           // "[object Object]"); fall back to String for non-Error rejections.
           error:
@@ -389,6 +397,30 @@ export function Settings() {
       })
       .finally(() => {
         if (isMounted.current) setEngineProbing(false);
+      });
+  };
+
+  /**
+   * Ask the backend for the worker plan (slider max + per-worker RAM) for the
+   * live engine × genre_classifier. Reads both from the store at CALL time (not
+   * the captured closure) so the effect that fires on a change sends the NEW
+   * values. Passes the usable WSL distro so the VM's RAM is measured, not the
+   * host total. Non-fatal — the slider falls back to the static ceiling.
+   */
+  const refreshWorkerBudget = () => {
+    if (!isMounted.current) return;
+    const st = useConfigStore.getState().config.analysis;
+    fetchWorkerBudget({
+      engine: st.inference_engine,
+      genre_classifier: st.genre_classifier,
+      workers: st.workers,
+      distro: preflightResult?.wsl?.usable_distro ?? null,
+    })
+      .then((b) => {
+        if (isMounted.current) setBudget(b);
+      })
+      .catch(() => {
+        /* non-fatal — slider keeps the static WORKERS_MAX ceiling */
       });
   };
 
@@ -465,8 +497,19 @@ export function Settings() {
       })
       .catch(() => {});
     refreshPreflight();
+    refreshWorkerBudget();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Re-compute the worker budget whenever the engine or the genre classifier
+  // changes — CLAP's ~4.5 GB/worker drops the max dramatically vs Discogs, and
+  // onnx/native measure a different RAM pool than essentia_tf routes to. The
+  // doctrine: "the slider should be based on the model we're using — when CLAP
+  // is selected, it should slide to the max workers supported."
+  useEffect(() => {
+    refreshWorkerBudget();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cfg.analysis.inference_engine, cfg.analysis.genre_classifier]);
 
   // Re-probe the engine GPU whenever the user switches inference engines.
   // The probe is engine-specific server-side (ONNX populates provider/runtime
@@ -532,6 +575,7 @@ export function Settings() {
         sysInfo={sysInfo}
         engineGpu={engineGpu}
         engineProbing={engineProbing}
+        budget={budget}
         analyzeVia={
           // Narrow the wire-level `string | null` to the literal union the
           // component expects. Anything unexpected falls back to null.
@@ -557,52 +601,94 @@ export function Settings() {
         title="Analysis"
         subtitle="How much of your machine to use"
       >
-        <Field label={`Worker processes ${sysInfo ? `(of ${sysInfo.cpu_count} cores)` : ""}`}>
-          <div className="flex items-center gap-3">
-            <input
-              type="range"
-              min={1}
-              // static high ceiling instead of
-              // sysInfo.cpu_count, which used to snap a user-set value
-              // (e.g. 32) down when sysInfo loaded asynchronously with a
-              // smaller cpu_count. Warning below if value > cpu_count.
-              max={WORKERS_MAX}
-              step={1}
-              value={Math.max(1, cfg.analysis.workers)}
-              onChange={(e) => updateAnalysis({ workers: Number(e.target.value) })}
-              className="flex-1 accent-accent"
-            />
-            <span className="text-sm font-mono w-12 text-right tabular-nums">
-              {Math.max(1, cfg.analysis.workers)}
-            </span>
-            {sysInfo && (
-              <button
-                className="btn-ghost text-xs"
-                onClick={() =>
-                  updateAnalysis({ workers: sysInfo.recommended_workers })
-                }
-                title={`Recommended: ${sysInfo.recommended_workers}`}
-              >
-                auto
-              </button>
-            )}
-          </div>
-          <Hint>
-            Each worker holds ~500 MB of model weights in RAM. Best:{" "}
-            <code>cpu_count − 1</code> for a responsive system,{" "}
-            <code>cpu_count</code> for max throughput.
-          </Hint>
-          {sysInfo && cfg.analysis.workers > sysInfo.cpu_count && (
-            <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
-              <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
-              <span>
-                {cfg.analysis.workers} workers exceeds the {sysInfo.cpu_count}{" "}
-                CPU cores Vibechek detected. The extra workers will compete
-                for CPU time rather than add throughput.
-              </span>
-            </div>
-          )}
-        </Field>
+        {(() => {
+          // Slider MAX is the backend-computed budget (RAM + cores for THIS
+          // engine × classifier), falling back to the static ceiling until it
+          // loads. When CLAP is selected the max drops to what its ~4.5 GB/
+          // worker allows on the measured pool — "the slider slides to the max
+          // workers supported" per the doctrine.
+          const sliderMax =
+            budget && budget.max_workers > 0
+              ? budget.max_workers
+              : WORKERS_MAX;
+          const saved = Math.max(1, cfg.analysis.workers);
+          // Clamp the DISPLAY to the budget, but keep the SAVED value untouched —
+          // the backend re-clamps every run to the same budget anyway, so we
+          // never silently rewrite the user's number here.
+          const shown = Math.min(saved, sliderMax);
+          const perWorkerGb = budget
+            ? (budget.per_worker_mb / 1024).toFixed(1)
+            : null;
+          const poolGb = budget
+            ? (budget.ram_seen_mb / 1024).toFixed(1)
+            : null;
+          const poolLabel =
+            budget?.ram_pool === "wsl_vm" ? "the WSL VM" : "this machine";
+          const classifierLabel =
+            cfg.analysis.genre_classifier === "clap" ? "CLAP" : "Discogs";
+          const refused = budget != null && budget.max_workers === 0;
+          return (
+            <Field label={`Worker processes ${sysInfo ? `(of ${sysInfo.cpu_count} cores)` : ""}`}>
+              <div className="flex items-center gap-3">
+                <input
+                  type="range"
+                  min={1}
+                  // Bound to the live budget max (RAM/core aware), not a static
+                  // ceiling — so the slider can't offer more workers than fit.
+                  max={sliderMax}
+                  step={1}
+                  value={shown}
+                  onChange={(e) => updateAnalysis({ workers: Number(e.target.value) })}
+                  className="flex-1 accent-accent"
+                  disabled={refused}
+                />
+                <span className="text-sm font-mono w-12 text-right tabular-nums">
+                  {shown}
+                </span>
+                {budget && budget.max_workers > 0 && (
+                  <button
+                    className="btn-ghost text-xs"
+                    onClick={() => updateAnalysis({ workers: budget.max_workers })}
+                    title={`Max that fits: ${budget.max_workers}`}
+                  >
+                    max
+                  </button>
+                )}
+              </div>
+              <Hint>
+                {budget && perWorkerGb && poolGb ? (
+                  <>
+                    Each {classifierLabel} worker uses ~{perWorkerGb} GB in RAM.
+                    Up to <code>{budget.max_workers}</code> fit on {poolLabel}
+                    {" "}({poolGb} GB measured).
+                  </>
+                ) : (
+                  <>
+                    Each worker holds the model weights in RAM. Best:{" "}
+                    <code>cpu_count − 1</code> for a responsive system,{" "}
+                    <code>cpu_count</code> for max throughput.
+                  </>
+                )}
+              </Hint>
+              {refused && budget?.refusal_reason && (
+                <div className="text-xs text-accent-red/90 mt-1 flex items-start gap-1">
+                  <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+                  <span>{budget.refusal_reason}</span>
+                </div>
+              )}
+              {!refused && saved > sliderMax && (
+                <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
+                  <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+                  <span>
+                    Your saved {saved} workers won&apos;t all fit — the run will
+                    use {sliderMax}
+                    {budget?.ram_pool === "wsl_vm" ? " (WSL VM RAM limit)" : ""}.
+                  </span>
+                </div>
+              )}
+            </Field>
+          );
+        })()}
 
         <Field label="GPU acceleration">
           <div className="flex gap-2">

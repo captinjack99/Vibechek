@@ -441,6 +441,13 @@ class EngineGpuInfo:
     # engine (which uses tf_version / missing_cuda_libs instead).
     provider: str | None = None
     runtime: str | None = None      # "onnxruntime X.Y.Z" for the onnx engine
+    # Honest CPU-only story for engines that don't attempt the GPU at all — the
+    # Windows-native engine runs the BUNDLED ONNX Runtime in-process, and that
+    # wheel ships no GPU execution providers (a roadmap item). Set only by the
+    # native-bundled probe; the UI renders it verbatim instead of the old
+    # host-only "GPU available … via native TensorFlow" (which was doubly wrong:
+    # no TF, and the host GPU is never used by that engine).
+    note: str | None = None
 
 
 # Process-level cache: probes take ~10s (TF import + GPU enumeration). The UI
@@ -863,9 +870,21 @@ def probe_engine_gpu(distro: str | None, *, force: bool = False, engine: str = "
             return cached[0]
 
     native = not distro or not IS_WINDOWS
-    if engine == "onnx":
+    if engine == "native" and IS_WINDOWS:
+        # The Windows-native engine runs the BUNDLED ONNX Runtime in-process.
+        # That wheel is CPU-only (no GPU EPs bundled — roadmap), so the honest
+        # answer is "no GPU" regardless of host hardware. The old code fell into
+        # the `elif native` TF branch below → a host-only nvidia-smi probe
+        # rendered as a green "GPU available … via native TensorFlow", doubly
+        # wrong. On Linux/macOS "native" is the managed venv-onnx, so it keeps
+        # the real onnxruntime EP probe below.
+        info = _probe_native_bundled_gpu()
+    elif engine == "onnx":
         # ONNX engine: query onnxruntime's EPs in venv-onnx, not TF.
         info = _probe_native_onnx_gpu() if native else _probe_wsl_onnx_gpu(distro)
+    elif engine == "native" and native:
+        # Linux/macOS native = managed venv-onnx: use the real ONNX EP probe.
+        info = _probe_native_onnx_gpu()
     elif native:
         info = _probe_native_engine_gpu()
     else:
@@ -1003,6 +1022,37 @@ def _probe_host_only_native_gpu() -> EngineGpuInfo:
         nvidia_driver=res.cuda_runtime,
         nvidia_smi_available=res.cuda_runtime is not None,
     )
+
+
+def _probe_native_bundled_gpu() -> EngineGpuInfo:
+    """The Windows-native engine's honest CPU-only GPU story.
+
+    The native engine runs the bundled ONNX Runtime IN-PROCESS in the sidecar's
+    own Python. That wheel is CPU-only — no GPU execution providers are bundled
+    (a roadmap item) — so it runs on CPU no matter what GPU the host has. We
+    still note whether the host has GPU hardware so the panel can say "your card
+    isn't used by this engine" rather than pretend there's no card.
+    """
+    info = EngineGpuInfo(
+        engine="native",
+        ok=True,
+        gpu_available=False,
+        runtime="bundled ONNX Runtime (CPU-only)",
+        note="The bundled ONNX Runtime is CPU-only; GPU support is a roadmap item.",
+    )
+    try:
+        from vibechek.resources import detect  # noqa: PLC0415
+        res = detect()
+        if res.gpu_devices:
+            info.gpu_hardware_visible = True
+            for g in res.gpu_devices:
+                info.devices.append(EngineGpuDevice(
+                    name=g.name, backend=g.backend, memory_mb=g.memory_mb,
+                    vendor=getattr(g, "vendor", "nvidia"),
+                ))
+    except Exception as e:  # noqa: BLE001 — never break the probe on detection
+        log.debug("host GPU inventory failed in native-bundled probe: %s", e)
+    return info
 
 
 def _probe_wsl_engine_gpu(distro: str) -> EngineGpuInfo:
@@ -3290,6 +3340,58 @@ def _detect_wsl_encoding_order(sample: bytes) -> tuple[str, ...]:
     return ("utf-8", "utf-16-le", "cp1252")
 
 
+# Cache the WSL VM's RAM readout — `free -m` inside a distro is a ~1s wsl.exe
+# round-trip and the Settings slider re-fetches on every engine/genre change.
+_WSL_VM_MEM_CACHE: dict[str, tuple[int | None, float]] = {}
+_WSL_VM_MEM_CACHE_LOCK = threading.Lock()
+_WSL_VM_MEM_CACHE_TTL_SEC = 60.0
+
+
+def wsl_vm_memory_mb(distro: str, *, force: bool = False) -> int | None:
+    """Total RAM (MB) the WSL VM sees — the pool analyze workers actually draw from.
+
+    On Windows the WSL VM gets a SLICE of host RAM (default ~50%, or whatever
+    `.wslconfig memory=` sets), NOT the full host total the Settings panel used
+    to show. Sizing the worker budget against the host's 31.7 GB while the VM
+    only has 15.8 GB is exactly why the slider and the run disagreed. This reads
+    `free -m` inside `distro` so the budget measures the right pool. Cached 60s.
+
+    Returns None when it can't be measured (not Windows, no wsl.exe, bad distro
+    name, probe failure) — the caller then falls back to the host total.
+    """
+    if not IS_WINDOWS or not distro or not _VALID_DISTRO_RE.match(distro):
+        return None
+    now = time.time()
+    if not force:
+        with _WSL_VM_MEM_CACHE_LOCK:
+            cached = _WSL_VM_MEM_CACHE.get(distro)
+        if cached is not None and (now - cached[1]) < _WSL_VM_MEM_CACHE_TTL_SEC:
+            return cached[0]
+
+    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    mem: int | None = None
+    if wsl:
+        try:
+            # `free -m` prints "Mem:  <total> <used> ..."; field 2 is total MB.
+            proc = _wsl_run(
+                [wsl, "-d", distro, "--", "bash", "-lc",
+                 "free -m | awk '/^Mem:/{print $2}'"],
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    s = line.strip()
+                    if s.isdigit():
+                        mem = int(s)
+                        break
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.debug("wsl_vm_memory_mb probe failed for %s: %s", distro, e)
+
+    with _WSL_VM_MEM_CACHE_LOCK:
+        _WSL_VM_MEM_CACHE[distro] = (mem, now)
+    return mem
+
+
 def _wsl_run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
     """Run a wsl.exe command, decoding the UTF-16-or-UTF-8 output Windows uses."""
     result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
@@ -3325,6 +3427,7 @@ __all__ = [
     "install_cuda_libs_in_wsl",
     "run_vibechek_in_wsl",
     "probe_engine_gpu",
+    "wsl_vm_memory_mb",
     "engine_gpu_info_to_dict",
     "win_to_wsl_path",
     "wsl_to_win_path",

@@ -581,6 +581,57 @@ def _engine_gpu_status(params: dict) -> dict:
     return engine_gpu_info_to_dict(info)
 
 
+def _worker_budget(params: dict) -> dict:
+    """Compute the effective worker plan for (engine × genre_classifier × the
+    MEASURED environment) so the Settings slider binds its max to what actually
+    fits — the slider and the real run share ONE model (resources.compute_
+    worker_budget), so they can never disagree.
+
+    Measures the RIGHT RAM pool: for WSL-routed engines (essentia_tf / onnx on
+    Windows) the WSL VM's RAM (the pool workers draw from), not the host total.
+    The GUI passes the usable `distro` from its preflight; without it we fall
+    back to the host total and say so via `ram_pool`. GPU sizing is intentionally
+    skipped here (the slider max is RAM/core-bound); the GPU split is a run-time
+    concern surfaced separately by `engine_gpu_status`.
+    """
+    import dataclasses
+
+    from vibechek.resources import compute_worker_budget, detect
+    from vibechek.wsl import IS_WINDOWS, wsl_vm_memory_mb
+
+    engine = _valid_engine(params.get("engine"))
+    genre_classifier = _valid_genre_classifier(params.get("genre_classifier"))
+    requested = _nonneg_int(params.get("workers", 0), 0)
+
+    res = detect()
+    total_ram_mb: int | None = res.memory_total_mb
+    cpu = res.cpu_count
+    ram_pool = "host"
+    under_wsl = False
+
+    # essentia_tf/onnx on Windows route through WSL — measure the VM, not the host.
+    if IS_WINDOWS and engine in ("essentia_tf", "onnx"):
+        distro = params.get("distro")
+        vm_mb = wsl_vm_memory_mb(distro) if distro else None
+        if vm_mb is not None:
+            total_ram_mb = vm_mb
+            ram_pool = "wsl_vm"
+            under_wsl = True
+        # else: no distro or probe failed → keep the host total (ram_pool="host").
+
+    budget = compute_worker_budget(
+        engine, genre_classifier, requested,
+        total_ram_mb=total_ram_mb,
+        free_vram_mb=None,
+        gpu_registrable=None,
+        cpu_count=cpu,
+        under_wsl=under_wsl,
+        use_gpu="off",  # slider max is RAM/core-bound; GPU split is run-time only
+        ram_pool=ram_pool,
+    )
+    return dataclasses.asdict(budget)
+
+
 def _preflight(params: dict) -> dict:
     """Verify essentia + models are ready for `analyze_directory`.
 
@@ -1908,6 +1959,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "version": _version,
     "system_info": _system_info,
     "engine_gpu_status": _engine_gpu_status,
+    "worker_budget": _worker_budget,
     "preflight": _preflight,
     "wsl_status": _wsl_status,
     "install_wsl": _install_wsl,

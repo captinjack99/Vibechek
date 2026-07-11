@@ -285,6 +285,13 @@ class _FakeSession:
         name = "melspectrogram" if self._is_backbone else "embedding"
         return [types.SimpleNamespace(name=name)]
 
+    def get_providers(self):
+        # Real onnxruntime returns the ACTIVE providers (post-init). Mirror the
+        # requested list so the per-run EP-honesty check (onnx_backend compares
+        # get_providers()[0] to the requested provider) sees a clean "acquired
+        # what we asked for" — no downgrade warning in the CPU-pinned tests.
+        return list(self.providers) if self.providers else ["CPUExecutionProvider"]
+
     def run(self, output_names, feeds):
         x = next(iter(feeds.values()))
         k = x.shape[0]

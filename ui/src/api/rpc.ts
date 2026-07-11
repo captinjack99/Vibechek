@@ -102,6 +102,8 @@ import type {
   TagRestoreStats,
   VersionResult,
   VibechekConfig,
+  WorkerBudget,
+  WorkerBudgetRequest,
   WSLStatus,
   WSLStatusRequest,
 } from "./methods";
@@ -169,6 +171,18 @@ export function wslStatus(
 /** Detect what's installed in the managed `~/.vibechek/venv/`. */
 export function nativeVenvStatus(): Promise<NativeVenvStatus> {
   return rpc<NativeVenvStatus>("native_venv_status");
+}
+
+/**
+ * Compute the worker plan (slider max, per-worker RAM, which RAM pool was
+ * measured) for the given engine + genre classifier. The Settings slider binds
+ * its max to `max_workers` so it can never let the user pick more than fits;
+ * the backend clamps the run to the same budget regardless.
+ */
+export function workerBudget(
+  params: WorkerBudgetRequest = {},
+): Promise<WorkerBudget> {
+  return rpc<WorkerBudget>("worker_budget", params);
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +592,7 @@ const api = {
   version,
   systemInfo,
   engineGpuStatus,
+  workerBudget,
   preflight,
   wslStatus,
   nativeVenvStatus,

@@ -27,14 +27,19 @@ def test_per_worker_mb_accounts_for_clap() -> None:
     """CLAP loads a ~2.2 GB model into EVERY worker (MEASURED ~3.8 GB resident),
     so the RAM cap budgets 4.5 GB — not the essentia-only 800 MB (which put a
     32 GB box at 15 workers ≈ 50 GB) and not the old 3.5 GB (which still let
-    three 3.8 GB workers OOM a 16 GB box)."""
-    assert analyzer._per_worker_mb("discogs") == 800
-    assert analyzer._per_worker_mb("clap") == 4500
+    three 3.8 GB workers OOM a 16 GB box). Now engine-aware (the onnx/native
+    engines pass through too); CLAP dominates regardless of engine."""
+    assert analyzer._per_worker_mb("essentia_tf", "discogs") == 800
+    assert analyzer._per_worker_mb("essentia_tf", "clap") == 4500
+    # onnx/native deliberately reuse the essentia_tf baseline (conservative,
+    # pending a real measurement) — not a separate invented number.
+    assert analyzer._per_worker_mb("onnx", "discogs") == 800
+    assert analyzer._per_worker_mb("native", "discogs") == 800
     # The bug: a 16 GB box under WSL must cap CLAP at 2 workers, not 3 — each
     # worker is ~3.8 GB and WSL shares RAM with the Windows host.
-    assert (16384 - 4096) // analyzer._per_worker_mb("clap") == 2
+    assert (16384 - 4096) // analyzer._per_worker_mb("essentia_tf", "clap") == 2
     # A 32 GB native box stays generous but bounded.
-    assert (32768 - 2048) // analyzer._per_worker_mb("clap") <= 8
+    assert (32768 - 2048) // analyzer._per_worker_mb("essentia_tf", "clap") <= 8
 
 
 def test_running_under_wsl_detected_via_env(monkeypatch: pytest.MonkeyPatch) -> None:

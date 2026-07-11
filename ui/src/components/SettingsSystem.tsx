@@ -24,7 +24,7 @@ import { useNotificationStore } from "../stores";
 import { newOpId, progressMatches } from "../stores/operation";
 import { isCancellation, rpc, useSidecarProgress } from "../hooks/useSidecar";
 import { useUpdater } from "../hooks/useUpdater";
-import type { EngineGpuInfo, GpuDevice, PreflightResult, SystemResources } from "../types";
+import type { EngineGpuInfo, GpuDevice, PreflightResult, SystemResources, WorkerBudget } from "../types";
 import { Hint, Row, Section, Stat } from "./SettingsPrimitives";
 
 /** Subtle animated placeholder shown while a section's data is still loading. */
@@ -310,6 +310,7 @@ export function ResourcesSection({
   engineProbing,
   analyzeVia,
   preflight,
+  budget,
   onRefreshEngine,
   onRefreshPreflight,
 }: {
@@ -318,6 +319,9 @@ export function ResourcesSection({
   engineProbing: boolean;
   analyzeVia: "native" | "native_venv" | "wsl" | null;
   preflight: PreflightResult | null;
+  /** Backend worker budget — carries which RAM pool was measured so the Memory
+   *  stat can show the WSL VM's RAM (the real ceiling), not just the host. */
+  budget?: WorkerBudget | null;
   onRefreshEngine: () => void;
   onRefreshPreflight: () => void;
 }) {
@@ -369,23 +373,40 @@ export function ResourcesSection({
       title="System"
       subtitle="What Vibechek can see on this machine"
     >
-      <div className="grid grid-cols-3 gap-4">
-        <Stat label="CPU cores" value={sysInfo.cpu_count} />
-        <Stat
-          label="Memory"
-          value={
-            sysInfo.memory_total_mb
-              ? `${(sysInfo.memory_total_mb / 1024).toFixed(1)} GB`
-              : "?"
-          }
-          sub={memPct !== null ? `${memPct}% in use` : undefined}
-        />
-        <Stat
-          label="GPU"
-          value={gpuStat.value}
-          accent={gpuStat.accent}
-        />
-      </div>
+      {(() => {
+        // For WSL-routed engines the analyze workers draw from the VM's RAM
+        // slice, not the host total — so show the VM figure the budget measured
+        // ("WSL VM: 15.8 GB · of 31.7 GB host"), the pool the worker cap actually
+        // uses. Falls back to the plain host total when native / not measured.
+        const vmMeasured =
+          budget?.ram_pool === "wsl_vm" && budget.ram_seen_mb > 0;
+        const hostGb = sysInfo.memory_total_mb
+          ? `${(sysInfo.memory_total_mb / 1024).toFixed(1)} GB`
+          : "?";
+        const memValue = vmMeasured
+          ? `${(budget!.ram_seen_mb / 1024).toFixed(1)} GB`
+          : hostGb;
+        const memSub = vmMeasured
+          ? `WSL VM · of ${hostGb} host`
+          : memPct !== null
+            ? `${memPct}% in use`
+            : undefined;
+        return (
+          <div className="grid grid-cols-3 gap-4">
+            <Stat label="CPU cores" value={sysInfo.cpu_count} />
+            <Stat
+              label={vmMeasured ? "Memory (WSL VM)" : "Memory"}
+              value={memValue}
+              sub={memSub}
+            />
+            <Stat
+              label="GPU"
+              value={gpuStat.value}
+              accent={gpuStat.accent}
+            />
+          </div>
+        );
+      })()}
 
       {/* Engine-side GPU truth block. Replaces the old host-only block so
           the UI never lies about whether analyze will actually use the GPU. */}
@@ -739,6 +760,32 @@ function EngineGpuBlock({
               Host has {sysInfo.gpu_devices.map((g) => g.name).join(", ")}{" "}
               but the analyze engine couldn&apos;t enumerate it. Analysis will
               fall back to CPU.
+            </div>
+          )}
+          <button className="btn-ghost text-xs mt-1" onClick={onRefresh}>
+            Re-probe
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Native (bundled ONNX Runtime) engine: the honest CPU-only story. That wheel
+  // ships no GPU execution providers (roadmap), so it runs on CPU regardless of
+  // host hardware. `note` is set ONLY by the native-bundled probe — the old code
+  // fell through to a host-only nvidia-smi read rendered as a green "GPU
+  // available … via native TensorFlow", doubly wrong (no TF, GPU never used).
+  if (engineGpu.note) {
+    return (
+      <div className="mt-3 flex items-start gap-2 text-xs">
+        <Cpu className="w-4 h-4 flex-none text-white/50 mt-0.5" />
+        <div>
+          <div className="text-white/70">{engineGpu.note}</div>
+          {engineGpu.gpu_hardware_visible && sysInfo.gpu_available && (
+            <div className="text-white/40 mt-0.5">
+              Your {sysInfo.gpu_devices.map((g) => g.name).join(", ")} isn&apos;t
+              used by the native engine — switch to the WSL/ONNX engine for GPU
+              acceleration.
             </div>
           )}
           <button className="btn-ghost text-xs mt-1" onClick={onRefresh}>

@@ -147,22 +147,11 @@ def test_probe_skips_malformed_rows_but_keeps_good_ones() -> None:
 # cap formula by replicating it (the same constants are used in source).
 
 
-@pytest.mark.parametrize(
-    "free_mb, expected_cap",
-    [
-        (2500, 1),       # exactly 1 worker fits at the 2500-MB-per-worker budget
-        (7500, 3),       # 7500 / 2500 = 3
-        (7948, 3),       # the user's RTX 4070 Laptop empirical case — 3 workers
-                         #   stable, 4 stalls under contention
-        (10000, 4),      # 10 GB card -> 4 workers
-        (24000, 9),      # 24 GB monster -> 9 workers
-        (500, 1),        # below per-worker budget -> still 1 (max(1, ...))
-        (0, 1),          # zero free -> still 1 worker requested
-    ],
-)
-def test_gpu_cap_formula(free_mb: int, expected_cap: int) -> None:
-    """The documented formula: max(1, free_mb // _GPU_WORKER_MB)."""
-    assert max(1, free_mb // analyzer._GPU_WORKER_MB) == expected_cap
+# NOTE: the GPU-cap DECISION (and its floor-to-0 fix — a near-empty card now
+# yields 0 GPU workers + a reason, not a doomed 1-worker pool that __init_fail__s
+# the whole run) moved into the pure vibechek.resources.compute_worker_budget.
+# It's exercised table-driven in tests/test_worker_budget.py. The probe below is
+# unchanged, so its tests stay here.
 
 
 def test_gpu_worker_mb_is_sane() -> None:

@@ -438,6 +438,29 @@ def load_onnx_models(
     log.info("ONNX backbone EPs (in order): %s", providers)
     backbone_sess = ort.InferenceSession(str(backbone_path), providers=providers or None)
 
+    # Per-run GPU honesty: onnxruntime SILENTLY drops a requested EP that can't
+    # initialize (wrong CUDA/cuDNN version, missing libs) and falls back to the
+    # next in the chain — printing only a C++-side stderr warning we don't
+    # capture. The old code never called get_providers() after construction, so
+    # a session that requested CUDA but got CPU looked identical to a real GPU
+    # run: analyze that should take minutes silently took hours on CPU. Compare
+    # the ACTIVE provider to what we asked for and record an honest flag so the
+    # analyzer's "N GPU workers" line and the report reflect what really ran.
+    gpu_active = False
+    if use_gpu != "off" and providers:
+        active = backbone_sess.get_providers()
+        requested_gpu_ep = providers[0] if providers[0] != "CPUExecutionProvider" else None
+        active_first = active[0] if active else None
+        if requested_gpu_ep is not None and active_first == requested_gpu_ep:
+            gpu_active = True
+        elif requested_gpu_ep is not None:
+            log.warning(
+                "ONNX backbone requested %s but is running on %s — GPU "
+                "acceleration is NOT active (likely a CUDA/cuDNN version "
+                "mismatch or missing libs). Analysis will run on CPU.",
+                requested_gpu_ep, active_first or "CPU",
+            )
+
     # Pure-NumPy mel frontend (essentia-free). Explicit arg wins; otherwise the
     # VIBECHEK_NUMPY_FRONTEND env var opts in. Default OFF — essentia's
     # TensorflowInputMusiCNN stays the frontend until the full gold-corpus parity
@@ -453,6 +476,10 @@ def load_onnx_models(
         log.info("ONNX backbone using the pure-NumPy mel frontend (essentia-free)")
 
     loaded: dict[str, Any] = {}
+    # Record whether GPU acceleration actually took (see the get_providers()
+    # check above) so an in-process consumer / the analyze summary can report the
+    # truth instead of assuming the requested EP won.
+    loaded["_gpu_active"] = gpu_active
     effnet = _OnnxEffnet(backbone_sess, numpy_frontend=numpy_frontend)
     loaded["effnet"] = effnet
 

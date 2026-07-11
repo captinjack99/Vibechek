@@ -21,6 +21,7 @@ import re
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from dataclasses import replace as dataclass_replace
 from multiprocessing import cpu_count
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from mutagen.flac import FLAC
 from mutagen.id3 import ID3
 
 from vibechek import cancellation
+from vibechek import resources as _resources
 from vibechek.config import AnalysisConfig, engine_venv_subdir
 from vibechek.filename import extract_from_filename
 from vibechek.genres import GenreResult, get_best_genre
@@ -83,7 +85,15 @@ from vibechek.model_download import (
 from vibechek.model_download import (
     verify_model_sha256 as verify_model_sha256,
 )
-from vibechek.resources import apply_gpu_preference
+from vibechek.resources import apply_gpu_preference, compute_worker_budget
+
+# The canonical worker-sizing budget + GPU constants live in vibechek.resources
+# now (shared with the `worker_budget` RPC so the slider and the run can't
+# disagree). Re-bind them here so existing callers and tests that read
+# analyzer._GPU_WORKER_MB / analyzer._per_worker_mb keep working.
+_GPU_WORKER_MB = _resources._GPU_WORKER_MB
+_GPU_FALLBACK_CAP = _resources._GPU_FALLBACK_CAP
+_per_worker_mb = _resources.per_worker_mb
 from vibechek.utils import (
     ProgressCallback,
     find_audio_files,
@@ -207,21 +217,6 @@ class TrackAnalysis:
         "existing_tags": "ExistingTags",
         "ml_analysis": "MLResult | null",
     }
-
-
-def _per_worker_mb(genre_classifier: str) -> int:
-    """RAM budget per analysis worker, used to cap the worker count.
-
-    The baseline 800 MB covers the essentia/TF path (measured ~340 MB resident
-    after load; 800 leaves headroom for per-track buffers + TF inference). The
-    CLAP genre classifier loads a ~2.2 GB fp32 checkpoint + the torch runtime
-    INTO EVERY worker (load_models → _maybe_load_clap) — MEASURED at ~3.8 GB
-    resident and peaking higher during inference — so it budgets 4.5 GB. The old
-    3.5 GB estimate still let three 3.8 GB workers OOM a 16 GB machine (silent
-    exit 1, the worker killed before it could print); sizing CLAP off the 800 MB
-    baseline was even worse (a 32 GB box at 15 workers ≈ 50 GB resident).
-    """
-    return 4500 if genre_classifier == "clap" else 800
 
 
 def _running_under_wsl() -> bool:
@@ -1177,37 +1172,21 @@ def _wsl_install_is_outdated(wsl_version: str, sidecar_version: str) -> bool:
         return _normalize_version(wsl_version) != _normalize_version(sidecar_version)
 
 
-# Per-worker GPU memory budget. ~2.5 GB covers a steady-state essentia + TF
-# worker process under multi-worker contention:
-#
-#   - Persistent CUDA context: ~800 MB
-#   - EffNet + Discogs-400 + 6 mood heads, materialized as TF graphs: ~600 MB
-#   - Activation buffers + intermediate tensors: ~400 MB
-#   - Growth-allocator fragmentation: ~700 MB (this is the biggest hidden cost)
-#
-# The fragmentation overhead is the killer — TF_FORCE_GPU_ALLOW_GROWTH=true
-# tells TF to grow allocations as needed, but it never shrinks. After dozens
-# of inferences with varying batch shapes, each worker's footprint is
-# significantly larger than the sum of its tensors. With N workers sharing
-# one card, the effective steady-state per-worker can be 50-100% higher
-# than naive accounting suggests.
-#
-# Tuned against an RTX 4070 Laptop (8 GB shared with the desktop):
-#
-#   _GPU_WORKER_MB = 1500 (original) → cap = 5 → stalled after ~12 tracks
-#   _GPU_WORKER_MB = 1800              → cap = 4 → stalled at startup (init OOM)
-#   _GPU_WORKER_MB = 2500 (current)    → cap = 3 → ran 12 tracks cleanly
-#
-# 2500 might leave parallelism on the table for dedicated cards (a 24-GB
-# card gets 9 workers instead of 13), but the previous cap was producing
-# 5-min stall-watchdog errors with no useful diagnostic — the worst possible
-# failure mode. We prefer "always finishes" over "sometimes faster".
-_GPU_WORKER_MB = 2500
+# The per-worker GPU (2.5 GB) and fallback (4) budgets now live in
+# vibechek.resources alongside the pure `compute_worker_budget`, which both this
+# sizing block and the `worker_budget` RPC share (so the Settings slider and the
+# actual run can't disagree). Re-exported here as module aliases so callers and
+# tests that read `analyzer._GPU_WORKER_MB` keep working. The 2500 tuning story:
+# on an RTX 4070 Laptop (8 GB shared) 2500 → cap 3 ran cleanly while 1800 → cap 4
+# stalled at init OOM — the fragmentation of TF_FORCE_GPU_ALLOW_GROWTH (never
+# shrinks) makes steady-state per-worker RSS much higher than naive accounting.
+# We prefer "always finishes" over "sometimes faster".
 
-# Fallback cap when VRAM probing fails — preserves prior behaviour of
-# "at most 4 workers in GPU mode" so we never regress on systems where
-# nvidia-smi is missing or unreadable (e.g. WSL with no GPU passthrough).
-_GPU_FALLBACK_CAP = 4
+
+# Fixed VRAM headroom (MB) held back from the card's TOTAL when we sample free
+# VRAM for GPU sizing. See _stable_free_vram_mb for why we sample free (min of
+# two reads) rather than size off total-minus-headroom.
+_GPU_VRAM_HEADROOM_MB = 2048
 
 
 def _visible_gpu_index() -> int:
@@ -1285,6 +1264,71 @@ def _probe_free_vram_mb() -> int | None:
     # Target index out of range (e.g. CUDA_VISIBLE_DEVICES points past the
     # visible cards) — fall back to the first card we can see.
     return rows[0]
+
+
+def _stable_free_vram_mb() -> int | None:
+    """Free VRAM for GPU sizing, taken as the MIN of two quick samples.
+
+    The audit measured free VRAM swinging wildly between probes (3129 vs 7948
+    MiB) as other apps (browser GPU-accel, a DAW) allocate and release. We size
+    off free VRAM rather than total-minus-headroom on purpose: free respects
+    what another process is genuinely holding, so we never oversize the GPU pool
+    into a card that's already full and trigger the CUDA init-OOM that aborts the
+    whole run. Taking the MIN of two reads is the conservative direction — a
+    transient high free reading can't inflate the worker count; under-sizing just
+    shifts work to CPU (correct + safe). None if either read fails (→ caller uses
+    the conservative fallback cap).
+    """
+    first = _probe_free_vram_mb()
+    if first is None:
+        return None
+    second = _probe_free_vram_mb()
+    return first if second is None else min(first, second)
+
+
+def _probe_gpu_registrable(engine: str) -> tuple[bool | None, str | None]:
+    """Ask the ACTUAL engine (in a separate subprocess) if it can REGISTER a GPU.
+
+    This is the ground truth the old nvidia-smi-VRAM sizing never checked — which
+    let us report "3 GPU workers" while TensorFlow couldn't register the GPU and
+    every one silently ran on CPU. Uses the same engine probe the Settings panel
+    does (TF list_physical_devices / ORT live EP session), cached 5 min.
+
+    Returns (registrable, reason):
+      * (True, None)   — a real engine probe ran and the GPU registered.
+      * (False, why)   — a real engine probe ran and the GPU did NOT register.
+      * (None, None)   — the probe couldn't run a REAL engine check (e.g. only a
+        host-only nvidia-smi fallback was available). We then size off VRAM as
+        before rather than needlessly disabling a healthy GPU.
+    """
+    try:
+        from vibechek.wsl import probe_engine_gpu  # noqa: PLC0415
+
+        # distro=None → the in-process/native probe path. Inside WSL (where every
+        # Windows analyze routes) this runs the venv's TF/ORT in a subprocess.
+        info = probe_engine_gpu(None, engine=engine)
+    except Exception as e:  # noqa: BLE001 — probing must never break analyze
+        log.debug("GPU registration probe raised (treating as inconclusive): %s", e)
+        return None, None
+    if not getattr(info, "ok", False):
+        return None, None
+    # Only trust the result when a REAL engine probe ran (tf_version for TF,
+    # runtime for ONNX). A host-only nvidia-smi fallback sets neither and its
+    # gpu_available reflects hardware presence, not registration — inconclusive.
+    engine_probe_ran = bool(
+        getattr(info, "tf_version", None) or getattr(info, "runtime", None)
+    )
+    if not engine_probe_ran:
+        return None, None
+    if info.gpu_available:
+        return True, None
+    reason = "the analysis engine could not register the GPU"
+    missing = list(getattr(info, "missing_cuda_libs", None) or [])
+    if missing:
+        reason += f" (missing CUDA libs: {', '.join(missing[:3])})"
+    elif getattr(info, "gpu_hardware_visible", False):
+        reason += " (GPU hardware visible, but the engine can't use it)"
+    return False, reason
 
 
 # ---------------------------------------------------------------------------
@@ -1852,113 +1896,104 @@ def analyze_directory(
     file_strs = [str(f) for f in files]
     results: list[dict[str, Any]] = []
 
-    # Resolve worker count with TWO real-world constraints baked in:
-    #
-    #   1. *Memory*: each worker loads the models into its own process. We use
-    #      psutil for total RAM, reserve some for the OS (and, under WSL, for the
-    #      Windows host + GUI + browser that share the SAME physical RAM), then
-    #      cap workers at floor(usable / per-worker budget). The budget is
-    #      engine-aware (CLAP loads a 2.2 GB checkpoint per worker — see
-    #      _per_worker_mb); the WSL reserve is what stops three CLAP workers from
-    #      OOM-killing a 16 GB machine while Windows is also using RAM.
-    #
-    #   2. *GPU contention*: even with TF_FORCE_GPU_ALLOW_GROWTH=true,
-    #      N workers each carving up one GPU is fragile. We cap at 4 in GPU
-    #      mode — empirically the sweet spot for ~8 GB consumer cards.
-    requested = config.workers if config.workers and config.workers > 0 else max(1, cpu_count() - 1)
-    workers = max(1, min(requested, cpu_count()))
-
-    # Memory cap
+    # Resolve the worker plan through the ONE shared budget model
+    # (vibechek.resources.compute_worker_budget) that the Settings slider's
+    # `worker_budget` RPC also uses — so the slider max and the actual run can
+    # never disagree (the exact bug the user hit: slider said 16, the run
+    # silently clamped to 2 with only a discarded log.warning). Everything the
+    # old inline math got wrong — the RAM floor-to-1, the GPU floor-to-1 that
+    # dispatched a doomed worker, the silent psutil-missing pass, GPU workers
+    # sized off nvidia-smi VRAM without a registration check — is fixed inside
+    # that pure function; here we only gather the measured inputs and surface the
+    # reasons it returns.
+    total_ram_mb: int | None
     try:
         import psutil  # noqa: PLC0415
-        total_mb = psutil.virtual_memory().total // (1024 * 1024)
-        per_worker_mb = _per_worker_mb(config.genre_classifier)
-        # Hold back more under WSL: its RAM is shared with the Windows host +
-        # GUI + browser, so a 2 GB Linux-only reserve starves Windows and the
-        # whole machine thrashes/OOMs (a worker dies silently → exit 1/15).
-        reserve_mb = 4096 if _running_under_wsl() else 2048
-        usable_mb = max(0, total_mb - reserve_mb)
-        memory_cap = max(1, usable_mb // per_worker_mb)
-        if memory_cap < workers:
-            log.warning(
-                "Capping workers from %d -> %d based on available RAM "
-                "(%d MB total, ~%d MB per worker%s)",
-                workers, memory_cap, total_mb, per_worker_mb,
-                " — CLAP genre model loads in every worker" if per_worker_mb != 800 else "",
-            )
-            workers = memory_cap
+        total_ram_mb = psutil.virtual_memory().total // (1024 * 1024)
     except ImportError:
-        pass  # psutil missing — fall through with the cpu_count-based number
+        total_ram_mb = None  # capping unavailable — the budget names it loudly
 
-    # Split the RAM-bounded budget into GPU + CPU workers.
-    #
-    # `workers` is the RAM-capped total. In GPU mode we probe free VRAM to size
-    # the GPU subset (`gpu_cap`), then — when hybrid is enabled — fill the rest
-    # of the RAM budget with CPU workers instead of throwing that headroom away.
-    # The old behaviour capped the WHOLE run to `gpu_cap` (≈3 on an 8 GB card),
-    # leaving most cores idle; hybrid keeps all of them busy via the shared
-    # work queue.
-    ram_cap = workers  # RAM-bounded total (== memory_cap when psutil present)
-    gpu_workers = 0
-    cpu_workers = ram_cap  # default (use_gpu=off, or no GPU): all CPU
-
+    under_wsl = _running_under_wsl()
+    free_vram_mb: int | None = None
+    gpu_registrable: bool | None = None
     if config.use_gpu in ("auto", "on"):
-        free_vram_mb = _probe_free_vram_mb()
-        if free_vram_mb is not None:
-            gpu_cap = max(1, free_vram_mb // _GPU_WORKER_MB)
-            cap_reason = (
-                f"{free_vram_mb // 1024} GB free VRAM "
-                f"(~{_GPU_WORKER_MB} MB per worker)"
-            )
-        else:
-            gpu_cap = _GPU_FALLBACK_CAP
-            cap_reason = (
-                "nvidia-smi unavailable; using conservative GPU cap of "
-                f"{_GPU_FALLBACK_CAP}"
-            )
-            log.warning(
-                "GPU mode active but VRAM probe failed — capping GPU workers at "
-                "%d. Hybrid CPU workers still fill the rest of the RAM budget.",
-                _GPU_FALLBACK_CAP,
-            )
-        gpu_workers = min(gpu_cap, ram_cap)
+        # Gate GPU workers on ACTUAL registration (TF/ORT), not nvidia-smi VRAM,
+        # so we never report "N GPU workers" that silently run on CPU. This costs
+        # a one-time ~10s engine probe (cached) — worth it for the honesty; note
+        # it so the progress bar isn't a mystery pause.
+        _emit_event("stage", name="gpu_probe",
+                    message="Checking GPU availability...")
+        report_progress(on_progress, 0, total, "Checking GPU availability...")
+        gpu_registrable, _gpu_probe_reason = _probe_gpu_registrable(config.inference_engine)
+        if gpu_registrable is not False:
+            free_vram_mb = _stable_free_vram_mb()
 
-        if config.hybrid_cpu_gpu and ram_cap > gpu_workers:
-            # Hybrid: GPU workers + CPU workers (filling remaining RAM, bounded
-            # by core count) run concurrently against one shared queue.
-            cpu_workers = max(0, min(cpu_count(), ram_cap) - gpu_workers)
-            msg = (
-                f"Hybrid mode: {gpu_workers} GPU + {cpu_workers} CPU workers "
-                f"({cap_reason}; CPU fills the rest of the RAM budget)."
-            )
-            log.info(msg)
-            report_progress(on_progress, 0, total, msg)
-            _emit_event("stage", name="hybrid_plan", message=msg,
-                        gpu_workers=gpu_workers, cpu_workers=cpu_workers,
-                        reason=cap_reason)
-        else:
-            # Single-device GPU pool: hybrid disabled, or GPU cap already
-            # covers the whole RAM budget. Surface the cap so the user
-            # understands why fewer workers than configured are running.
-            cpu_workers = 0
-            if gpu_workers < ram_cap:
-                requested_workers = (
-                    config.workers if config.workers and config.workers > 0
-                    else max(1, cpu_count() - 1)
-                )
-                msg = (
-                    f"Capped to {gpu_workers} GPU worker(s) from "
-                    f"{requested_workers} ({cap_reason}). Enable hybrid CPU+GPU "
-                    f"(Settings) or set GPU mode 'off' to use more CPU workers."
-                )
-                log.warning(msg)
-                report_progress(on_progress, 0, total, msg)
-                _emit_event("stage", name="worker_cap", message=msg,
-                            requested=requested_workers, applied=gpu_workers,
-                            reason=cap_reason)
+    budget = compute_worker_budget(
+        config.inference_engine,
+        config.genre_classifier,
+        config.workers,
+        total_ram_mb=total_ram_mb,
+        free_vram_mb=free_vram_mb,
+        gpu_registrable=gpu_registrable,
+        cpu_count=cpu_count(),
+        under_wsl=under_wsl,
+        use_gpu=config.use_gpu,
+        hybrid=config.hybrid_cpu_gpu,
+        ram_pool="wsl_vm" if under_wsl else "host",
+    )
 
-    workers = gpu_workers + cpu_workers
+    # Nothing fits — refuse with the actionable message (naming the classifier +
+    # measured RAM) instead of launching one worker the budget says is doomed.
+    if budget.refusal_reason is not None:
+        _emit_event("stage", name="worker_budget_refused",
+                    message=budget.refusal_reason)
+        raise RuntimeError(budget.refusal_reason)
+
+    if not budget.ram_measured and budget.cap_reason:
+        # psutil-missing path: was a bare `pass`; now a real diagnostic line.
+        log.warning("%s", budget.cap_reason)
+
+    # Capture the user's GPU intent BEFORE we possibly force CPU below, so the
+    # "GPU unavailable: <reason>" line still fires for the registration-failure
+    # case (where we set use_gpu="off" precisely because the GPU can't register).
+    gpu_mode_requested = config.use_gpu in ("auto", "on")
+    if gpu_mode_requested and gpu_registrable is False:
+        # The engine can't register the GPU; force CPU so each worker doesn't
+        # waste a doomed CUDA init (and emit a scary GPU warning to its stderr).
+        config = dataclass_replace(config, use_gpu="off")
+
+    gpu_workers = budget.gpu_workers
+    cpu_workers = budget.cpu_workers
+    workers = budget.effective_workers
     hybrid = gpu_workers > 0 and cpu_workers > 0
+
+    # Surface the RAM/worker cap on the GUI channel (was a discarded log.warning).
+    # This routes through _emit_event, which the WSL-subprocess line handler
+    # forwards to on_progress — so "Workers capped 16→2: CLAP needs ~4.5 GB each;
+    # the WSL VM has 15.8 GB" reaches the GUI on WSL runs too, not just native.
+    if budget.cap_reason and budget.ram_measured:
+        log.warning("%s", budget.cap_reason)
+        report_progress(on_progress, 0, total, budget.cap_reason)
+        _emit_event("stage", name="worker_cap", message=budget.cap_reason,
+                    requested=budget.requested_workers, applied=workers,
+                    gpu_workers=gpu_workers, cpu_workers=cpu_workers)
+
+    # Honest GPU line: state the REGISTERED truth, not a phantom GPU pool. When
+    # GPU mode is on but no GPU worker ran, say why (registration failure or low
+    # VRAM) instead of silently reporting CPU-only.
+    if hybrid:
+        msg = (f"Hybrid mode: {gpu_workers} GPU + {cpu_workers} CPU workers "
+               "(shared work queue).")
+        log.info(msg)
+        report_progress(on_progress, 0, total, msg)
+        _emit_event("stage", name="hybrid_plan", message=msg,
+                    gpu_workers=gpu_workers, cpu_workers=cpu_workers)
+    elif gpu_mode_requested and gpu_workers == 0 and budget.gpu_reason:
+        msg = f"{cpu_workers} CPU worker(s) (GPU unavailable: {budget.gpu_reason})."
+        log.info(msg)
+        report_progress(on_progress, 0, total, msg)
+        _emit_event("stage", name="gpu_unavailable", message=msg,
+                    reason=budget.gpu_reason, cpu_workers=cpu_workers)
 
     log.info("Analyzing %d files with %d worker(s) (GPU=%d, CPU=%d, mode=%s)",
              total, workers, gpu_workers, cpu_workers, config.use_gpu)

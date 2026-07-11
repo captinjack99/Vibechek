@@ -38,6 +38,7 @@ const PYTHON_METHODS = [
   "version",
   "system_info",
   "engine_gpu_status",
+  "worker_budget",
   "preflight",
   "wsl_status",
   "install_wsl",
