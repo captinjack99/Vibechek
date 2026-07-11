@@ -242,6 +242,17 @@ def resolve(
                 used_web = not snippets.startswith("(")
             except Exception as e:  # noqa: BLE001 — web is best-effort
                 log.debug("ddgs lookup failed (%s - %s): %s", artist, title, e)
+            if not used_web:
+                # Honesty gate: the caller asked for a WEB-grounded read, but the
+                # search returned nothing (a transient DuckDuckGo throttle/outage,
+                # or zero hits). Falling through to the LLM here produces a guess
+                # from its training data alone — no web input — which the pipeline
+                # would then label "Set by an online source" at 0.9 confidence,
+                # a web-verified provenance the user never actually got. Skip the
+                # tier entirely so reconcile falls back to the honest audio read.
+                # (This does NOT touch the ~60% web-tier value: that path only
+                # runs when the search succeeds, which is unchanged.)
+                return {**empty, "used_web": False}
         user = base
         if used_web:
             user += ("\n\nWeb search results (ignore non-matching songs):\n" + snippets

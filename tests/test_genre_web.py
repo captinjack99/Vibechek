@@ -72,14 +72,39 @@ def test_resolve_never_raises_on_llm_failure(monkeypatch: pytest.MonkeyPatch) ->
     assert r == {"genre": "", "confidence": 0.0, "source_matched": False, "used_web": False}
 
 
-def test_resolve_survives_ddgs_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A web-search blowup falls back to a parametric (no-web) classification."""
+def test_resolve_skips_ungrounded_llm_when_ddgs_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A web-search blowup must NOT masquerade as an online read.
+
+    When the caller asked for a web-grounded genre but ddgs failed (throttle,
+    outage), the LLM would otherwise guess from its training data alone and the
+    pipeline would label it "Set by an online source" at 0.9 — a web-verified
+    provenance the user never got. The tier is skipped instead (empty genre →
+    reconcile falls back to the honest audio read), and the LLM is never called.
+    """
     def ddgs_boom(q, n=6):
         raise RuntimeError("throttled")
+    llm_calls: list = []
+
+    def spy_llm(*a, **k):
+        llm_calls.append(a)
+        return {"genre": "Deep House", "confidence": 0.6,
+                "source_matched": False, "evidence": ""}
+
     monkeypatch.setattr(genre_web, "_ddgs_snippets", ddgs_boom)
-    monkeypatch.setattr(genre_web, "_llm_chat",
-                        lambda *a, **k: {"genre": "Deep House", "confidence": 0.6,
-                                         "source_matched": False, "evidence": ""})
+    monkeypatch.setattr(genre_web, "_llm_chat", spy_llm)
     r = genre_web.resolve("nimino", "Better")
-    assert r["genre"] == "Deep House"
+    assert r["genre"] == ""          # no ungrounded read leaks out as "web"
     assert r["used_web"] is False
+    assert llm_calls == []           # didn't even pay for the ungrounded guess
+
+
+def test_resolve_skips_ungrounded_llm_when_ddgs_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ddgs returning zero hits ("(no results)") is the same masquerade risk —
+    also skip rather than let the LLM guess and be labelled a web read."""
+    monkeypatch.setattr(genre_web, "_ddgs_snippets", lambda q, n=6: "(no results)")
+    called = []
+    monkeypatch.setattr(genre_web, "_llm_chat",
+                        lambda *a, **k: called.append(a) or {"genre": "Trance"})
+    r = genre_web.resolve("nimino", "Better")
+    assert r["genre"] == "" and r["used_web"] is False
+    assert called == []

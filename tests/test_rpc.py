@@ -336,6 +336,47 @@ def test_handler_runtime_error_becomes_app_error(rpc_server, monkeypatch: pytest
         rpc.METHODS.pop("_test_boom", None)
 
 
+def test_internal_valueerror_is_internal_error_not_invalid_params(
+    rpc_server, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ValueError raised DEEP in a handler (e.g. tagger reading a truncated
+    tag-backup JSON) is an INTERNAL fault, not a caller 'bad params' problem —
+    it must map to INTERNAL_ERROR, not INVALID_PARAMS which mislabels it."""
+    def corrupt(_params: dict) -> dict:
+        raise ValueError(
+            "Backup file at /x is not valid JSON; it may be truncated or corrupted"
+        )
+
+    monkeypatch.setitem(rpc.METHODS, "_test_corrupt", corrupt)
+    try:
+        stdin, stdout = rpc_server
+        stdin.write_line({"jsonrpc": "2.0", "id": 95, "method": "_test_corrupt"})
+        response = _wait_for_response(stdout, 95)
+        assert response["error"]["code"] == rpc.INTERNAL_ERROR
+        assert "truncated or corrupted" in response["error"]["message"]
+    finally:
+        rpc.METHODS.pop("_test_corrupt", None)
+
+
+def test_invalid_params_marker_still_maps_to_invalid_params(
+    rpc_server, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rpc's explicit InvalidParams marker (a genuine caller error) is unchanged:
+    it still maps to INVALID_PARAMS even though bare ValueError now doesn't."""
+    def bad(_params: dict) -> dict:
+        raise rpc.InvalidParams("you sent nonsense")
+
+    monkeypatch.setitem(rpc.METHODS, "_test_bad_params", bad)
+    try:
+        stdin, stdout = rpc_server
+        stdin.write_line({"jsonrpc": "2.0", "id": 96, "method": "_test_bad_params"})
+        response = _wait_for_response(stdout, 96)
+        assert response["error"]["code"] == rpc.INVALID_PARAMS
+        assert "you sent nonsense" in response["error"]["message"]
+    finally:
+        rpc.METHODS.pop("_test_bad_params", None)
+
+
 def test_cancellation_error_includes_cancelled_flag(rpc_server, monkeypatch: pytest.MonkeyPatch) -> None:
     from vibechek import cancellation as cm
 

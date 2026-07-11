@@ -67,6 +67,8 @@ const oneTrack: TrackAnalysis[] = [
       ml_vocal_source: null,
       ml_key_tag: null,
       ml_key_conflict: null,
+      ml_genre_classifier: null,
+      ml_degraded_heads: null,
     },
     error: null,
   },

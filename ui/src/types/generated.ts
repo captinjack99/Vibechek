@@ -235,6 +235,8 @@ export interface MLResult {
   ml_vocal_source: string | null;
   ml_key_tag: string | null;
   ml_key_conflict: boolean | null;
+  ml_genre_classifier: string | null;
+  ml_degraded_heads: string[] | null;
 }
 
 export interface TrackAnalysis {
@@ -274,6 +276,8 @@ export interface DuplicateSummary {
   audio_duplicate_files: number;
   total_duplicates: number;
   space_recoverable_mb: number;
+  phases_run: string[];
+  fpcalc_available: boolean;
 }
 
 export interface FileInfo {

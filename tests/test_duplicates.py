@@ -182,6 +182,39 @@ def test_find_duplicates_detects_exact_md5_match(tiny_library: Path) -> None:
     assert filenames == {"track3.mp3", "track3_dup.mp3"}
 
 
+def test_find_duplicates_flags_missing_fpcalc(tmp_path: Path, monkeypatch) -> None:
+    """When audio fingerprinting is requested but fpcalc is missing, the phase
+    silently no-ops — the report must record fpcalc_available=False so the GUI
+    can banner 'fingerprint scan skipped' instead of implying a clean fuzzy pass."""
+    from vibechek import duplicates
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "a.mp3").write_bytes(b"aaaa")
+    (lib / "b.mp3").write_bytes(b"bbbb")
+
+    monkeypatch.setattr(duplicates, "find_fpcalc", lambda: None)
+    report = duplicates.find_duplicates(
+        lib, DuplicateConfig(use_md5=True, use_chromaprint=True),
+    )
+    assert report.summary.fpcalc_available is False
+    assert "chromaprint" not in report.summary.phases_run
+    assert report.summary.phases_run == ["md5"]
+    # The field survives the wire round-trip (asdict) the RPC uses.
+    assert report.to_dict()["summary"]["fpcalc_available"] is False
+
+
+def test_find_duplicates_fpcalc_available_when_not_requested(tmp_path: Path) -> None:
+    """fpcalc_available defaults True (no false 'skipped' banner) when the user
+    never asked for the fingerprint phase."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "a.mp3").write_bytes(b"aaaa")
+    report = find_duplicates(lib, DuplicateConfig(use_md5=True, use_chromaprint=False))
+    assert report.summary.fpcalc_available is True
+    assert report.summary.phases_run == ["md5"]
+
+
 def test_find_duplicates_handle_move_relocates_dupes(tmp_path: Path) -> None:
     # Build two byte-identical files
     a = tmp_path / "lib" / "a.mp3"

@@ -530,6 +530,23 @@ function ReportView({
         groupCount={activeGroups.length}
       />
 
+      {report.summary.fpcalc_available === false && (
+        // Audio fingerprinting was requested but fpcalc wasn't found, so the
+        // near-duplicate (re-encode/re-tag) phase silently never ran. Without
+        // this banner "0 near-duplicates" reads as a thorough clean scan — a
+        // user could reorganize believing a fuzzy pass ran when only exact-hash
+        // matching did.
+        <div className="panel-pad flex items-start gap-2 text-sm text-accent-yellow">
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>
+            Fingerprint scan skipped — <strong>fpcalc not found</strong>. Only
+            exact-match duplicates were detected; re-encodes and re-tags of the
+            same track were <em>not</em> compared. Install libchromaprint-tools
+            (fpcalc) and re-scan to find near-duplicates.
+          </span>
+        </div>
+      )}
+
       <RulesPanel rules={rules} setRules={setRules} />
 
       <ActionBar

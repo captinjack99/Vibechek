@@ -73,6 +73,19 @@ _LONG_OP_LOCK = threading.Lock()
 # byte into MP3 frames (or raises per-file). These tiny helpers re-establish the
 # same guarantees the CLI already gives, at the RPC seam.
 
+class InvalidParams(ValueError):
+    """A genuine caller parameter problem — maps to JSON-RPC INVALID_PARAMS.
+
+    Subclasses ValueError so the many existing `raise ValueError`/`pytest.raises(
+    ValueError)` call sites and tests keep working, but it lets the dispatch seam
+    tell an EXPLICIT "you sent bad params" from a plain ValueError that bubbled
+    up out of deep library code (e.g. a truncated tag-backup JSON that tagger
+    raises ValueError for). The latter is an INTERNAL fault, not a caller error;
+    labeling it "Invalid params" misdirects the user and support triage. rpc's
+    own param validation raises THIS; unmarked ValueErrors get INTERNAL_ERROR.
+    """
+
+
 # Encodings mutagen's ID3 frame constructors accept: 0=ISO-8859-1, 1=UTF-16,
 # 2=UTF-16BE, 3=UTF-8. Anything else is corrupt; fall back to UTF-8 (3).
 _VALID_ID3_ENCODINGS = frozenset({0, 1, 2, 3})
@@ -125,7 +138,7 @@ def _validate_distro(value: Any, default: str = "Ubuntu-24.04") -> str:
         return default
     s = str(value)
     if not _DISTRO_RE.match(s):
-        raise ValueError(
+        raise InvalidParams(
             f"Invalid distro name {s!r}: must match {_DISTRO_RE.pattern}"
         )
     return s
@@ -693,7 +706,7 @@ def _valid_vibechek_source(params: dict) -> str | None:
         return None
     p = Path(str(src))
     if not p.is_dir():
-        raise ValueError(
+        raise InvalidParams(
             f"vibechek_source must be an existing local directory, got {str(src)!r}"
         )
     return str(p)
@@ -874,7 +887,7 @@ def _rebuild_report(d: dict) -> Any:
     # ('str' object has no attribute 'get'). Validate at the seam so a
     # malformed report returns a clean INVALID_PARAMS instead.
     if not isinstance(d, dict):
-        raise ValueError("'report' must be an object")
+        raise InvalidParams("'report' must be an object")
     from vibechek.duplicates import (
         DuplicateGroup,
         DuplicateReport,
@@ -916,7 +929,7 @@ def _plan_organization(params: dict) -> dict:
         params.get("target_root"), source_library=params.get("library_path"),
     )
     if not check["ok"]:
-        raise ValueError(check["error"])
+        raise InvalidParams(check["error"])
 
     config = OrganizationConfig(
         use_subgenres=bool(params.get("use_subgenres", True)),
@@ -952,7 +965,7 @@ def _organize(params: dict) -> dict:
         params.get("target_root"), source_library=params.get("library_path"),
     )
     if not check["ok"]:
-        raise ValueError(check["error"])
+        raise InvalidParams(check["error"])
 
     config = OrganizationConfig(
         use_subgenres=bool(params.get("use_subgenres", True)),
@@ -1004,7 +1017,7 @@ def _apply_ml_tags(params: dict) -> dict:
     vocal_inst_max = _clamp01(params.get("vocal_instrumental_max", 0.72), 0.72)
     vocal_full_min = _clamp01(params.get("vocal_full_min", 0.88), 0.88)
     if vocal_inst_max >= vocal_full_min:
-        raise ValueError(
+        raise InvalidParams(
             "vocal_instrumental_max "
             f"({vocal_inst_max}) must be < vocal_full_min ({vocal_full_min})"
         )
@@ -1411,7 +1424,7 @@ def _save_config(params: dict) -> dict:
     # classifies as APP_ERROR (-32000) + a traceback. A malformed `config`
     # payload is a caller bug, so surface it as INVALID_PARAMS instead.
     if not isinstance(data, dict):
-        raise ValueError("'config' must be an object")
+        raise InvalidParams("'config' must be an object")
     cfg = VibechekConfig._from_dict(data)
     path = cfg.save()
     return {"saved_to": str(path)}
@@ -1482,7 +1495,7 @@ def _tag_library(params: dict) -> dict:
     path = params["path"]
     tags = params.get("tags") or []
     if not isinstance(tags, list):
-        raise ValueError("tags must be a list of strings")
+        raise InvalidParams("tags must be a list of strings")
     record = library_state.tag_library(path, [str(t) for t in tags])
     if record is None:
         return {"tagged": False}
@@ -1619,7 +1632,7 @@ def _load_profile(params: dict) -> dict:
     try:
         result = load_profile(str(params["name"]))
     except KeyError as e:
-        raise ValueError(f"Unknown profile: {e}") from e
+        raise InvalidParams(f"Unknown profile: {e}") from e
     return result
 
 
@@ -1947,11 +1960,11 @@ def _load_analysis_payload(params: dict) -> dict:
         # clear message instead.
         ap = Path(params["analysis_path"])
         if not ap.exists():
-            raise ValueError(f"analysis_path does not exist: {ap}")
+            raise InvalidParams(f"analysis_path does not exist: {ap}")
         if not ap.is_file():
-            raise ValueError(f"analysis_path is not a file: {ap}")
+            raise InvalidParams(f"analysis_path is not a file: {ap}")
         return json.loads(ap.read_text(encoding="utf-8"))
-    raise ValueError("params must include 'analysis' (object) or 'analysis_path' (string)")
+    raise InvalidParams("params must include 'analysis' (object) or 'analysis_path' (string)")
 
 
 METHODS: dict[str, Callable[[dict], Any]] = {
@@ -2144,10 +2157,27 @@ def _dispatch(request: dict[str, Any]) -> None:
         log.info("Path not found in method %s: %s", method, e)
         if req_id is not None:
             _err(req_id, INVALID_PARAMS, str(e))
-    except (TypeError, KeyError, ValueError) as e:
-        log.exception("Invalid params to method %s", method)
+    except InvalidParams as e:
+        # rpc's OWN param validation raised this — a genuine caller error.
+        log.info("Invalid params to method %s: %s", method, e)
         if req_id is not None:
             _err(req_id, INVALID_PARAMS, f"Invalid params: {e}")
+    except (TypeError, KeyError) as e:
+        # A missing required key (`params["x"]`) or a wrong-typed param access is
+        # caller-shaped — correctly INVALID_PARAMS.
+        log.info("Invalid params to method %s: %s", method, e)
+        if req_id is not None:
+            _err(req_id, INVALID_PARAMS, f"Invalid params: {e}")
+    except ValueError as e:
+        # A ValueError that ISN'T our explicit InvalidParams marker bubbled up out
+        # of deep library code — e.g. a truncated/corrupt tag-backup JSON that
+        # tagger raises ValueError for, or a corrupt analysis file json.loads
+        # can't parse. That's a server-side INTERNAL fault, not "you sent bad
+        # params": mislabeling it INVALID_PARAMS (and logging "Invalid params")
+        # misdirects both the user and support triage. Report internal semantics.
+        log.exception("Internal error handling method %s", method)
+        if req_id is not None:
+            _err(req_id, INTERNAL_ERROR, str(e), data={"traceback": traceback.format_exc()})
     except Exception as e:  # noqa: BLE001
         log.exception("Handler raised for method %s", method)
         if req_id is not None:

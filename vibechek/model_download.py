@@ -271,6 +271,29 @@ def _expected_sha256(model_name: str, suffix: str) -> str | None:
     return MODEL_SHA256.get(model_name, {}).get(suffix)
 
 
+def _download_failure_hint(errors: list[str], model_dir: Path) -> str:
+    """Pick the RIGHT remediation for a batch of model-download failures.
+
+    The failures land in `errors` from two unrelated sources — real network
+    errors, `OSError` (disk full / permission) from the atomic-write path, and
+    SHA256 mismatches (a poisoned mirror asset or a bit-rotted cached file).
+    The old summary always said "Check your network and retry", which is
+    actively wrong for the other two: on a full disk "retry" wastes time and
+    never helps, and on a persistent checksum mismatch "retry" is deterministic
+    futility. Classify from the collected messages (same substring approach as
+    wsl.py's `_explain_install_failure`) and give the actionable hint. Disk
+    space takes precedence (retry is pointless until it's freed), then a
+    checksum re-fetch, else the network hint.
+    """
+    blob = " ".join(errors).lower()
+    if "no space left on device" in blob or "errno 28" in blob:
+        return f"Free up disk space at {model_dir} and retry."
+    if "failed sha256 check" in blob:
+        return ("A downloaded model file is corrupted (checksum mismatch) — "
+                "re-run to re-fetch it from the canonical mirror.")
+    return "Check your network and retry."
+
+
 def download_models(
     model_dir: Path,
     on_progress: ProgressCallback | None = None,
@@ -534,7 +557,8 @@ def download_models(
     if errors:
         raise RuntimeError(
             f"{len(errors)} model file(s) failed to download. "
-            f"Check your network and retry. Errors: " + "; ".join(errors[:5])
+            + _download_failure_hint(errors, model_dir)
+            + " Errors: " + "; ".join(errors[:5])
         )
 
     return descriptors

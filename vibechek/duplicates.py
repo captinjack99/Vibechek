@@ -96,6 +96,17 @@ class DuplicateSummary:
     audio_duplicate_files: int = 0
     total_duplicates: int = 0
     space_recoverable_mb: float = 0.0
+    # Which detection phases actually ran ("md5", "chromaprint"). The
+    # audio-fingerprint (near-duplicate) phase silently no-ops when the `fpcalc`
+    # binary is missing, so a scan that only ran exact-hash matching would
+    # otherwise look identical to a thorough clean scan — a user could reorganize
+    # or delete believing a fuzzy re-encode pass ran when it never did.
+    phases_run: list[str] = field(default_factory=list)
+    # False only when the user asked for audio fingerprinting but `fpcalc` wasn't
+    # found — the GUI banners "fingerprint scan skipped — fpcalc not found"
+    # instead of returning a misleading "0 near-duplicates" for a phase that
+    # never executed. True when fingerprinting ran, or wasn't requested at all.
+    fpcalc_available: bool = True
 
 
 @dataclass
@@ -565,12 +576,20 @@ def find_duplicates(
                     recoverable_mb=round(sum(d.size_mb for d in dupes), 2),
                 ))
 
+    # Provenance so the report can honestly say which phases ran (see below).
+    phases_run: list[str] = ["md5"] if config.use_md5 else []
+    fpcalc_available = True
+
     # ---------- Phase 2: chromaprint on what's left ----------
     if config.use_chromaprint:
         fpcalc = find_fpcalc()
         if not fpcalc:
+            # Silent no-op territory: without this flag the report would show
+            # "0 near-duplicates" indistinguishably from a real clean fuzzy pass.
+            fpcalc_available = False
             log.warning("fpcalc not found; skipping audio fingerprinting")
         else:
+            phases_run.append("chromaprint")
             exact_dupe_paths = {
                 d.path for g in report.exact_duplicates for d in g.duplicates
             }
@@ -670,6 +689,10 @@ def find_duplicates(
                         ))
 
     report.update_summary()
+    # update_summary only recomputes the count fields — stamp the phase
+    # provenance after it so the GUI can surface a skipped-fingerprint banner.
+    report.summary.phases_run = phases_run
+    report.summary.fpcalc_available = fpcalc_available
     return report
 
 

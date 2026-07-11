@@ -108,6 +108,55 @@ def test_no_env_var_uses_default_mirror_tuple() -> None:
 
 
 # ---------------------------------------------------------------------------
+# WP8: the failure summary must not blame the network for disk-full / checksum
+# ---------------------------------------------------------------------------
+
+
+def test_download_failure_hint_disk_full(tmp_path: Path) -> None:
+    """ENOSPC gets a 'free disk space' hint (retry is futile until freed), not
+    the old blanket 'Check your network and retry'."""
+    from vibechek import model_download as md
+
+    errors = ["genre.pb: [Errno 28] No space left on device: '/x'"]
+    hint = md._download_failure_hint(errors, tmp_path)
+    assert "disk space" in hint.lower()
+    assert str(tmp_path) in hint
+    assert "network" not in hint.lower()
+
+
+def test_download_failure_hint_checksum(tmp_path: Path) -> None:
+    """A SHA256 mismatch says 're-fetch', not 'check your network'."""
+    from vibechek import model_download as md
+
+    errors = ["genre.pb: Model file genre.pb failed SHA256 check: expected abc…, got def…."]
+    hint = md._download_failure_hint(errors, tmp_path)
+    assert "corrupted" in hint.lower() and "re-fetch" in hint.lower()
+    assert "network" not in hint.lower()
+
+
+def test_download_failure_hint_network_default(tmp_path: Path) -> None:
+    """A genuine connectivity failure keeps the network hint."""
+    from vibechek import model_download as md
+
+    errors = ["genre.pb: <urlopen error [Errno -3] Temporary failure in name resolution>"]
+    hint = md._download_failure_hint(errors, tmp_path)
+    assert "network" in hint.lower()
+
+
+def test_download_failure_hint_disk_takes_precedence(tmp_path: Path) -> None:
+    """Mixed failures: disk-full wins (retrying is pointless until space frees)."""
+    from vibechek import model_download as md
+
+    errors = [
+        "a.pb: some network blip",
+        "b.pb: [Errno 28] No space left on device",
+        "c.pb: failed SHA256 check",
+    ]
+    hint = md._download_failure_hint(errors, tmp_path)
+    assert "disk space" in hint.lower()
+
+
+# ---------------------------------------------------------------------------
 # SHA256 content-hash pinning (`verify_model_sha256` / `MODEL_SHA256`)
 # ---------------------------------------------------------------------------
 

@@ -239,8 +239,10 @@ def test_ensure_backend_false_when_unreachable_and_no_install(
 
 def test_grounding_requires_actual_web_results(monkeypatch: pytest.MonkeyPatch) -> None:
     """With ZERO web snippets the model can still claim source_matched and
-    fabricate evidence text that names the genre — grounding must be refused
-    when no search results were actually seen."""
+    fabricate evidence text that names the genre — so the tier is skipped
+    entirely: no genre leaks out, and it can never be labelled a grounded web
+    read. (Stronger than merely refusing the source_matched flag: an ungrounded
+    guess must not masquerade as 'an online source' at all.)"""
     def ddgs_boom(q, n=6):
         raise RuntimeError("throttled")
 
@@ -252,9 +254,103 @@ def test_grounding_requires_actual_web_results(monkeypatch: pytest.MonkeyPatch) 
                          "evidence": "Beatport: Genre: Tech House"},
     )
     r = genre_web.resolve("A", "B")
-    assert r["genre"] == "Tech House"
+    assert r["genre"] == ""            # no ungrounded read escapes
     assert r["used_web"] is False
     assert r["source_matched"] is False
+
+
+# ---------------------------------------------------------------------------
+# WP3: silent-degradation surfacing (CLAP fallback + failed model heads)
+# ---------------------------------------------------------------------------
+
+
+def _ml_track(path: str, ml: dict) -> dict:
+    base = {"ml_genre": ml.get("ml_genre", "House"),
+            "ml_genre_audio": ml.get("ml_genre", "House")}
+    base.update(ml)
+    return {"path": path, "filename": Path(path).name,
+            "existing_tags": {}, "ml_analysis": base}
+
+
+def test_report_flags_clap_fallback_to_discogs() -> None:
+    """CLAP was the selected classifier but a track was silently scored by the
+    weaker Discogs head — the report must surface an aggregate count so the GUI
+    can warn, instead of pretending the whole run got the model the user paid for."""
+    tracks = [
+        _ml_track("/m/a.flac", {"ml_genre": "House", "ml_genre_classifier": "clap"}),
+        _ml_track("/m/b.flac", {"ml_genre": "Techno", "ml_genre_classifier": "discogs"}),
+        _ml_track("/m/c.flac", {"ml_genre": "Trance", "ml_genre_classifier": "discogs"}),
+    ]
+    rep = analyzer._build_report(tracks, 3, in_progress=False, genre_classifier="clap")
+    warn = rep["genre_fallback_warning"]
+    assert "2 of 3" in warn and "Discogs" in warn
+
+
+def test_report_no_clap_warning_when_discogs_is_the_selected_classifier() -> None:
+    """Discogs-classified tracks are NOT a fallback when Discogs is what the user
+    selected — no false alarm."""
+    tracks = [_ml_track("/m/a.flac", {"ml_genre_classifier": "discogs"})]
+    rep = analyzer._build_report(tracks, 1, in_progress=False, genre_classifier="discogs")
+    assert "genre_fallback_warning" not in rep
+
+
+def test_report_flags_failed_model_heads_and_affected_fields() -> None:
+    """A mood/vocal head that failed to LOAD degraded energy/mood/vocal for the
+    whole run — the report names the models AND the user-facing fields."""
+    tracks = [
+        _ml_track("/m/a.flac", {"ml_degraded_heads": ["voice_instrumental", "sad"]}),
+        _ml_track("/m/b.flac", {"ml_degraded_heads": ["voice_instrumental", "sad"]}),
+    ]
+    rep = analyzer._build_report(tracks, 2, in_progress=False)
+    warn = rep["model_degradation_warning"]
+    assert "voice_instrumental" in warn and "sad" in warn
+    assert "vocal" in warn and "energy/mood" in warn
+
+
+def test_report_clean_run_has_no_degradation_warnings() -> None:
+    tracks = [_ml_track("/m/a.flac", {"ml_genre_classifier": "clap"})]
+    rep = analyzer._build_report(tracks, 1, in_progress=False, genre_classifier="clap")
+    assert "genre_fallback_warning" not in rep
+    assert "model_degradation_warning" not in rep
+
+
+def test_partial_checkpoint_never_carries_degradation_warnings() -> None:
+    """Degradation is aggregated only on the FINAL report; a transient partial
+    checkpoint (in_progress) must not claim a degradation verdict."""
+    tracks = [_ml_track("/m/a.flac", {"ml_genre_classifier": "discogs",
+                                      "ml_degraded_heads": ["sad"]})]
+    rep = analyzer._build_report(tracks, 1, in_progress=True, genre_classifier="clap")
+    assert "genre_fallback_warning" not in rep
+    assert "model_degradation_warning" not in rep
+
+
+def test_analyze_audio_features_preserves_essentia_import_error() -> None:
+    """A broken/absent essentia surfaces its REAL import error, not the old
+    blanket 'not installed' lie that sent users to re-install what's present."""
+    try:
+        import essentia  # noqa: F401,PLC0415
+        pytest.skip("essentia importable in this env — the ImportError path won't fire")
+    except ImportError:
+        pass
+    with pytest.raises(RuntimeError, match="failed to load") as exc:
+        analyzer.analyze_audio_features(Path("/nonexistent.mp3"), {})
+    assert exc.value.__cause__ is not None  # chained from the real ImportError
+
+
+@pytest.mark.parametrize(("exitcode", "mentions_oom", "needle"), [
+    (-9, True, "out of memory"),      # SIGKILL — the OOM-killer's fingerprint
+    (-11, False, "signal 11"),        # SIGSEGV — a native crash, NOT memory
+    (1, False, "may be corrupt"),     # clean nonzero — no cause claim
+    (None, False, "cause unknown"),   # didn't finish exiting — don't guess
+])
+def test_worker_death_cause_only_claims_oom_on_sigkill(
+    exitcode, mentions_oom, needle,
+) -> None:
+    """The repeated-worker-death message asserted 'likely out of memory' for
+    EVERY cause; now it only claims OOM when the exit signal says so."""
+    msg = analyzer._worker_death_cause(exitcode)
+    assert ("out of memory" in msg) is mentions_oom
+    assert needle in msg
 
 
 # ---------------------------------------------------------------------------

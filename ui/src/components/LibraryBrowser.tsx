@@ -619,14 +619,25 @@ export function LibraryBrowser() {
           );
         }
         if (report.priors_warning) detailLines.push(report.priors_warning);
+        // Silent-degradation banners: a weaker classifier or a model that failed
+        // to load ran without a word. Surface them so per-track fields the user
+        // sees aren't taken as full-fidelity (extends this same toast, no
+        // parallel toast).
+        if (report.genre_fallback_warning) detailLines.push(report.genre_fallback_warning);
+        if (report.model_degradation_warning) detailLines.push(report.model_degradation_warning);
+        const degraded = Boolean(
+          report.genre_fallback_warning || report.model_degradation_warning,
+        );
         const headline =
           errors > 0
             ? `Analyzed ${analyzed}/${total} — ${errors} error${errors === 1 ? "" : "s"}`
             : `Analyzed ${analyzed}/${total}`;
         notify(headline, {
-          // A dropped Rekordbox import is a caution (warning); per-track errors
-          // are informational; a clean run is a success.
-          kind: report.priors_warning ? "warning" : errors > 0 ? "info" : "success",
+          // A dropped Rekordbox import or a silent model/classifier degradation
+          // is a caution (warning); per-track errors are informational; a clean
+          // run is a success.
+          kind:
+            report.priors_warning || degraded ? "warning" : errors > 0 ? "info" : "success",
           detail: detailLines.length > 0 ? detailLines.join("\n") : undefined,
         });
       }

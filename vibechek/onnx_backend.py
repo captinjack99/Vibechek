@@ -403,11 +403,18 @@ def load_onnx_models(
     try:
         import onnxruntime as ort  # noqa: PLC0415
     except ImportError as e:
+        # Keep the REAL failure. onnxruntime is frequently INSTALLED but broken
+        # (a CUDA/cuDNN skew, a missing shared lib the provider dlopens) — that
+        # surfaces as an ImportError with a specific, actionable message. The old
+        # blanket "is not installed" discarded it and told the user to re-install
+        # something already present, hiding the actual defect (a live box with
+        # onnxruntime installed-but-broken got the lying message).
         raise RuntimeError(
-            "onnxruntime is not installed but inference_engine='onnx' was "
-            "selected. Install it (CPU: `pip install onnxruntime`; GPU: "
-            "`pip install onnxruntime-gpu` / `onnxruntime-directml`), or switch "
-            "back to inference_engine='essentia_tf'."
+            f"onnxruntime failed to load: {e}. If it is genuinely not installed "
+            "(inference_engine='onnx' was selected), install it (CPU: `pip "
+            "install onnxruntime`; GPU: `pip install onnxruntime-gpu` / "
+            "`onnxruntime-directml`), or switch back to "
+            "inference_engine='essentia_tf'."
         ) from e
 
     model_dir = Path(model_dir)

@@ -186,6 +186,25 @@ class MLResult:
     ml_key_tag: str | None = None          # file's key tag, normalized to Camelot
     ml_key_conflict: bool | None = None    # parseable tag key != audio key
 
+    # --- Silent-degradation provenance (WP3) -----------------------------
+    # Which audio genre classifier ACTUALLY produced this track's genre:
+    # "clap" (the opt-in ~54%-accurate CLAP+kNN student the user paid a 2.2 GB
+    # checkpoint for) or "discogs" (the ~28% engine head). A per-track CLAP
+    # embed failure, or CLAP failing to load for the whole worker, silently
+    # falls back to Discogs — without this field a user could not tell, even by
+    # opening analysis.json, which of their tracks got the weaker read. None
+    # when no genre was produced (error track) or CLAP wasn't selected and the
+    # distinction is moot. The report aggregates these into one banner.
+    ml_genre_classifier: str | None = None
+    # The mood/vocal/danceability model heads that failed to LOAD this run (bad
+    # node-name after a model release, a corrupt .pb). A failed head is absent
+    # for every track that worker touches, so energy/mood/vocal silently drop to
+    # the genre-table fallback for the WHOLE run with only a load-time log line.
+    # Stamped per track (identical across a run — model load is deterministic) so
+    # it survives the worker→parent process boundary; the report unions them into
+    # one "these models didn't load" degradation banner. None = full fidelity.
+    ml_degraded_heads: list[str] | None = None
+
 
 @dataclass
 class TrackAnalysis:
@@ -320,9 +339,15 @@ def load_models(
             TensorflowPredictEffnetDiscogs,
         )
     except ImportError as e:
+        # Preserve the REAL import error. essentia is often present in
+        # site-packages but broken at load (a shared-lib/DLL version mismatch, a
+        # missing libsndfile/ffmpeg the C extension dlopens) — discarding {e} and
+        # asserting "not installed" sends the user to re-run an install that
+        # changes nothing while the actual defect stays hidden.
         raise RuntimeError(
-            "essentia-tensorflow is not installed. Install with: "
-            "pip install 'vibechek[ml]' (Linux/macOS) — see docs/ for Windows."
+            f"essentia-tensorflow failed to load: {e}. If it is genuinely not "
+            "installed, install with: pip install 'vibechek[ml]' (Linux/macOS) — "
+            "see docs/ for Windows."
         ) from e
 
     essentia.log.infoActive = False
@@ -367,6 +392,7 @@ def load_models(
         log.warning("Could not load model %s with any known node pattern", name)
         return None
 
+    degraded_heads: list[str] = []
     for name in ("danceability", "voice_instrumental", "aggressive", "happy", "relaxed", "sad"):
         if name in descriptors:
             model = _try_load(name, descriptors[name]["weights"])
@@ -380,6 +406,15 @@ def load_models(
                 classes = descriptors[name].get("classes")
                 if classes:
                     loaded[f"{name}_classes"] = classes
+            else:
+                # In the model set but couldn't load with any known node
+                # pattern — record it so the run can tell the user energy/mood/
+                # vocal was degraded, instead of quietly serving the fallback.
+                degraded_heads.append(name)
+    if degraded_heads:
+        # Rides in the models dict so analyze_audio_features can stamp it onto
+        # every track (the only channel back to the report-building parent).
+        loaded["_degraded_heads"] = degraded_heads
 
     _maybe_load_clap(loaded, genre_classifier, use_gpu)
     return loaded
@@ -648,7 +683,10 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         import numpy as np
         from essentia.standard import KeyExtractor, MonoLoader, RhythmExtractor2013
     except ImportError as e:
-        raise RuntimeError("essentia-tensorflow not installed") from e
+        # Keep the real dlopen/shared-lib error rather than the "not installed"
+        # lie — essentia is usually present but broken here, so a bare install
+        # hint wastes the user's time (see the same fix in load_models).
+        raise RuntimeError(f"essentia-tensorflow failed to load: {e}") from e
 
     result = MLResult()
 
@@ -711,6 +749,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
                 result.ml_subgenre = sub
                 result.ml_genre_confidence = round(min(fam_conf, 1.0), 3)
                 result.ml_genre_raw_confidence = round(float(shares[g]), 3)
+                result.ml_genre_classifier = "clap"
                 clap_done = True
         except Exception as e:  # noqa: BLE001
             log.warning("CLAP genre failed for %s (falling back to Discogs): %s", filepath.name, e)
@@ -724,6 +763,10 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
             result.ml_subgenre = genre_result.subgenre
             result.ml_genre_confidence = genre_result.confidence
             result.ml_genre_raw_confidence = genre_result.raw_confidence
+            # Provenance: whether this is the intended Discogs read or a silent
+            # fallback from a failed CLAP path is reconciled at report level
+            # (config knows if CLAP was selected); stamp the classifier used.
+            result.ml_genre_classifier = "discogs"
         except Exception as e:  # noqa: BLE001
             log.warning("Genre classification failed for %s: %s", filepath.name, e)
 
@@ -863,6 +906,14 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         result.ml_direction = _classify_direction(aggressive_raw)
     else:
         result.ml_direction = "Steady"
+
+    # Stamp any mood/vocal heads that failed to LOAD this run so the report can
+    # tell the user which fields (energy/mood/vocal) ran on the fallback rather
+    # than pretending full fidelity. Copied per track (the list is worker-wide
+    # and identical everywhere) so it survives the worker→parent boundary.
+    degraded = models.get("_degraded_heads")
+    if degraded:
+        result.ml_degraded_heads = list(degraded)
 
     return result
 
@@ -1441,6 +1492,29 @@ def _hybrid_worker_loop(in_q, out_q, done_event, model_dir, device, maxtasks, en
     # remains (so memory growth is bounded to ~maxtasks per worker lifetime).
 
 
+def _worker_death_cause(exitcode: int | None) -> str:
+    """Best-effort parenthetical cause for a worker that died repeatedly.
+
+    The old message ALWAYS said "(likely out of memory)" — but a worker just as
+    often dies from a native decoder segfault on a corrupt/adversarial file, a
+    GPU driver crash, or an AV kill. A user on a 32 GB box with headroom chases
+    the wrong lead. `multiprocessing.Process.exitcode` is a real signal we can
+    read (negative = killed by signal N): -9 (SIGKILL) is the OOM-killer's
+    fingerprint; another signal is a crash; a non-negative code isn't memory
+    pressure at all. Only claim OOM when we can actually infer it; otherwise
+    point at the file (the far more common repeat-kill cause).
+    """
+    if exitcode is None:
+        # Didn't finish exiting within our short join — don't guess.
+        return " (cause unknown; the file may be corrupt or triggering a crash)"
+    if exitcode == -9:
+        return " (the worker was killed — most likely out of memory)"
+    if exitcode < 0:
+        return (f" (the worker crashed on signal {-exitcode} — the file may be "
+                "corrupt or triggering a decoder crash)")
+    return " (the file may be corrupt or triggering a crash)"
+
+
 class _HybridPool:
     """Supervises a fixed set of GPU + CPU worker processes over a shared queue.
 
@@ -1529,7 +1603,8 @@ class _HybridPool:
                             "extension": pp.suffix.lower(),
                             "size_mb": 0.0,
                             "error": "analysis worker died repeatedly on this "
-                                     "track (likely out of memory) — skipped",
+                                     "track" + _worker_death_cause(p.exitcode)
+                                     + " — skipped",
                         }, getattr(p, "_vibechek_device", "-1"), 0.0))
                 if self._results_out < self.total:
                     device = getattr(p, "_vibechek_device", "-1")
@@ -2148,6 +2223,7 @@ def analyze_directory(
         results, total, in_progress=False,
         genre_policy=(config.genre_source_policy, config.genre_ml_override_confidence),
         web_cfg={"enabled": config.genre_web_lookup, "backend": config.genre_llm_backend},
+        genre_classifier=config.genre_classifier,
     )
     if output_path:
         # Atomic write — a kill/power-loss/disk-full mid-write must not
@@ -2830,10 +2906,32 @@ def _reconcile_record_vocal(r: dict[str, Any]) -> None:
         ml["ml_vocal_source"] = "audio"
 
 
+# Which user-facing attributes each mood/vocal head feeds — so a "model failed
+# to load" banner can name the fields the user will see go generic, not just the
+# opaque internal model names.
+_HEAD_AFFECTS = {
+    "voice_instrumental": "vocal",
+    "danceability": "danceability",
+    "aggressive": "energy/mood",
+    "happy": "energy/mood",
+    "relaxed": "energy/mood",
+    "sad": "energy/mood",
+}
+
+
+def _degraded_head_fields(heads: set[str]) -> str:
+    """Human list of the attributes affected by the given failed-to-load heads."""
+    fields = sorted({_HEAD_AFFECTS.get(h, h) for h in heads})
+    if len(fields) == 1:
+        return fields[0]
+    return ", ".join(fields[:-1]) + " and " + fields[-1]
+
+
 def _build_report(
     results: list[dict[str, Any]], total: int, in_progress: bool,
     genre_policy: tuple[str, float] = ("prefer_tag", 0.90),
     web_cfg: dict[str, Any] | None = None,
+    genre_classifier: str = "discogs",
 ) -> dict[str, Any]:
     # Reconcile ML genre against existing tags on the FINAL report only (partial
     # checkpoints stay raw-ML — they're transient). _reconcile_record_genre is
@@ -2882,6 +2980,11 @@ def _build_report(
     timeslots: dict[str, int] = defaultdict(int)
     moods: dict[str, int] = defaultdict(int)
 
+    # Aggregate the per-track silent-degradation provenance (WP3) so the GUI can
+    # banner it once at the end instead of the user having to notice a field is
+    # quietly missing. Only meaningful on the FINAL report.
+    degraded_heads: set[str] = set()
+    clap_fallbacks = 0
     for r in results:
         ml = r.get("ml_analysis") or {}
         if ml.get("ml_genre"):
@@ -2892,8 +2995,16 @@ def _build_report(
             timeslots[ml["ml_timeslot"]] += 1
         if ml.get("ml_mood"):
             moods[ml["ml_mood"]] += 1
+        if ml.get("ml_degraded_heads"):
+            degraded_heads.update(ml["ml_degraded_heads"])
+        # CLAP was the selected classifier, yet this track was scored by the
+        # weaker Discogs head — a per-track embed failure or a whole-worker CLAP
+        # load failure. Either way the user paid for CLAP and silently didn't get
+        # it here.
+        if genre_classifier == "clap" and ml.get("ml_genre_classifier") == "discogs":
+            clap_fallbacks += 1
 
-    return {
+    report: dict[str, Any] = {
         "status": "in_progress" if in_progress else "complete",
         "summary": {
             "total_files": total,
@@ -2908,6 +3019,30 @@ def _build_report(
         },
         "tracks": results,
     }
+
+    if not in_progress:
+        if degraded_heads:
+            fields = _degraded_head_fields(degraded_heads)
+            warning = (
+                "Some ML models failed to load this run ("
+                + ", ".join(sorted(degraded_heads))
+                + f") — {fields} used a fallback for every track. Re-run the "
+                "model download; if it persists the model files may be corrupt."
+            )
+            report["model_degradation_warning"] = warning
+            _emit_event("stage", name="model_load_degraded", message=warning,
+                        heads=sorted(degraded_heads))
+        if clap_fallbacks:
+            warning = (
+                f"CLAP genre unavailable for {clap_fallbacks} of {total} track"
+                f"{'' if clap_fallbacks == 1 else 's'} — they were scored by the "
+                "weaker Discogs model. Re-run CLAP setup if this repeats."
+            )
+            report["genre_fallback_warning"] = warning
+            _emit_event("stage", name="genre_classifier_degraded", message=warning,
+                        fallbacks=clap_fallbacks, total=total)
+
+    return report
 
 
 __all__ = [

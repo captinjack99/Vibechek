@@ -201,9 +201,18 @@ def load_clap_model(checkpoint: Path | None = None, use_gpu: str = "auto") -> An
         try:
             verify_model_sha256(ckpt, _CHECKPOINT_SHA256)
         except RuntimeError as e:
+            # Do NOT interpolate verify_model_sha256's message: it tells the user
+            # to run `vibechek verify-models`, which only checks the essentia .pb
+            # weight set and never looks at the CLAP checkpoint — so it would
+            # report all-OK and the user would hit this same error again. Build a
+            # CLAP-specific message; the real checksum detail stays on the chained
+            # cause (`from e`) for logs/tracebacks.
+            log.debug("CLAP checkpoint SHA256 mismatch: %s", e)
             raise RuntimeError(
-                f"CLAP checkpoint failed its integrity check ({e}). Delete "
-                f"{ckpt} and re-run the CLAP genre setup to re-download it."
+                f"CLAP checkpoint at {ckpt} failed its integrity check — the file "
+                "is corrupted or truncated. `vibechek verify-models` does NOT "
+                "cover the CLAP checkpoint and cannot fix this: delete the file "
+                "and re-run the CLAP genre setup to re-download it."
             ) from e
     try:
         import laion_clap  # noqa: PLC0415

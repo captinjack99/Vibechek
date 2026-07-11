@@ -234,8 +234,15 @@ def test_inference_engine_roundtrips_in_config(tmp_path: Path) -> None:
 
 
 def test_load_onnx_models_missing_onnxruntime_raises_clear_error() -> None:
-    with pytest.raises(RuntimeError, match="onnxruntime is not installed"):
+    # The message now PRESERVES the real import error (a broken-but-installed
+    # onnxruntime is common — CUDA skew, missing shared lib — and the old
+    # blanket "not installed" hid it, sending users to re-install what's present).
+    with pytest.raises(RuntimeError, match="onnxruntime failed to load") as exc:
         ob.load_onnx_models(Path("/nonexistent/models"), "auto")
+    # The underlying ImportError text (e.g. "No module named 'onnxruntime'") is
+    # carried through, not discarded.
+    assert "onnxruntime" in str(exc.value)
+    assert exc.value.__cause__ is not None  # chained from the real ImportError
 
 
 def test_load_onnx_models_missing_backbone_raises_clear_error(tmp_path: Path) -> None:

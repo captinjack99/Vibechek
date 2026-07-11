@@ -82,6 +82,13 @@ export interface AnalysisReport {
    *  an unreadable sidecar, or 0 tracks matched because the library moved. The
    *  curated genre edits weren't applied; the GUI warns the DJ to re-import. */
   priors_warning?: string | null;
+  /** Set when CLAP was the selected genre classifier but N tracks silently fell
+   *  back to the weaker Discogs model (per-track embed failure or CLAP never
+   *  loaded). The GUI banners it so the user knows those genres are lower-fidelity. */
+  genre_fallback_warning?: string | null;
+  /** Set when one or more mood/vocal model heads failed to LOAD this run, so
+   *  energy/mood/vocal ran on a fallback for every track. Names the models. */
+  model_degradation_warning?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +115,11 @@ export interface DuplicateReport {
     audio_duplicate_files: number;
     total_duplicates: number;
     space_recoverable_mb: number;
+    /** Detection phases that actually ran ("md5", "chromaprint"). */
+    phases_run?: string[];
+    /** False only when audio fingerprinting was requested but `fpcalc` was
+     *  missing, so that phase silently never ran — the view banners it. */
+    fpcalc_available?: boolean;
   };
   exact_duplicates: DuplicateGroup[];
   audio_duplicates: DuplicateGroup[];
