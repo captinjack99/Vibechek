@@ -89,6 +89,13 @@ export interface AnalysisReport {
   /** Set when one or more mood/vocal model heads failed to LOAD this run, so
    *  energy/mood/vocal ran on a fallback for every track. Names the models. */
   model_degradation_warning?: string | null;
+  /** Set when the WSL engine environment was auto-repaired before this run
+   *  (a version-drift reinstall / ML-stack fix). Informational — the run then
+   *  proceeded on the now-working engine. */
+  runtime_healed?: string | null;
+  /** Set when GPU libraries couldn't be restored during that auto-repair, so
+   *  the run fell back to CPU. A caution — GPU acceleration needs a re-setup. */
+  runtime_heal_warning?: string | null;
 }
 
 // ---------------------------------------------------------------------------

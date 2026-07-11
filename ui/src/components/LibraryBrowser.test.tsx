@@ -571,6 +571,38 @@ describe("<LibraryBrowser /> — analyze completion toast", () => {
       expect(items[0].detail).toMatch(/Rekordbox priors no longer match/);
     });
   });
+
+  it("warns when GPU libraries couldn't be restored during an engine self-heal", async () => {
+    await reanalyzeWith({
+      summary: { total_files: 3, analyzed: 3, errors: 0 },
+      tracks: [track("D:/LibraryA/a.mp3")],
+      runtime_heal_warning: "GPU libraries could not be restored automatically — this run used the CPU.",
+    });
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      // A failed GPU restore is a caution, not a clean success.
+      expect(items[0].kind).toBe("warning");
+      expect(items[0].detail).toMatch(/GPU libraries could not be restored/);
+    });
+  });
+
+  it("notes a successful engine auto-repair without downgrading a clean run", async () => {
+    await reanalyzeWith({
+      summary: { total_files: 3, analyzed: 3, errors: 0 },
+      tracks: [track("D:/LibraryA/a.mp3")],
+      runtime_healed: "The analysis engine environment was repaired automatically (ml-stack).",
+    });
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      // A successful repair is informational — the clean run stays a success.
+      expect(items[0].kind).toBe("success");
+      expect(items[0].detail).toMatch(/repaired automatically/);
+    });
+  });
 });
 
 describe("<LibraryBrowser /> — Import Rekordbox XML (tag priors)", () => {

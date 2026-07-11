@@ -209,9 +209,15 @@ export function PreflightSection({
     (nativeVenv?.essentia_installed && nativeVenv?.vibechek_installed) ?? false;
 
   // The Essentia row tells the user where analyze gets its ML engine from.
-  // Three possible "ready" sources, three possible "not yet" messages.
+  // Gate the green "installed in the sidecar" row on `essentia_usable`, NOT the
+  // raw `installed` flag: the bundled DSP-only Windows wheel imports fine
+  // (installed=true) but can't serve essentia_tf/onnx in-process (needs a
+  // TF-capable build), so essentia_usable is the honest "can actually run THIS
+  // engine here" signal the backend already computes. Branching on `installed`
+  // painted a green check for the very component blocking analyze, directly
+  // under the section's own red "Not ready" title.
   const essentiaRow = (() => {
-    if (preflight.essentia.installed) {
+    if (preflight.essentia_usable) {
       return {
         ok: true,
         label: "Essentia",
@@ -230,6 +236,18 @@ export function PreflightSection({
         ok: true,
         label: "Essentia",
         detail: `available via managed venv${nativeVenv?.essentia_version ? ` (${nativeVenv.essentia_version})` : ""}`,
+      };
+    }
+    // Installed in the sidecar but that build can't serve the engine the banner
+    // is evaluating (the DSP-only wheel serves only the native engine). Say so
+    // explicitly instead of a green check — and point at the real fix.
+    if (preflight.essentia.installed) {
+      return {
+        ok: false,
+        label: "Essentia",
+        detail: isWindows
+          ? "installed in the sidecar, but that build can't run this engine in-process — set up WSL below"
+          : "installed in the sidecar, but that build can't run this engine — set up the managed venv below",
       };
     }
     if (isWindows) {

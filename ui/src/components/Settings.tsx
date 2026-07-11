@@ -425,10 +425,17 @@ export function Settings() {
   };
 
   const refreshPreflight = () => {
+    // Evaluate readiness for the engine the user is ACTUALLY on. Read it at call
+    // time from the store (not the captured `cfg` closure): this fn runs from a
+    // mount-time effect whose closure can hold the pre-disk-load default, and
+    // the RPC defaults a missing engine to essentia_tf — so without this the
+    // banner always judged essentia_tf (green sidecar row) even for a native/
+    // onnx user. Mirrors the analyze path, which already sends the engine.
+    const engine = useConfigStore.getState().config.analysis.inference_engine;
     // Two-phase load: fast quick=true preflight for instant UI feedback,
     // then upgrade with a full quick=false call so we know the real WSL
     // state and can pick the right engine GPU probe target.
-    rpc<PreflightResult>("preflight", { quick: true })
+    rpc<PreflightResult>("preflight", { quick: true, engine })
       .then((quick) => {
         if (!isMounted.current) return;
         setPreflightResult(quick);
@@ -439,7 +446,7 @@ export function Settings() {
         // distro hasn't been booted in a while. If users start hitting
         // the 60s ceiling we'll need to either bump it or split preflight
         // into preflight + preflight_full with their own timeouts.
-        rpc<PreflightResult>("preflight", { quick: false })
+        rpc<PreflightResult>("preflight", { quick: false, engine })
           .then((full) => {
             if (!isMounted.current) return;
             setPreflightResult(full);
@@ -891,15 +898,30 @@ export function Settings() {
               </button>
             ))}
           </div>
+          {/* CLAP setup targets the ONNX/Essentia·TF engine venv; the native
+              (in-process, no-WSL) engine has no venv to install it into, and the
+              setup RPC guard rejects it with an error that BLAMES native. Gate
+              the button on the engine — mirroring how "Set up ONNX engine" only
+              shows for onnx — and explain the requirement inline instead. */}
           {cfg.analysis.genre_classifier === "clap" && (
-            <button
-              className="btn-primary mt-2"
-              onClick={handleSetupClap}
-              disabled={diagBusy !== null || active !== null}
-            >
-              <Download className="w-4 h-4" />
-              {diagBusy === "clap-setup" ? "Setting up CLAP…" : "Set up CLAP genre engine"}
-            </button>
+            cfg.analysis.inference_engine === "native" ? (
+              <div className="text-xs text-accent-yellow/90 mt-2 flex items-start gap-1">
+                <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+                <span>
+                  CLAP requires the ONNX or Essentia·TF engine on Windows. Switch
+                  the inference engine above to set it up.
+                </span>
+              </div>
+            ) : (
+              <button
+                className="btn-primary mt-2"
+                onClick={handleSetupClap}
+                disabled={diagBusy !== null || active !== null}
+              >
+                <Download className="w-4 h-4" />
+                {diagBusy === "clap-setup" ? "Setting up CLAP…" : "Set up CLAP genre engine"}
+              </button>
+            )
           )}
           <Hint>
             <strong>CLAP audio</strong> is a pure-audio genre model ~2x as accurate

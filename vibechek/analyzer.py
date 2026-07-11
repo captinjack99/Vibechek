@@ -2225,6 +2225,20 @@ def analyze_directory(
         web_cfg={"enabled": config.genre_web_lookup, "backend": config.genre_llm_backend},
         genre_classifier=config.genre_classifier,
     )
+    # Stamp the resolved worker/GPU plan onto the report so the durable run log
+    # (written by the RPC analyze handler) can record what THIS run actually
+    # decided — requested vs effective workers, the GPU split, and why the GPU
+    # was or wasn't used. It rides through the WSL route too: the in-WSL analyze
+    # writes it into analysis.json and the parent reads it straight back.
+    report["run_meta"] = {
+        "engine": config.inference_engine,
+        "genre_classifier": config.genre_classifier,
+        "requested_workers": budget.requested_workers,
+        "effective_workers": budget.effective_workers,
+        "gpu_workers": budget.gpu_workers,
+        "cpu_workers": budget.cpu_workers,
+        "gpu_reason": budget.gpu_reason,
+    }
     if output_path:
         # Atomic write — a kill/power-loss/disk-full mid-write must not
         # truncate the report (which can represent 30+ min of GPU time).
@@ -2569,6 +2583,14 @@ def _analyze_via_wsl(
         noise_re=_STDERR_NOISE,
     )
 
+    # Self-heal notices (set by the drift-update path below) to thread onto the
+    # finished report — same transport as the persist/priors warnings — so the
+    # GUI completion toast can say the engine was auto-repaired, or that GPU
+    # libraries couldn't be restored so the run fell back to CPU. Without this
+    # the repair is a silent progress blip the user never sees the outcome of.
+    runtime_healed: str | None = None
+    runtime_heal_warning: str | None = None
+
     # Version-drift guard: catch the worst class of "silent exit 1" — the WSL
     # vibechek install is older than the sidecar, so it's missing whatever
     # safety patch landed since (worker cap, stall watchdog, atomic writes,
@@ -2636,6 +2658,21 @@ def _analyze_via_wsl(
                     f"could not be repaired automatically: "
                     f"{heal.get('error', 'unknown error')}. Re-run Settings → "
                     f"\"Set up WSL\" to repair it."
+                )
+            # ok=True but something was repaired (or a GPU-lib restore failed and
+            # we deliberately ran on CPU rather than failing). Capture an honest
+            # notice to surface on the finished report; the analyze itself is
+            # about to proceed on a now-working engine.
+            if heal.get("gpu_heal_failed"):
+                runtime_heal_warning = (
+                    "GPU libraries could not be restored automatically — this run "
+                    f"used the CPU ({heal['gpu_heal_failed']}). Re-run Settings → "
+                    "\"Set up WSL\" to restore GPU acceleration."
+                )
+            elif heal.get("healed"):
+                runtime_healed = (
+                    "The analysis engine environment was repaired automatically "
+                    f"({', '.join(heal['healed'])})."
                 )
 
     result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir)
@@ -2714,6 +2751,14 @@ def _analyze_via_wsl(
     for track in report.get("tracks", []):
         if "path" in track:
             track["path"] = wsl_to_win_path(track["path"])
+
+    # Thread the self-heal notices onto the report so the GUI can tell the user
+    # the engine was repaired (or that GPU acceleration couldn't be restored and
+    # the run fell back to CPU). Mirrors the persist/priors warning transport.
+    if runtime_healed:
+        report["runtime_healed"] = runtime_healed
+    if runtime_heal_warning:
+        report["runtime_heal_warning"] = runtime_heal_warning
 
     if output_path is not None:
         # Rewrite the file with translated paths so external consumers see

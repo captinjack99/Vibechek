@@ -209,3 +209,64 @@ def test_load_with_corrupted_types_uses_defaults(tmp_path: Path) -> None:
     assert loaded.tagging.genre_confidence_threshold == TaggingConfig().genre_confidence_threshold
     # Good fields still apply
     assert loaded.analysis.use_gpu == "off"
+
+
+# ---------------------------------------------------------------------------
+# Surfacing the snap-back: a silently-reverted setting must not masquerade as
+# the user's own choice. `_subset` collects notes; `get_config` ships them.
+# ---------------------------------------------------------------------------
+
+
+def test_subset_collects_warning_note_for_snapped_value() -> None:
+    warnings: list[str] = []
+    _subset(AnalysisConfig, {"genre_classifier": "CLAP"}, warnings)
+    assert len(warnings) == 1
+    assert "genre_classifier" in warnings[0]
+    assert "CLAP" in warnings[0]
+
+
+def test_subset_collects_note_on_coercion_failure() -> None:
+    warnings: list[str] = []
+    _subset(AnalysisConfig, {"workers": "lots"}, warnings)
+    assert warnings and "workers" in warnings[0]
+
+
+def test_subset_no_notes_for_clean_values() -> None:
+    warnings: list[str] = []
+    _subset(AnalysisConfig, {"workers": 4, "genre_classifier": "clap"}, warnings)
+    assert warnings == []
+
+
+def test_from_dict_attaches_load_warnings() -> None:
+    cfg = VibechekConfig._from_dict({"analysis": {"genre_source_policy": "ml"}})
+    assert any("genre_source_policy" in w for w in cfg.load_warnings)
+
+
+def test_get_config_rpc_surfaces_reset_warnings() -> None:
+    """The GUI's config-load path reads `config_warnings` off get_config to show
+    a one-time 'some saved settings were invalid and reset' toast."""
+    from vibechek import config as cfg_module
+    from vibechek.rpc import _get_config
+
+    # conftest isolates CONFIG_FILE to a per-test tmp path; load() reads it as
+    # JSON regardless of the .toml suffix.
+    cfg_module.CONFIG_FILE.write_text(
+        json.dumps({"analysis": {"inference_engine": "TF", "genre_classifier": "CLAP"}}),
+        encoding="utf-8",
+    )
+    payload = _get_config({})
+    warnings = payload.get("config_warnings")
+    assert warnings
+    assert any("inference_engine" in w for w in warnings)
+    assert any("genre_classifier" in w for w in warnings)
+
+
+def test_get_config_rpc_no_warnings_key_on_clean_config() -> None:
+    from vibechek import config as cfg_module
+    from vibechek.rpc import _get_config
+
+    cfg_module.CONFIG_FILE.write_text(
+        json.dumps({"analysis": {"workers": 4}}), encoding="utf-8"
+    )
+    payload = _get_config({})
+    assert "config_warnings" not in payload

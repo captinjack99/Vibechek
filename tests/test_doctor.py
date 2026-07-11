@@ -90,6 +90,85 @@ def test_model_integrity_verified_when_sha_table_populated(monkeypatch) -> None:
     assert "Integrity: **verified**" in md
 
 
+# ---------------------------------------------------------------------------
+# Engine-aware readiness + last-run sections (WP9)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_readiness_section_uses_saved_engine(monkeypatch) -> None:
+    """doctor must probe the SAVED config's engine, not a hardcoded essentia_tf —
+    else a native/onnx GUI gets a diagnostic describing the wrong engine."""
+    from vibechek import config as cfg_module
+    from vibechek import preflight as _pf
+
+    cfg_module.CONFIG_FILE.write_text(
+        json.dumps({"analysis": {"inference_engine": "onnx"}}), encoding="utf-8"
+    )
+
+    def fake_pf(models_dir=None, *, quick_wsl=True, engine="essentia_tf"):
+        return _pf.PreflightResult(
+            ready=False,
+            essentia=_pf.EssentiaCheck(installed=True),
+            models=_pf.ModelsCheck(models_dir="/x", found=["a"], missing=["b"]),
+            platform="test",
+            engine=engine,
+            essentia_usable=False,
+            analyze_via=None,
+        )
+
+    monkeypatch.setattr(_pf, "preflight", fake_pf)
+
+    report = doctor.build_report()
+    er = report.engine_readiness
+    assert er is not None
+    assert er["engine"] == "onnx"
+    assert er["ready"] is False
+    assert er["models_missing"] == 1
+    assert er["reasons_not_ready"]  # populated (missing engine + missing model)
+
+    md = doctor.render_markdown(report)
+    assert "## Engine readiness" in md
+    assert "`onnx`" in md
+
+
+def test_last_run_section_reads_run_history() -> None:
+    from vibechek import logging_setup
+
+    logging_setup.append_run_summary({
+        "ts": "2026-07-11T10:00:00+0000",
+        "engine": "native",
+        "genre_classifier": "discogs",
+        "requested_workers": 8,
+        "effective_workers": 4,
+        "gpu_workers": 0,
+        "cpu_workers": 4,
+        "gpu_reason": "no GPU registered",
+        "analyzed": 100,
+        "errors": 3,
+        "total": 103,
+        "duration_sec": 42.5,
+        "warnings": {"model_degradation_warning": "mood head failed to load"},
+    })
+
+    report = doctor.build_report()
+    assert report.last_run is not None
+    assert report.last_run["engine"] == "native"
+
+    md = doctor.render_markdown(report)
+    assert "## Last analyze run" in md
+    assert "`native`" in md
+    assert "no GPU registered" in md
+    assert "mood head failed to load" in md
+
+
+def test_last_run_section_empty_when_no_runs() -> None:
+    report = doctor.build_report()
+    assert report.last_run is None
+    md = doctor.render_markdown(report)
+    assert "## Last analyze run" in md
+    assert "no analyze run recorded yet" in md
+
+
 def test_render_markdown_is_paste_safe_no_credentials() -> None:
     """Defensive: the markdown must not contain known credential markers.
 

@@ -349,13 +349,21 @@ class VibechekConfig:
 
     @classmethod
     def _from_dict(cls, data: dict[str, Any]) -> VibechekConfig:
-        return cls(
-            analysis=_subset(AnalysisConfig, data.get("analysis", {})),
-            tagging=_subset(TaggingConfig, data.get("tagging", {})),
-            duplicates=_subset(DuplicateConfig, data.get("duplicates", {})),
-            organization=_subset(OrganizationConfig, data.get("organization", {})),
-            ui=_subset(UIConfig, data.get("ui", {})),
+        # Collect per-section coercion/snap-back notes so `get_config` can tell
+        # the user their saved choice was silently reverted (see `_subset`). The
+        # list is stashed on the returned instance as a NON-field attribute — it
+        # deliberately never round-trips through `asdict`/`save`, so it can't
+        # pollute the on-disk config or the config wire shape.
+        warnings: list[str] = []
+        cfg = cls(
+            analysis=_subset(AnalysisConfig, data.get("analysis", {}), warnings),
+            tagging=_subset(TaggingConfig, data.get("tagging", {}), warnings),
+            duplicates=_subset(DuplicateConfig, data.get("duplicates", {}), warnings),
+            organization=_subset(OrganizationConfig, data.get("organization", {}), warnings),
+            ui=_subset(UIConfig, data.get("ui", {}), warnings),
         )
+        cfg.load_warnings = warnings
+        return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -363,13 +371,31 @@ class VibechekConfig:
 # ---------------------------------------------------------------------------
 
 
-def _subset(cls: type, data: dict[str, Any]) -> Any:
+def _subset(
+    cls: type, data: dict[str, Any], warnings: list[str] | None = None
+) -> Any:
     """Build `cls` from `data`, dropping unknown keys + coercing field types.
 
     Lets us evolve the dataclass without breaking older config files. On a
     coercion failure we fall back to the dataclass default for that field
     rather than crashing — the user sees a warning naming the bad value.
+
+    Every snap-back logs (for support) AND, when `warnings` is provided, appends
+    a short user-facing note (field + rejected value). Those notes ride out
+    through `get_config` so Settings can tell the user their saved choice was
+    silently reverted — a green-looking control that isn't actually what they
+    picked is exactly the status-dishonesty this audit targets.
     """
+    section = cls.__name__.removesuffix("Config").lower() or cls.__name__
+
+    def note(field_name: str, rejected: Any, fallback: str) -> None:
+        # `warnings is None` = a direct/test call that doesn't care about the
+        # user-facing list; keep those callers free of the extra arg's cost.
+        if warnings is not None:
+            warnings.append(
+                f"{section}.{field_name} was {rejected!r} — reset to {fallback}"
+            )
+
     valid_fields = {f.name: f for f in fields(cls)}
     kwargs: dict[str, Any] = {}
     for key, value in data.items():
@@ -383,6 +409,7 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "Config field %s.%s has invalid value %r (%s); using default",
                 cls.__name__, key, value, e,
             )
+            note(key, value, "the default")
             # Falling through without setting kwargs[key] uses the dataclass default.
             continue
         # id3_text_encoding feeds mutagen's ID3 frame constructors directly, so
@@ -393,6 +420,7 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "Config field %s.id3_text_encoding has out-of-range value %r; "
                 "falling back to 3 (UTF-8)", cls.__name__, coerced,
             )
+            note(key, coerced, "UTF-8 (3)")
             continue  # use the dataclass default (3)
         # inference_engine steers every `if engine == "onnx"` branch; a typo or
         # wrong-case value ("ONNX", "tf") would silently run the essentia_tf
@@ -402,6 +430,7 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "Config field %s.inference_engine has unknown value %r; "
                 "falling back to the platform default", cls.__name__, coerced,
             )
+            note(key, coerced, "the platform default")
             continue  # use the dataclass default (_DEFAULT_INFERENCE_ENGINE)
         # "native" is the bundled-Windows-installer engine; on Linux/macOS the
         # onnx engine IS the in-process path and the managed venvs have no
@@ -418,6 +447,7 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "(the onnx engine is the in-process path on this platform); "
                 "falling back to the platform default", cls.__name__,
             )
+            note(key, "native (Windows-only)", "the platform default")
             continue  # use the dataclass default (_DEFAULT_INFERENCE_ENGINE)
         # The genre enums steer model loading + reconciliation the same way —
         # a hand-edited value ("CLAP", "ml") would render Settings with neither
@@ -427,6 +457,7 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "Config field %s.genre_classifier has unknown value %r; "
                 "falling back to 'discogs'", cls.__name__, coerced,
             )
+            note(key, coerced, "'discogs'")
             continue
         if key == "genre_source_policy" and coerced not in (
             "prefer_tag", "prefer_ml", "tag_only", "ml_only",
@@ -435,12 +466,14 @@ def _subset(cls: type, data: dict[str, Any]) -> Any:
                 "Config field %s.genre_source_policy has unknown value %r; "
                 "falling back to 'prefer_tag'", cls.__name__, coerced,
             )
+            note(key, coerced, "'prefer_tag'")
             continue
         if key == "genre_llm_backend" and coerced not in ("ollama",):
             log.warning(
                 "Config field %s.genre_llm_backend has unknown value %r; "
                 "falling back to 'ollama'", cls.__name__, coerced,
             )
+            note(key, coerced, "'ollama'")
             continue
         kwargs[key] = coerced
     return cls(**kwargs)

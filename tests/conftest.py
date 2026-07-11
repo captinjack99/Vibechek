@@ -48,6 +48,12 @@ def _isolate_user_dirs(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
     log_dir = data_dir / "logs"
     monkeypatch.setattr(logging_setup, "LOG_DIR", log_dir, raising=True)
     monkeypatch.setattr(logging_setup, "LOG_FILE", log_dir / "vibechek.log", raising=True)
+    # RUN_HISTORY_FILE is derived from LOG_DIR at import, so patch it too — an
+    # analyze RPC in a test would otherwise append run summaries into the user's
+    # real diagnostics log.
+    monkeypatch.setattr(
+        logging_setup, "RUN_HISTORY_FILE", log_dir / "run_history.jsonl", raising=True
+    )
     # Force re-configure: a previous test that called configure() set _configured=True
     # and added a file handler pointing at the OLD log file.
     monkeypatch.setattr(logging_setup, "_configured", False, raising=True)

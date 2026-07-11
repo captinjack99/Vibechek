@@ -186,6 +186,63 @@ def test_preflight_full_mode_does_distro_probes(monkeypatch) -> None:
         f"Expected detect_wsl(quick=False) call, got: {probe_calls}"
 
 
+def test_preflight_engine_flag_selects_engine(monkeypatch) -> None:
+    """`vibechek preflight --engine onnx` must check the ONNX environment, not the
+    hardcoded essentia_tf — matching the "anything the GUI can do, the CLI can do"
+    contract for a Windows GUI whose default engine is native."""
+    from vibechek import preflight as _preflight_module
+
+    captured: dict[str, str] = {}
+
+    def fake_preflight(models_dir=None, *, quick_wsl=True, engine="essentia_tf"):
+        captured["engine"] = engine
+        return _preflight_module.PreflightResult(
+            ready=True,
+            essentia=_preflight_module.EssentiaCheck(installed=True, version="2.1"),
+            models=_preflight_module.ModelsCheck(models_dir="/x"),
+            platform="test-platform",
+            engine=engine,
+            essentia_usable=True,
+            analyze_via="native",
+        )
+
+    monkeypatch.setattr(_preflight_module, "preflight", fake_preflight)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["preflight", "--engine", "onnx", "--quick"])
+    assert result.exit_code == 0, result.output
+    assert captured["engine"] == "onnx"
+
+
+def test_preflight_no_engine_flag_resolves_from_config(monkeypatch) -> None:
+    """Without --engine the command resolves the engine the same way `analyze`
+    does (saved config → platform default), not a hardcoded essentia_tf."""
+    from vibechek import cli as _cli
+    from vibechek import preflight as _preflight_module
+
+    monkeypatch.setattr(_cli, "_resolve_default_engine", lambda: "native")
+    captured: dict[str, str] = {}
+
+    def fake_preflight(models_dir=None, *, quick_wsl=True, engine="essentia_tf"):
+        captured["engine"] = engine
+        return _preflight_module.PreflightResult(
+            ready=True,
+            essentia=_preflight_module.EssentiaCheck(installed=True),
+            models=_preflight_module.ModelsCheck(models_dir="/x"),
+            platform="test-platform",
+            engine=engine,
+            essentia_usable=True,
+            analyze_via="native",
+        )
+
+    monkeypatch.setattr(_preflight_module, "preflight", fake_preflight)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["preflight", "--quick"])
+    assert result.exit_code == 0, result.output
+    assert captured["engine"] == "native"
+
+
 # ---------------------------------------------------------------------------
 # journal._read_journal — a stray non-dict line must be skipped, not crash the
 # whole undo list / revert (bug: AttributeError/TypeError on valid-but-non-dict

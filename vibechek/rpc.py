@@ -29,6 +29,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -416,6 +417,7 @@ def _analyze_directory(params: dict) -> dict:
             "to restore them."
         )
 
+    _run_started = time.monotonic()
     report = analyze_directory(
         library_path,
         config=config,
@@ -428,6 +430,7 @@ def _analyze_directory(params: dict) -> dict:
         skip_paths=skip_set,
         tag_priors=tag_priors_map,
     )
+    _run_duration_sec = round(time.monotonic() - _run_started, 1)
 
     # The WSL / managed-venv routes reconcile inside the subprocess from file
     # tags only — the priors sidecar never reaches them. Re-applying here is
@@ -501,7 +504,52 @@ def _analyze_directory(params: dict) -> dict:
         # their curated genre edits weren't applied this run (see above).
         report["priors_warning"] = priors_warning
 
+    _record_run_history(report, config, _run_duration_sec)
+
     return report
+
+
+def _record_run_history(report: dict, config: AnalysisConfig, duration_sec: float) -> None:
+    """Append a compact summary of this completed analyze run to the durable
+    run-history log (`doctor`'s "last analyze run" section reads it back).
+
+    Prefers the analyzer-stamped `run_meta` (the plan the run ACTUALLY used —
+    effective workers, GPU split, why the GPU was/wasn't used) and falls back to
+    the requested config when an older WSL analyzer didn't stamp it. Best-effort:
+    `append_run_summary` swallows write errors, so a diagnostics-log failure
+    never touches the analyze result the user just waited on.
+    """
+    from vibechek import logging_setup  # noqa: PLC0415
+
+    meta = report.get("run_meta") or {}
+    summary = report.get("summary") or {}
+    warnings = {
+        k: report[k]
+        for k in (
+            "persist_error",
+            "priors_warning",
+            "genre_fallback_warning",
+            "model_degradation_warning",
+            "runtime_healed",
+            "runtime_heal_warning",
+        )
+        if report.get(k)
+    }
+    logging_setup.append_run_summary({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "engine": meta.get("engine", config.inference_engine),
+        "genre_classifier": meta.get("genre_classifier", config.genre_classifier),
+        "requested_workers": meta.get("requested_workers", config.workers),
+        "effective_workers": meta.get("effective_workers"),
+        "gpu_workers": meta.get("gpu_workers"),
+        "cpu_workers": meta.get("cpu_workers"),
+        "gpu_reason": meta.get("gpu_reason"),
+        "analyzed": summary.get("analyzed"),
+        "errors": summary.get("errors"),
+        "total": summary.get("total_files"),
+        "duration_sec": duration_sec,
+        "warnings": warnings,
+    })
 
 
 def _reattach_skipped_records(
@@ -559,6 +607,13 @@ def _reattach_skipped_records(
     # only the summary/statistics — then restore the true status.
     rebuilt = _build_report(merged, total=len(merged), in_progress=True)
     rebuilt["status"] = report.get("status", "complete")
+    # _build_report only rebuilds summary/statistics/tracks, so carry the fresh
+    # run's out-of-band fields (worker/GPU plan for the durable run log, and the
+    # engine self-heal notices) across the rebuild — otherwise an incremental
+    # run silently loses them.
+    for key in ("run_meta", "runtime_healed", "runtime_heal_warning"):
+        if key in report:
+            rebuilt[key] = report[key]
     return rebuilt
 
 
@@ -1412,8 +1467,21 @@ def _setup_genre_resolver(params: dict) -> dict:
 
 
 def _get_config(_params: dict) -> dict:
-    """Load config from disk (or defaults if no file exists yet)."""
-    return _config_to_jsonable(VibechekConfig.load())
+    """Load config from disk (or defaults if no file exists yet).
+
+    Attaches `config_warnings` at the TRANSPORT level (not a config field, so it
+    never round-trips back to disk on save): the notes `VibechekConfig.load()`
+    collected while snapping invalid/cross-platform saved values back to
+    defaults. Without this the GUI renders a silently-reverted default as if the
+    user chose it — Settings shows a one-time "some saved settings were invalid
+    and reset" toast off this list.
+    """
+    cfg = VibechekConfig.load()
+    payload = _config_to_jsonable(cfg)
+    warnings = getattr(cfg, "load_warnings", None)
+    if warnings:
+        payload["config_warnings"] = list(warnings)
+    return payload
 
 
 def _save_config(params: dict) -> dict:

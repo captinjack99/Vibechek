@@ -13,14 +13,27 @@ asking the user to find the file.
 
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
 import sys
+from typing import Any
 
 from vibechek.config import DATA_DIR
 
+log = logging.getLogger(__name__)
+
 LOG_DIR = DATA_DIR / "logs"
 LOG_FILE = LOG_DIR / "vibechek.log"
+
+# Durable, compact history of completed analyze runs — one JSON object per line.
+# The rolling app log (above) rotates on size and gets buried under per-track
+# chatter, so a "what did my last run actually decide?" question (engine, worker
+# split, GPU fallback reason, error count) had nowhere to be read back from.
+# `doctor`'s last-run section reads this file; it's capped to the last N entries
+# so it never grows without bound.
+RUN_HISTORY_FILE = LOG_DIR / "run_history.jsonl"
+_RUN_HISTORY_CAP = 50
 
 _configured = False
 
@@ -80,4 +93,65 @@ def tail(n: int = 200) -> list[str]:
         return []
 
 
-__all__ = ["configure", "tail", "LOG_FILE"]
+def append_run_summary(entry: dict[str, Any], *, cap: int = _RUN_HISTORY_CAP) -> None:
+    """Append one analyze-run summary line to `RUN_HISTORY_FILE`, keeping the
+    last `cap` entries.
+
+    Best-effort by design: a write failure here must NEVER affect the analyze
+    result the user just waited on, so every error is swallowed to the log. We
+    rewrite the whole (small, capped) file each call rather than open-append so
+    the rotation stays atomic — analyze runs are serialized in the sidecar, so
+    there's no concurrent writer to race.
+    """
+    try:
+        RUN_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        if RUN_HISTORY_FILE.exists():
+            with open(RUN_HISTORY_FILE, encoding="utf-8", errors="replace") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        # default=str so a stray Path/enum never turns a diagnostics write into
+        # an exception on the analyze completion path.
+        lines.append(json.dumps(entry, default=str))
+        lines = lines[-cap:]
+        tmp = RUN_HISTORY_FILE.with_name(RUN_HISTORY_FILE.name + ".tmp")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp.replace(RUN_HISTORY_FILE)
+    except Exception as e:  # noqa: BLE001 — diagnostics must not break analyze
+        log.warning("Could not append run-history summary: %s", e)
+
+
+def read_run_history(n: int = _RUN_HISTORY_CAP) -> list[dict[str, Any]]:
+    """Return up to the last `n` run summaries (oldest first). Never raises."""
+    if not RUN_HISTORY_FILE.exists():
+        return []
+    try:
+        with open(RUN_HISTORY_FILE, encoding="utf-8", errors="replace") as f:
+            raw = [ln for ln in f.read().splitlines() if ln.strip()]
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for ln in raw[-n:]:
+        try:
+            obj = json.loads(ln)
+        except json.JSONDecodeError:
+            continue  # skip a partially-written / corrupt line, keep the rest
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
+
+
+def last_run_summary() -> dict[str, Any] | None:
+    """The most recent run summary, or None if no run has been recorded."""
+    hist = read_run_history(1)
+    return hist[-1] if hist else None
+
+
+__all__ = [
+    "configure",
+    "tail",
+    "LOG_FILE",
+    "RUN_HISTORY_FILE",
+    "append_run_summary",
+    "read_run_history",
+    "last_run_summary",
+]

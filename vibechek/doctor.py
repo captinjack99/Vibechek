@@ -70,6 +70,13 @@ class DiagnosticReport:
     wsl: dict[str, Any] | None = None
     native_venv: dict[str, Any] | None = None
     tempfile_leaks: int = 0
+    # Engine-aware readiness for the SAVED config's engine (not just the
+    # hardcoded essentia_tf), so a diagnostic reflects what the user's GUI
+    # actually runs: onnx/native model set, essentia_usable, venv .error reasons.
+    engine_readiness: dict[str, Any] | None = None
+    # The most recent analyze run's durable summary (engine, worker/GPU plan,
+    # counts, degradation warnings, timestamp) — read from run_history.jsonl.
+    last_run: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +228,58 @@ def _collect_native_venv() -> dict[str, Any] | None:
         return {"error": str(e)}
 
 
+def _collect_engine_readiness() -> dict[str, Any] | None:
+    """Run preflight for the SAVED config's engine and flatten the answer.
+
+    doctor was blind to the ONNX/native model set + `essentia_usable` because
+    the old `preflight` default checked essentia_tf only — so a native-engine
+    Windows box (the GUI default) got a diagnostic describing the wrong engine.
+    Uses the quick WSL probe (the full per-distro detail is already in the WSL
+    section); models/essentia_usable/native-venv are disk-fast either way.
+
+    Lazy-imports preflight so doctor stays importable without the ML stack (the
+    essentia import inside preflight is itself guarded).
+    """
+    try:
+        from vibechek.config import VibechekConfig
+        from vibechek.preflight import preflight as run_preflight
+
+        engine = VibechekConfig.load().analysis.inference_engine
+        r = run_preflight(quick_wsl=True, engine=engine)
+        nv = r.native_venv
+        return {
+            "engine": engine,
+            "ready": r.ready,
+            "analyze_via": r.analyze_via,
+            "essentia_usable": r.essentia_usable,
+            "models_found": len(r.models.found),
+            "models_missing": len(r.models.missing),
+            "reasons_not_ready": r.reasons_not_ready,
+            # The new "venv interpreter broken…" reason surfaces here too, not
+            # just in the platform venv section (which is Windows/non-Windows
+            # exclusive) — so support sees it regardless of platform.
+            "native_venv_error": nv.error if nv else None,
+            "wsl_can_run": r.wsl.can_run_vibechek if r.wsl else None,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.debug("engine readiness probe failed: %s", e)
+        return {"error": str(e)}
+
+
+def _collect_last_run() -> dict[str, Any] | None:
+    """The most recent analyze-run summary from the durable run-history log.
+
+    Lazy-imports logging_setup (matching `_collect_log_tail`) so tests that
+    monkeypatch RUN_HISTORY_FILE after import are respected.
+    """
+    try:
+        from vibechek import logging_setup
+        return logging_setup.last_run_summary()
+    except Exception as e:  # noqa: BLE001
+        log.debug("last-run probe failed: %s", e)
+        return None
+
+
 def _collect_tempfile_leaks() -> int:
     """Count `vibechek-wsl-*` tempfiles. Symptom of crashed sidecar sessions."""
     try:
@@ -274,6 +333,8 @@ def build_report(
         wsl=_collect_wsl(),
         native_venv=_collect_native_venv(),
         tempfile_leaks=_collect_tempfile_leaks(),
+        engine_readiness=_collect_engine_readiness(),
+        last_run=_collect_last_run(),
     )
 
 
@@ -353,6 +414,61 @@ def render_markdown(report: DiagnosticReport) -> str:
         else:
             reason = f" ({m.get('error')})" if m.get("error") else ""
             lines.append(f"  - `{m['name']}` — **MISSING**{reason}")
+    lines.append("")
+
+    lines.append("## Engine readiness")
+    er = report.engine_readiness
+    if not er:
+        lines.append("- _not probed_")
+    elif er.get("error"):
+        lines.append(f"- Error probing readiness: `{er['error']}`")
+    else:
+        lines.append(f"- Engine (saved config): `{er.get('engine')}`")
+        lines.append(f"- Ready: **{er.get('ready')}**")
+        lines.append(f"- Analyze via: `{er.get('analyze_via')}`")
+        lines.append(f"- In-process essentia serves this engine: **{er.get('essentia_usable')}**")
+        lines.append(
+            f"- Models: **{er.get('models_found')} present, "
+            f"{er.get('models_missing')} missing** (for this engine's set)"
+        )
+        if er.get("wsl_can_run") is not None:
+            lines.append(f"- WSL can run this engine: **{er.get('wsl_can_run')}**")
+        if er.get("native_venv_error"):
+            lines.append(f"- Managed venv problem: `{er['native_venv_error']}`")
+        reasons = er.get("reasons_not_ready") or []
+        if reasons:
+            lines.append("- Not ready because:")
+            for reason in reasons:
+                lines.append(f"  - {reason}")
+    lines.append("")
+
+    lines.append("## Last analyze run")
+    lr = report.last_run
+    if not lr:
+        lines.append("- _no analyze run recorded yet_")
+    else:
+        lines.append(f"- Time: `{lr.get('ts', '?')}`")
+        lines.append(
+            f"- Engine: `{lr.get('engine')}` · classifier `{lr.get('genre_classifier')}`"
+        )
+        lines.append(
+            f"- Workers: requested {lr.get('requested_workers')}, "
+            f"effective {lr.get('effective_workers')} "
+            f"(GPU {lr.get('gpu_workers')} + CPU {lr.get('cpu_workers')})"
+        )
+        if lr.get("gpu_reason"):
+            lines.append(f"- GPU not used: {lr['gpu_reason']}")
+        lines.append(
+            f"- Tracks: {lr.get('analyzed')}/{lr.get('total')} "
+            f"({lr.get('errors')} errors)"
+        )
+        if lr.get("duration_sec") is not None:
+            lines.append(f"- Duration: {lr.get('duration_sec')} s")
+        warnings = lr.get("warnings") or {}
+        if warnings:
+            lines.append("- Degradation warnings:")
+            for key, msg in warnings.items():
+                lines.append(f"  - **{key}**: {msg}")
     lines.append("")
 
     if report.wsl is not None:

@@ -631,7 +631,16 @@ def download_models_cmd(models_dir: Path | None, engine: str | None) -> None:
               help="Override the ML model directory (defaults to user data dir).")
 @click.option("--quick/--full", default=False, show_default=True,
               help="Skip per-distro WSL probes (faster, less accurate).")
-def preflight(models_dir: Path | None, quick: bool) -> None:
+@click.option("--engine", type=click.Choice(["essentia_tf", "onnx", "native"]),
+              default=None,
+              help="Which engine's environment to check: essentia_tf checks the "
+                   "TensorFlow venv + .pb models; onnx/native check the ONNX venv "
+                   "+ .onnx models. Omitted → the saved config's engine, then the "
+                   "platform default (native on Windows, essentia_tf elsewhere) — "
+                   "same resolution as `analyze`. The old hardcoded essentia_tf "
+                   "reported the wrong engine's readiness for a Windows GUI whose "
+                   "default is native.")
+def preflight(models_dir: Path | None, quick: bool, engine: str | None) -> None:
     """Verify Vibechek is ready to run `analyze` (essentia + model files).
 
     Does a full WSL distro probe by default so the output is accurate. Pass
@@ -641,7 +650,8 @@ def preflight(models_dir: Path | None, quick: bool) -> None:
     from vibechek.preflight import preflight as run_preflight
     from vibechek.preflight import summary_lines
 
-    result = run_preflight(models_dir, quick_wsl=quick)
+    engine = engine or _resolve_default_engine()
+    result = run_preflight(models_dir, quick_wsl=quick, engine=engine)
     for line in summary_lines(result):
         console.print(line)
 

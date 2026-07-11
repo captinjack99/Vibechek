@@ -625,17 +625,24 @@ export function LibraryBrowser() {
         // parallel toast).
         if (report.genre_fallback_warning) detailLines.push(report.genre_fallback_warning);
         if (report.model_degradation_warning) detailLines.push(report.model_degradation_warning);
+        // Engine self-heal notices (WSL drift auto-repair): a successful repair
+        // is informational; a failed GPU-lib restore means the run fell back to
+        // CPU — a caution. Same completion toast, no parallel one.
+        if (report.runtime_healed) detailLines.push(report.runtime_healed);
+        if (report.runtime_heal_warning) detailLines.push(report.runtime_heal_warning);
         const degraded = Boolean(
-          report.genre_fallback_warning || report.model_degradation_warning,
+          report.genre_fallback_warning ||
+            report.model_degradation_warning ||
+            report.runtime_heal_warning,
         );
         const headline =
           errors > 0
             ? `Analyzed ${analyzed}/${total} — ${errors} error${errors === 1 ? "" : "s"}`
             : `Analyzed ${analyzed}/${total}`;
         notify(headline, {
-          // A dropped Rekordbox import or a silent model/classifier degradation
-          // is a caution (warning); per-track errors are informational; a clean
-          // run is a success.
+          // A dropped Rekordbox import, a silent model/classifier degradation,
+          // or a GPU-restore failure is a caution (warning); per-track errors
+          // are informational; a clean run is a success.
           kind:
             report.priors_warning || degraded ? "warning" : errors > 0 ? "info" : "success",
           detail: detailLines.length > 0 ? detailLines.join("\n") : undefined,
