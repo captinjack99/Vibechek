@@ -32,7 +32,7 @@ ui/
 ┌────────────────────────────────────────────────────────┐
 │  React frontend (Vite)                                 │
 │  - Zustand stores, virtualized track list, settings UI │
-│  - 104 vitest tests (Tauri APIs mocked in setup)        │
+│  - 119 vitest tests (Tauri APIs mocked in setup)        │
 └──────────────────────────┬─────────────────────────────┘
                            │ Tauri invoke("rpc_call", method, params)
                            ▼
@@ -141,7 +141,7 @@ First Tauri compile is 10-15 minutes (downloads + builds ~400 MB of crates). Sub
 
 ```bash
 cd ui
-npm test           # vitest run — 104 tests
+npm test           # vitest run — 119 tests
 npm run test:watch # watch mode
 npm run test:ui    # web UI for tests
 ```

@@ -8,6 +8,65 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ---
 
+## [Unreleased]
+
+### Added
+- **The worker slider now tells the truth — and so does the run.** A single
+  worker-budget model (new `worker_budget` RPC) computes the real maximum for
+  your engine + genre model against MEASURED resources: the WSL VM's memory
+  (not the host's) for WSL-routed engines, GPU workers only when the engine
+  can actually register the GPU, per-worker cost for the selected classifier
+  (CLAP ≈ 4.5 GB vs 0.8 GB). The Settings slider binds its max to that
+  computation and explains it; a mid-run clamp streams its reason to the GUI
+  ("Workers capped 16→2: CLAP needs ~4.4 GB each; the WSL VM has 15.5 GB")
+  instead of silently running fewer workers than you asked for.
+- **The engine environment heals itself.** Before dispatching an analyze, the
+  app verifies the WSL venv actually imports its ML stack and repairs it in
+  place when broken — including automatically restoring GPU libraries wiped
+  by a WSL reinstall ("Restoring GPU libraries…" with live progress). No
+  manual setup step is the only path anymore; repairs announce themselves in
+  the completion summary. Opt out with VIBECHEK_NO_AUTOHEAL.
+- **A durable run history.** Every analyze appends engine, workers requested
+  vs used, the GPU decision and its reason, counts, and warnings to
+  `logs/run_history.jsonl`; `vibechek doctor` gained an engine-aware
+  readiness section plus a "last analyze run" section that reads it.
+
+### Fixed
+- **Two silent data-loss paths.** An analyze whose auto-save failed (disk
+  full, cloud-sync/antivirus lock) looked successful and vanished on next
+  launch — the failure now surfaces as a persistent warning. Worse:
+  "Analyze new tracks only" treated a momentarily-unreadable saved analysis
+  as "never analyzed" and overwrote the whole library's results with just
+  the new tracks — it now aborts loudly, leaving your data untouched.
+- **GPU honesty across all engines.** The hybrid pool reported "N GPU
+  workers" sized from nvidia-smi VRAM even when TensorFlow/ONNX could not
+  register the device (they all ran on CPU); GPU workers are now gated on a
+  real registration probe and the progress line states what actually ran. A
+  near-zero-VRAM reading no longer creates a doomed 1-worker GPU pool that
+  aborted the entire run. The native engine's Settings row now says honestly
+  that the bundled ONNX Runtime is CPU-only. `onnxruntime-gpu` is pinned to
+  the CUDA-12 line (an unpinned install resolved to a CUDA-13 build that
+  crashed the ONNX engine on import).
+- **Silent result degradation now surfaces.** CLAP falling back to Discogs
+  (globally or per-track), a mood/vocal model failing to load, and a dedupe
+  fingerprint phase skipped because fpcalc is missing all stamp provenance
+  and warn in the completion summary. A web-genre lookup whose search
+  returned nothing no longer lets an ungrounded LLM guess masquerade as a
+  verified "online source".
+- **Error messages name the real cause.** "onnxruntime is not installed"
+  (it was installed but broken — the real loader error now shows), "check
+  your network" for disk-full/corrupted downloads, a CLAP checksum hint
+  pointing at a command that never checks CLAP, and "likely out of memory"
+  for every worker death (now gated on the exit code) are all fixed.
+- **Settings can't contradict reality.** The readiness banner no longer
+  shows a green Essentia row under a "Not ready" title (it now evaluates the
+  engine you selected, with an explicit "installed but can't serve this
+  engine" state); invalid saved settings that were silently reset now
+  announce themselves once; the CLAP setup button is gated off the native
+  engine; venv probes verify the interpreter actually runs before reporting
+  READY; a settings change made just before quitting is no longer lost to
+  the autosave debounce.
+
 ## [0.7.0-beta] — 2026-07-02
 
 Two review rounds in one release: the 17 adversarially-confirmed fixes from

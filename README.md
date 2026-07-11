@@ -224,10 +224,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**1052 Python tests** · **49 JSON-RPC methods** · **36 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**1129 Python tests** · **50 JSON-RPC methods** · **36 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 104 frontend tests across 14 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
+- 119 frontend tests across 17 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 
