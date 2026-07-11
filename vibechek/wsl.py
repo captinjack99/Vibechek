@@ -47,6 +47,21 @@ _NON_LINUX_DISTROS = {"docker-desktop", "docker-desktop-data", "rancher-desktop"
 # Real distro names — "Ubuntu-24.04", "Debian", "kali-linux" — all match this.
 _VALID_DISTRO_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# onnxruntime-gpu version ceiling for the CUDA-12 wheel set we install alongside
+# it (nvidia-*-cu12). This MUST stay coherent or `import onnxruntime` hard-crashes
+# on a fresh GPU install: the default PyPI `onnxruntime-gpu` wheel has been built
+# against CUDA 12.x since 1.19.0 and stayed CUDA-12 through the 1.26 line, but
+# **1.27.0 removed CUDA-12 support** and made the default wheel target CUDA 13 —
+# so an UNPINNED `pip install onnxruntime-gpu` resolves to 1.27.0, which then
+# dlopens libcudart.so.13 at import and dies with "libcudart.so.13: cannot open
+# shared object file" against the cu12 runtime we bundle. Pinning `<1.27` keeps
+# us on the newest CUDA-12 release line (currently 1.26.x) so the import always
+# matches the cu12 wheels. Bump this ceiling only together with a move to the
+# nvidia-*-cu13 wheel set. (Verified 2026-07: onnxruntime 1.27.0 released Jun-2026
+# is CUDA-13-only; 1.19–1.26 default wheels are CUDA-12.) Shared with the native
+# (Linux/macOS) install path in native_install.py so both stay in lockstep.
+ONNXRUNTIME_GPU_SPEC = "onnxruntime-gpu<1.27"
+
 log = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -260,12 +275,30 @@ if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
     fi
     rm -f "$TMP"
 fi
-for p in "$SHIM"{extra_bin}; do
-  if [ -x "$p" ]; then
-    printf 'vibechek=%s\n' "$p"
-    break
-  fi
-done
+# FUNCTIONAL readiness, not existence-only. The shim being present on disk does
+# NOT prove the venv's interpreter still runs: a distro `apt` release-upgrade
+# that moves the base `python3`, or a WSL reinstall that rebuilt the distro,
+# leaves the venv files intact while their shebang'd interpreter is gone. An
+# existence-only `[ -x "$SHIM" ]` then reports READY and analyze later dies with
+# an opaque "Invalid params: Expecting value" toast (empty output from a shim
+# that can't exec). Gate `vibechek=` on the cheapest possible liveness check —
+# `python -c "import sys"` — so a dead interpreter downgrades to "not ready" and
+# drives the existing "Set up WSL" remediation UI instead.
+VENV_PY="$VENV/bin/python"
+PY_OK=0
+if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import sys" >/dev/null 2>&1; then
+  PY_OK=1
+fi
+if [ "$PY_OK" = "1" ]; then
+  for p in "$SHIM"{extra_bin}; do
+    if [ -x "$p" ]; then
+      printf 'vibechek=%s\n' "$p"
+      break
+    fi
+  done
+else
+  printf 'py_broken=1\n'
+fi
 # Probe the installed vibechek __version__ from site-packages metadata. We
 # prefer reading PKG-INFO over invoking `vibechek --version` because the
 # latter imports the package (slow + can fail if the install is half-broken),
@@ -327,6 +360,18 @@ done
             log.warning(
                 "Auto-repaired broken vibechek shim in distro %s (stripped "
                 "stale `. cuda-env.sh` line from a pre-beta.10 CUDA install)",
+                distro.name,
+            )
+        elif line == "py_broken=1":
+            # Interpreter is dead behind an otherwise-present venv. Leave
+            # vibechek_installed False so preflight reports "not ready" and the
+            # GUI offers "Set up WSL" instead of dispatching an analyze that
+            # would fail with an opaque toast. Logged (never swallowed) so it's
+            # visible in the sidecar log; ensure_engine_runtime repairs it on
+            # the next analyze per the zero-setup doctrine.
+            log.warning(
+                "WSL venv interpreter is broken in distro %s (python -c "
+                "'import sys' failed) — the engine venv needs a reinstall",
                 distro.name,
             )
 
@@ -1482,7 +1527,10 @@ def _user_bootstrap(engine: str = "essentia_tf") -> str:
             f'{pip} uninstall -y onnxruntime onnxruntime-gpu onnxruntime-rocm >/dev/null 2>&1 || true\n'
             'if command -v nvidia-smi >/dev/null 2>&1; then\n'
             f'    echo "  NVIDIA GPU detected — installing onnxruntime-gpu + CUDA 12 runtime"\n'
-            f'    {pip} install --quiet essentia onnxruntime-gpu {cuda_wheels}\n'
+            # The pin is DOUBLE-quoted for bash so the `<` in "<1.27" is a literal
+            # part of the pip version specifier, not a shell input redirect. See
+            # ONNXRUNTIME_GPU_SPEC for why an unpinned install hard-crashes on cu12.
+            f'    {pip} install --quiet essentia "{ONNXRUNTIME_GPU_SPEC}" {cuda_wheels}\n'
             'else\n'
             f'    echo "  No NVIDIA GPU — installing CPU onnxruntime"\n'
             f'    {pip} install --quiet essentia onnxruntime\n'
@@ -1843,6 +1891,32 @@ def upgrade_vibechek_in_wsl(
     if rc != 0:
         return {"ok": False, "error": f"vibechek upgrade exited with {rc}",
                 "tail": "\n".join(tail_lines)}
+
+    # Post-upgrade honesty gate. This fast path is a `--no-deps` code-only
+    # reinstall (apt + essentia deliberately untouched — only the Python code
+    # changes between betas), so it CANNOT reconcile an ML-dependency skew
+    # carried over from the initial install (e.g. an onnxruntime-gpu build stuck
+    # against the wrong CUDA runtime). Printing "Upgrade complete" while
+    # `import onnxruntime` / `import essentia` still crashes is the status-lie
+    # the audit flagged. Verify the venv can import its ML stack; if not, DON'T
+    # claim success — return ok:False carrying the REAL import error plus a
+    # `stack_broken` flag so the analyzer's self-heal (ensure_engine_runtime)
+    # repairs it in place rather than the user hitting a raw crash on analyze.
+    stack_ok, stack_detail = _probe_engine_stack_import(distro, engine)
+    if not stack_ok:
+        return {
+            "ok": False,
+            "stack_broken": True,
+            "stack_error": stack_detail,
+            "error": (
+                f"The WSL vibechek code updated, but the {engine} engine can't "
+                f"import its ML libraries in {distro}: {stack_detail}. This is a "
+                f"dependency skew the code-only update can't fix; it will be "
+                f"repaired automatically."
+            ),
+            "distro": distro,
+            "tail": "\n".join(tail_lines),
+        }
 
     if on_progress:
         on_progress(100, 100, "Upgrade complete")
@@ -2619,17 +2693,18 @@ def install_cuda_libs_in_wsl(
         token_file.unlink(missing_ok=True)
 
     if rc != 0:
-        last_lines = "\n".join(tail[-25:])
+        # Route through the shared cause-detector instead of hardcoding a
+        # network-only hint. The old message always blamed "pip couldn't reach
+        # PyPI" regardless of the real tail — so a disk-full WSL or a pip
+        # resolver miss sent the user to run `curl pypi.org` (which succeeds and
+        # proves nothing) while the actual fix went unmentioned.
+        # `_explain_install_failure` already discriminates disk-full / apt-lock /
+        # DNS / pip-version failures from the tail and is used for the sibling
+        # essentia install paths; the "cuda-libs" phase adds the network+venv
+        # fallback hint when nothing more specific matched.
         return {
             "ok": False,
-            "error": (
-                f"CUDA wheel install exited with {rc}.\n\n"
-                f"Last output:\n{last_lines}\n\n"
-                f"If pip couldn't reach PyPI, check WSL's network: "
-                f"  wsl -d {distro} -- curl https://pypi.org\n"
-                f"If the venv doesn't exist, install Essentia first via "
-                f"Settings -> Set up now."
-            ),
+            "error": _explain_install_failure(rc, tail, phase="cuda-libs"),
             "tail": "\n".join(tail[-100:]),
             "unknown_libs": unknown,
             "packages_attempted": pip_packages,
@@ -2667,13 +2742,246 @@ def _explain_install_failure(rc: int, tail: list[str], phase: str) -> str:
         hints.append("WSL can't reach the internet. Check your network / VPN / firewall.")
     elif phase == "pip" and ("Could not find a version" in tail_text or "No matching distribution" in tail_text):
         hints.append("pip can't find essentia-tensorflow. Ensure your WSL Ubuntu is 22.04+ with python 3.10+.")
+    elif phase == "cuda-libs" and ("Could not find a version" in tail_text or "No matching distribution" in tail_text):
+        hints.append("pip couldn't resolve a CUDA runtime wheel for this platform/Python. "
+                     "Ensure your WSL Ubuntu is 22.04+ with python 3.10+.")
     elif "ERROR: Could not install packages" in tail_text:
         hints.append("pip install failed — see the tail for the package and reason.")
+
+    # Fallback for the CUDA-libs phase: when the tail matched none of the
+    # specific cases above, keep the original network + missing-venv guidance
+    # (the two most common real causes) rather than leaving no hint at all.
+    if not hints and phase == "cuda-libs":
+        hints.append(
+            "If pip couldn't reach PyPI, check WSL's network (VPN / firewall / DNS). "
+            "If the analysis venv is missing, install Essentia first via Settings -> Set up now."
+        )
 
     hint_str = ("\n\nHint: " + " ".join(hints)) if hints else ""
     return (
         f"Phase '{phase}' exited with {rc}.\n\nLast output:\n  {last_lines}{hint_str}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Zero-setup self-heal: verify + repair the engine runtime on drift
+# ---------------------------------------------------------------------------
+#
+# Product doctrine (zero-setup-doctrine): DETECT -> SELF-HEAL -> RUN. The user
+# should never need a manual "repair" button. Two real incidents motivate this:
+# (1) a WSL reinstall wiped the CUDA-11 libs essentia's TF needs and nothing
+# regenerated cuda-env.sh, so the GPU was silently dead for a month; (2) the
+# code-only drift auto-update can't reconcile an onnxruntime/CUDA skew, so the
+# venv stayed import-broken while the update reported success. ensure_engine_runtime
+# closes both gaps transparently on the next analyze.
+
+
+def _autoheal_disabled() -> bool:
+    """True iff the user opted out of automatic environment repair.
+
+    ``VIBECHEK_NO_AUTOHEAL=1`` (or true/yes/on) suppresses the *repair* actions
+    (multi-GB reinstalls / CUDA-lib downloads) — DETECTION and honest failure
+    reporting still happen, so a power user who manages their own venv isn't
+    surprised by a background reinstall but also isn't lied to. Default is ON
+    (unset -> healing enabled) per the doctrine: no manual step may be the ONLY
+    path to a working engine.
+    """
+    return os.environ.get("VIBECHEK_NO_AUTOHEAL", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _engine_stack_imports(engine: str) -> str:
+    """The Python import that proves `engine`'s ML stack is loadable.
+
+    onnx/native run onnxruntime (the exact thing that hard-crashes on a CUDA
+    12/13 wheel skew — ``libcudart.so.13: cannot open shared object file``) plus
+    essentia for the DSP; essentia_tf runs essentia-tensorflow. We import only
+    the top-level packages — enough to catch a broken shared-library dlopen
+    without paying the multi-second full-backend init.
+    """
+    if engine_venv_subdir(engine) == "venv-onnx":
+        return "import essentia, onnxruntime"
+    return "import essentia"
+
+
+def _probe_engine_stack_import(distro: str, engine: str) -> tuple[bool, str]:
+    """Run ``<venv python> -c "import <ml stack>"`` inside `distro`; report health.
+
+    Returns ``(ok, detail)``. ``ok=False`` ONLY on a definite negative — the venv
+    python is missing, or the import exits non-zero (``detail`` then carries the
+    real stderr tail, e.g. the libcudart mismatch). A probe that can't even
+    launch (no wsl.exe, Popen/timeout error) returns ``(True, "<reason>")`` so we
+    never false-flag a healthy install as broken and trigger a needless reinstall.
+    """
+    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    if not wsl:
+        return True, "probe skipped: wsl.exe not on PATH"
+    subdir = engine_venv_subdir(engine)
+    imports = _engine_stack_imports(engine)
+    # `bash -s` over stdin (not `-c`) to dodge wsl.exe's multi-line -c variable
+    # mangling — same pattern as _probe_distro and the install scripts.
+    script = (
+        'HOME_DIR="$(printenv HOME)"\n'
+        f'PY="$HOME_DIR/.vibechek/{subdir}/bin/python"\n'
+        'if [ ! -x "$PY" ]; then echo "VIBECHEK_STACK_NO_PY"; exit 90; fi\n'
+        f'"$PY" -c "{imports}"\n'
+    )
+    try:
+        proc = subprocess.Popen(
+            [wsl, "-d", distro, "--", "bash", "-s"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        clean = script.replace("\r\n", "\n").replace("\r", "\n")
+        stdout_bytes, stderr_bytes = proc.communicate(
+            input=clean.encode("utf-8"), timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return True, f"probe inconclusive: {type(e).__name__}: {e}"
+    if proc.returncode == 0:
+        return True, ""
+    out = (stdout_bytes or b"").decode("utf-8", errors="replace")
+    err = (stderr_bytes or b"").decode("utf-8", errors="replace")
+    if "VIBECHEK_STACK_NO_PY" in out:
+        return False, f"the {subdir} venv's Python interpreter is missing"
+    # Surface the last few real stderr lines (the actual ImportError / dlopen
+    # failure) — never a generic "not installed".
+    tail = [ln for ln in err.splitlines() if ln.strip()][-4:]
+    detail = " / ".join(tail) if tail else f"import exited {proc.returncode}"
+    return False, detail
+
+
+def ensure_engine_runtime(
+    distro: str,
+    engine: str = "essentia_tf",
+    on_progress: ProgressCallback | None = None,
+) -> dict:
+    """DETECT -> SELF-HEAL -> RUN the WSL engine runtime for `engine`.
+
+    Called transparently from the analyzer's drift-update path so a WSL reinstall
+    / app upgrade self-heals on the next analyze instead of dead-ending:
+
+      (a) verify the venv imports its ML stack (essentia / onnxruntime);
+      (b) on failure, reinstall the wheel set in place (reuses
+          ``install_vibechek_in_wsl`` — same progress + cancellation), re-verify;
+      (c) for essentia_tf, if a GPU is physically visible but the engine can't use
+          it because the CUDA libs / cuda-env.sh are absent (the classic
+          post-WSL-reinstall wipe), restore them via ``install_cuda_libs_in_wsl``,
+          announcing "Restoring GPU libraries…".
+
+    Returns ``{ok, healed:[...], ...}``. ``ok=False`` only for a FATAL problem
+    (the ML stack can't import and couldn't be repaired) — a GPU-lib restore
+    failure is non-fatal (analyze still runs on CPU) and returned as ``ok:True``
+    with a ``gpu_heal_failed`` note. ``VIBECHEK_NO_AUTOHEAL`` suppresses the
+    repairs (but not detection): a broken stack then returns ``ok:False`` with the
+    real reason so the user gets an honest error instead of a raw crash.
+    """
+    if not IS_WINDOWS:
+        return {"ok": True, "skipped": "not-windows"}
+    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    if not wsl:
+        return {"ok": False, "error": "wsl.exe not found"}
+
+    from vibechek import cancellation  # noqa: PLC0415
+
+    subdir = engine_venv_subdir(engine)
+    autoheal = not _autoheal_disabled()
+    healed: list[str] = []
+
+    # (a) DETECT — can the venv import its ML stack?
+    stack_ok, detail = _probe_engine_stack_import(distro, engine)
+    if not stack_ok:
+        if not autoheal:
+            return {
+                "ok": False,
+                "error": (
+                    f"The {engine} engine can't import its ML stack in {distro}: "
+                    f"{detail}. Automatic repair is disabled (VIBECHEK_NO_AUTOHEAL); "
+                    f"re-run Settings -> Set up WSL to fix it."
+                ),
+                "stack_error": detail,
+                "autoheal_disabled": True,
+            }
+        # (b) SELF-HEAL — reinstall the wheel set in place.
+        if on_progress:
+            on_progress(
+                0, 0,
+                f"Repairing the {engine} analysis engine in {distro} "
+                f"(reinstalling its ML libraries; one-time)…",
+            )
+        log.warning(
+            "Engine ML stack import failed in %s (%s) — auto-repairing in place",
+            distro, detail,
+        )
+        res = install_vibechek_in_wsl(distro, on_progress=on_progress, engine=engine)
+        if res.get("cancelled") or cancellation.is_cancelled():
+            return {"ok": False, "cancelled": True, "error": "Cancelled by user"}
+        if not res.get("ok"):
+            return {
+                "ok": False,
+                "phase": "stack-repair",
+                "error": (
+                    f"Automatic repair of the {engine} engine failed: "
+                    f"{res.get('error', 'unknown error')}"
+                ),
+                "tail": res.get("tail"),
+            }
+        stack_ok2, detail2 = _probe_engine_stack_import(distro, engine)
+        if not stack_ok2:
+            return {
+                "ok": False,
+                "phase": "stack-repair",
+                "error": (
+                    f"The {engine} engine still can't import its ML stack after an "
+                    f"in-place reinstall: {detail2}. Re-run Settings -> Set up WSL."
+                ),
+                "stack_error": detail2,
+            }
+        healed.append("ml-stack")
+
+    # (c) CUDA libs / cuda-env.sh — essentia_tf only. The TF build needs the
+    # CUDA runtime libs on LD_LIBRARY_PATH via ~/.vibechek/cuda-env.sh; a WSL
+    # reinstall wipes them and nothing else restores them (the "GPU silently
+    # dead for a month" incident). onnx/native get their cu12 wheels IN the venv
+    # from step (b)'s reinstall and don't use cuda-env.sh at all, so they're
+    # covered there (and install_cuda_libs_in_wsl targets the essentia_tf venv).
+    if subdir == "venv":
+        try:
+            ginfo = probe_engine_gpu(distro, force=True, engine="essentia_tf")
+        except Exception as e:  # noqa: BLE001
+            log.warning("GPU probe failed during self-heal in %s: %s", distro, e)
+            ginfo = None
+        if ginfo is not None and ginfo.gpu_hardware_visible and ginfo.missing_cuda_libs:
+            if not autoheal:
+                log.warning(
+                    "GPU visible in %s but CUDA libs are missing (%s); auto-repair "
+                    "disabled — analyze will run on CPU",
+                    distro, ginfo.missing_cuda_libs,
+                )
+                return {"ok": True, "healed": healed,
+                        "gpu_heal_skipped": "autoheal-disabled"}
+            if on_progress:
+                on_progress(0, 0, f"Restoring GPU libraries in {distro}…")
+            log.info(
+                "Self-heal: restoring %d CUDA lib(s) in %s (%s)",
+                len(ginfo.missing_cuda_libs), distro, ginfo.missing_cuda_libs,
+            )
+            res = install_cuda_libs_in_wsl(
+                distro, ginfo.missing_cuda_libs, on_progress=on_progress,
+            )
+            if res.get("cancelled") or cancellation.is_cancelled():
+                return {"ok": False, "cancelled": True, "error": "Cancelled by user"}
+            if not res.get("ok"):
+                # GPU is an accelerator, not a requirement — don't fail the
+                # analyze, just note the degradation (it runs on CPU).
+                log.warning("GPU-lib restore failed in %s: %s", distro, res.get("error"))
+                return {"ok": True, "healed": healed,
+                        "gpu_heal_failed": res.get("error")}
+            healed.append("cuda-libs")
+
+    return {"ok": True, "distro": distro, "engine": engine, "healed": healed}
 
 
 # ---------------------------------------------------------------------------

@@ -169,9 +169,12 @@ def test_drift_auto_updates_wsl_in_place_then_analyzes(
     fake_run = MagicMock(returncode=0, stdout="", stderr="")
     fake_upgrade = MagicMock(return_value={"ok": True})
 
+    fake_ensure = MagicMock(return_value={"ok": True, "healed": []})
+
     with patch("vibechek.preflight.preflight", return_value=_stub_preflight("0.1.0-dev")), \
          patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]), \
          patch("vibechek.wsl.upgrade_vibechek_in_wsl", fake_upgrade), \
+         patch("vibechek.wsl.ensure_engine_runtime", fake_ensure), \
          patch("vibechek.wsl.run_vibechek_in_wsl", return_value=fake_run), \
          patch("vibechek.wsl.win_to_wsl_path", side_effect=lambda s: s), \
          patch("vibechek.wsl.wsl_to_win_path", side_effect=lambda s: s):
@@ -186,6 +189,11 @@ def test_drift_auto_updates_wsl_in_place_then_analyzes(
     # Auto-update fired exactly once, engine-aware, then analyze proceeded.
     assert fake_upgrade.call_count == 1
     assert fake_upgrade.call_args.kwargs.get("engine") == "essentia_tf"
+    # DETECT → SELF-HEAL → RUN: the drift block also runs the engine-runtime
+    # self-heal (engine-aware) before dispatching the analyze.
+    assert fake_ensure.call_count == 1
+    assert "essentia_tf" in fake_ensure.call_args.args or \
+        fake_ensure.call_args.kwargs.get("engine") == "essentia_tf"
     assert report.get("status") == "complete"
 
 
@@ -204,6 +212,65 @@ def test_drift_auto_update_failure_surfaces_clean_error(
         with pytest.raises(RuntimeError, match="update.*failed|out of date"):
             analyzer.analyze_directory(
                 tmp_path, config=AnalysisConfig(workers=1, use_gpu="off"),
+            )
+
+
+def test_drift_stack_broken_upgrade_self_heals_then_analyzes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A code upgrade that reports `stack_broken` (ML deps skewed) must NOT
+    dead-end: the drift block falls through to ensure_engine_runtime, which
+    repairs the stack, and the analyze then proceeds."""
+    import vibechek as _vibechek  # noqa: PLC0415
+    monkeypatch.setattr(_vibechek, "__version__", "0.5.0-beta", raising=False)
+
+    (tmp_path / "x.flac").write_bytes(b"\x00")
+    output = tmp_path / "out.json"
+    output.write_text('{"tracks": [], "status": "complete", "summary": {}}', encoding="utf-8")
+    fake_run = MagicMock(returncode=0, stdout="", stderr="")
+    # Upgrade succeeded code-wise but flagged an import-broken ML stack.
+    fake_upgrade = MagicMock(return_value={"ok": False, "stack_broken": True,
+                                           "error": "onnxruntime import failed"})
+    fake_ensure = MagicMock(return_value={"ok": True, "healed": ["ml-stack"]})
+
+    with patch("vibechek.preflight.preflight", return_value=_stub_preflight("0.1.0-dev")), \
+         patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]), \
+         patch("vibechek.wsl.upgrade_vibechek_in_wsl", fake_upgrade), \
+         patch("vibechek.wsl.ensure_engine_runtime", fake_ensure), \
+         patch("vibechek.wsl.run_vibechek_in_wsl", return_value=fake_run), \
+         patch("vibechek.wsl.win_to_wsl_path", side_effect=lambda s: s), \
+         patch("vibechek.wsl.wsl_to_win_path", side_effect=lambda s: s):
+        from vibechek.config import AnalysisConfig
+        report = analyzer.analyze_directory(
+            tmp_path,
+            config=AnalysisConfig(workers=1, use_gpu="off", inference_engine="onnx"),
+            output_path=output,
+        )
+
+    # stack_broken did NOT raise; the self-heal ran and the analyze completed.
+    assert fake_ensure.call_count == 1
+    assert report.get("status") == "complete"
+
+
+def test_drift_self_heal_failure_surfaces_clean_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ensure_engine_runtime can't repair the engine, surface a clear error
+    instead of letting the analyze crash raw."""
+    import vibechek as _vibechek  # noqa: PLC0415
+    monkeypatch.setattr(_vibechek, "__version__", "0.5.0-beta", raising=False)
+    (tmp_path / "x.flac").write_bytes(b"\x00")
+
+    with patch("vibechek.preflight.preflight", return_value=_stub_preflight("0.1.0-dev")), \
+         patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]), \
+         patch("vibechek.wsl.upgrade_vibechek_in_wsl", return_value={"ok": True}), \
+         patch("vibechek.wsl.ensure_engine_runtime",
+               return_value={"ok": False, "error": "still broken after reinstall"}):
+        from vibechek.config import AnalysisConfig
+        with pytest.raises(RuntimeError, match="could not be repaired|still broken"):
+            analyzer.analyze_directory(
+                tmp_path,
+                config=AnalysisConfig(workers=1, use_gpu="off", inference_engine="onnx"),
             )
 
 

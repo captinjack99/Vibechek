@@ -322,6 +322,12 @@ def _native_install_summary_lines(r: PreflightResult) -> list[str]:
             f"  OK ({nv.venv_dir}: vibechek {nv.vibechek_version or '?'} + "
             f"essentia {nv.essentia_version or '?'})"
         )
+    elif nv.error:
+        # A functional probe failure (e.g. the venv's interpreter no longer
+        # runs after a host-Python upgrade) — surface the real reason instead of
+        # a bare "not installed" that sends the user to reinstall blindly.
+        lines.append(f"  BROKEN: {nv.error}")
+        lines.append("  In the desktop app: Settings → System → Install Essentia (reinstalls the venv)")
     elif nv.vibechek_installed:
         lines.append(f"  Partial: vibechek installed at {nv.venv_dir}, essentia missing")
         lines.append("  In the desktop app: Settings → System → Install Essentia")

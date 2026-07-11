@@ -91,6 +91,73 @@ def test_probe_handles_absent_venv(
 
 
 # ---------------------------------------------------------------------------
+# FUNCTIONAL readiness probe: a shim on disk whose interpreter no longer runs
+# must read NOT installed (+ a reason), not READY. Regression: the probe set
+# vibechek_installed=True from `bin/vibechek` existing alone and swallowed the
+# exec check, so a host-Python upgrade left analyze to crash with a raw OSError
+# instead of routing to the "reinstall the engine" UI.
+# ---------------------------------------------------------------------------
+
+
+def _make_venv_with_shim(root: Path) -> Path:
+    """venv skeleton with BOTH a python3 and a vibechek shim present on disk."""
+    vd = root / "venv"
+    (vd / "bin").mkdir(parents=True)
+    (vd / "bin" / "python3").write_text("#!/bin/sh\n")
+    (vd / "bin" / "vibechek").write_text("#!/bin/sh\n")
+    return vd
+
+
+def test_probe_reports_ready_when_interpreter_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live interpreter → vibechek_installed True, no error."""
+    vd = _make_venv_with_shim(tmp_path)
+    monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
+    monkeypatch.setattr(native_install, "VENV_DIR", vd)
+    monkeypatch.setattr(native_install, "_venv_python_runs", lambda _p: True)
+
+    status = native_install.probe_native_venv()
+
+    assert status.vibechek_installed is True
+    assert status.error is None
+
+
+def test_probe_dead_interpreter_reports_not_ready_with_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A present shim over a dead interpreter must NOT report installed — it must
+    downgrade to not-ready and carry an actionable reason."""
+    vd = _make_venv_with_shim(tmp_path)
+    monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
+    monkeypatch.setattr(native_install, "VENV_DIR", vd)
+    # Simulate `<venv>/bin/python -c "import sys"` failing (OSError / nonzero).
+    monkeypatch.setattr(native_install, "_venv_python_runs", lambda _p: False)
+
+    status = native_install.probe_native_venv()
+
+    assert status.vibechek_installed is False
+    assert status.error == "venv interpreter broken — reinstall the engine"
+    # venv_vibechek is still recorded (the file exists) — only readiness flips.
+    assert status.venv_vibechek is not None
+
+
+def test_venv_python_runs_executes_the_interpreter(tmp_path: Path) -> None:
+    """The helper is FUNCTIONAL, not existence-based: a real python passes, a
+    missing/garbage path fails (never raises)."""
+    import sys
+
+    # The test runner's own interpreter genuinely runs `import sys`.
+    assert native_install._venv_python_runs(Path(sys.executable)) is True
+    # A path that doesn't exist → OSError swallowed → False (not an exception).
+    assert native_install._venv_python_runs(tmp_path / "nope" / "python") is False
+    # A non-executable text file that only LOOKS like an interpreter → False.
+    fake = tmp_path / "python3"
+    fake.write_text("#!/bin/sh\necho nope\n")
+    assert native_install._venv_python_runs(fake) is False
+
+
+# ---------------------------------------------------------------------------
 # ML-stack install ceiling: the GPU wheel set is multi-GB and must get the
 # 2 h wall-clock (live-verified: the 15 min ceiling killed a real CUDA-stack
 # install mid-download on an ordinary connection). CPU sets keep 30 min.
@@ -154,7 +221,14 @@ def test_ml_install_gpu_stack_gets_two_hour_ceiling(
     packages, timeout = _run_install_capturing_ml_step(
         tmp_path, monkeypatch, engine="onnx", has_nvidia=True,
     )
-    assert "onnxruntime-gpu" in packages
+    # onnxruntime-gpu is PINNED to the CUDA-12 line (see ONNXRUNTIME_GPU_SPEC):
+    # an unpinned install resolves to the CUDA-13-only 1.27.0 and then
+    # `import onnxruntime` hard-crashes against the cu12 wheels installed here.
+    from vibechek.wsl import ONNXRUNTIME_GPU_SPEC
+
+    assert ONNXRUNTIME_GPU_SPEC in packages
+    assert "onnxruntime-gpu" not in packages, "must be the pinned spec, not bare"
+    assert any(p.startswith("onnxruntime-gpu") for p in packages)
     assert any(p.startswith("nvidia-") for p in packages)
     assert timeout == 60 * 120
 

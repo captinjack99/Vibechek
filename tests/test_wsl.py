@@ -1411,3 +1411,296 @@ def test_native_venv_status_to_dict_is_jsonable() -> None:
     rt = json.loads(s)
     assert rt["essentia_installed"] is True
     assert rt["vibechek_version"] == "0.3.0-beta.1"
+
+
+# ---------------------------------------------------------------------------
+# onnxruntime-gpu CUDA-12 pin. Unpinned resolves to the CUDA-13-only 1.27.0 and
+# `import onnxruntime` then hard-crashes on the cu12 wheels we install alongside
+# (libcudart.so.13 missing). The bootstrap MUST carry the ceiling.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("engine", ["onnx", "native"])
+def test_user_bootstrap_pins_onnxruntime_gpu_to_cuda12_line(engine: str) -> None:
+    from vibechek.wsl import ONNXRUNTIME_GPU_SPEC, _user_bootstrap
+
+    assert ONNXRUNTIME_GPU_SPEC == "onnxruntime-gpu<1.27"
+    script = _user_bootstrap(engine)
+    # The pin must appear on the GPU install line, quoted for bash so the `<`
+    # is a literal version specifier and not an input redirect.
+    assert f'"{ONNXRUNTIME_GPU_SPEC}"' in script
+    # And never the bare unpinned form on the GPU branch.
+    assert "essentia onnxruntime-gpu " not in script
+
+
+def test_user_bootstrap_essentia_tf_has_no_onnxruntime_pin() -> None:
+    """The TF engine installs essentia-tensorflow, not onnxruntime — the pin is
+    irrelevant there and must not leak in."""
+    from vibechek.wsl import _user_bootstrap
+
+    assert "onnxruntime" not in _user_bootstrap("essentia_tf")
+
+
+# ---------------------------------------------------------------------------
+# CUDA-libs install failure must go through _explain_install_failure (the
+# cause-detector already used for the sibling essentia paths) instead of a
+# hardcoded "check your network" hint.
+# ---------------------------------------------------------------------------
+
+
+def test_explain_install_failure_cuda_libs_detects_disk_full() -> None:
+    from vibechek.wsl import _explain_install_failure
+
+    msg = _explain_install_failure(3, ["pip: No space left on device"], phase="cuda-libs")
+    assert "disk space" in msg.lower()
+    assert "network" not in msg.lower()  # must NOT misdiagnose a full disk
+
+
+def test_explain_install_failure_cuda_libs_generic_falls_back_to_network_and_venv() -> None:
+    """When nothing specific matched, keep the original network + missing-venv
+    guidance rather than emitting no hint at all."""
+    from vibechek.wsl import _explain_install_failure
+
+    msg = _explain_install_failure(1, ["some opaque pip traceback"], phase="cuda-libs")
+    low = msg.lower()
+    assert "network" in low
+    assert "set up now" in low or "install essentia" in low
+
+
+def test_install_cuda_libs_failure_routes_through_explain(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rc!=0 path must build its message via _explain_install_failure — so a
+    disk-full failure reports the disk hint, not the old network-only text."""
+    import threading
+
+    from vibechek import wsl as wsl_mod
+
+    monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(wsl_mod.shutil, "which", lambda _n: "C:\\fake\\wsl.exe")
+    monkeypatch.setattr(wsl_mod, "_stage_script_for_wsl", lambda s: tmp_path / f"s-{id(s)}")
+    monkeypatch.setattr(wsl_mod, "win_to_wsl_path", lambda s: s)
+    monkeypatch.setattr(
+        wsl_mod, "_start_cancellation_watchdog",
+        lambda proc, on_cancel=None: (threading.Event(), {"v": False}),
+    )
+    import vibechek.cancellation as cancel_mod
+    monkeypatch.setattr(cancel_mod, "is_cancelled", lambda: False)
+
+    class _FakeProc:
+        pid = 4242
+        stdout = iter([b"[1/3] Installing...\n", b"ERROR: No space left on device\n"])
+
+        def wait(self, timeout=None):
+            return 3
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", lambda *a, **k: _FakeProc())
+
+    result = wsl_mod.install_cuda_libs_in_wsl("Ubuntu", ["libcublas.so.11"])
+    assert result["ok"] is False
+    assert "disk space" in result["error"].lower()
+    # The old hardcoded message always said this even for a full disk.
+    assert "curl https://pypi.org" not in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# ensure_engine_runtime — the zero-setup self-heal (DETECT -> SELF-HEAL -> RUN)
+# ---------------------------------------------------------------------------
+
+
+def _win_wsl(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vibechek import wsl as wsl_mod
+    monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(wsl_mod.shutil, "which", lambda _n: "C:\\fake\\wsl.exe")
+
+
+def test_engine_stack_imports_maps_engine_to_stack() -> None:
+    from vibechek.wsl import _engine_stack_imports
+
+    # onnx + native both run onnxruntime (the CUDA-skew crash point).
+    assert "onnxruntime" in _engine_stack_imports("onnx")
+    assert "onnxruntime" in _engine_stack_imports("native")
+    # essentia_tf runs essentia-tensorflow, not onnxruntime.
+    assert _engine_stack_imports("essentia_tf") == "import essentia"
+
+
+def test_probe_engine_stack_import_inconclusive_without_wsl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No wsl.exe -> the probe returns ok=True (inconclusive), NEVER False — we
+    must never trigger a reinstall off a probe that couldn't even run."""
+    from vibechek import wsl as wsl_mod
+    monkeypatch.setattr(wsl_mod.shutil, "which", lambda _n: None)
+    ok, detail = wsl_mod._probe_engine_stack_import("Ubuntu", "onnx")
+    assert ok is True
+    assert "skipped" in detail
+
+
+def test_ensure_engine_runtime_repairs_broken_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken ML-stack import triggers an in-place reinstall, then re-verifies
+    and reports the heal."""
+    from vibechek import wsl as wsl_mod
+    _win_wsl(monkeypatch)
+
+    calls = {"probe": 0, "install": 0}
+
+    def fake_probe(distro, engine):
+        calls["probe"] += 1
+        # First probe: broken. Second (post-repair): healthy.
+        return (calls["probe"] > 1, "libcudart.so.13: cannot open shared object file")
+
+    def fake_install(distro, on_progress=None, engine="essentia_tf"):
+        calls["install"] += 1
+        return {"ok": True}
+
+    monkeypatch.setattr(wsl_mod, "_probe_engine_stack_import", fake_probe)
+    monkeypatch.setattr(wsl_mod, "install_vibechek_in_wsl", fake_install)
+
+    result = wsl_mod.ensure_engine_runtime("Ubuntu", "onnx")
+    assert result["ok"] is True
+    assert "ml-stack" in result["healed"]
+    assert calls["install"] == 1
+    assert calls["probe"] == 2  # detect + re-verify
+
+
+def test_ensure_engine_runtime_reinstall_still_broken_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibechek import wsl as wsl_mod
+    _win_wsl(monkeypatch)
+
+    monkeypatch.setattr(
+        wsl_mod, "_probe_engine_stack_import",
+        lambda d, e: (False, "still broken"),
+    )
+    monkeypatch.setattr(
+        wsl_mod, "install_vibechek_in_wsl",
+        lambda d, on_progress=None, engine="essentia_tf": {"ok": True},
+    )
+
+    result = wsl_mod.ensure_engine_runtime("Ubuntu", "onnx")
+    assert result["ok"] is False
+    assert result["phase"] == "stack-repair"
+    assert "still broken" in result["error"]
+
+
+def test_ensure_engine_runtime_autoheal_disabled_detects_but_does_not_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VIBECHEK_NO_AUTOHEAL suppresses the repair but STILL surfaces an honest
+    failure — no silent proceed into a doomed analyze."""
+    from vibechek import wsl as wsl_mod
+    _win_wsl(monkeypatch)
+    monkeypatch.setenv("VIBECHEK_NO_AUTOHEAL", "1")
+
+    def _must_not_install(*a, **k):  # pragma: no cover - the assertion IS the test
+        raise AssertionError("repair ran despite VIBECHEK_NO_AUTOHEAL=1")
+
+    monkeypatch.setattr(
+        wsl_mod, "_probe_engine_stack_import", lambda d, e: (False, "broken onnxruntime"),
+    )
+    monkeypatch.setattr(wsl_mod, "install_vibechek_in_wsl", _must_not_install)
+
+    result = wsl_mod.ensure_engine_runtime("Ubuntu", "onnx")
+    assert result["ok"] is False
+    assert result.get("autoheal_disabled") is True
+    assert "broken onnxruntime" in result["error"]
+
+
+def test_ensure_engine_runtime_restores_cuda_libs_for_tf_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """essentia_tf + GPU visible + missing CUDA libs (cuda-env.sh wiped) → the
+    self-heal restores them via install_cuda_libs_in_wsl and announces it."""
+    import types
+
+    from vibechek import wsl as wsl_mod
+    _win_wsl(monkeypatch)
+
+    # ML stack imports fine — only the GPU libs are missing.
+    monkeypatch.setattr(wsl_mod, "_probe_engine_stack_import", lambda d, e: (True, ""))
+    monkeypatch.setattr(
+        wsl_mod, "probe_engine_gpu",
+        lambda distro, force=False, engine="essentia_tf": types.SimpleNamespace(
+            gpu_hardware_visible=True, missing_cuda_libs=["libcublas.so.11"],
+        ),
+    )
+    cuda_calls: dict = {}
+
+    def fake_cuda(distro, missing, on_progress=None):
+        cuda_calls["missing"] = missing
+        return {"ok": True}
+
+    monkeypatch.setattr(wsl_mod, "install_cuda_libs_in_wsl", fake_cuda)
+
+    progress: list[str] = []
+    result = wsl_mod.ensure_engine_runtime(
+        "Ubuntu", "essentia_tf", on_progress=lambda d, t, m: progress.append(m),
+    )
+    assert result["ok"] is True
+    assert "cuda-libs" in result["healed"]
+    assert cuda_calls["missing"] == ["libcublas.so.11"]
+    assert any("Restoring GPU libraries" in m for m in progress)
+
+
+def test_ensure_engine_runtime_onnx_skips_cuda_env_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """onnx/native get their cu12 wheels IN the venv (not via cuda-env.sh), so the
+    TF-only CUDA-lib restore must be skipped — probe_engine_gpu is never called."""
+    from vibechek import wsl as wsl_mod
+    _win_wsl(monkeypatch)
+
+    monkeypatch.setattr(wsl_mod, "_probe_engine_stack_import", lambda d, e: (True, ""))
+
+    def _must_not_probe(*a, **k):  # pragma: no cover - the assertion IS the test
+        raise AssertionError("probe_engine_gpu called for the onnx cuda-env path")
+
+    monkeypatch.setattr(wsl_mod, "probe_engine_gpu", _must_not_probe)
+
+    result = wsl_mod.ensure_engine_runtime("Ubuntu", "onnx")
+    assert result["ok"] is True
+    assert result["healed"] == []
+
+
+def test_ensure_engine_runtime_gpu_restore_failure_is_non_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed GPU-lib restore must NOT fail the analyze — GPU is an accelerator;
+    the run falls back to CPU."""
+    import types
+
+    from vibechek import wsl as wsl_mod
+    _win_wsl(monkeypatch)
+
+    monkeypatch.setattr(wsl_mod, "_probe_engine_stack_import", lambda d, e: (True, ""))
+    monkeypatch.setattr(
+        wsl_mod, "probe_engine_gpu",
+        lambda distro, force=False, engine="essentia_tf": types.SimpleNamespace(
+            gpu_hardware_visible=True, missing_cuda_libs=["libcublas.so.11"],
+        ),
+    )
+    monkeypatch.setattr(
+        wsl_mod, "install_cuda_libs_in_wsl",
+        lambda d, missing, on_progress=None: {"ok": False, "error": "pip timeout"},
+    )
+
+    result = wsl_mod.ensure_engine_runtime("Ubuntu", "essentia_tf")
+    assert result["ok"] is True  # non-fatal
+    assert result.get("gpu_heal_failed") == "pip timeout"
+
+
+def test_ensure_engine_runtime_non_windows_is_noop() -> None:
+    """On Linux/macOS the WSL self-heal is not applicable and must no-op cleanly."""
+    from unittest.mock import patch
+
+    from vibechek import wsl as wsl_mod
+    with patch.object(wsl_mod, "IS_WINDOWS", False):
+        result = wsl_mod.ensure_engine_runtime("Ubuntu", "onnx")
+    assert result["ok"] is True
+    assert result.get("skipped") == "not-windows"

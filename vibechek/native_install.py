@@ -94,6 +94,24 @@ def to_dict(s: NativeVenvStatus) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _venv_python_runs(python_path: Path) -> bool:
+    """True iff the venv's interpreter actually launches (`python -c "import sys"`).
+
+    Cheap functional liveness check (~50 ms, no heavy imports). Any OSError
+    (interpreter file gone, not executable, or a broken symlink to a removed
+    host Python) or a non-zero exit means the interpreter is dead — see
+    ``probe_native_venv`` for why file-existence alone is not sufficient.
+    """
+    try:
+        result = subprocess.run(
+            [str(python_path), "-c", "import sys"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def probe_native_venv(engine: str = "essentia_tf") -> NativeVenvStatus:
     """Snapshot the managed venv state for the given inference engine.
 
@@ -131,19 +149,37 @@ def probe_native_venv(engine: str = "essentia_tf") -> NativeVenvStatus:
     cli = next((p for p in candidate_clis if p.exists()), None)
     if cli is not None:
         status.venv_vibechek = str(cli)
-        status.vibechek_installed = True
-        # Best-effort version probe — small subprocess, ~50ms
-        try:
-            result = subprocess.run(
-                [str(cli), "--version"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                m = re.search(r"version\s+(\S+)", result.stdout)
-                if m:
-                    status.vibechek_version = m.group(1)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        # FUNCTIONAL readiness, not existence-only. The shim file being on disk
+        # does NOT prove its shebang'd interpreter still runs: a host-Python
+        # upgrade/removal (`brew upgrade python@3.11` dropping 3.11, a distro
+        # `apt` release-upgrade moving `python3`) leaves the venv files intact
+        # while the interpreter they point at is gone. An existence-only probe
+        # then reports READY, and analyze dies at `subprocess.Popen` with a raw
+        # OSError ("cannot execute: required file not found") instead of routing
+        # to the "reinstall the engine" UI. Gate `vibechek_installed` on the
+        # cheapest possible interpreter check — `python -c "import sys"` — and
+        # record a reason on failure. Previously the exec check (`vibechek
+        # --version` below) was SWALLOWED by a bare `except: pass` AFTER
+        # vibechek_installed was already set True, so a dead interpreter still
+        # reported ready.
+        if _venv_python_runs(py):
+            status.vibechek_installed = True
+            # Best-effort version string only — its failure no longer flips
+            # readiness (interpreter liveness above is the gate). A half-broken
+            # vibechek package that imports-fails is a separate concern.
+            try:
+                result = subprocess.run(
+                    [str(cli), "--version"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    m = re.search(r"version\s+(\S+)", result.stdout)
+                    if m:
+                        status.vibechek_version = m.group(1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        else:
+            status.error = "venv interpreter broken — reinstall the engine"
 
     # Disk-only check for essentia (avoids the ~10s TF load that
     # `import essentia` would trigger). NB: the wildcard segment must be
@@ -324,8 +360,15 @@ def install_essentia_native(
         if IS_MAC:
             ml_packages = ["essentia", "onnxruntime"]
         elif shutil.which("nvidia-smi"):
+            # onnxruntime-gpu MUST be pinned to the CUDA-12 release line to match
+            # the nvidia-*-cu12 wheels below — an unpinned install resolves to
+            # 1.27.0 (CUDA-13-only) and then `import onnxruntime` hard-crashes on
+            # the cu12 runtime with "libcudart.so.13: cannot open shared object
+            # file". Shared with the WSL bootstrap via ONNXRUNTIME_GPU_SPEC so
+            # both install paths stay in lockstep.
+            from vibechek.wsl import ONNXRUNTIME_GPU_SPEC  # noqa: PLC0415
             ml_packages = [
-                "essentia", "onnxruntime-gpu",
+                "essentia", ONNXRUNTIME_GPU_SPEC,
                 "nvidia-cuda-runtime-cu12", "nvidia-cudnn-cu12", "nvidia-cublas-cu12",
                 "nvidia-cufft-cu12", "nvidia-curand-cu12", "nvidia-cusparse-cu12",
                 "nvidia-cuda-nvrtc-cu12",

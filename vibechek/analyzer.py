@@ -2477,7 +2477,10 @@ def _analyze_via_wsl(
         # ahead of the app) is left alone. Fast path: vibechek package only,
         # targeting the engine's venv; clear error only if the update fails.
         if _wsl_install_is_outdated(wsl_vibechek_version, _sidecar_version):
-            from vibechek.wsl import upgrade_vibechek_in_wsl  # noqa: PLC0415
+            from vibechek.wsl import (  # noqa: PLC0415
+                ensure_engine_runtime,
+                upgrade_vibechek_in_wsl,
+            )
             log.info(
                 "WSL vibechek %s < sidecar %s — auto-updating in place (engine=%s)",
                 wsl_vibechek_version, _sidecar_version, config.inference_engine,
@@ -2492,12 +2495,36 @@ def _analyze_via_wsl(
             )
             if up.get("cancelled"):
                 raise cancellation.CancelledError("Analysis cancelled by user")
-            if not up.get("ok"):
+            # A code-only upgrade can succeed yet leave the ML stack import-broken
+            # (onnxruntime/CUDA skew): upgrade_vibechek_in_wsl now flags that as
+            # `stack_broken` rather than a hard failure so we can self-heal it
+            # below instead of dead-ending. Any OTHER upgrade failure (the code
+            # re-pull itself failed) is genuinely fatal.
+            if not up.get("ok") and not up.get("stack_broken"):
                 raise RuntimeError(
                     f"WSL vibechek was out of date ({wsl_vibechek_version} < "
                     f"{_sidecar_version}) and the automatic in-place update "
                     f"failed: {up.get('error', 'unknown error')}. Re-run "
                     f"Settings → \"Set up WSL\" to repair it."
+                )
+            # DETECT → SELF-HEAL → RUN (zero-setup doctrine): after the code
+            # update, verify the venv can import its ML stack and that the GPU
+            # libs are present; repair in place if not. This turns a WSL
+            # reinstall / app upgrade into a self-healing next-analyze instead of
+            # a silently-dead GPU or a raw import crash. Multi-GB repair
+            # downloads announce themselves via on_progress; opt out with
+            # VIBECHEK_NO_AUTOHEAL (which still reports an honest failure).
+            heal = ensure_engine_runtime(
+                distro, config.inference_engine, on_progress=on_progress,
+            )
+            if heal.get("cancelled"):
+                raise cancellation.CancelledError("Analysis cancelled by user")
+            if not heal.get("ok"):
+                raise RuntimeError(
+                    f"The {config.inference_engine} analysis engine in {distro} "
+                    f"could not be repaired automatically: "
+                    f"{heal.get('error', 'unknown error')}. Re-run Settings → "
+                    f"\"Set up WSL\" to repair it."
                 )
 
     result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir)
