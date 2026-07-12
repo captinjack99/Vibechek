@@ -66,7 +66,12 @@ onnx = [
 ]
 onnx-gpu = [
     "essentia>=2.1b6.dev1110; platform_system != 'Windows'",
-    "onnxruntime-gpu>=1.19",
+    # Ceiling matches wsl.ONNXRUNTIME_GPU_SPEC (a coherence test locks them
+    # together): 1.19-1.26 are the CUDA-12 line matching the nvidia-*-cu12
+    # wheels below; 1.27 moved to CUDA-13-only, which hard-crashes import
+    # against this wheel set (libcudart.so.13 missing) — the exact skew that
+    # broke a real onnx install before the managed-venv path was pinned.
+    "onnxruntime-gpu>=1.19,<1.27",
     "nvidia-cuda-runtime-cu12",
     "nvidia-cudnn-cu12",
     "nvidia-cublas-cu12",

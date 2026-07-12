@@ -1704,3 +1704,30 @@ def test_ensure_engine_runtime_non_windows_is_noop() -> None:
         result = wsl_mod.ensure_engine_runtime("Ubuntu", "onnx")
     assert result["ok"] is True
     assert result.get("skipped") == "not-windows"
+
+
+def test_pyproject_onnx_gpu_extra_matches_the_bootstrap_pin() -> None:
+    """The manual `pip install vibechek[onnx-gpu]` path and the managed-venv
+    bootstrap must carry the SAME onnxruntime-gpu ceiling: both install the
+    nvidia-*-cu12 wheel set, and an unpinned resolve (1.27+ = CUDA-13-only)
+    hard-crashes `import onnxruntime` against it. The extra stayed unpinned
+    after the bootstrap was fixed — this locks the two sites together so a
+    future bump can't fix one and strand the other."""
+    import re
+    from pathlib import Path
+
+    from vibechek.wsl import ONNXRUNTIME_GPU_SPEC
+
+    ceiling = re.search(r"<([\d.]+)", ONNXRUNTIME_GPU_SPEC)
+    assert ceiling, "the bootstrap spec must carry an upper bound"
+
+    pyproject = (Path(__file__).parent.parent / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    extra = re.search(r'"onnxruntime-gpu([^"]*)"', pyproject)
+    assert extra, "onnx-gpu extra must pin onnxruntime-gpu"
+    assert f"<{ceiling.group(1)}" in extra.group(1), (
+        f"pyproject's onnx-gpu extra ({extra.group(0)}) must carry the same "
+        f"ceiling as wsl.ONNXRUNTIME_GPU_SPEC ({ONNXRUNTIME_GPU_SPEC}) — both "
+        "feed the cu12 wheel set"
+    )
