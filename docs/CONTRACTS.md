@@ -107,6 +107,52 @@ The key pair is read-only surfacing: `ml_key` itself stays the audio read (embed
 keys measured 49% exact vs audio's 63% on the gold corpus, wrong 10:1 on disagreement —
 `internal/bughunt/score_tag_priors.py`), so tags flag for review, never override.
 
+`MLResult` also carries two **silent-degradation provenance** fields, `ml_genre_classifier`
+(`"clap"` | `"discogs"` — which audio model actually produced this track's genre) and
+`ml_degraded_heads` (the mood/vocal/danceability model heads that failed to *load* this
+run, so the track's energy/mood/vocal ran on a fallback). Unlike the reconciliation fields
+above, both are stamped inside `analyze_track`/`analyze_audio_features` during the initial
+worker pass, so — unusually for this optional-field family — they ARE present on the raw
+per-track `track_analyzed` notifications, not just the final report.
+
+### Report-level warning fields
+
+Separately, the **`AnalysisReport`** dict returned by the `analyze_directory` RPC (not
+`scan_only`, which is a filename-hints-only pass with no ML and none of these fields)
+carries transport-level warning fields attached by `rpc._analyze_directory` /
+`analyzer._build_report` / `analyzer._analyze_via_wsl` after the run finishes. Every one
+follows the same None-omitted contract — **absent when the run was clean**, present only
+when something degraded:
+
+| Field | Set when |
+|---|---|
+| `persist_error` / `persist_path` | The analyze succeeded but the auto-save to the analyses JSON failed (disk full, a cloud-sync/antivirus lock); `persist_path` is where the save was attempted. |
+| `priors_warning` | A Rekordbox tag-priors import existed but was dropped this run — an unreadable sidecar, or (on a FULL run only) 0 tracks matched because the library moved. |
+| `genre_fallback_warning` | CLAP was the selected genre classifier but N tracks silently fell back to Discogs (per-track embed failure, or CLAP never loaded for the worker). Derived by unioning every track's `ml_genre_classifier`. |
+| `model_degradation_warning` | One or more mood/vocal/danceability heads failed to load, so energy/mood/vocal ran on a fallback for the whole run. Derived by unioning every track's `ml_degraded_heads`. |
+| `runtime_healed` | The WSL engine environment was auto-repaired before this run (`wsl.ensure_engine_runtime`) — informational, the run then proceeded normally. |
+| `runtime_heal_warning` | That auto-repair could not restore GPU libraries, so this run fell back to CPU. |
+| `run_meta` | The resolved worker/GPU plan this run actually used (`engine`, `genre_classifier`, `requested_workers`, `effective_workers`, `gpu_workers`, `cpu_workers`, `gpu_reason`). Set on every non-trivial `analyze_directory` response (absent only on the early empty-library return, `total_files == 0`) — but it's **not declared in `generated.ts`/`index.ts`**, since the GUI doesn't read it live; only `rpc._record_run_history` reads it off the report to append a line to `logs/run_history.jsonl`, which `doctor`'s "last analyze run" section reads back. |
+
+`persist_error`/`priors_warning`/`genre_fallback_warning`/`model_degradation_warning`/
+`runtime_healed`/`runtime_heal_warning`/`run_meta` are exactly the set `_record_run_history`
+copies into the durable run-history line (`vibechek/rpc.py`). All except `run_meta` are
+declared on `AnalysisReport` in `ui/src/types/index.ts` (hand-written — analyze's wire
+shape isn't code-generated) and surfaced by the GUI's post-analyze completion toast.
+
+`DuplicateSummary` (part of `DuplicateReport.summary`, also hand-written in `index.ts`
+since `DuplicateReport.to_dict()` renames/flattens the Python dataclass) similarly gained
+`phases_run` (which detection phases actually ran — `"md5"`, `"chromaprint"`) and
+`fpcalc_available` (false only when audio fingerprinting was requested but the `fpcalc`
+binary wasn't found, so that phase silently never ran). Both have non-`None` dataclass
+defaults (`[]` / `True`), so the Python side always emits them; `index.ts` still marks them
+optional (`phases_run?`, `fpcalc_available?`) for defensive parsing of older cached reports.
+
+`get_config`'s response gains a transport-level `config_warnings: string[]` field (not a
+`VibechekConfig` field, so it never round-trips back to disk on save) when `VibechekConfig.load()`
+had to snap one or more invalid/cross-platform saved values back to defaults — Settings
+shows a one-time "some saved settings were invalid and were reset" toast off this list.
+
 ## The five steps
 
 ### 1. Implement the handler

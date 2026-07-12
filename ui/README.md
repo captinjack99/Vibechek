@@ -48,7 +48,7 @@ ui/
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │  `vibechek rpc` (Python sidecar)                       │
-│  - 49 RPC methods, threadpool dispatch (8 workers)     │
+│  - 50 RPC methods, threadpool dispatch (8 workers)     │
 │  - Stdout lock keeps concurrent JSON frames atomic     │
 │  - Cooperative cancellation token                      │
 │  - All real work: analyzer, tagger, dedup, organize    │
@@ -146,7 +146,7 @@ npm run test:watch # watch mode
 npm run test:ui    # web UI for tests
 ```
 
-Tests cover (representative — 14 test files in total):
+Tests cover (representative — 17 test files in total):
 - `lib/keeperRules.test.ts` — pure auto-picker logic
 - `lib/review.test.ts` — genre-conflict severity / reason / provenance helpers
 - `api/rpc.test.ts` — JSON-RPC client wrappers + error mapping
@@ -198,12 +198,13 @@ beta builds ship without them (the updater is inert until a key is enrolled). Se
 
 ## Sidecar protocol
 
-JSON-RPC 2.0, one message per line on stdin/stdout. 49 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
+JSON-RPC 2.0, one message per line on stdin/stdout. 50 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
 
 | Method | What |
 |---|---|
 | `ping`, `version` | Health check |
 | `system_info`, `engine_gpu_status` | CPU/RAM/GPU (host) + actual-engine GPU probe |
+| `worker_budget` | Computes the real worker-slider max (max_workers, per-worker RAM, which RAM pool — the WSL VM's for WSL-routed engines) for an engine × genre-classifier pair; the Settings slider and the analyzer's own sizing share this one calculation so they can't disagree |
 | `preflight`, `wsl_status`, `doctor`, `verify_models`, `native_venv_status` | Readiness checks + diagnostics |
 | `install_wsl`, `install_vibechek_in_wsl`, `install_cuda_libs_in_wsl`, `install_essentia_native`, `upgrade_vibechek_in_wsl`, `repair_wsl_shim` | Auto-setup / GPU / version-drift repair |
 | `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` | One-click provisioning of the opt-in ONNX / CLAP-audio / online-resolver engines (cancellable, progress-emitting) |
@@ -229,6 +230,13 @@ All long ops emit `progress` notifications:
 {"jsonrpc":"2.0","method":"progress","params":{"current":50,"total":100,"message":"..."}}
 ```
 The Rust shell re-broadcasts these as Tauri events on channel `sidecar:progress`.
+
+The sidecar also emits a `notify` notification (re-broadcast as `sidecar:notify`) for
+startup warnings — e.g. a risky/hang-prone install path. `notify`/`ready` fire at sidecar
+startup, usually before `App.tsx` has mounted its listeners, and Tauri doesn't queue events
+for late subscribers — so the Rust shell buffers every notification it sees before the
+frontend is ready. `App.tsx` drains that buffer once on mount via the `drain_startup_notifications`
+Tauri command; anything emitted after the drain reaches the live `notify` listener instead.
 
 ## Troubleshooting
 

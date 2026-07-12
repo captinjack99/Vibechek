@@ -116,8 +116,24 @@ wsl -d Ubuntu-24.04 -- bash -lc '
 Essentia's bundled TensorFlow (2.5) can use an NVIDIA GPU to speed up
 analysis by ~3-10×. Useful if you have a 5,000+ track library. The runtime
 libraries TF needs (`libcublas`, `libcufft`, `libcudnn`, `libcusparse`) are
-**not** installed by default on WSL Ubuntu. Vibechek detects this exact
-state and exposes a one-click fix:
+**not** installed by default on WSL Ubuntu — and a WSL reinstall or Ubuntu
+upgrade wipes them again even if they were present before.
+
+**Since v0.8.0-beta this self-heals.** Before dispatching an analyze on the
+essentia-tensorflow engine, Vibechek verifies the WSL venv can actually
+import its ML stack and checks whether an NVIDIA GPU is visible but the CUDA
+libs are missing; if so it restores them automatically — a "Restoring GPU
+libraries…" progress line appears (a one-time multi-GB download, since the
+cuDNN/cuBLAS wheels are large) and analyze continues once it's done. You don't
+need to click anything. If the restore
+fails for some reason, analyze still proceeds on CPU with the reason
+recorded. Set `VIBECHEK_NO_AUTOHEAL=1` to disable automatic repairs (Vibechek
+still detects and reports the problem honestly; repairing then requires the
+manual button below).
+
+The **Enable GPU (install CUDA wheels)** button in **Settings → System** is
+now an accelerator rather than the only path — use it to trigger the same
+repair on demand instead of waiting for the next analyze:
 
 1. Open **Settings → System**.
 2. If you have an NVIDIA GPU but the engine probe shows:
@@ -125,8 +141,9 @@ state and exposes a one-click fix:
    libraries are missing"*, click **Enable GPU (install CUDA wheels)**.
 3. The installer downloads NVIDIA's CUDA runtime wheels from PyPI
    (`nvidia-cublas-cu11`, `nvidia-cudnn-cu11`, `nvidia-cufft-cu11`,
-   `nvidia-cusparse-cu11`) into the managed venv — about 200 MB total,
-   ~30 seconds on a normal connection.
+   `nvidia-cusparse-cu11`, and related cu11 packages) into the managed venv —
+   roughly 1-2 GB total (cuDNN alone is large), a few minutes on a normal
+   connection.
 4. The probe automatically re-runs; the row turns green and shows your card
    name (e.g. "NVIDIA GeForce RTX 4070 Laptop GPU").
 
@@ -138,9 +155,12 @@ venv's `vibechek` shim is patched to source it on launch.
 
 Vibechek will not lie to you about the GPU. If your card is visible to the
 host but Essentia can't actually use it (driver / lib version mismatch), the
-UI says so plainly and tells you what's wrong. CPU mode is fast enough on a
-modern multi-core system — typical throughput is ~25-40 tracks/min with all
-cores in use.
+UI says so plainly and tells you what's wrong. Readiness checks actually run
+the venv's Python interpreter rather than just checking that the venv folder
+exists, so a venv left behind by a removed/upgraded host Python is reported
+as broken (and repaired) instead of falsely showing READY. CPU mode is fast
+enough on a modern multi-core system — typical throughput is ~25-40
+tracks/min with all cores in use.
 
 **Doing it by hand:**
 
@@ -161,10 +181,15 @@ Then set `LD_LIBRARY_PATH` to include the resulting `~/.vibechek/venv/lib/python
 > default engine (CUDA verified on an RTX 4070; ROCm/CoreML wired but
 > hardware-unverified). Turn it on in Settings → **Set up ONNX engine**: it
 > provisions a separate `~/.vibechek/venv-onnx` (a second WSL venv on Windows) and
-> auto-picks the GPU runtime for your hardware. For a manual CLI install:
-> `pip install vibechek[onnx]` (CPU) or `pip install vibechek[onnx-gpu]`
-> (NVIDIA/CUDA); on AMD Linux the setup uses `onnxruntime-rocm` and on macOS the
-> CoreML provider ships in the base `onnxruntime` wheel. Then
+> auto-picks the GPU runtime for your hardware — the in-app installer pins
+> `onnxruntime-gpu` to the CUDA-12 line (`<1.27`; an unpinned install used to
+> resolve to a CUDA-13-only build that crashed the ONNX engine on import with
+> a missing `libcudart.so.13`) alongside the matching `nvidia-*-cu12` runtime
+> wheels. For a manual CLI install: `pip install vibechek[onnx]` (CPU) or
+> `pip install vibechek[onnx-gpu]` (NVIDIA/CUDA — this extra is unpinned, so
+> pin `onnxruntime-gpu<1.27` yourself if you hit the CUDA-13 crash); on AMD
+> Linux the setup uses `onnxruntime-rocm` and on macOS the CoreML provider
+> ships in the base `onnxruntime` wheel. Then
 > `vibechek download-models --engine onnx`.
 > See [docs/ONNX_MIGRATION.md](ONNX_MIGRATION.md).
 >

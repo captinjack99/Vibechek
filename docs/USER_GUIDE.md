@@ -75,7 +75,51 @@ A progress overlay at the bottom shows current track / total + elapsed time. You
 - Click around other tabs — the analyze keeps running in the background.
 - Hit **Cancel** to stop. Partial results aren't kept; restart from scratch when you're ready.
 
-When done, the track list populates. Each row shows genre, BPM, key, energy bar.
+Before dispatching to a WSL-routed engine (essentia-tensorflow, ONNX, or the opt-in
+CLAP / online-resolver genre engines), Vibechek quietly verifies that environment
+still imports its ML stack and repairs it in place if not — including restoring GPU
+libraries a WSL reinstall wiped out. If that happens you'll see a line like
+"Restoring GPU libraries…" scroll through the progress overlay instead of the run
+just failing; it's normal (a one-time multi-GB download of the cuDNN/cuBLAS wheels,
+usually a few minutes) and then analyze proceeds. Set the environment
+variable `VIBECHEK_NO_AUTOHEAL=1` if you'd rather Vibechek only report a broken
+environment and never repair it automatically.
+
+If you asked for more workers than fit in memory for the current engine and genre
+classifier, the overlay also shows a line like *"Workers capped 16→2: CLAP needs
+~4.4 GB each; the WSL VM has 15.5 GB"* — the run doesn't silently do less than you
+asked for. See **Settings → Analysis** below for why the number varies.
+
+When done, the track list populates. Each row shows genre, BPM, key, energy bar. A
+toast in the corner reports how the run actually went — see the next section.
+
+### What the completion toast tells you
+
+The analyze completion toast is honest about anything that went differently than
+"clean run, everything written":
+
+- **Per-track failures** — "N tracks failed" with a pointer to the **Errors** filter.
+- **Could not be saved** — if writing the results to disk failed (disk full, a
+  OneDrive/Google Drive or antivirus lock on the analyses file), the toast says so
+  explicitly and tells you to re-run or export before closing the app — the results
+  are on screen but not yet safe on disk.
+- **Rekordbox priors stopped matching** — if you've imported a Rekordbox XML (see
+  below) and none of its entries matched this run, the toast tells you your library
+  was likely moved or renamed and to re-import the XML.
+- **A genre classifier or model fell back** — e.g. CLAP was selected but unavailable
+  for some tracks and those were scored by Discogs instead, or a mood/vocal model
+  failed to load (the affected fields are named).
+- **The engine environment was auto-repaired** — "engine environment repaired
+  automatically" if the self-heal above kicked in, or a caution if a GPU-library
+  restore failed and the run fell back to CPU.
+
+**"Analyze new (N)"** (the incremental option, next to "Analyze with ML" once a
+library has already been analyzed once) only scans tracks it hasn't seen before and
+merges them into your existing saved results. If Vibechek can't currently read the
+existing saved analysis for this library — a transient file lock from antivirus or
+cloud sync, or a truncated file from a crash — it **refuses to run** rather than risk
+overwriting your whole library's results with just the newly scanned tracks. Close
+whatever might be locking the file and try again, or run a full re-analyze.
 
 ### Step 4 — Click a track to see details
 
@@ -137,7 +181,10 @@ Two passes run:
 1. **MD5 hash** — catches byte-identical files (the same MP3 saved twice).
 2. **Chromaprint fingerprint** — catches re-encoded copies (same song as FLAC and MP3, or 320 kbps and 192 kbps).
 
-(If you don't have `fpcalc` installed, only MD5 runs. The app says so.)
+(If you don't have `fpcalc` installed, only MD5 runs — a yellow "Fingerprint scan
+skipped" banner above the results says so explicitly, so a scan that only found
+exact-hash duplicates never reads as a clean, thorough sweep. It also names what
+you're missing: re-encodes and re-tags of the same track weren't compared.)
 
 ### Variants aren't duplicates
 
@@ -301,38 +348,84 @@ Requires `soundfile` (the optional `[cdj]` extra) or `ffmpeg` on your PATH — s
 
 Top of the page:
 
-- **Ready to analyze?** banner — green if Essentia + models are ready, otherwise tells you what's missing.
+- **Ready to analyze?** banner — green if the *engine you've selected* is ready
+  (a green Essentia row never appears under a red title for an engine that can't
+  actually serve it), otherwise tells you what's missing.
 - **System** — CPU cores, RAM, GPU. The GPU row shows what the actual analyze
   engine sees, not just what your host has — see the next section.
-- **Analysis** — workers slider (snaps to recommended = cores − 1), GPU auto/on/off, models directory + download button.
+- **Analysis** — a workers slider whose max is computed for your current engine +
+  genre classifier + measured resources, GPU auto/on/off, models directory + download
+  button.
 
 ### System — what the GPU row really means
 
 Vibechek goes out of its way to never lie to you about GPU acceleration. The
-GPU row in **Settings → System** asks the *actual analyze engine* (Essentia's
-bundled TensorFlow, running inside WSL on Windows) what it can see. It is
-NOT a host-side `nvidia-smi` check. This means the value reflects what
-analysis will really use.
+GPU row in **Settings → System** asks the *actual analyze engine* what it can
+see — Essentia's bundled TensorFlow inside WSL for essentia-tensorflow, ONNX
+Runtime's provider list for the ONNX engine, and an honest "CPU-only" for the
+bundled native engine (below). It is NOT a host-side `nvidia-smi` check. This
+means the value reflects what analysis will really use, and GPU *workers* are
+only counted when the engine can actually register the device — a card that's
+visible but unusable never gets reported as "N GPU workers" that silently run
+on CPU.
 
-Three possible states:
+Possible states for essentia-tensorflow / ONNX:
 
-- **GPU available** (green) — TF registered the GPU. Analyze will use it.
-  Shows your card name, e.g. *"NVIDIA GeForce RTX 4070 Laptop GPU"*, plus
-  the driver version and TF version.
+- **GPU available** (green) — the engine registered the GPU. Analyze will use
+  it. Shows your card name, e.g. *"NVIDIA GeForce RTX 4070 Laptop GPU"*, plus
+  the driver version and TF/ONNX Runtime version.
 
-- **GPU detected but TensorFlow can&apos;t use it** (yellow) — your card is
-  visible to WSL, but Essentia's TF couldn&apos;t load the CUDA runtime
-  libraries it needs (typically `libcublas`, `libcufft`, `libcudnn`,
-  `libcusparse`). Analysis would silently fall back to CPU. Click
-  **Enable GPU (install CUDA libs)** to install them as NVIDIA&apos;s
-  PyPI wheels into the managed venv (~200 MB, ~30 sec — no apt repo, no root).
+- **GPU detected but the engine can&apos;t use it** (yellow) — your card is
+  visible to WSL, but the required CUDA runtime libraries (typically
+  `libcublas`, `libcufft`, `libcudnn`, `libcusparse`) aren't loadable. This is
+  the case Vibechek now **self-heals automatically**: the next time you click
+  Analyze, it checks the engine environment first and restores missing CUDA
+  libraries in place, so this yellow state is usually transient — you'll see
+  "Restoring GPU libraries…" in the progress overlay instead of a silent
+  CPU fallback. **Enable GPU (install CUDA wheels)** here does the same repair
+  on demand, without waiting for the next analyze (roughly 1-2 GB, a few
+  minutes — no apt repo, no root). Set `VIBECHEK_NO_AUTOHEAL=1` to turn off the automatic
+  repair-on-analyze and rely on this button instead.
 
 - **No GPU** (grey) — either you have no NVIDIA card or the WSL kernel
   isn&apos;t passing it through. Analysis runs on CPU. On a modern multi-core
   CPU this is still fast — ~25-40 tracks/min with workers ≈ cores − 1.
 
-The probe is slow the first time (~10 sec to spin up TF inside WSL) and then
+The **native engine** (Windows default) is honest about a simpler fact: its
+bundled ONNX Runtime ships no GPU execution provider, so this row just says
+it's CPU-only, even if your host has a GPU. Switch to the ONNX or
+essentia-tensorflow engine for GPU acceleration.
+
+The probe is slow the first time (~10 sec to spin up the engine) and then
 cached for 5 minutes. Click **Re-probe** to force a fresh check.
+
+### Analysis — the worker slider
+
+The worker slider's maximum isn't a fixed number — it's computed for your
+*current engine + genre classifier* against measured resources, so it can
+never offer more workers than will actually fit. On a WSL-routed engine
+(essentia-tensorflow, ONNX, or the opt-in CLAP / online-resolver genre
+engines) the memory it measures is the **WSL VM's RAM**, not your host's —
+that's the pool the workers actually draw from, and the hint under the slider
+names it ("15.5 GB measured" on "the WSL VM"). On the native engine it's your
+host's RAM directly.
+
+Per-worker cost depends on the genre classifier: the default Discogs-EffNet
+model needs well under 1 GB per worker, while **CLAP audio needs ~4.5 GB per
+worker** (it loads a full checkpoint into every process) — so switching to
+CLAP can drop the slider's max sharply on the same machine. The hint under the
+slider always shows the actual per-worker figure for whatever's selected.
+GPU workers only appear in that count when the engine can genuinely register
+the GPU — not just when a card is present.
+
+If you'd saved a worker count that no longer fits (you switched to CLAP, or
+moved to a smaller WSL VM), the slider shows a warning naming the number it'll
+actually use instead of silently running fewer than your saved value. If
+*nothing* fits — not even one worker — the run refuses outright with an
+actionable message (switch classifier, or raise the WSL memory limit in
+`.wslconfig`) rather than launching a worker that gets silently killed by the
+OS. And if the run gets clamped below what you asked for, the progress overlay
+during the run says why (see Workflow 1, Step 3).
 
 Click **Advanced settings** to expand:
 
@@ -392,7 +485,11 @@ Analysis** (BPM/key/mood are unaffected by these):
 - **Genre classifier** — **Discogs-EffNet** (default, bundled) or **CLAP audio** (opt-in).
   CLAP is an audio-embedding model that's **~2× more accurate on pure audio** and,
   unlike a file tag, works on **untagged / white-label** tracks. Select it and click
-  **Set up CLAP genre engine** (a one-time ~2.2 GB download), then re-analyze.
+  **Set up CLAP genre engine** (a one-time ~2.2 GB download), then re-analyze. CLAP
+  installs into the ONNX / essentia-tensorflow engine's environment, so **the setup
+  button isn't available while you're on the native engine** (Windows default) — you'll
+  see an inline hint instead of the button. Switch **Settings → Analysis → Inference
+  engine** to ONNX or Essentia · TensorFlow first, then come back and set up CLAP.
 - **Online genre lookup** (toggle) — a **fully-local LLM** reads web results for each
   track's artist + title and synthesizes the specific subgenre, distrusting commercial
   chart buckets ("Dance/Pop") and verifying the match. It's layered in as **your tag ›
@@ -429,6 +526,15 @@ tag key shows up in Track Details as a flag ("tag says 9B") instead of silently 
 the better value, and agreement shows as a quiet confirmation. MIK's "Energy N" (1-10)
 displays alongside Vibechek's energy without being mixed into it.
 
+**If your library moves** (new drive, reorganized folders), the import is keyed to the
+absolute paths in the XML you exported, so it stops matching anything. Rather than the
+import silently going quiet, a full analyze run's completion toast tells you your
+imported priors ("N tracks") no longer match any track in this library and to
+re-import the Rekordbox XML. The same warning appears if the priors sidecar itself is
+unreadable or corrupted. (This check only runs on a full analyze — an incremental
+"Analyze new" run legitimately may not contain any track from an older export, so it
+doesn't trigger a false warning.)
+
 ---
 
 ## Troubleshooting
@@ -444,7 +550,28 @@ again — it'll re-open. The dialog will walk you through:
 2. Installing Vibechek + Essentia inside WSL (3-5 min, no prompts)
 3. Downloading the ML models (~800 MB, a couple of minutes)
 
-Once everything is green, the analyze proceeds automatically.
+Once everything is green, the analyze proceeds automatically. If the message you're
+actually seeing names a *different* real error (Vibechek now shows the underlying
+loader exception instead of a blanket "not installed" when the package is present but
+broken), follow that message instead — it's telling you the truth about what failed.
+
+### The WSL environment looks broken / GPU stopped working
+
+You shouldn't need to manually reinstall or repair the WSL venv anymore. Before every
+WSL-routed analyze, Vibechek checks that the environment actually imports its ML stack
+and repairs it in place if not — including restoring CUDA libraries a WSL reinstall
+wiped out. Just click **Analyze** again; if a repair is needed you'll see it announce
+itself in the progress overlay ("Restoring GPU libraries…") and in the completion
+toast ("engine environment repaired automatically"). The manual **Install in Ubuntu** /
+**Enable GPU** buttons in Settings still exist as accelerators if you'd rather fix it
+before an analyze run, or if you've set `VIBECHEK_NO_AUTOHEAL=1` to disable the
+automatic repair.
+
+If something still looks wrong, run `vibechek doctor` (or **Settings → About → View
+logs** for the raw log) — it reports engine-aware readiness for whichever engine
+you've actually selected (not just the default) and a "last analyze run" section
+showing your most recent run's worker count, GPU decision and reason, and any
+warnings, straight from `logs/run_history.jsonl`.
 
 ### Sidecar died / "sidecar is no longer running"
 
@@ -456,7 +583,9 @@ Click **Cancel** in the progress overlay at the bottom. The op gets a clean shut
 
 ### "fpcalc not found" during dedupe
 
-Only affects audio-fingerprint dedup (Chromaprint). MD5 dedup still works. To enable Chromaprint:
+Only affects audio-fingerprint dedup (Chromaprint) — the results screen shows a
+"Fingerprint scan skipped" banner when this happens. MD5 dedup still works. To enable
+Chromaprint:
 
 - Linux: `sudo apt install libchromaprint-tools`
 - macOS: `brew install chromaprint`
@@ -466,18 +595,21 @@ Or just leave it — MD5 catches the bulk of duplicates anyway.
 
 ### Models download is slow / fails
 
-`essentia.upf.edu` occasionally rate-limits. Hit "Download models now" again — it picks up where it left off (each model is a separate file).
+`essentia.upf.edu` occasionally rate-limits. Hit "Download models now" again — it picks up where it left off (each model is a separate file). A failure now names the real cause where it can tell (corrupted/checksum-mismatched download vs. out of disk space vs. a network problem), instead of a generic network hint for everything.
 
 ### Settings reset themselves
 
-Look for write errors in the logs (Settings → View logs → filter by ERROR). The most common cause is the config folder being read-only or full. The config lives at:
+If a saved setting is invalid for your platform or got corrupted, Vibechek now shows a
+one-time "some saved settings were invalid and were reset" toast naming which ones —
+so a reverted value never quietly renders as if it were your choice. For anything not
+covered by that toast, look for write errors in the logs (Settings → View logs → filter by ERROR). The most common cause is the config folder being read-only or full. The config lives at:
 - Windows: `%APPDATA%\Vibechek\Vibechek\config.json`
 - macOS: `~/Library/Application Support/Vibechek/Vibechek/config.json`
 - Linux: `~/.config/Vibechek/Vibechek/config.json`
 
 ### "Something went wrong" toast keeps appearing
 
-Click **Copy details** to grab the full error, **View logs** to see what the sidecar was doing, or **Report on GitHub** to open a pre-filled issue with your platform + sidecar info.
+Click **Copy details** to grab the full error, **View logs** to see what the sidecar was doing, or **Report on GitHub** to open a pre-filled issue with your platform + sidecar info. `vibechek doctor` (see above) is worth running first — it bundles most of what a bug report needs into one paste-able block.
 
 ---
 
@@ -510,6 +642,11 @@ The desktop app's Python backend is also a CLI. Run `vibechek --help` to see wha
 - Running an analyze on a remote / headless machine
 - Scripting bulk operations
 - Quick one-off checks (e.g., `vibechek system-info`)
+- `vibechek doctor` — a paste-able diagnostic report (engine readiness, models,
+  WSL/venv status, your last analyze run's worker/GPU decisions, recent log lines);
+  `vibechek doctor --output report.md` writes it to a file
+- `vibechek preflight --engine onnx` — check readiness for a specific engine instead
+  of whatever's saved in your config
 
 The CLI is the same code the GUI uses; anything the GUI can do, the CLI can do.
 

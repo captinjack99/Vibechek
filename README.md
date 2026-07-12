@@ -2,7 +2,7 @@
 
 **Open-source ML for your DJ library.** Auto-tag genre, mood, energy, BPM, and key. Find duplicates the way your ears would. Organize 10,000 tracks in an afternoon. Keep every Rekordbox cue point intact.
 
-> **Status:** `v0.6.3-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux); on Windows the WSL-free native analysis engine bundled into the installer is now the default. Free forever under AGPL-3.0.
+> **Status:** `v0.8.0-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux); on Windows the WSL-free native analysis engine bundled into the installer is now the default. Free forever under AGPL-3.0.
 
 ---
 
@@ -96,6 +96,8 @@ Got a GPU? Vibechek probes the *actual analysis engine* (not just the host) to s
 
 Better yet: **hybrid analysis runs your GPU and your spare CPU cores at the same time.** A modest laptop GPU might only fit ~3 analysis workers in VRAM, which used to leave 16 CPU cores idle. Now Vibechek runs GPU workers *and* CPU workers against one shared work queue that self-balances — whichever device finishes a track grabs the next. On an RTX 4070 Laptop + i9, a 50-track run split GPU 9 / CPU 41 and used every resource at once. Toggle it in Settings.
 
+The worker slider tells the truth about what it can actually deliver: its max is computed live from your engine, your chosen genre classifier, and measured resources — the WSL VM's RAM (not the host's) for WSL-routed engines, since CLAP costs ~4.5 GB/worker against ~0.8 GB for the default classifier. A mid-run clamp streams its reason to the GUI ("Workers capped 16→2: CLAP needs ~4.4 GB each; the WSL VM has 15.5 GB") instead of silently running fewer workers than you asked for. And before a WSL-routed analyze starts, Vibechek verifies the engine venv still imports its ML stack and repairs it in place — including restoring CUDA libraries a WSL reinstall wiped out — so a stale environment heals itself instead of failing partway through a run.
+
 There's also a selectable **ONNX Runtime inference engine** (Settings → Analysis → **Inference engine**, opt-in) that runs the same models with **cross-vendor GPU acceleration** and **drops the end-of-life TensorFlow runtime entirely** (it runs on plain Essentia + ONNX Runtime + converted heads, in a separate `~/.vibechek/venv-onnx`). **NVIDIA CUDA is validated** (the backbone runs GPU-accelerated on an RTX 4070, TF-free); **AMD (ROCm, native Linux) and Apple (CoreML) are wired** via ONNX Runtime's execution-provider chain. On Windows the ONNX path runs inside WSL, because Essentia has no Windows wheel — the WSL-free native default is a separate, CPU-only path. Validated to match the default engine on real tracks. The default engine is the bundled native engine on Windows and essentia-tensorflow on macOS/Linux; flip to ONNX in Settings and click **Set up ONNX engine** to provision it (the installer auto-picks the GPU runtime for your hardware). Extras: `vibechek[onnx]` (CPU) and `vibechek[onnx-gpu]`.
 
 ### Undo that survives a crash mid-run
@@ -188,7 +190,7 @@ Full developer setup + the platform-specific bits: [docs/INSTALL.md](docs/INSTAL
 React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]──► Python sidecar
                                                                           │
                               ┌───────────────────────────────────────────┴───────────┐
-                              │ vibechek package (49 RPC methods)                     │
+                              │ vibechek package (50 RPC methods)                     │
                               │  analyzer · tagger · duplicates · organizer · genres  │
                               │  clap_genre · genre_web · journal · profiles · config  │
                               │  cancellation · onnx_backend                           │

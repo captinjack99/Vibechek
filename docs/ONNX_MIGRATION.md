@@ -1,6 +1,39 @@
 # ONNX Runtime Migration Plan
 
-Status: **WIRED + VALIDATED TF-FREE + GPU-ACCELERATED (2026-06-02).** The ONNX engine is selectable in the app (Settings → Analysis → Inference engine) and runs end-to-end on **plain Essentia + ONNX Runtime with zero TensorFlow** — confirmed by running the real analyzer in a plain-essentia venv (genre=Rock, vocal=Vocal 0.977 vs the TF baseline Rock/0.972; `tensorflow` never imported). **GPU is validated:** the EffNet backbone runs on an NVIDIA RTX 4070's **CUDAExecutionProvider** via `onnxruntime-gpu` + the `nvidia-*-cu12` runtime wheels, loaded at runtime with `onnxruntime.preload_dlls()` (no system CUDA toolkit / `LD_LIBRARY_PATH`). The installer auto-picks the GPU stack when `nvidia-smi` is present (`venv-onnx`); CLI: `pip install vibechek[onnx-gpu]`. The melspec linchpin is settled: plain `essentia` ships `TensorflowInputMusiCNN`, **bit-identical** to the TF build (no NumPy reimpl). The default stays `essentia_tf`. **Remaining to flip the default:** (1) host the converted head bundle on the `models-onnx-v1` release (`scripts/build_onnx_model_bundle.py`); (2) AMD-ROCm / Apple-CoreML GPU variants (NVIDIA-CUDA done; the Settings "engine GPU" indicator still probes the TF venv for onnx — display only, the engine itself uses the GPU). Parity harness: [`scripts/onnx_parity.py`](../scripts/onnx_parity.py).
+Status: **WIRED + VALIDATED TF-FREE + GPU-ACCELERATED (2026-06-02).** The ONNX engine is selectable in the app (Settings → Analysis → Inference engine) and runs end-to-end on **plain Essentia + ONNX Runtime with zero TensorFlow** — confirmed by running the real analyzer in a plain-essentia venv (genre=Rock, vocal=Vocal 0.977 vs the TF baseline Rock/0.972; `tensorflow` never imported). **GPU is validated:** the EffNet backbone runs on an NVIDIA RTX 4070's **CUDAExecutionProvider** via `onnxruntime-gpu` + the `nvidia-*-cu12` runtime wheels, loaded at runtime with `onnxruntime.preload_dlls()` (no system CUDA toolkit / `LD_LIBRARY_PATH`). The installer auto-picks the GPU stack when `nvidia-smi` is present (`venv-onnx`); CLI: `pip install vibechek[onnx-gpu]`. The melspec linchpin is settled: plain `essentia` ships `TensorflowInputMusiCNN`, **bit-identical** to the TF build (no NumPy reimpl). ~~The default stays `essentia_tf`.~~ ~~**Remaining to flip the default:** (1) host the converted head bundle on the `models-onnx-v1` release (`scripts/build_onnx_model_bundle.py`); (2) AMD-ROCm / Apple-CoreML GPU variants (NVIDIA-CUDA done; the Settings "engine GPU" indicator still probes the TF venv for onnx — display only, the engine itself uses the GPU).~~ *(Both struck-through claims are superseded — see the status note directly below.)* Parity harness: [`scripts/onnx_parity.py`](../scripts/onnx_parity.py).
+
+> **Status as of v0.8.0-beta (2026-07-11).** Three corrections to the 2026-06-02
+> snapshot above, oldest-first:
+> - **The hosting gate closed the same month it was written** (`43cd4ec`,
+>   2026-06-03): the converted ONNX heads are bundled with the app and
+>   **Settings → Set up ONNX engine** is a one-click, self-healing install —
+>   there's no external `models-onnx-v1` dependency left to "host." The
+>   Settings "engine GPU" indicator caveat is stale too: `probe_engine_gpu` /
+>   the `engine_gpu_status` RPC have taken an `engine` argument since that same
+>   GPU-status work, so the indicator reflects whichever engine is actually
+>   selected, not always the TF venv.
+> - **"The default stays `essentia_tf`" is no longer true everywhere.** Since
+>   v0.6.3-beta, Windows defaults to a separate **`native`** engine
+>   (`inference_engine="native"`) — a bundled DSP-only essentia wheel + a
+>   pure-NumPy mel frontend + **this same ONNX Runtime stack**, all in-process,
+>   no WSL. So on Windows "the default" already runs ONNX inference (CPU-only —
+>   no GPU execution providers are bundled into the native wheel). `essentia_tf`
+>   remains the default only on Linux/macOS; the standalone `onnx` engine
+>   documented in this file (WSL on Windows, a managed venv on Linux/macOS,
+>   with GPU execution providers) is still opt-in on every platform. See
+>   [docs/INSTALL.md](INSTALL.md).
+> - **GPU worker counts are registration-gated, not VRAM-guessed (audit wave
+>   2, `91fb4c9`).** The hybrid CPU+GPU worker pool used to size "N GPU
+>   workers" off raw `nvidia-smi` VRAM even when the runtime couldn't actually
+>   register the device (TF/ORT both silently ran those workers on CPU); GPU
+>   workers are now counted only after a real registration probe, and the
+>   completion summary states what actually ran. Separately, the **in-app**
+>   ONNX installer paths (WSL bootstrap + the native-engine installer) pin
+>   `onnxruntime-gpu` to the CUDA-12 line (`<1.27`; audit wave 3, `71939e0`) —
+>   an unpinned resolve had drifted to a CUDA-13-only build that crashed the
+>   ONNX engine on import. The `pyproject.toml` `[onnx-gpu]` extra used for
+>   manual `pip install` is **not** pinned; add `onnxruntime-gpu<1.27` by hand
+>   if you hit the CUDA-13 crash on a manual install.
 
 This document is the contract a contributor should be able to pick up and execute against. If something here is ambiguous, file an issue before writing code.
 
@@ -73,9 +106,16 @@ This document is the contract a contributor should be able to pick up and execut
 >   in distinct managed venvs (`~/.vibechek/venv` vs `~/.vibechek/venv-onnx`), each
 >   with its own essentia build. The engine is chosen per-analysis (`inference_engine`
 >   config / `analyze --engine` / Settings toggle), not by a single `config.py` flag
->   replacing the install.
-> - **Default stays `essentia_tf`**, not `onnx` (the §6 "default to onnx" plan is
->   superseded by the remaining-work list in the status block above).
+>   replacing the install. A third engine, `native` (Windows-only, in-process, no
+>   WSL — see [docs/INSTALL.md](INSTALL.md)), shares `venv-onnx` for its
+>   WSL/managed-venv fallback path since it runs this same ONNX stack.
+> - **The default is `onnx` on Windows in disguise, `essentia_tf` elsewhere.**
+>   §6's "default to `onnx`" never happened as a literal config flip — but
+>   Windows' `native` default (v0.6.3-beta) runs the ONNX Runtime stack
+>   in-process, so the practical outcome §6 wanted (ONNX inference by default on
+>   the platform most users are on) already landed, just via a different engine
+>   name. `essentia_tf` is still the default on Linux/macOS. See the "Status as
+>   of v0.8.0-beta" note above.
 > - **Melspec is settled:** plain `essentia` ships `TensorflowInputMusiCNN`
 >   bit-identically, so the §3/§4 "reimplement the mel-spectrogram in NumPy" risk
 >   did **not** materialize.

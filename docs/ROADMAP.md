@@ -49,7 +49,7 @@ Goal: a build any DJ can download, unzip, and run — without touching `pip`.
 
 Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI required.
 
-- ✅ **JSON-RPC sidecar** ([`vibechek/rpc.py`](../vibechek/rpc.py)): 49 methods (28 at first ship, grown since), threadpool dispatch (8 workers), stdout lock, progress + per-track notifications, structured error codes.
+- ✅ **JSON-RPC sidecar** ([`vibechek/rpc.py`](../vibechek/rpc.py)): 50 methods (28 at first ship, grown since), threadpool dispatch (8 workers), stdout lock, progress + per-track notifications, structured error codes.
 - ✅ **Async sidecar**: long ops don't block fast ones. Fast endpoints (system_info, preflight) interleave with running analyze/dedupe/organize.
 - ✅ **Cancellation** ([`vibechek/cancellation.py`](../vibechek/cancellation.py)): cooperative token; multiprocessing pool terminates cleanly on cancel; WSL subprocess gets SIGTERM+SIGKILL.
 - ✅ **Auto-saved analysis state** ([`vibechek/library_state.py`](../vibechek/library_state.py)): analysis result writes to `<data_dir>/analyses/...` automatically; recent libraries index surfaces them on the Library tab's empty state.
@@ -116,6 +116,13 @@ Goal: full graphical workflow — open folder, analyze, preview, apply. No CLI r
 - ✅ **Wired the rest of the backend into the UI** — DJ profiles picker, doctor (copy diagnostic), verify-models, update-WSL-install, rename/tag a recent library.
 - ✅ **CI release pipeline working** — Windows `.exe` (NSIS) + Linux `.deb`/`.AppImage` + macOS `.dmg` build on tag push. Code signing made opt-in; beta ships unsigned (Gatekeeper bypass documented).
 - ✅ **PyInstaller `--onefile` sidecar** (single signed-able binary per platform) + version-drift guard for the WSL install.
+
+**Shipped in 0.8.0-beta — silent-degradation audit (five waves, 41 defects):**
+
+- ✅ **Honest, dynamic resource UI** — a new `worker_budget` RPC ([`vibechek/resources.py`](../vibechek/resources.py) `compute_worker_budget`) computes the Settings worker slider's real max per engine × genre classifier against *measured* resources — the WSL VM's memory for WSL-routed engines (not the host's), per-worker cost for the selected classifier (CLAP ≈ 4.5 GB vs 0.8 GB baseline), and GPU workers gated on the engine actually being able to register the GPU (not just `nvidia-smi` seeing one). A mid-run clamp streams its reason to the GUI instead of silently running fewer workers than requested. Closes the "2-worker clamp" root cause (CLAP's real footprint vs the WSL VM's RAM) with a GUI-visible explanation instead of a silent surprise.
+- ✅ **Zero-setup self-healing engine runtime** (`vibechek/wsl.py` `ensure_engine_runtime`) — before any WSL-dispatched analyze, the venv is verified to actually import its ML stack and repaired in place if broken, including auto-restoring CUDA-11 libraries wiped by a WSL reinstall (with live "Restoring GPU libraries…" progress for the multi-GB download). Manual buttons (Enable GPU, Set up WSL) remain as accelerators, not the only path. Opt out with `VIBECHEK_NO_AUTOHEAL`. `onnxruntime-gpu` pinned `<1.27` (CUDA-12 line) after an unpinned install resolved to a CUDA-13 build that crashed the ONNX engine on import.
+- ✅ **Durable run diagnostics** — every analyze appends engine, requested-vs-effective workers, GPU decision + reason, counts, and warnings to `logs/run_history.jsonl` (capped 50); `vibechek doctor` gained an engine-aware readiness section (evaluates the *saved* engine, not a generic Essentia check) and a "last analyze run" section that reads the history back. CLI `preflight` gained `--engine`.
+- ✅ **Result-degradation + data-loss surfacing** — analyze completion now reports persist failures, CLAP-falls-back-to-Discogs, a mood/vocal model failing to load, a skipped dedupe fingerprint phase (no fpcalc), and config snap-backs from invalid saved settings; incremental analyze now **aborts** (instead of silently overwriting the whole library) when the saved analysis exists but is unreadable; Rekordbox tag-prior imports that match zero tracks or hit an unreadable sidecar warn instead of failing silently.
 
 **Remaining for the launch:**
 

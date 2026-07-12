@@ -16,6 +16,10 @@ How a new release happens, end-to-end. It's fully automated: bump the version st
 #    Also bump the two lockfiles so CI doesn't dirty them:
 #    - ui/src-tauri/Cargo.lock     (the vibechek-desktop package entry)
 #    - ui/package-lock.json        (root + package version)
+#    Also bump SECURITY.md's supported-versions table: the current line
+#    becomes the new minor version, the old current line becomes
+#    critical-only-for-90-days, and the old critical-only line drops off
+#    to unsupported.
 git add -A && git commit -m "chore: bump to v0.5.0-beta"
 
 # 2. Tag and push (the CI workflow keys on `v*` tag pushes):

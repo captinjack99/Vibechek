@@ -23,7 +23,7 @@ corrected and the change is noted under "Corrections applied" at the bottom.
 | Preserves Rekordbox GEOB/PRIV cues | ✅ | n/a² | sync only | native | — | n/a |
 | Works offline, no account | ✅ | — (online + acct)³ | ~ (acct for paid/cloud) | — (acct to activate) | ✅ | — (web app) |
 | Open source | AGPL-3.0 | — | — | — | — | — |
-| GPU acceleration | ✅ | — | — | — | — | — |
+| GPU acceleration | ✅⁵ | — | — | — | — | — |
 | Price | **$0** | $58 once⁴ | $10-20/mo or $199-399 once | $0-36/mo | €34.95 once | freemium ($7.99/mo Pro) |
 
 ✅ = yes · ~ = partial/qualified · — = no/none
@@ -33,6 +33,12 @@ energy rating or set-position tag. ² MIK generates its *own* cue points; it doe
 preserve pre-existing Rekordbox cue/grid data. ³ Since v2.5 MIK's analysis runs on its
 servers, so analyzing new tracks needs an internet connection + license activation.
 ⁴ MIK standard list $58 (on sale $39 as of writing); free tier analyzes up to 200 tracks.
+⁵ Qualified: NVIDIA CUDA is hardware-validated (essentia-tensorflow and ONNX engines, WSL/Linux).
+AMD (ROCm) and Apple (CoreML) are wired via the opt-in ONNX engine but hardware-unverified.
+The Windows-default **native** engine (WSL-free) bundles CPU-only ONNX Runtime — switching
+to the ONNX engine gets GPU on Windows but goes back through WSL. None of the other five
+tools offer GPU acceleration at all, so the differentiator holds; it just isn't universal
+across every Vibechek engine.
 
 ## Per-tool detail
 
@@ -105,8 +111,9 @@ updated to match reality:
 - **beaTunes price is in EUR** — €34.95 one-time, not "~$35" USD.
 - The "stacking MIK + Lexicon still doesn't do acoustic de-dup" line was removed (Lexicon
   does). Vibechek's honest, still-unique differentiators are **ML genre/subgenre
-  auto-detection, timeslot tagging, local-first + open-source + $0, and GPU acceleration** —
-  none of the five offers ML genre auto-detection or is open source.
+  auto-detection, timeslot tagging, local-first + open-source + $0, and GPU acceleration
+  (NVIDIA validated; the Windows-default native engine is CPU-only, see note ⁵)** — none of
+  the five offers ML genre auto-detection or is open source.
 
 ## Analysis accuracy & methodology vs the field (researched 2026-06-18)
 

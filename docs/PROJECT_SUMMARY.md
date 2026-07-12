@@ -13,7 +13,7 @@ silently overwriting a hand-curated tag. It runs entirely on your machine: no
 account, no telemetry, no upload. Free forever under **AGPL-3.0**.
 
 - **Repo:** https://github.com/captinjack99/Vibechek
-- **Current version:** `v0.6.0-beta` (public beta)
+- **Current version:** `v0.8.0-beta` (public beta)
 - **Platforms:** Windows, macOS, Linux (desktop app + CLI)
 
 > This is the living project summary. For release history see [CHANGELOG.md](../CHANGELOG.md).
@@ -39,7 +39,7 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
   Settings — plus a persistent global audio player and a "Recent operations" undo panel.
 - **Rust shell:** spawns the Python sidecar, multiplexes JSON-RPC by id, re-broadcasts
   progress + per-track records as Tauri events, detects sidecar death on EOF.
-- **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 48 JSON-RPC
+- **Python sidecar (`vibechek rpc`):** the same package the CLI uses. 50 JSON-RPC
   methods, threadpool dispatch (8 workers) so fast reads interleave with long ops,
   cooperative cancellation, and all the real work (analyzer, tagger, duplicates,
   organizer, journal, profiles, config, wsl, resources, …). Notable add-ons:
@@ -50,6 +50,35 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
   reference, via `genre_classifier="clap"`) and `genre_web` (a fully-local LLM that reads
   web results for artist+title, via `genre_web_lookup`) — both layered into the existing
   tag-vs-ML reconciliation in `genres.py`.
+- **Worker sizing (`resources.compute_worker_budget`):** the single source for how many
+  workers an analyze run gets. `analyzer.py` calls it before dispatch and the
+  `worker_budget` RPC exposes the identical computation for the Settings slider's max, so
+  the two can never disagree. Sizes against MEASURED resources — the WSL VM's RAM via
+  `wsl.wsl_vm_memory_mb` for WSL-routed engines, not the host's — with a per-worker cost
+  keyed by engine × genre classifier (CLAP ≈4.5 GB vs Discogs ≈0.8 GB), and gates GPU
+  workers on a real registration probe rather than free VRAM alone. A run-time clamp
+  streams its `cap_reason`/`gpu_reason` to the GUI instead of silently running fewer
+  workers than requested.
+- **Self-heal (`wsl.ensure_engine_runtime`):** runs before every WSL-dispatched analyze —
+  verifies the venv's ML stack still imports, reinstalls it in place on failure (reusing
+  `install_vibechek_in_wsl`), and, for `essentia_tf`, restores CUDA-11 libs wiped by a WSL
+  reinstall ("Restoring GPU libraries…"). `VIBECHEK_NO_AUTOHEAL` disables the repair step
+  (detection still runs). Manual Settings buttons (Enable GPU, Set up WSL) remain as
+  accelerators, not the only path to a working install. Venv readiness probes are
+  functional — they run the interpreter (`python -c "import sys"`), not just check that
+  the venv's files exist, so a distro upgrade that leaves the venv intact but breaks its
+  shebang'd interpreter reports not-ready instead of a false READY.
+- **Durable run history (`logs/run_history.jsonl`):** every successful analyze appends one
+  JSON line (engine, classifier, requested vs effective workers, GPU decision + reason,
+  counts, warnings, duration) via `logging_setup.append_run_summary`, capped at the most
+  recent 50; `doctor` reads it back for a "last analyze run" section.
+- **Report warning fields ride the report dict, not a dataclass.** `persist_error`,
+  `priors_warning`, `model_degradation_warning`, `genre_fallback_warning`,
+  `runtime_healed`, `runtime_heal_warning`, and `run_meta` are set directly on the
+  JSON-RPC report dict in `rpc.py`/`analyzer.py` at transport time, so adding one doesn't
+  need a TS-codegen regen — unlike genuine `MLResult`/`DuplicateSummary` dataclass field
+  additions (`ml_genre_classifier`, `ml_degraded_heads`, `fpcalc_available`,
+  `phases_run`), which do.
 - **Auto-generated types:** `scripts/generate_ts_types.py` mirrors Python dataclasses
   into `ui/src/types/generated.ts` so the wire stays type-safe.
 
@@ -90,11 +119,19 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
   alone, a same-version "no such option" code drift triggers one in-place update +
   retry, and it hard-errors only if the automatic update itself fails. The pip source
   is pinned to the sidecar's own release tag (`git+…@v<version>`, not `main`), so the
-  update converges WSL onto exactly the sidecar's version.
+  update converges WSL onto exactly the sidecar's version. On every WSL-routed analyze
+  (not just the version-drift path), `wsl.ensure_engine_runtime` additionally verifies the
+  venv's ML stack imports and self-heals it in place before dispatch — see the
+  Architecture section above.
 - **macOS / Linux:** a managed venv at `~/.vibechek/venv/` runs Essentia directly.
 - **GPU:** NVIDIA CUDA runtime via PyPI wheels installed into the venv (works on any
-  Linux/WSL distro, no apt/keyring/root). The Settings GPU row probes the *actual*
-  analysis engine (TF inside WSL on Windows), never a host-only `nvidia-smi`.
+  Linux/WSL distro, no apt/keyring/root); `onnxruntime-gpu` is pinned `<1.27` (the
+  CUDA-12 release line) alongside the `nvidia-*-cu12` wheels — an unpinned install
+  resolves to a CUDA-13-only build and crashes on import against the bundled CUDA-12
+  runtime. The Settings GPU row probes the *actual* analysis engine (TF inside WSL on
+  Windows), never a host-only `nvidia-smi`, and only reports GPU workers when the engine
+  can actually **register** the device — a card with near-zero free VRAM no longer
+  creates a doomed single-worker GPU pool that aborts the whole run.
 
 ## Distribution
 
@@ -140,8 +177,8 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
 
 <!-- These mirror the README stats line. NOTE: scripts/update_readme_stats.py
      only rewrites README.md — refresh this copy by hand when it drifts. -->
-- **929 Python tests**, **48 JSON-RPC methods**, **32 Python modules**
-- **119 frontend tests** (vitest + RTL + jsdom + Tauri mocks)
+- **1129 Python tests** (1127 pass / 2 skip), **50 JSON-RPC methods**, **36 Python modules**
+- **119 frontend tests** across 17 files (vitest + RTL + jsdom + Tauri mocks)
 - Production-tested against a ~12,000-track personal DJ library
 
 ## Roadmap
