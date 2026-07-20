@@ -1933,10 +1933,11 @@ def analyze_directory(
 
     pf = preflight(config.models_dir, quick_wsl=False, engine=config.inference_engine)
     if not pf.ready:
+        # Plain, CLI-free (voice-guide rule 4): the reasons are already
+        # user-facing; point at the in-app setup instead of a terminal command.
         raise RuntimeError(
-            "Cannot analyze: " + "; ".join(pf.reasons_not_ready) +
-            ". Run `vibechek preflight` (or check Settings in the GUI) "
-            "for actionable instructions."
+            "Can't analyze yet: " + "; ".join(pf.reasons_not_ready) +
+            " Open Settings to finish setting up the analysis engine."
         )
 
     # If native essentia is missing but WSL has it, route through WSL transparently.
@@ -2044,7 +2045,9 @@ def analyze_directory(
 
     if not budget.ram_measured and budget.cap_reason:
         # psutil-missing path: was a bare `pass`; now a real diagnostic line.
-        log.warning("%s", budget.cap_reason)
+        # The detail (psutil mechanism) rides the log; the calm headline is
+        # budget.cap_reason.
+        log.warning("%s", budget.cap_detail or budget.cap_reason)
 
     # Capture the user's GPU intent BEFORE we possibly force CPU below, so the
     # "GPU unavailable: <reason>" line still fires for the registration-failure
@@ -2061,13 +2064,16 @@ def analyze_directory(
     hybrid = gpu_workers > 0 and cpu_workers > 0
 
     # Surface the RAM/worker cap on the GUI channel (was a discarded log.warning).
-    # This routes through _emit_event, which the WSL-subprocess line handler
-    # forwards to on_progress — so "Workers capped 16→2: CLAP needs ~4.5 GB each;
-    # the WSL VM has 15.8 GB" reaches the GUI on WSL runs too, not just native.
+    # The progress line stays CALM ("Using fewer workers to fit available memory
+    # (16 → 2).", budget.cap_reason); the GB math / RAM pool are DEMOTED to the
+    # log + the run-history event's detail (voice-guide rule 9). This routes
+    # through _emit_event, which the WSL-subprocess line handler forwards to
+    # on_progress — so the cap reaches the GUI on WSL runs too, not just native.
     if budget.cap_reason and budget.ram_measured:
-        log.warning("%s", budget.cap_reason)
+        log.warning("%s", budget.cap_detail or budget.cap_reason)
         report_progress(on_progress, 0, total, budget.cap_reason)
         _emit_event("stage", name="worker_cap", message=budget.cap_reason,
+                    detail=budget.cap_detail,
                     requested=budget.requested_workers, applied=workers,
                     gpu_workers=gpu_workers, cpu_workers=cpu_workers)
 
@@ -2082,8 +2088,11 @@ def analyze_directory(
         _emit_event("stage", name="hybrid_plan", message=msg,
                     gpu_workers=gpu_workers, cpu_workers=cpu_workers)
     elif gpu_mode_requested and gpu_workers == 0 and budget.gpu_reason:
-        msg = f"{cpu_workers} CPU worker(s) (GPU unavailable: {budget.gpu_reason})."
-        log.info(msg)
+        # Calm progress line; the specific reason ("could not register the GPU",
+        # low VRAM) is DEMOTED to the log + the run-history event (Doctor tier).
+        msg = "Running on CPU — your GPU wasn't available for this pass."
+        log.info("GPU unavailable (%d CPU workers): %s",
+                 cpu_workers, budget.gpu_reason)
         report_progress(on_progress, 0, total, msg)
         _emit_event("stage", name="gpu_unavailable", message=msg,
                     reason=budget.gpu_reason, cpu_workers=cpu_workers)

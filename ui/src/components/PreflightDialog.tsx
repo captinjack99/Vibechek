@@ -364,13 +364,14 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
           {(preflight.wsl?.distros.length ?? 0) > 0 && (
             <div className="text-[11px] text-white/40 flex items-center gap-2 pt-1">
               <Wrench className="w-3 h-3" />
-              <span>Analyze failing with a SyntaxError in WSL?</span>
+              <span>Analyze crashing right after it starts?</span>
               <button
                 onClick={handleRepairWslShim}
                 disabled={repairBusy || busyAction !== null}
+                title="Repairs a corrupted launch file (SyntaxError) in the Linux analysis environment"
                 className="underline hover:text-white/70 disabled:opacity-50"
               >
-                {repairBusy ? "Repairing…" : "Repair WSL shim"}
+                {repairBusy ? "Repairing…" : "Repair analysis environment"}
               </button>
             </div>
           )}
@@ -382,7 +383,11 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             {preflight.analyze_via && (
               <>
                 analyze will run:{" "}
-                <span className="text-white/80 font-mono">{preflight.analyze_via}</span>
+                <span className="text-white/80">
+                  {preflight.analyze_via === "wsl"
+                    ? "inside the Linux analysis environment"
+                    : "on this computer"}
+                </span>
               </>
             )}
           </div>
@@ -433,9 +438,9 @@ function WindowsFlow({
     return (
       <Step
         ok={false}
-        title="WSL (Windows Subsystem for Linux)"
+        title="The Linux analysis environment (WSL)"
         sub="Not enabled on this machine"
-        info="Vibechek runs the ML analysis inside a tiny Ubuntu environment. WSL is a Windows-native feature; install takes 5-15 minutes and triggers a UAC prompt."
+        info="Vibechek runs the ML analysis inside a small Linux environment (WSL, a Windows-native feature). Setup takes 5-15 minutes and triggers a Windows permission prompt (click Yes to continue)."
         action={
           <ActionButton
             label="Install WSL + Ubuntu"
@@ -452,8 +457,8 @@ function WindowsFlow({
     return (
       <Step
         ok={false}
-        title="Ubuntu distribution"
-        sub="WSL is enabled but no distro is installed"
+        title="Linux environment"
+        sub="the Linux environment is enabled but nothing is installed yet"
         action={
           <ActionButton
             label="Install Ubuntu"
@@ -473,15 +478,13 @@ function WindowsFlow({
       <>
         <Step
           ok={true}
-          title="WSL + Ubuntu"
+          title="Linux environment (WSL)"
           sub={`${target} is installed and ready`}
         />
         <Step
           ok={false}
-          title={isOnnx ? `Vibechek + ONNX engine in ${target}` : `Vibechek + Essentia in ${target}`}
-          sub={isOnnx
-            ? "The TF-free ONNX engine isn't installed in your WSL distro yet"
-            : "The Python side isn't installed in your WSL distro yet"}
+          title="Analysis engine"
+          sub="The analysis engine isn't installed in the Linux environment yet"
           info={
             <>
               Vibechek will run: <code>apt install python3-pip libchromaprint-tools</code>,
@@ -511,8 +514,8 @@ function WindowsFlow({
   return (
     <Step
       ok={true}
-      title={`WSL: ${wsl.usable_distro} ready`}
-      sub="Analyze will route through WSL automatically"
+      title={`Linux analysis environment (WSL): ${wsl.usable_distro} ready`}
+      sub="Ready — using the Linux analysis environment"
     />
   );
 }
@@ -544,8 +547,8 @@ function UnixEssentiaFlow({
     return (
       <Step
         ok={true}
-        title="Essentia (Python ML library)"
-        sub={`Installed in the sidecar process${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`}
+        title="Analysis engine"
+        sub={`Installed${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`}
       />
     );
   }
@@ -555,8 +558,8 @@ function UnixEssentiaFlow({
     return (
       <Step
         ok={true}
-        title="Essentia (managed venv)"
-        sub={`Installed at ${nv.venv_dir}${nv.essentia_version ? ` (${nv.essentia_version})` : ""}`}
+        title="Analysis engine (already set up)"
+        sub={`Installed in the managed analysis environment${nv.essentia_version ? ` (${nv.essentia_version})` : ""}`}
       />
     );
   }
@@ -565,7 +568,7 @@ function UnixEssentiaFlow({
   return (
     <Step
       ok={false}
-      title="Essentia (Python ML library)"
+      title="Analysis engine"
       sub={
         nv?.supported === false
           ? "Native install not supported on this OS"

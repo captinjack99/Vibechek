@@ -124,7 +124,7 @@ export function OnnxSetupDialog({
               <CheckCircle2 className="h-5 w-5" /> ONNX engine ready
             </div>
             <p className="text-xs leading-snug text-white/60">
-              {state.staged} model files staged. Switch the inference engine to ONNX (if you haven't) and
+              {state.staged} model files staged. Switch the analysis engine to ONNX (if you haven't) and
               re-analyze your library to use it.
             </p>
             <button onClick={onClose} className="btn-primary w-full justify-center">

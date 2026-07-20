@@ -723,9 +723,15 @@ def run_vibechek_in_native_venv(
 
     status = probe_native_venv(engine)
     if not status.vibechek_installed or not status.venv_vibechek:
+        # Plain, in-app guidance (voice-guide rules 4/5): no Python-API or CLI
+        # instruction, no venv path in the headline. The dev detail is in the
+        # log for support triage.
+        log.warning(
+            "vibechek not installed in the managed venv at %s (engine=%s)",
+            _venv_dir(engine), engine,
+        )
         raise FileNotFoundError(
-            f"vibechek is not installed in the managed venv at {_venv_dir(engine)}. "
-            f"Run install_essentia_native(engine={engine!r}) first."
+            "The analysis engine isn't set up yet — open Settings to install it."
         )
 
     cmd = [status.venv_vibechek, *args]

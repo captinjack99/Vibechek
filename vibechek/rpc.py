@@ -1774,9 +1774,11 @@ def _count_new_tracks(params: dict) -> dict:
     except library_state.AnalysisUnreadable as e:
         # Present-but-unreadable (locked/corrupt): don't claim the file is
         # simply "missing" (which reads as "never analyzed") — say why the
-        # banner can't be computed so the number isn't silently wrong.
+        # banner can't be computed so the number isn't silently wrong. Plain
+        # wording; the raw OS error is DEMOTED to the log.
+        log.warning("Saved analysis unreadable (new-count skipped): %s", e.cause)
         return {"new_count": 0, "total_count": total, "analyzed_count": 0,
-                "reason": f"analysis file unreadable: {e.cause}"}
+                "reason": "the saved analysis couldn't be read right now"}
     if not report:
         return {"new_count": 0, "total_count": total, "analyzed_count": 0,
                 "reason": "analysis file missing"}
@@ -1813,7 +1815,18 @@ def _load_recent_analysis(params: dict) -> dict:
         try:
             report = library_state.load_analysis(record)
         except library_state.AnalysisUnreadable as e:
-            return {"loaded": False, "reason": f"analysis file unreadable: {e.cause}"}
+            # Plain, actionable reason (the GUI shows it verbatim); the raw
+            # OS error is DEMOTED to the log.
+            log.warning("Saved analysis unreadable for %s: %s",
+                        params["library_path"], e.cause)
+            return {
+                "loaded": False,
+                "reason": (
+                    "Vibechek couldn't read the saved analysis for this library "
+                    "right now — close anything that might be locking the file "
+                    "(antivirus, cloud sync) and try again."
+                ),
+            }
     elif "analysis_path" in params:
         path = Path(params["analysis_path"])
         if not path.exists():

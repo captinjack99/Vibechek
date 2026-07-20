@@ -245,9 +245,11 @@ def revert_journal(
     # fully-reverted one — carries a valid header written by start_journal, so
     # this only false-rejects genuine non-journals, not legitimately-empty runs.
     if _header.get("kind") not in (KIND_ORGANIZE, KIND_DEDUPE_MOVE, KIND_DEDUPE_TRASH):
+        # Plain, CLI-free headline (voice-guide rule 4): the GUI shows this
+        # verbatim and has no terminal. The path is DEMOTED to the log.
+        log.warning("Not a Vibechek operation journal: %s", path)
         raise ValueError(
-            f"{path} is not a Vibechek operation journal — "
-            f"run `vibechek journals` to list valid ones."
+            "This file isn't a Vibechek undo record, so it can't be reverted."
         )
     moves = [e for e in entries if e.get("action") == "move"]
     trashed = [e for e in entries if e.get("action") == "trash"]

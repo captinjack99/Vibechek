@@ -404,14 +404,26 @@ def parse_rekordbox_xml(path: Path) -> ET.ElementTree:
     that isn't well-formed XML or isn't a Rekordbox export.
     """
     path = Path(path)
+    how_to = (
+        " In Rekordbox: File → Export Collection in xml format, then pick "
+        "that file."
+    )
     try:
         tree = ET.parse(path)
     except ET.ParseError as e:
-        raise CdjExportError(f"Not valid XML ({path}): {e}") from e
+        # Plain headline + how-to; the parser error / path are DEMOTED to the log.
+        log.warning("Not valid XML (%s): %s", path, e)
+        raise CdjExportError(
+            "That file doesn't look like a Rekordbox collection export." + how_to
+        ) from e
     root = tree.getroot()
     if root.tag != "DJ_PLAYLISTS":
+        log.warning(
+            "Not a Rekordbox XML (root is <%s>, expected <DJ_PLAYLISTS>): %s",
+            root.tag, path,
+        )
         raise CdjExportError(
-            f"Not a Rekordbox XML (root is <{root.tag}>, expected <DJ_PLAYLISTS>): {path}"
+            "That file doesn't look like a Rekordbox collection export." + how_to
         )
     return tree
 

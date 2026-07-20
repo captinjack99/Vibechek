@@ -72,7 +72,7 @@ def test_reasons_not_ready_essentia_missing_no_wsl() -> None:
     )
     reasons = r.reasons_not_ready
     assert len(reasons) == 1
-    assert "essentia" in reasons[0].lower()
+    assert "analysis engine" in reasons[0].lower()
 
 
 def test_reasons_not_ready_essentia_missing_but_wsl_ready() -> None:
@@ -184,7 +184,7 @@ def test_reasons_not_ready_managed_venv_essentia_without_vibechek() -> None:
     )
     reasons = r.reasons_not_ready
     assert reasons, "ready=False must always surface at least one reason"
-    assert any("not installed" in x.lower() for x in reasons), reasons
+    assert any("analysis engine" in x.lower() for x in reasons), reasons
 
 
 def test_reasons_not_ready_managed_venv_fully_installed_is_clean() -> None:

@@ -159,7 +159,7 @@ export function ErrorToast() {
       "",
       "---",
       `Vibechek version: ${version}`,
-      `Sidecar: ${sidecar}`,
+      `Analysis service: ${sidecar}`,
       `Platform: ${navigator.userAgent}`,
     ].join("\n");
 

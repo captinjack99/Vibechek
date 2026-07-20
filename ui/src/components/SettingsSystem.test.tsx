@@ -39,9 +39,9 @@ describe("<PreflightSection /> — Essentia row honesty", () => {
         onSetupClick={vi.fn()}
       />,
     );
-    expect(screen.getByText(/installed in the sidecar \(2\.1\)/i)).toBeInTheDocument();
-    // The honest "can't run this engine" caption must NOT appear when usable.
-    expect(screen.queryByText(/can't run this engine/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/^installed \(2\.1\)$/i)).toBeInTheDocument();
+    // The honest "can't run the analysis engine" caption must NOT appear when usable.
+    expect(screen.queryByText(/can't run the analysis engine/i)).not.toBeInTheDocument();
   });
 
   it("does NOT show a green row when essentia is installed but can't serve the engine", () => {
@@ -59,13 +59,13 @@ describe("<PreflightSection /> — Essentia row honesty", () => {
       />,
     );
     // Explicit installed-but-can't-serve wording, not a green "installed" check.
-    expect(screen.getByText(/can't run this engine in-process/i)).toBeInTheDocument();
+    expect(screen.getByText(/can't run the analysis engine here/i)).toBeInTheDocument();
     expect(
-      screen.queryByText(/^installed in the sidecar \(2\.1-dsp\)$/i),
+      screen.queryByText(/^installed \(2\.1-dsp\)$/i),
     ).not.toBeInTheDocument();
   });
 
-  it("shows 'not installed inside your WSL distro' when essentia is absent on Windows", () => {
+  it("shows 'not installed in the Linux analysis environment' when essentia is absent on Windows", () => {
     render(
       <PreflightSection
         preflight={makePreflight({
@@ -78,7 +78,7 @@ describe("<PreflightSection /> — Essentia row honesty", () => {
       />,
     );
     expect(
-      screen.getByText(/not installed inside your WSL distro yet/i),
+      screen.getByText(/not installed in the Linux analysis environment yet/i),
     ).toBeInTheDocument();
   });
 });

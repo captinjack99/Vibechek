@@ -43,6 +43,7 @@ export interface WorkerBudget {
   gpu_workers: number;
   cpu_workers: number;
   cap_reason: string | null;
+  cap_detail: string | null;
   gpu_reason: string | null;
   refusal_reason: string | null;
   ram_pool: string;

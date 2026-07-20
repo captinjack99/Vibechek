@@ -712,10 +712,18 @@ def _load_backup_files(backup_path: Path) -> dict[str, Any]:
             f"backup attempt's log for write errors."
         ) from e
     if not isinstance(data, dict) or "files" not in data:
+        # Plain headline (the GUI shows it verbatim); the structural detail
+        # (missing key / top-level keys) is DEMOTED to the log.
+        got = (
+            list(data.keys()) if isinstance(data, dict) else type(data).__name__
+        )
+        log.warning(
+            "Not a Vibechek tag backup (missing 'files' key) at %s; top-level: %s",
+            path, got,
+        )
         raise ValueError(
-            f"Backup file at {path} is not in vibechek backup format "
-            f"(missing 'files' key). Got top-level keys: "
-            f"{list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+            "This doesn't look like a Vibechek tag backup. Pick the .json file "
+            "you saved with 'Create backup'."
         )
     files = data["files"]
     if not isinstance(files, dict):

@@ -196,13 +196,18 @@ def test_verify_model_sha256_rejects_mismatch(tmp_path: Path) -> None:
 
 
 def test_verify_model_sha256_error_mentions_remediation(tmp_path: Path) -> None:
-    """The error message should tell the user how to recover."""
+    """The error message should tell the user how to recover — without naming a
+    CLI command (voice-guide rule 4: this rides in a GUI detail toggle)."""
     from vibechek import model_download as analyzer
 
     target = tmp_path / "model.pb"
     target.write_bytes(b"bad")
-    with pytest.raises(RuntimeError, match="verify-models"):
+    with pytest.raises(RuntimeError, match="re-downloaded"):
         analyzer.verify_model_sha256(target, "f" * 64)
+    # No CLI instruction leaks into the (GUI-reachable) message.
+    with pytest.raises(RuntimeError) as ei:
+        analyzer.verify_model_sha256(target, "f" * 64)
+    assert "verify-models" not in str(ei.value)
 
 
 def test_model_sha256_table_is_dict_of_dicts() -> None:

@@ -91,16 +91,10 @@ class PreflightResult:
             )
         )
         if not have_engine:
-            pkg = (
-                "the native engine (in-process essentia wheel + onnxruntime)"
-                if self.engine == "native"
-                else "the ONNX engine (plain essentia + onnxruntime)"
-                if self.engine == "onnx"
-                else "essentia-tensorflow"
-            )
-            out.append(
-                f"{pkg} is not installed (native, in WSL, or in the managed venv)"
-            )
+            # Plain, user-facing reason (voice-guide): the install MECHANISM
+            # (native / WSL / managed venv) is a diagnostic detail, not the
+            # headline a user reads on the setup screen.
+            out.append("The analysis engine isn't set up yet.")
         if self.models.missing:
             out.append(f"{len(self.models.missing)} ML model file(s) missing")
         # NOTE: WSL version drift is deliberately NOT a "not ready" reason. The

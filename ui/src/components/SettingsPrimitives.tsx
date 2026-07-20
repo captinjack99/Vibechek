@@ -66,11 +66,15 @@ export function Stat({
   label,
   value,
   sub,
+  subTitle,
   accent,
 }: {
   label: string;
   value: string | number;
   sub?: string;
+  /** Optional hover tooltip on the sub-line — used to DEMOTE a technical
+   *  qualifier (e.g. that a memory figure is the WSL pool) off the visible row. */
+  subTitle?: string;
   accent?: "green" | "neutral";
 }) {
   return (
@@ -83,7 +87,11 @@ export function Stat({
       >
         {value}
       </div>
-      {sub && <div className="text-[11px] text-white/40">{sub}</div>}
+      {sub && (
+        <div className="text-[11px] text-white/40" title={subTitle}>
+          {sub}
+        </div>
+      )}
     </div>
   );
 }

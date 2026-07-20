@@ -13,7 +13,7 @@ function logCancelFailure(e: unknown): void {
   console.warn("cancel_operation RPC failed:", e);
 }
 
-const KIND_LABELS: Record<string, string> = {
+export const KIND_LABELS: Record<string, string> = {
   analyze: "Analyzing library",
   dedupe: "Finding duplicates",
   organize: "Organizing files",

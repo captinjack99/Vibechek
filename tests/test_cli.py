@@ -329,7 +329,7 @@ def test_revert_corrupt_file_gives_clean_error(tmp_path: Path) -> None:
     bad.write_text("not json {", encoding="utf-8")
     result = CliRunner().invoke(main, ["revert", str(bad)])
     assert result.exit_code != 0
-    assert "not a Vibechek operation journal" in result.output
+    assert "isn't a Vibechek undo record" in result.output
     assert "Reverted 0" not in result.output
     assert not isinstance(result.exception, ValueError)
 
@@ -341,7 +341,7 @@ def test_revert_wrong_shape_file_gives_clean_error(tmp_path: Path) -> None:
     notjournal.write_text(json.dumps({"tracks": []}), encoding="utf-8")
     result = CliRunner().invoke(main, ["revert", str(notjournal)])
     assert result.exit_code != 0
-    assert "not a Vibechek operation journal" in result.output
+    assert "isn't a Vibechek undo record" in result.output
     assert "Reverted 0" not in result.output
 
 

@@ -258,11 +258,17 @@ def verify_model_sha256(path: Path, expected: str | None) -> None:
             h.update(chunk)
     got = h.hexdigest()
     if got.lower() != expected.lower():
+        # This is a DETAIL/log-tier message (it rides inside a UserFacingError's
+        # `detail` or the download-failure list, never a GUI headline), so the
+        # technical "failed SHA256 check" wording stays — `_download_failure_hint`
+        # classifies on it and support triage needs the hashes. But the CLI/env
+        # remediation is DROPPED (voice-guide rule 4): GUI callers re-download
+        # automatically; there's no terminal to run a command in.
         raise RuntimeError(
             f"Model file {path.name} failed SHA256 check: "
             f"expected {expected[:12]}…, got {got[:12]}…. "
-            f"Run `vibechek verify-models` to re-download from the canonical "
-            f"mirror, or set VIBECHEK_MODELS_URL to a trusted source."
+            "The file is corrupted or incompletely downloaded and needs to be "
+            "re-downloaded."
         )
 
 

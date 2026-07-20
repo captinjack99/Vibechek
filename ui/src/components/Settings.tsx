@@ -208,7 +208,7 @@ export function Settings() {
   const handleUpgradeWsl = async () => {
     const distro = preflightResult?.wsl?.usable_distro;
     if (!distro) {
-      notify("No usable WSL distro detected.", { kind: "info" });
+      notify("No Linux analysis environment (WSL) is set up.", { kind: "info" });
       return;
     }
     setDiagBusy("upgrade");
@@ -218,9 +218,9 @@ export function Settings() {
       const res = await upgradeVibechekInWSL({ distro, inference_engine: engine }, opId);
       finish();
       if (res.ok) {
-        notify("WSL Vibechek updated", {
+        notify("Analysis environment updated", {
           kind: "success",
-          detail: "The WSL analyzer now matches the app version.",
+          detail: "The Linux analysis environment now matches the app version.",
         });
         refreshPreflight();
       } else {
@@ -492,8 +492,15 @@ export function Settings() {
         typeof e === "object" && e !== null && "message" in e
           ? String((e as { message: unknown }).message)
           : String(e);
+      // Map the raw OS error to a plain reason; the raw text ([Errno 2]…) is a
+      // debugging detail, not a headline the user should read.
+      const plain = /errno 2|no such file|cannot find|not exist/i.test(msg)
+        ? "it doesn't exist yet"
+        : /errno 13|permission|denied|access is denied/i.test(msg)
+          ? "you don't have permission to open it"
+          : "it couldn't be opened";
       setModelsDirWarning(
-        `Couldn't read this directory: ${msg}. Vibechek will try to create it on download.`,
+        `Couldn't read this folder — ${plain}. Vibechek will try to create it on download.`,
       );
     }
   };
@@ -641,7 +648,9 @@ export function Settings() {
             ? (budget.ram_seen_mb / 1024).toFixed(1)
             : null;
           const poolLabel =
-            budget?.ram_pool === "wsl_vm" ? "the WSL VM" : "this machine";
+            budget?.ram_pool === "wsl_vm"
+              ? "the Linux analysis environment"
+              : "this computer";
           const classifierLabel =
             cfg.analysis.genre_classifier === "clap" ? "CLAP" : "Discogs";
           const refused = budget != null && budget.max_workers === 0;
@@ -710,7 +719,7 @@ export function Settings() {
                   <span>
                     Your saved {saved} workers won&apos;t all fit — the run will
                     use {sliderMax}
-                    {budget?.ram_pool === "wsl_vm" ? " (WSL VM RAM limit)" : ""}.
+                    {budget?.ram_pool === "wsl_vm" ? " (Linux analysis environment memory limit)" : ""}.
                   </span>
                 </div>
               )}
@@ -763,19 +772,19 @@ export function Settings() {
               // The engine probe is ground truth — it asks TF (in WSL or
               // native) what it actually sees. Falls back to the host probe
               // until engine probe finishes (or if it's not applicable).
-              if (engineProbing && !engineGpu) return "Asking the analyze engine what GPUs it sees…";
+              if (engineProbing && !engineGpu) return "Asking the analysis engine what GPUs it sees…";
               if (engineGpu?.ok) {
                 if (engineGpu.gpu_available) {
                   const dev = engineGpu.devices[0]?.name ?? "GPU";
                   const where = engineGpu.engine === "wsl"
-                    ? ` (visible to TF inside ${engineGpu.distro})`
+                    ? " (visible to the analysis engine)"
                     : "";
                   return `${dev}${where} — auto will use it.`;
                 }
                 if (engineGpu.nvidia_smi_available) {
-                  return `NVIDIA driver ${engineGpu.nvidia_driver ?? "?"} is present but TensorFlow ${engineGpu.engine === "wsl" ? `inside ${engineGpu.distro}` : ""} can't see the GPU. Check CUDA/cuDNN versions inside the engine.`;
+                  return `NVIDIA driver ${engineGpu.nvidia_driver ?? "?"} is present, but the analysis engine can't use the GPU — analysis will run on CPU.`;
                 }
-                return "No GPU visible to the analyze engine. Stays on CPU.";
+                return "No GPU visible to the analysis engine. Stays on CPU.";
               }
               if (!sysInfo) return "Detecting GPU…";
               return sysInfo.gpu_available
@@ -799,7 +808,7 @@ export function Settings() {
             Selecting it provisions a separate engine (plain essentia +
             onnxruntime) on the next analyze. Validated to parity with the TF
             path — see docs/ONNX_MIGRATION.md. */}
-        <Field label="Inference engine">
+        <Field label="Analysis engine">
           <div className="flex gap-2">
             {([
               { id: "essentia_tf", label: "Essentia · TensorFlow" },
@@ -871,7 +880,7 @@ export function Settings() {
             <strong>ONNX Runtime</strong> runs the same models with cross-vendor
             GPU — AMD, Intel, and Apple Silicon via DirectML/CoreML — and drops
             the end-of-life TensorFlow runtime entirely. Validated to match the
-            default engine's output; see <code>docs/ONNX_MIGRATION.md</code>.
+            default engine's output.
           </Hint>
         </Field>
 
@@ -930,7 +939,7 @@ export function Settings() {
                 <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
                 <span>
                   CLAP requires the ONNX or Essentia·TF engine on Windows. Switch
-                  the inference engine above to set it up.
+                  the analysis engine above to set it up.
                 </span>
               </div>
             ) : (
@@ -954,7 +963,7 @@ export function Settings() {
 
         <Field label="Online genre lookup">
           <Toggle
-            label="Resolve genre online (local LLM + web)"
+            label="Resolve genre online (small AI model + web)"
             checked={cfg.analysis.genre_web_lookup}
             onChange={(v) => updateAnalysis({ genre_web_lookup: v })}
           />
@@ -969,11 +978,11 @@ export function Settings() {
             </button>
           )}
           <Hint>
-            Looks up each track's genre online (a local LLM reads web results for
-            the artist + title), then layers it into reconciliation (tag › web ›
-            audio) — the most accurate option (~60%) on tagged libraries. Needs
-            network + a local LLM (one-time ~4.7 GB setup, fully private). Adds time
-            per track; off by default.
+            Looks up each track's genre online (a small AI model reads the web
+            results for the artist + title), then layers it into reconciliation
+            (tag › web › audio) — the most accurate option (~60%) on tagged
+            libraries. Needs network + a small AI model (one-time ~4.7 GB setup,
+            fully private). Adds time per track; off by default.
           </Hint>
         </Field>
 
@@ -1383,19 +1392,19 @@ export function Settings() {
               className="btn-ghost"
               onClick={handleUpgradeWsl}
               disabled={diagBusy !== null || active !== null}
-              title="Re-install the Vibechek package inside WSL so the analyzer matches this app version (fast — skips apt + essentia)"
+              title="Re-installs the Vibechek package in the Linux analysis environment so it matches this app version (fast — skips apt + essentia)"
             >
               {diagBusy === "upgrade"
                 ? <Loader2 className="w-4 h-4 animate-spin" />
                 : <Download className="w-4 h-4" />}
-              Update WSL install
+              Update Linux analysis environment
             </button>
           )}
         </div>
         <Hint>
-          Use “Update WSL install” if analyze fails with an “out of date”
-          message — it brings the WSL analyzer up to this app’s version without
-          a full re-install.
+          Use “Update Linux analysis environment” if analyze fails with an “out
+          of date” message — it brings the Linux analysis environment up to this
+          app’s version without a full re-install.
         </Hint>
       </Section>
 
@@ -1403,10 +1412,10 @@ export function Settings() {
 
       <Section title="About" subtitle="">
         <div className="text-xs text-white/40 font-mono break-all">
-          Sidecar: {sidecarBinary ?? "?"}
+          Analysis service: {sidecarBinary ?? "?"}
         </div>
         <div className="text-xs text-white/40 mt-1">
-          Settings are saved to <code className="font-mono">config.toml</code> automatically (debounced 500ms).
+          Settings are saved automatically.
         </div>
         <div className="mt-3">
           <button

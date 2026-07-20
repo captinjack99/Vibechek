@@ -351,8 +351,13 @@ class WorkerBudget:
     gpu_workers: int
     cpu_workers: int
     # Why effective_workers < the requested count (RAM cap or GPU single-device
-    # cap). None when the request was honored in full.
+    # cap), as a CALM one-line headline safe to show on the progress line or the
+    # Settings slider. None when the request was honored in full.
     cap_reason: str | None = None
+    # The technical explanation behind cap_reason (GB-per-model math, which RAM
+    # pool) — DEMOTED to logs / Doctor / run-history, never the progress line
+    # (voice-guide rule 9). None when there's nothing extra to demote.
+    cap_detail: str | None = None
     # Why GPU workers = 0 despite GPU mode being on (engine can't register the
     # GPU, or insufficient VRAM). None when GPU mode is off or GPU workers ran.
     gpu_reason: str | None = None
@@ -421,7 +426,11 @@ def compute_worker_budget(
     reserve_mb = 4096 if under_wsl else 2048
 
     classifier_label = "CLAP" if genre_classifier == "clap" else "Discogs"
-    pool_label = "the WSL VM" if (under_wsl or ram_pool == "wsl_vm") else "this machine"
+    pool_label = (
+        "the Linux analysis environment (WSL)"
+        if (under_wsl or ram_pool == "wsl_vm")
+        else "this computer"
+    )
 
     cap_reason: str | None = None
 
@@ -433,8 +442,13 @@ def compute_worker_budget(
         max_workers = cpu_count
         ram_seen = 0
         cap_reason = (
-            "RAM-based worker capping unavailable (psutil not importable) — "
-            f"sizing by CPU cores ({cpu_count}) only, unbounded by memory"
+            "Couldn't measure available memory — sizing workers by CPU core "
+            f"count ({cpu_count}) instead."
+        )
+        cap_detail = (
+            "psutil is not importable, so RAM-based worker capping was skipped; "
+            f"the pool is sized by CPU cores ({cpu_count}) only, unbounded by "
+            "memory."
         )
         return _finish_budget(
             max_workers=max_workers, requested_run=requested_run,
@@ -442,7 +456,7 @@ def compute_worker_budget(
             reserve_mb=reserve_mb, cpu_count=cpu_count, use_gpu=use_gpu,
             hybrid=hybrid, free_vram_mb=free_vram_mb,
             gpu_registrable=gpu_registrable, ram_pool=ram_pool,
-            cap_reason=cap_reason, ram_measured=False,
+            cap_reason=cap_reason, cap_detail=cap_detail, ram_measured=False,
         )
 
     ram_seen = total_ram_mb
@@ -469,13 +483,19 @@ def compute_worker_budget(
         )
 
     max_workers = min(cpu_count, memory_cap)
+    cap_detail: str | None = None
     if max_workers < requested_run or max_workers < raw_request:
         # The RUN is capped below what the user asked for. Surface it (was a
-        # discarded log.warning) so "16→2" reaches the GUI, on WSL runs too.
+        # discarded log.warning) so "16 → 2" reaches the GUI, on WSL runs too —
+        # a CALM headline on the progress line, the GB math DEMOTED to detail
+        # (voice-guide rule 9).
         cap_reason = (
-            f"Workers capped {raw_request}→{max_workers}: {classifier_label} "
-            f"needs ~{pw / 1024:.1f} GB each; {pool_label} has "
-            f"{ram_seen / 1024:.1f} GB"
+            f"Using fewer workers to fit available memory "
+            f"({raw_request} → {max_workers})."
+        )
+        cap_detail = (
+            f"{classifier_label} needs ~{pw / 1024:.1f} GB each; {pool_label} "
+            f"has {ram_seen / 1024:.1f} GB."
         )
     return _finish_budget(
         max_workers=max_workers, requested_run=requested_run,
@@ -483,7 +503,7 @@ def compute_worker_budget(
         reserve_mb=reserve_mb, cpu_count=cpu_count, use_gpu=use_gpu,
         hybrid=hybrid, free_vram_mb=free_vram_mb,
         gpu_registrable=gpu_registrable, ram_pool=ram_pool,
-        cap_reason=cap_reason, ram_measured=True,
+        cap_reason=cap_reason, cap_detail=cap_detail, ram_measured=True,
     )
 
 
@@ -543,7 +563,7 @@ def _finish_budget(
     *, max_workers: int, requested_run: int, raw_request: int, pw: int,
     ram_seen: int, reserve_mb: int, cpu_count: int, use_gpu: str, hybrid: bool,
     free_vram_mb: int | None, gpu_registrable: bool | None, ram_pool: str,
-    cap_reason: str | None, ram_measured: bool,
+    cap_reason: str | None, ram_measured: bool, cap_detail: str | None = None,
 ) -> WorkerBudget:
     """Split the RAM-bounded total into GPU + CPU workers and finalize."""
     ram_cap = min(requested_run, max_workers)  # RAM-bounded total for THIS run
@@ -595,8 +615,8 @@ def _finish_budget(
         max_workers=max_workers, effective_workers=effective_workers,
         per_worker_mb=pw, ram_seen_mb=ram_seen, reserve_mb=reserve_mb,
         gpu_workers=gpu_workers, cpu_workers=cpu_workers, cap_reason=cap_reason,
-        gpu_reason=gpu_reason, ram_pool=ram_pool, requested_workers=raw_request,
-        ram_measured=ram_measured,
+        cap_detail=cap_detail, gpu_reason=gpu_reason, ram_pool=ram_pool,
+        requested_workers=raw_request, ram_measured=ram_measured,
     )
 
 

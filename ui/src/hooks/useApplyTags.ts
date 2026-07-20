@@ -14,6 +14,13 @@ import { useCallback } from "react";
 import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
 import { rpc, RpcError } from "./useSidecar";
 import type { TrackAnalysis } from "../types";
+import { KIND_LABELS } from "../components/AnalysisProgress";
+
+/** Plain-language name for an operation kind (e.g. "download-models" →
+ *  "Downloading ML models"), so "X is in progress" never shows a raw op id. */
+function opLabel(kind: string): string {
+  return KIND_LABELS[kind] ?? kind;
+}
 
 export interface ApplyTagsResult {
   /** Files where the genre was written (confidence >= threshold). */
@@ -67,7 +74,7 @@ export function useApplyTags(): UseApplyTagsReturn {
         const label =
           active === "backup"
             ? "Backup in progress, please wait."
-            : `${active} is in progress, please wait.`;
+            : `${opLabel(active)} is in progress, please wait.`;
         notify(label, { kind: "info" });
         return null;
       }
@@ -133,7 +140,7 @@ export function useApplyTags(): UseApplyTagsReturn {
             running === "backup"
               ? "Backup in progress, please wait."
               : running
-                ? `${running} is in progress, please wait.`
+                ? `${opLabel(running)} is in progress, please wait.`
                 : "Another operation is in progress, please wait.";
           notify(label, { kind: "info" });
           // Reset our local op state so the Apply button re-enables.

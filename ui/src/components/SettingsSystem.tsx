@@ -220,22 +220,22 @@ export function PreflightSection({
     if (preflight.essentia_usable) {
       return {
         ok: true,
-        label: "Essentia",
-        detail: `installed in the sidecar${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`,
+        label: "Analysis engine",
+        detail: `installed${preflight.essentia.version ? ` (${preflight.essentia.version})` : ""}`,
       };
     }
     if (isWindows && wslReady && usableDistro) {
       return {
         ok: true,
-        label: "Essentia",
-        detail: `available via WSL (${usableDistro})`,
+        label: "Analysis engine",
+        detail: "available via the Linux analysis environment",
       };
     }
     if (nativeVenvReady) {
       return {
         ok: true,
-        label: "Essentia",
-        detail: `available via managed venv${nativeVenv?.essentia_version ? ` (${nativeVenv.essentia_version})` : ""}`,
+        label: "Analysis engine",
+        detail: `available via the managed analysis environment${nativeVenv?.essentia_version ? ` (${nativeVenv.essentia_version})` : ""}`,
       };
     }
     // Installed in the sidecar but that build can't serve the engine the banner
@@ -244,17 +244,17 @@ export function PreflightSection({
     if (preflight.essentia.installed) {
       return {
         ok: false,
-        label: "Essentia",
+        label: "Analysis engine",
         detail: isWindows
-          ? "installed in the sidecar, but that build can't run this engine in-process — set up WSL below"
-          : "installed in the sidecar, but that build can't run this engine — set up the managed venv below",
+          ? "installed, but this build can't run the analysis engine here — set up the Linux analysis environment below"
+          : "installed, but this build can't run the analysis engine here — set up the managed analysis environment below",
       };
     }
     if (isWindows) {
       return {
         ok: false,
-        label: "Essentia (via WSL)",
-        detail: "not installed inside your WSL distro yet — click Set up below",
+        label: "Analysis engine",
+        detail: "not installed in the Linux analysis environment yet — click Set up below",
       };
     }
     return {
@@ -266,9 +266,9 @@ export function PreflightSection({
 
   const subtitle = ready
     ? (preflight.analyze_via === "wsl"
-        ? "analyze will route through WSL"
+        ? "ready — using the Linux analysis environment"
         : preflight.analyze_via === "native_venv"
-        ? "analyze will route through the managed venv"
+        ? "ready — using the managed analysis environment"
         : "all prerequisites satisfied")
     : "see below";
 
@@ -409,7 +409,7 @@ export function ResourcesSection({
           ? `${(budget!.ram_seen_mb / 1024).toFixed(1)} GB`
           : hostGb;
         const memSub = vmMeasured
-          ? `WSL VM · of ${hostGb} host`
+          ? `of ${hostGb} total on this PC`
           : memPct !== null
             ? `${memPct}% in use`
             : undefined;
@@ -417,9 +417,10 @@ export function ResourcesSection({
           <div className="grid grid-cols-3 gap-4">
             <Stat label="CPU cores" value={sysInfo.cpu_count} />
             <Stat
-              label={vmMeasured ? "Memory (WSL VM)" : "Memory"}
+              label={vmMeasured ? "Memory (Linux analysis environment)" : "Memory"}
               value={memValue}
               sub={memSub}
+              subTitle={vmMeasured ? "Measured inside the Linux analysis environment (WSL), not the full host total" : undefined}
             />
             <Stat
               label="GPU"
@@ -520,13 +521,14 @@ function TroubleshootingRow({
   return (
     <div className="mt-3 text-[11px] text-white/40 flex items-center gap-2">
       <Wrench className="w-3 h-3" />
-      <span>Analyze failing with a SyntaxError in WSL?</span>
+      <span>Analysis crashing right when it starts?</span>
       <button
         onClick={handleClick}
         disabled={busy}
+        title="Repairs a corrupted launch file (SyntaxError) in the Linux analysis environment"
         className="underline hover:text-white/70 disabled:opacity-50"
       >
-        {busy ? "Repairing…" : "Repair WSL shim"}
+        {busy ? "Repairing…" : "Repair the analysis environment"}
       </button>
     </div>
   );

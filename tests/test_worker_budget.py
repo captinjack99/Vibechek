@@ -56,7 +56,10 @@ def test_clap_wsl_16req_caps_to_2_with_reason() -> None:
     assert b.effective_workers == 2
     assert b.cap_reason is not None
     assert "16" in b.cap_reason and "2" in b.cap_reason
-    assert "CLAP" in b.cap_reason
+    # The GB math / model name are DEMOTED to cap_detail (voice-guide rule 9);
+    # the calm cap_reason on the progress line stays free of them.
+    assert "CLAP" in (b.cap_detail or "")
+    assert "CLAP" not in b.cap_reason
     assert b.refusal_reason is None
     assert b.ram_pool == "wsl_vm"
 
@@ -204,7 +207,10 @@ def test_psutil_absent_is_named_not_silent() -> None:
     )
     assert b.ram_measured is False
     assert b.cap_reason is not None
-    assert "psutil" in b.cap_reason
+    # The psutil mechanism is NAMED (not a silent `pass`) — but DEMOTED to the
+    # detail; the calm cap_reason stays plain.
+    assert "psutil" in (b.cap_detail or "")
+    assert "psutil" not in b.cap_reason
     # No RAM info → cores are the only ceiling; still runs.
     assert b.max_workers == 8
     assert b.effective_workers == 8
