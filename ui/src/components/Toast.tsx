@@ -55,6 +55,9 @@ function ToastItem({
   const ttl = notification.detail ? AUTO_DISMISS_DETAIL_MS : AUTO_DISMISS_MS;
 
   const arm = () => {
+    // A persistent notification (app-breaking condition) never auto-dismisses —
+    // only a click removes it.
+    if (notification.persistent) return;
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(onDismiss, ttl);
   };
@@ -90,6 +93,14 @@ function ToastItem({
           <div className="text-xs text-white/60 mt-0.5 whitespace-pre-line break-words">
             {notification.detail}
           </div>
+        )}
+        {notification.action && (
+          <button
+            onClick={notification.action.onClick}
+            className="mt-2 text-xs font-medium text-white/90 hover:text-white underline underline-offset-2"
+          >
+            {notification.action.label}
+          </button>
         )}
       </div>
       <button

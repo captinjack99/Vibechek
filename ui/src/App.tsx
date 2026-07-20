@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openPath } from "@tauri-apps/plugin-shell";
 import { AnimatePresence, MotionConfig } from "framer-motion";
 
 import { Sidebar } from "./components/Sidebar";
@@ -38,6 +39,46 @@ interface NotifyPayload {
   level?: string;
   message: string;
   detail?: string;
+  /** The install path the warning is about (the sidecar's `sys.executable`).
+   *  Present on the risky-install-path warning; drives "Open install folder". */
+  path?: string;
+}
+
+/**
+ * Build the notification options for a sidecar `notify` warning. The
+ * install-path warning is an app-breaking condition, so it is made PERSISTENT
+ * (never auto-dismisses) and — when the sidecar told us the path — carries an
+ * "Open install folder" action so the user has a next step in-view rather than
+ * a dead-end banner that vanishes after 8s.
+ */
+function notifyOptsFor(p: NotifyPayload) {
+  const isWarning = p.level === "warning";
+  const opts: {
+    kind: "warning" | "info";
+    detail?: string;
+    persistent?: boolean;
+    action?: { label: string; onClick: () => void };
+  } = {
+    kind: isWarning ? "warning" : "info",
+    detail: p.detail,
+  };
+  if (isWarning) {
+    opts.persistent = true;
+    if (p.path) {
+      // Open the CONTAINING folder (strip the trailing file segment) in the
+      // OS file manager via the existing shell-open capability.
+      const folder = p.path.replace(/[\\/][^\\/]*$/, "") || p.path;
+      opts.action = {
+        label: "Open install folder",
+        onClick: () => {
+          void openPath(folder).catch(() => {
+            /* opener unavailable — the banner text still stands on its own */
+          });
+        },
+      };
+    }
+  }
+  return opts;
 }
 
 /**
@@ -112,10 +153,7 @@ export default function App() {
   // being shoehorned into cheerful cyan "info".
   useSidecarEvent<NotifyPayload>("notify", (payload) => {
     if (!payload?.message) return;
-    useNotificationStore.getState().notify(payload.message, {
-      kind: payload.level === "warning" ? "warning" : "info",
-      detail: payload.detail,
-    });
+    useNotificationStore.getState().notify(payload.message, notifyOptsFor(payload));
   });
 
   // Collect the startup notifications the Rust shell BUFFERED for us.
@@ -131,10 +169,9 @@ export default function App() {
       .then((events) => {
         for (const evt of events ?? []) {
           if (evt?.method !== "notify" || !evt.params?.message) continue;
-          useNotificationStore.getState().notify(evt.params.message, {
-            kind: evt.params.level === "warning" ? "warning" : "info",
-            detail: evt.params.detail,
-          });
+          useNotificationStore
+            .getState()
+            .notify(evt.params.message, notifyOptsFor(evt.params));
         }
       })
       .catch(() => {

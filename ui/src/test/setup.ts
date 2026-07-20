@@ -77,6 +77,7 @@ beforeEach(async () => {
     progress: null,
     startedAt: null,
     error: null,
+    errorInfo: null,
     duplicateReport: null,
     organizePlan: null,
   });

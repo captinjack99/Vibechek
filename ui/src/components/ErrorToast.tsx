@@ -1,17 +1,30 @@
 /**
- * Global error banner. Shown whenever `useOperationStore.error` is set so an
+ * Global error banner. Shown whenever `useOperationStore.errorInfo` is set so an
  * operation failure can never silently disappear.
  *
- * Two actions:
- *   - Copy details — full error to clipboard
- *   - Report issue — opens a prefilled GitHub Issue with the error + system
- *     context so the user doesn't have to type it all out
+ * The failure arrives pre-classified (see stores/operation.ts `classifyError`):
+ * a plain user-facing headline, a technical `detail` demoted behind a toggle,
+ * and a `kind` that decides which recovery action we offer:
+ *   - kind "retryable"   → "Try again" re-issues the exact failed call
+ *   - kind "engine_dead" → "Restart Vibechek" relaunches the app
+ *
+ * Plus the always-available actions: Copy details, View logs, Report on GitHub.
  */
 
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { AlertCircle, X, Copy, Check, ExternalLink, FileText } from "lucide-react";
+import {
+  AlertCircle,
+  X,
+  Copy,
+  Check,
+  ExternalLink,
+  FileText,
+  RotateCcw,
+  RefreshCw,
+} from "lucide-react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
+import { isTauri } from "@tauri-apps/api/core";
 
 import { useNotificationStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
@@ -20,26 +33,66 @@ import { LogsViewer } from "./LogsViewer";
 const ISSUES_URL = "https://github.com/captinjack99/Vibechek/issues/new";
 
 export function ErrorToast() {
-  const error = useOperationStore((s) => s.error);
+  const errorInfo = useOperationStore((s) => s.errorInfo);
   const clearError = useOperationStore((s) => s.clearError);
   const notify = useNotificationStore((s) => s.notify);
 
   const [copied, setCopied] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [restarting, setRestarting] = useState(false);
 
   // Reset the copy state when a new error appears
   useEffect(() => {
     setCopied(false);
-  }, [error]);
+  }, [errorInfo]);
 
-  if (!error) return null;
+  if (!errorInfo) return null;
 
-  const message = friendlyMessage(error);
+  const { headline, detail, raw, kind } = errorInfo;
+  const canRetry = kind === "retryable" && !!errorInfo.retry;
+  const canRestart = kind === "engine_dead";
+
+  // Mid-analyze death: how many tracks had been analyzed when it stopped.
+  // Phrased honestly — analyzed, not necessarily saved.
+  const analyzedLine =
+    kind === "engine_dead" && errorInfo.analyzedCount
+      ? errorInfo.analyzedTotal
+        ? `${errorInfo.analyzedCount} of ${errorInfo.analyzedTotal} tracks were analyzed before it stopped.`
+        : `${errorInfo.analyzedCount} tracks were analyzed before it stopped.`
+      : null;
 
   const handleCopy = () => {
-    void navigator.clipboard.writeText(error);
+    void navigator.clipboard.writeText(raw);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
+  };
+
+  // "Try again" re-issues the exact call that failed (captured by the shared
+  // rpc wrapper). We clear the banner first, then re-fire; a fresh failure
+  // re-surfaces via fail(). Generic by design — no per-component retry wiring.
+  const handleRetry = async () => {
+    const retry = errorInfo.retry;
+    if (!retry) return;
+    clearError();
+    try {
+      await rpc(retry.method, retry.params);
+    } catch (e) {
+      useOperationStore.getState().fail(e);
+    }
+  };
+
+  // "Restart Vibechek" relaunches the app (same plugin the updater uses). No-op
+  // outside the Tauri shell (dev browser / tests) so the button is inert there.
+  const handleRestart = async () => {
+    if (!isTauri()) return;
+    setRestarting(true);
+    try {
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch {
+      // Relaunch failed — nothing more we can do; leave the banner up.
+      setRestarting(false);
+    }
   };
 
   const handleReport = async () => {
@@ -64,7 +117,7 @@ export function ErrorToast() {
       "",
       "**Got:**",
       "```",
-      error.slice(0, 4000),
+      raw.slice(0, 4000),
       "```",
       "",
       "---",
@@ -73,7 +126,7 @@ export function ErrorToast() {
       `Platform: ${navigator.userAgent}`,
     ].join("\n");
 
-    const url = `${ISSUES_URL}?title=${encodeURIComponent("Error: " + message.slice(0, 80))}&body=${encodeURIComponent(body)}`;
+    const url = `${ISSUES_URL}?title=${encodeURIComponent("Error: " + headline.slice(0, 80))}&body=${encodeURIComponent(body)}`;
 
     try {
       await openUrl(url);
@@ -98,13 +151,41 @@ export function ErrorToast() {
       <div className="panel-pad bg-accent-red/10 border-accent-red/40 flex items-start gap-3 shadow-lg">
         <AlertCircle className="w-5 h-5 text-accent-red flex-none mt-0.5" />
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium text-accent-red">
-            Something went wrong
+          <div className="text-sm font-medium text-accent-red break-words">
+            {headline}
           </div>
-          <div className="text-xs text-white/70 mt-1 break-words">
-            {message}
-          </div>
-          <div className="mt-3 flex items-center gap-2">
+          {analyzedLine && (
+            <div className="text-xs text-white/70 mt-1">{analyzedLine}</div>
+          )}
+
+          {/* Primary recovery actions — the "what do I do now" the doctrine
+              requires. Only shown for the kinds that support them. */}
+          {(canRetry || canRestart) && (
+            <div className="mt-3 flex items-center gap-2">
+              {canRetry && (
+                <button
+                  onClick={handleRetry}
+                  className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded px-2.5 py-1 inline-flex items-center gap-1.5"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Try again
+                </button>
+              )}
+              {canRestart && (
+                <button
+                  onClick={handleRestart}
+                  disabled={restarting}
+                  className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded px-2.5 py-1 inline-flex items-center gap-1.5 disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${restarting ? "animate-spin" : ""}`} />
+                  {restarting ? "Restarting…" : "Restart Vibechek"}
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Secondary / always-available actions. */}
+          <div className="mt-3 flex items-center gap-2 flex-wrap">
             <button
               onClick={handleCopy}
               className="text-xs text-white/60 hover:text-white inline-flex items-center gap-1"
@@ -120,7 +201,7 @@ export function ErrorToast() {
             <button
               onClick={() => setShowLogs(true)}
               className="text-xs text-white/60 hover:text-white inline-flex items-center gap-1"
-              title="Show recent log lines from the sidecar"
+              title="Show recent log lines from the analysis service"
             >
               <FileText className="w-3 h-3" />
               View logs
@@ -134,13 +215,14 @@ export function ErrorToast() {
               Report on GitHub
             </button>
           </div>
-          {message !== error && (
+
+          {detail && (
             <details className="mt-2 text-[11px] text-white/40">
               <summary className="cursor-pointer hover:text-white/60">
-                Full error
+                Technical details
               </summary>
               <pre className="mt-1 font-mono whitespace-pre-wrap break-all max-h-48 overflow-auto">
-                {error}
+                {detail}
               </pre>
             </details>
           )}
@@ -157,16 +239,4 @@ export function ErrorToast() {
       <LogsViewer open={showLogs} onClose={() => setShowLogs(false)} />
     </motion.div>
   );
-}
-
-function friendlyMessage(raw: string): string {
-  // Sidecar errors arrive as JSON-stringified {code, message, data}
-  try {
-    const stripped = raw.replace(/^sidecar error:\s*/i, "");
-    const parsed = JSON.parse(stripped);
-    if (parsed.message) return String(parsed.message);
-  } catch {
-    /* not JSON, fall through */
-  }
-  return raw.replace(/^Error invoking remote method '[^']+':\s*/, "").trim();
 }

@@ -16,11 +16,17 @@ pub async fn rpc_call(
     params: Option<Value>,
 ) -> Result<Value, String> {
     let params = params.unwrap_or(Value::Object(Default::default()));
+    // Transport failures come back as a structured `TransportError`; serialize
+    // it into the SAME `{message, data:{kind, headline, detail}}` envelope
+    // Python errors use, so the frontend's single RpcError parser produces a
+    // plain headline + a details toggle + a Restart/Retry action for every
+    // path. (No more `"sidecar error:"` free-text prefix — the frontend used to
+    // strip it with two ad-hoc regexes.)
     let response = state
         .sidecar
         .call(&method, params)
         .await
-        .map_err(|e| format!("sidecar error: {e}"))?;
+        .map_err(|e| e.into_envelope_json())?;
 
     // JSON-RPC: response has either `result` or `error`
     if let Some(error) = response.get("error") {

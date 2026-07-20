@@ -91,4 +91,33 @@ describe("<App /> — sidecar:notify install-path warning", () => {
     // No message → no notification added.
     expect(useNotificationStore.getState().items.length).toBe(before);
   });
+
+  it("makes the install-path warning persistent with an Open install folder action", async () => {
+    render(<App />);
+    await waitFor(() => {
+      expect(captureListener("sidecar:notify")).toBeTypeOf("function");
+    });
+    captureListener("sidecar:notify")!({
+      payload: {
+        level: "warning",
+        message: "Vibechek is installed in a location that may cause launch issues.",
+        detail: "Install path contains 'my drive'.",
+        path: "C:/Users/dj/My Drive/Vibechek/vibechek.exe",
+      },
+    });
+
+    await waitFor(() => {
+      expect(
+        useNotificationStore
+          .getState()
+          .items.some((n) => n.message.includes("launch issues")),
+      ).toBe(true);
+    });
+    const item = useNotificationStore
+      .getState()
+      .items.find((n) => n.message.includes("launch issues"))!;
+    // App-breaking → must not auto-dismiss, and must offer an in-view next step.
+    expect(item.persistent).toBe(true);
+    expect(item.action?.label).toBe("Open install folder");
+  });
 });

@@ -9,6 +9,7 @@ mod sidecar;
 
 use sidecar::SidecarHandle;
 use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 /// Application state, accessible from every Tauri command handler.
 pub struct AppState {
@@ -33,11 +34,50 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            // Spawn the Python sidecar at startup. If it dies later we don't
-            // try to restart automatically — surface the failure to the user
-            // via the rpc_call error path instead.
-            let handle = sidecar::spawn(app.handle().clone())?;
-            app.manage(AppState { sidecar: handle });
+            // Spawn the Python sidecar at startup. If it dies LATER we surface
+            // the failure via the rpc_call error path (the structured envelope).
+            //
+            // But a spawn failure HERE means the app has no analysis service at
+            // all. Propagating the error (`?`) would bubble to `.run().expect()`
+            // and PANIC — in a windowed release build that means no window, no
+            // console, nothing: a broken install is indistinguishable from
+            // "didn't launch." Catch it and show a native dialog instead, then
+            // exit cleanly.
+            match sidecar::spawn(app.handle().clone()) {
+                Ok(handle) => {
+                    app.manage(AppState { sidecar: handle });
+                }
+                Err(e) => {
+                    // Hide the (blank) main window so the user sees only the
+                    // error dialog, not a broken empty shell behind it.
+                    for (_, w) in app.webview_windows() {
+                        let _ = w.hide();
+                    }
+                    // A native dialog has no details toggle, so append the raw
+                    // error compactly in the body — a bug report still needs it.
+                    let body = format!(
+                        "Vibechek couldn't start its analysis service. \
+                         Reinstalling Vibechek usually fixes this.\n\n\
+                         Technical details:\n{e:#}"
+                    );
+                    // `blocking_show` dispatches the dialog onto the main thread
+                    // and then blocks on the reply — calling it on the main
+                    // thread before the event loop starts pumping would deadlock.
+                    // Show it from a worker thread and return Ok so the loop
+                    // starts and can service the dialog; the thread exits the
+                    // process once the user dismisses it.
+                    let handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        handle
+                            .dialog()
+                            .message(body)
+                            .title("Vibechek couldn't start")
+                            .kind(MessageDialogKind::Error)
+                            .blocking_show();
+                        std::process::exit(1);
+                    });
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

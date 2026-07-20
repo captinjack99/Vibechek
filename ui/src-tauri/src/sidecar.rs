@@ -101,6 +101,136 @@ fn timeout_for(method: &str) -> Option<Duration> {
     Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
 }
 
+// ---------------------------------------------------------------------------
+// Structured transport errors
+//
+// Rust-side transport failures (dead sidecar, mid-request death, per-method
+// timeout) used to reach the frontend as free text — ErrorToast couldn't split
+// them into a plain headline + a technical detail toggle, and the raw binary
+// path / method name / timeout had nowhere to demote to. We now serialize them
+// into the SAME envelope shape the Python errors already use:
+//
+//     { "code", "message", "data": { "kind", "headline", "detail" } }
+//
+// so the one shared frontend parser (RpcError) produces a plain headline and a
+// details toggle for EVERY path. `kind` drives the recovery affordance the UI
+// offers:
+//   - "engine_dead" → ErrorToast shows "Restart Vibechek"
+//   - "retryable"   → ErrorToast shows "Try again" (re-issues the call)
+//   - "fatal"       → no recovery action (should be rare for transport)
+// ---------------------------------------------------------------------------
+
+/// Error class the frontend branches on to pick a recovery action.
+#[derive(Debug, Clone, Copy)]
+pub enum TransportErrorKind {
+    /// The sidecar process is gone (already-dead flag, mid-request death, or
+    /// the stdout-EOF drain). Recovery = restart the app.
+    EngineDead,
+    /// A per-method wall-clock timeout. The sidecar may still be alive, so the
+    /// safe recovery is to re-issue the call, not to restart.
+    Retryable,
+    /// An internal transport fault we can't classify (should be rare).
+    Fatal,
+}
+
+impl TransportErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            TransportErrorKind::EngineDead => "engine_dead",
+            TransportErrorKind::Retryable => "retryable",
+            TransportErrorKind::Fatal => "fatal",
+        }
+    }
+}
+
+/// A transport-level failure carrying a plain, user-facing `headline` and a
+/// technical `detail` (the raw error text, incl. the binary path / method name)
+/// the frontend can demote to a details toggle.
+#[derive(Debug)]
+pub struct TransportError {
+    kind: TransportErrorKind,
+    headline: String,
+    detail: String,
+}
+
+impl TransportError {
+    /// The sidecar is gone. One plain headline for every death path; the
+    /// specific reason (mid-request, already-dead, stdin write failure) lands
+    /// in `detail`.
+    fn engine_dead(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TransportErrorKind::EngineDead,
+            headline: "The analysis service stopped unexpectedly.".into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// A per-method wall-clock timeout. Headline names the operation in plain
+    /// terms ("The library scan is taking longer than expected.").
+    fn timeout(method: &str, secs: u64) -> Self {
+        Self {
+            kind: TransportErrorKind::Retryable,
+            headline: format!(
+                "{} is taking longer than expected.",
+                plain_operation_name(method)
+            ),
+            detail: format!("sidecar call '{method}' timed out after {secs}s"),
+        }
+    }
+
+    /// An internal fault we couldn't classify (e.g. request encoding failed).
+    fn fatal(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TransportErrorKind::Fatal,
+            headline: "Vibechek hit an unexpected internal error.".into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Serialize into the `{code, message, data:{kind, headline, detail}}`
+    /// envelope the frontend's RpcError parser understands. `message` mirrors
+    /// the plain headline so any consumer that reads only `.message` still gets
+    /// user-facing text — never the raw error.
+    pub fn into_envelope_json(self) -> String {
+        let value = json!({
+            "code": -32001,
+            "message": self.headline,
+            "data": {
+                "kind": self.kind.as_str(),
+                "headline": self.headline,
+                "detail": self.detail,
+            }
+        });
+        serde_json::to_string(&value).unwrap_or_else(|_| {
+            // Every field is a plain string, so this cannot realistically fail;
+            // never panic on the error path — fall back to a minimal envelope.
+            "{\"code\":-32001,\"message\":\"The analysis service stopped unexpectedly.\"}"
+                .to_string()
+        })
+    }
+}
+
+/// Map a raw JSON-RPC method name to a plain, user-facing operation name for
+/// error headlines. Mirrors the taxonomy `timeout_for` groups methods by;
+/// anything unmapped falls back to a neutral "The operation".
+fn plain_operation_name(method: &str) -> &'static str {
+    match method {
+        "analyze_directory" => "Analysis",
+        "scan_directory" | "scan_only" => "The library scan",
+        "find_duplicates" | "handle_duplicates" => "The duplicate scan",
+        "plan_organization" | "organize" => "The organize",
+        "apply_ml_tags" => "Applying tags",
+        "backup_tags" => "The tag backup",
+        "restore_tags" | "restore_tags_with_remap" => "The tag restore",
+        "download_models" => "The model download",
+        "install_wsl" | "install_vibechek_in_wsl" | "upgrade_vibechek_in_wsl"
+        | "install_cuda_libs_in_wsl" | "install_essentia_native" | "setup_onnx_engine"
+        | "setup_clap_engine" | "setup_genre_resolver" => "Setup",
+        "revert_journal" => "The undo",
+        _ => "The operation",
+    }
+}
+
 /// Handle the frontend holds (via AppState) to talk to the sidecar.
 #[derive(Clone)]
 pub struct SidecarHandle {
@@ -147,14 +277,19 @@ impl SidecarHandle {
     }
 
     /// Send a JSON-RPC request and await its response.
-    pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    ///
+    /// The `Err` variant is a structured [`TransportError`] carrying a plain
+    /// headline, a technical detail, and a kind. `commands::rpc_call` serializes
+    /// it into the same envelope shape Python errors use, so ErrorToast can
+    /// render a plain headline, a details toggle, and a Restart/Retry action.
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value, TransportError> {
         // Fast-fail if we already know the sidecar is gone, rather than
         // hanging on the 1-hour timeout.
         if self.inner.is_dead() {
-            return Err(anyhow!(
+            return Err(TransportError::engine_dead(format!(
                 "sidecar is no longer running (binary: {}); restart the app",
                 self.inner.binary_path
-            ));
+            )));
         }
 
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
@@ -171,15 +306,32 @@ impl SidecarHandle {
             "method": method,
             "params": params,
         });
-        let line = serde_json::to_string(&request)? + "\n";
+        let line = match serde_json::to_string(&request) {
+            Ok(s) => s + "\n",
+            Err(e) => {
+                return Err(TransportError::fatal(format!(
+                    "failed to encode request for '{method}': {e}"
+                )));
+            }
+        };
 
         {
             let mut stdin = self.inner.stdin.lock().await;
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .context("write to sidecar stdin")?;
-            stdin.flush().await.context("flush sidecar stdin")?;
+            // A stdin write/flush failure means the sidecar's pipe is gone —
+            // treat it as a death, not a generic error, so the UI offers
+            // Restart rather than a bare stack fragment.
+            if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                return Err(TransportError::engine_dead(format!(
+                    "write to sidecar stdin failed for '{method}' (binary: {}): {e}",
+                    self.inner.binary_path
+                )));
+            }
+            if let Err(e) = stdin.flush().await {
+                return Err(TransportError::engine_dead(format!(
+                    "flush sidecar stdin failed for '{method}' (binary: {}): {e}",
+                    self.inner.binary_path
+                )));
+            }
         }
 
         // Per-method timeout. `None` means "wait indefinitely" —
@@ -189,32 +341,26 @@ impl SidecarHandle {
         match timeout_for(method) {
             None => match rx.await {
                 Ok(value) => Ok(value),
-                Err(_canceled) => Err(anyhow!(
+                Err(_canceled) => Err(TransportError::engine_dead(format!(
                     "sidecar died mid-request on method '{}' (binary: {})",
-                    method,
-                    self.inner.binary_path
-                )),
+                    method, self.inner.binary_path
+                ))),
             },
             Some(deadline) => match tokio::time::timeout(deadline, rx).await {
                 Ok(Ok(value)) => Ok(value),
                 Ok(Err(_canceled)) => {
                     // Receiver dropped — sender was either taken by the EOF
                     // drain (sidecar died) or never got the chance to fire.
-                    Err(anyhow!(
+                    Err(TransportError::engine_dead(format!(
                         "sidecar died mid-request on method '{}' (binary: {})",
-                        method,
-                        self.inner.binary_path
-                    ))
+                        method, self.inner.binary_path
+                    )))
                 }
                 Err(_elapsed) => {
                     // Drop the pending entry so we don't leak it
                     let mut pending = self.inner.pending.lock().await;
                     pending.remove(&id);
-                    Err(anyhow!(
-                        "sidecar call '{}' timed out after {}s",
-                        method,
-                        deadline.as_secs()
-                    ))
+                    Err(TransportError::timeout(method, deadline.as_secs()))
                 }
             },
         }
@@ -424,15 +570,27 @@ async fn mark_dead_and_drain(inner: &Arc<Inner>) {
     };
     let count = drained.len();
     for (id, tx) in drained {
+        // Carry the same structured envelope shape Python errors use so the
+        // frontend renders a plain headline + a details toggle + a "Restart
+        // Vibechek" action (kind=engine_dead). This is the path a mid-analyze
+        // death takes — the pending analyze oneshot is drained here, not via
+        // the `call()` timeout branch.
+        let detail = format!(
+            "sidecar died (binary: {}); in-flight request aborted",
+            inner.binary_path
+        );
+        let headline = "The analysis service stopped unexpectedly and this action didn't finish.";
         let err = json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": {
                 "code": -32000,
-                "message": format!(
-                    "sidecar died (binary: {}); in-flight request aborted",
-                    inner.binary_path
-                ),
+                "message": headline,
+                "data": {
+                    "kind": "engine_dead",
+                    "headline": headline,
+                    "detail": detail,
+                }
             }
         });
         let _ = tx.send(err);
@@ -580,6 +738,51 @@ fn resolve_sidecar_binary() -> Result<String> {
         }
     }
 
-    // Final fallback: hope it's on PATH
-    Ok("vibechek".to_string())
+    // Development fallback: a bare `vibechek` on PATH. Only use it if it
+    // actually resolves — spawning a name that isn't there would surface as an
+    // opaque OS "program not found" mid-startup. When nothing is found we fail
+    // here with a clear message so the setup handler can show the install
+    // dialog (K1) instead of spawning a nonexistent command.
+    if let Some(found) = find_on_path("vibechek") {
+        return Ok(found);
+    }
+
+    Err(anyhow!(
+        "could not locate the vibechek analysis service. Looked at: VIBECHEK_SIDECAR, \
+         a bundled `vibechek-sidecar` next to the app executable, and `vibechek` on PATH."
+    ))
+}
+
+/// Resolve an executable `name` against the `PATH` env var, honoring the
+/// platform's executable extensions (`.exe`/`.bat`/`.cmd` on Windows via
+/// `PATHEXT`, bare name elsewhere). Returns the first match's full path.
+fn find_on_path(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    // On Windows, a bare `vibechek` on the command line resolves via PATHEXT;
+    // replicate that here so we don't reject a real install just because the
+    // literal `vibechek` (no extension) isn't a file.
+    #[cfg(windows)]
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    #[cfg(not(windows))]
+    let exts: Vec<String> = Vec::new();
+
+    for dir in std::env::split_paths(&path) {
+        // Bare name first (POSIX, or a Windows file that already has an ext).
+        let bare = dir.join(name);
+        if bare.is_file() {
+            return Some(bare.to_string_lossy().into_owned());
+        }
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
 }
