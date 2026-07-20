@@ -21,7 +21,7 @@ export const KIND_LABELS: Record<string, string> = {
   backup: "Backing up tags",
   "download-models": "Downloading ML models",
   "install-wsl": "Installing WSL",
-  "install-essentia": "Setting up the analyzer",
+  "install-essentia": "Setting up the analysis engine",
   "install-cuda": "Installing GPU libraries",
   revert: "Undoing operation",
 };

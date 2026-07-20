@@ -37,7 +37,35 @@ interface Props {
   onReady: () => void;
 }
 
-type Action = "wsl" | "distro" | "vibechek" | "models" | null;
+export type Action = "wsl" | "distro" | "vibechek" | "models" | null;
+
+/**
+ * Map a preflight `Action` to the operation kind that drives the global
+ * progress-overlay label (see KIND_LABELS in AnalysisProgress). Each install
+ * gets its OWN kind so the overlay reads "Installing WSL" / "Setting up the
+ * analysis engine" instead of the generic "Downloading ML models" it used to
+ * show for every step. Exhaustive by design — a new Action member is a compile
+ * error here rather than a silent fall-through to "download-models".
+ *
+ * `vibechek` covers both install paths that share the button (install the
+ * analyzer into WSL on Windows, and the native managed-venv install on
+ * Linux/macOS). `models`/null aren't installs, so the generic download kind is
+ * the correct label for them.
+ */
+export function actionProgressKind(
+  action: Action,
+): "install-wsl" | "install-essentia" | "download-models" {
+  switch (action) {
+    case "wsl":
+    case "distro":
+      return "install-wsl";
+    case "vibechek":
+      return "install-essentia";
+    case "models":
+    case null:
+      return "download-models";
+  }
+}
 
 export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Props) {
   const active = useOperationStore((s) => s.active);
@@ -130,7 +158,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
     setActionMessage(null);
     setPostInstallNote(null);
     setLogLines([]);
-    const opId = begin("download-models"); // generic "busy" indicator
+    const opId = begin(actionProgressKind(action)); // per-action overlay label
     opIdRef.current = opId;
     try {
       const result = await rpc<T>(method, { ...params, op_id: opId });
