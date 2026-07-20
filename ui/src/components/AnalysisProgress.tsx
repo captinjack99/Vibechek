@@ -42,17 +42,27 @@ export function AnalysisProgress() {
     : 0;
 
   return (
+    // Right-anchored with a FIXED width, not center-anchored min/max-width.
+    // The old `left-1/2 -translate-x-1/2` + `min-w-[420px] max-w-[640px]`
+    // combo let every progress message re-width the panel, and since it was
+    // centered BOTH edges shifted with it — the Cancel button wandered
+    // sideways as text streamed in ("moves all over the place, impossible to
+    // click") and long messages could blow past `max-w` and run off the
+    // right edge of the screen. Pinning to bottom-right with a fixed width
+    // (clamped only so it can't poke off-screen on a narrow window) plus
+    // `truncate` on every variable-length row keeps geometry — and the
+    // Cancel button's position — pixel-stable regardless of message length.
     <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 20 }}
-      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50"
+      initial={{ opacity: 0, x: 20 }}
+      animate={{ opacity: 1, x: 0 }}
+      exit={{ opacity: 0, x: 20 }}
+      className="fixed bottom-6 right-6 z-50"
     >
-      <div className="panel-pad min-w-[420px] max-w-[640px] shadow-2xl">
+      <div className="panel-pad w-[440px] max-w-[calc(100vw-3rem)] shadow-2xl">
         <div className="flex items-center gap-3 mb-3">
-          <Loader2 className="w-4 h-4 text-accent animate-spin" />
-          <div className="flex-1">
-            <div className="text-sm font-medium text-white">{label}</div>
+          <Loader2 className="w-4 h-4 text-accent animate-spin flex-none" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-white truncate">{label}</div>
             {progress?.message && (
               <div className="text-xs text-white/40 font-mono truncate">
                 {progress.message}
@@ -60,7 +70,7 @@ export function AnalysisProgress() {
             )}
           </div>
           {pct !== null && (
-            <div className="text-sm font-mono text-white/60 tabular-nums">
+            <div className="text-sm font-mono text-white/60 tabular-nums flex-none">
               {pct}%
             </div>
           )}
@@ -68,7 +78,7 @@ export function AnalysisProgress() {
             onClick={() => {
               rpc("cancel_operation").catch(logCancelFailure);
             }}
-            className="text-white/40 hover:text-accent-red flex items-center gap-1 text-xs"
+            className="flex-none text-white/40 hover:text-accent-red flex items-center gap-1 text-xs"
             title="Cancel this operation"
           >
             <StopCircle className="w-4 h-4" />
@@ -84,13 +94,13 @@ export function AnalysisProgress() {
           />
         </div>
 
-        <div className="flex justify-between mt-2 text-[11px] text-white/40 font-mono">
-          <span>
+        <div className="flex justify-between gap-2 mt-2 text-[11px] text-white/40 font-mono">
+          <span className="truncate min-w-0">
             {progress
               ? `${progress.current.toLocaleString()} / ${progress.total.toLocaleString()}`
               : "starting…"}
           </span>
-          <span>{elapsedSec}s elapsed</span>
+          <span className="flex-none">{elapsedSec}s elapsed</span>
         </div>
       </div>
     </motion.div>
