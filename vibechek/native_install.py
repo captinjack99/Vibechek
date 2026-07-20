@@ -808,6 +808,179 @@ def run_vibechek_in_native_venv(
     )
 
 
+# ---------------------------------------------------------------------------
+# Self-heal — DETECT → SELF-HEAL → RUN parity with wsl.ensure_engine_runtime
+# (WP-G2). Same product doctrine (zero-setup): the user should never need a
+# manual "repair" step for the managed venv either. The classic break here is
+# a host OS/Python upgrade (`brew upgrade python@3.12` dropping 3.11, an apt
+# release-upgrade moving `python3`) that leaves the venv files on disk while
+# the interpreter — or the compiled ML wheels underneath — no longer load.
+# ---------------------------------------------------------------------------
+
+
+def _native_stack_imports(engine: str) -> str:
+    """The Python import that proves `engine`'s ML stack is loadable.
+
+    Mirrors ``wsl._engine_stack_imports``: onnx/native run onnxruntime (the
+    exact thing that hard-crashes on a CUDA wheel skew) plus essentia for the
+    DSP; essentia_tf runs essentia-tensorflow. Top-level packages only —
+    enough to catch a broken shared-library dlopen without paying the
+    multi-second full-backend init.
+    """
+    if engine in ("onnx", "native"):
+        return "import essentia, onnxruntime"
+    return "import essentia"
+
+
+def _probe_native_stack_import(engine: str) -> tuple[bool, str]:
+    """Run ``<venv python> -c "import <ml stack>"``; report venv health.
+
+    Returns ``(ok, detail)``. Unlike the WSL probe — where a launch failure
+    means wsl.exe/infrastructure trouble, not venv trouble, so it reports
+    healthy — a venv Python that is MISSING or fails to exec here IS the
+    classic broken state (a host-Python upgrade leaves ``bin/python3`` a
+    dangling symlink), so both count as definite negatives. Only a timeout is
+    inconclusive and reports healthy, so a slow-but-working install is never
+    false-flagged into a needless multi-minute reinstall.
+    """
+    vd = _venv_dir(engine)
+    py = next(
+        (p for p in (vd / "bin" / "python3", vd / "bin" / "python",
+                     vd / "Scripts" / "python.exe") if p.exists()),
+        None,
+    )
+    if py is None:
+        return False, f"the managed venv at {vd} has no working Python interpreter"
+    try:
+        proc = subprocess.run(
+            [str(py), "-c", _native_stack_imports(engine)],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:
+        return True, f"probe inconclusive: {type(e).__name__}: {e}"
+    except OSError as e:
+        # exec failure = dangling interpreter (the "cannot execute: required
+        # file not found" post-upgrade state probe_native_venv documents).
+        return False, f"the venv Python at {py} can't run: {e}"
+    if proc.returncode == 0:
+        return True, ""
+    # Surface the last few real stderr lines (the actual ImportError / dlopen
+    # failure) — never a generic "not installed".
+    tail = [ln for ln in (proc.stderr or "").splitlines() if ln.strip()][-4:]
+    detail = " / ".join(tail) if tail else f"import exited {proc.returncode}"
+    return False, detail
+
+
+def ensure_native_engine_runtime(
+    engine: str = "essentia_tf",
+    on_progress: ProgressCallback | None = None,
+) -> dict:
+    """DETECT → SELF-HEAL → RUN the managed-venv engine runtime for `engine`.
+
+    The Linux/macOS analog of ``wsl.ensure_engine_runtime`` (WP-G2 parity),
+    called by the analyzer right before every managed-venv dispatch:
+
+      (a) verify the venv imports its ML stack (essentia / onnxruntime);
+      (b) on failure, reinstall via ``install_essentia_native`` (whose verify
+          step already wipes + rebuilds a corrupt venv once — the WP-J1
+          clean-reinstall path), then re-verify.
+
+    Returns ``{ok, healed:[...], ...}``; failures carry the headline/detail/
+    kind trio for the analyzer's UserFacingError. Loop-guarded by
+    construction: one reinstall + one re-probe per call, no recursion (the
+    installer's internal wipe-retry is its own equally bounded second
+    chance). ``VIBECHEK_NO_AUTOHEAL`` suppresses the repair (never the
+    detection) — a broken stack then reports honestly instead of crashing raw.
+    """
+    if not IS_SUPPORTED:
+        return {"ok": True, "skipped": "unsupported-platform"}
+
+    from vibechek import cancellation  # noqa: PLC0415
+    from vibechek.wsl import _autoheal_disabled  # noqa: PLC0415  (the ONE opt-out switch)
+
+    # (a) DETECT — can the venv import its ML stack?
+    stack_ok, detail = _probe_native_stack_import(engine)
+    if stack_ok:
+        return {"ok": True, "healed": []}
+
+    if _autoheal_disabled():
+        return {
+            "ok": False,
+            "error": (
+                f"The {engine} engine can't import its ML stack in the managed "
+                f"venv: {detail}. Automatic repair is disabled "
+                "(VIBECHEK_NO_AUTOHEAL)."
+            ),
+            "kind": "fatal",
+            "headline": (
+                "The analysis engine can't start, and automatic repair is "
+                "turned off."
+            ),
+            "detail": (
+                f"The {engine} engine couldn't import its ML libraries in the "
+                f"managed venv at {_venv_dir(engine)}: {detail}. Automatic "
+                "repair is disabled (VIBECHEK_NO_AUTOHEAL) — turn it back on, "
+                "or reinstall the analysis environment from Vibechek's setup "
+                "screen."
+            ),
+            "stack_error": detail,
+            "autoheal_disabled": True,
+        }
+
+    # (b) SELF-HEAL — reinstall the venv in place.
+    if on_progress:
+        on_progress(
+            0, 0,
+            f"Repairing the {engine} analysis engine "
+            "(reinstalling its ML libraries; one-time)…",
+        )
+    log.warning(
+        "Engine ML stack import failed in the managed venv (%s) — "
+        "auto-repairing in place", detail,
+    )
+    res = install_essentia_native(on_progress, engine=engine)
+    if res.get("cancelled") or cancellation.is_cancelled():
+        return {"ok": False, "cancelled": True, "error": "Cancelled by user"}
+    if not res.get("ok"):
+        return {
+            "ok": False,
+            "phase": "stack-repair",
+            "error": (
+                f"Automatic repair of the {engine} engine failed: "
+                f"{res.get('error', 'unknown error')}"
+            ),
+            # install_essentia_native's verify failure already ships the
+            # headline/detail/kind trio; pass it through, with a generic
+            # headline for the earlier (venv-create / pip) branches that don't.
+            "kind": res.get("kind") or "fatal",
+            "headline": res.get("headline")
+            or "The analysis engine couldn't be repaired automatically.",
+            "detail": res.get("detail") or res.get("error"),
+        }
+    stack_ok2, detail2 = _probe_native_stack_import(engine)
+    if not stack_ok2:
+        return {
+            "ok": False,
+            "phase": "stack-repair",
+            "error": (
+                f"The {engine} engine still can't import its ML stack after a "
+                f"reinstall: {detail2}."
+            ),
+            "kind": "fatal",
+            "headline": (
+                "The analysis engine still isn't working after an automatic "
+                "repair."
+            ),
+            "detail": (
+                f"The {engine} engine still couldn't import its ML libraries "
+                f"after reinstalling the managed venv at {_venv_dir(engine)}: "
+                f"{detail2}. Reinstalling the analysis environment from "
+                "Vibechek's setup screen may fix it."
+            ),
+            "stack_error": detail2,
+        }
+    return {"ok": True, "healed": ["ml-stack"]}
+
 
 # ---------------------------------------------------------------------------
 # Opt-in genre engines (CLAP student / online resolver) — native analogs of

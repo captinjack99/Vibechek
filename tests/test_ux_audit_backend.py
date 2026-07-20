@@ -226,12 +226,22 @@ def _cfg(tmp_path: Path) -> AnalysisConfig:
     return AnalysisConfig(models_dir=tmp_path / "models")
 
 
+def _stub_heal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralize the WP-G2 pre-dispatch self-heal so these post-dispatch
+    error-shape tests never touch the real installer (multi-minute pip in CI)."""
+    monkeypatch.setattr(
+        native_install, "ensure_native_engine_runtime",
+        lambda *a, **k: {"ok": True, "healed": []},
+    )
+
+
 def test_g2_managed_venv_exit_nonzero_is_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_run(args, on_stderr_line=None, engine="essentia_tf"):
         return subprocess.CompletedProcess(args, 1, "boom stdout", "")
 
+    _stub_heal(monkeypatch)
     monkeypatch.setattr(native_install, "run_vibechek_in_native_venv", fake_run)
     with pytest.raises(UserFacingError) as ei:
         analyzer._analyze_via_native_venv(
@@ -252,6 +262,7 @@ def test_g4_managed_venv_bad_json_is_retryable(
     def fake_run(args, on_stderr_line=None, engine="essentia_tf"):
         return subprocess.CompletedProcess(args, 0, "", "")
 
+    _stub_heal(monkeypatch)
     monkeypatch.setattr(native_install, "run_vibechek_in_native_venv", fake_run)
     with pytest.raises(UserFacingError) as ei:
         analyzer._analyze_via_native_venv(
@@ -270,6 +281,7 @@ def test_g2_managed_venv_no_output_is_retryable(
     def fake_run(args, on_stderr_line=None, engine="essentia_tf"):
         return subprocess.CompletedProcess(args, 0, "", "")
 
+    _stub_heal(monkeypatch)
     monkeypatch.setattr(native_install, "run_vibechek_in_native_venv", fake_run)
     with pytest.raises(UserFacingError) as ei:
         analyzer._analyze_via_native_venv(

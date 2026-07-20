@@ -2376,7 +2376,42 @@ def _analyze_via_native_venv(
     import json as _json
     import tempfile
 
-    from vibechek.native_install import run_vibechek_in_native_venv
+    from vibechek.native_install import (
+        ensure_native_engine_runtime,
+        run_vibechek_in_native_venv,
+    )
+
+    # DETECT → SELF-HEAL → RUN (zero-setup doctrine; WP-G2 parity with the WSL
+    # sibling's ensure_engine_runtime): probe the managed venv's ML-stack
+    # import and repair it in place BEFORE dispatching, so a host OS/Python
+    # upgrade that broke the venv self-heals on the next analyze instead of
+    # dead-ending in the exit-non-zero error below. Repairs announce
+    # themselves via on_progress; VIBECHEK_NO_AUTOHEAL opts out of the repair
+    # (never the detection). Loop-guarded: one reinstall + one re-probe per
+    # analyze, and no retry after dispatch.
+    report_progress(on_progress, 0, 0, "Checking the analysis engine…")
+    heal = ensure_native_engine_runtime(
+        config.inference_engine, on_progress=on_progress,
+    )
+    if heal.get("cancelled"):
+        raise cancellation.CancelledError("Analysis cancelled by user")
+    if not heal.get("ok"):
+        raise UserFacingError(
+            heal.get("headline")
+            or "The analysis engine still isn't working after an automatic "
+            "repair. Reinstall the analysis environment from Vibechek's setup "
+            "screen to fix it.",
+            detail=heal.get("detail") or heal.get("error"),
+            kind=heal.get("kind") or "fatal",
+        )
+    # Honest self-heal notice for the completion toast — same transport as the
+    # WSL path's runtime_healed.
+    runtime_healed: str | None = None
+    if heal.get("healed"):
+        runtime_healed = (
+            "The analysis engine environment was repaired automatically "
+            f"({', '.join(heal['healed'])})."
+        )
 
     if output_path is None:
         tmp = tempfile.NamedTemporaryFile(
@@ -2436,14 +2471,9 @@ def _analyze_via_native_venv(
         if skip_paths_file is not None:
             skip_paths_file.unlink(missing_ok=True)
 
-    # PARITY NOTE (WP-G2): unlike the WSL sibling (_analyze_via_wsl), this
-    # managed-venv path has NO pre-run detect→self-heal (no ensure_engine_runtime
-    # equivalent). A broken managed venv (ML stack import failure after an OS/
-    # Python upgrade) therefore surfaces as the honest exit-non-zero error below
-    # instead of auto-repairing first. Adding parity — probe the venv's stack
-    # import and reinstall via native_install before dispatch, loop-guarded — is
-    # tracked as follow-up (see the background task), not done here to keep this
-    # change to messaging + the shared error shape.
+    # The pre-dispatch self-heal above already repaired what it could detect
+    # (an import-broken ML stack); an exit here is a genuine runtime failure,
+    # so stay honest rather than looping back into another repair attempt.
     if result.returncode != 0:
         raise UserFacingError(
             "Analysis stopped unexpectedly.",
@@ -2477,6 +2507,11 @@ def _analyze_via_native_venv(
             ),
             kind="retryable",
         ) from e
+
+    # Thread the self-heal notice onto the report so the GUI completion toast
+    # can say the engine was auto-repaired (mirrors the WSL path's transport).
+    if runtime_healed:
+        report["runtime_healed"] = runtime_healed
 
     if output_path is None:
         try:
