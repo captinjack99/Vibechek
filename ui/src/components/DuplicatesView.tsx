@@ -42,6 +42,7 @@ import {
   pickKeeper,
   ruleHelp,
   ruleLabel,
+  ruleShortLabel,
 } from "../lib/keeperRules";
 import { ConfirmModal } from "./ConfirmModal";
 
@@ -69,6 +70,14 @@ export function DuplicatesView() {
   const [keeperOverrides, setKeeperOverrides] = useState<Record<string, string>>({});
   const [skippedGroups, setSkippedGroups] = useState<Set<string>>(new Set());
   const [preconditionError, setPreconditionError] = useState<string | null>(null);
+
+  // Per-file failure list from the last move/trash. The backend returns an
+  // `error_messages` string[] (one line per file it couldn't act on); the old
+  // toast promised a "report" that never existed. This durable in-view panel
+  // IS that report — it survives the automatic rescan that follows a resolve.
+  const [resolveFailures, setResolveFailures] = useState<
+    { headline: string; messages: string[] } | null
+  >(null);
 
   // Pending confirm — captures the user's choice + the computed plan so the
   // modal can render without re-running applyChoices.
@@ -178,26 +187,51 @@ export function DuplicatesView() {
     if (!pendingResolve) return;
     const { action, filtered, reviewFolder } = pendingResolve;
     setPendingResolve(null);
+    // A new action supersedes any earlier failure list.
+    setResolveFailures(null);
 
     const opId = begin("dedupe");
     try {
-      const summary = await rpc<Record<string, number> & { journal_path?: string | null }>(
+      const summary = await rpc<
+        Record<string, number> & {
+          journal_path?: string | null;
+          // The backend has always returned a per-file failure list here; the
+          // old `Record<string, number>` type structurally hid it, so the toast
+          // pointed at a "report" that was never rendered. Surface it instead.
+          error_messages?: string[];
+        }
+      >(
         "handle_duplicates",
         { report: filtered, action, review_folder: reviewFolder, op_id: opId },
       );
       finish();
       const word = action === "trash" ? "Trashed" : "Moved";
+      const failedVerb = action === "trash" ? "sent to trash" : "moved";
       // Select the count by ACTION, not `deleted ?? moved`. The backend always
       // returns BOTH keys (initialised to 0), incrementing only the one for the
       // chosen action — so for a move, `deleted` is the number 0 and `??` (which
       // only falls through on null/undefined) returns 0 instead of `moved`,
       // making every move report "Moved 0 duplicates".
       const count = action === "trash" ? (summary.deleted ?? 0) : (summary.moved ?? 0);
-      const errors = summary.errors ?? 0;
+      const failures = summary.error_messages ?? [];
+      const errors = summary.errors ?? failures.length;
+      // Promote the per-file failure list into a durable in-view panel (the
+      // "report" the old toast promised). It has to be set BEFORE the rescan
+      // below — handleScan does not clear it, so it persists across the reload.
+      if (failures.length > 0) {
+        setResolveFailures({
+          headline: `${failures.length} file${failures.length === 1 ? "" : "s"} couldn't be ${failedVerb}`,
+          messages: failures,
+        });
+      }
       // Move-to-review is revertible via Recent operations; trash isn't
       // (it's in the OS recycle bin). Surface the right hint either way.
       const detailParts: string[] = [];
-      if (errors > 0) detailParts.push(`${errors} error${errors === 1 ? "" : "s"} — see report.`);
+      if (errors > 0) {
+        detailParts.push(
+          `${errors} file${errors === 1 ? "" : "s"} couldn't be ${failedVerb} — see the list above.`,
+        );
+      }
       if (action === "move" && summary.journal_path) {
         detailParts.push('Undo available in "Recent operations" (sidebar).');
       } else if (action === "trash" && count > 0) {
@@ -205,7 +239,7 @@ export function DuplicatesView() {
       }
       notify(`${word} ${count} duplicate${count === 1 ? "" : "s"}`, {
         detail: detailParts.length > 0 ? detailParts.join(" ") : undefined,
-        kind: errors > 0 ? "info" : "success",
+        kind: errors > 0 ? "warning" : "success",
       });
       // Clear the stale report immediately so the user can't act on
       // already-trashed entries, then await the rescan so the loading
@@ -233,7 +267,12 @@ export function DuplicatesView() {
           </button>
           <button
             className="btn-primary"
-            onClick={handleScan}
+            onClick={() => {
+              // A user-initiated scan starts fresh — drop any stale failure
+              // list from a previous move/trash.
+              setResolveFailures(null);
+              void handleScan();
+            }}
             disabled={!scanPath || active !== null}
           >
             <Search className="w-4 h-4" />
@@ -262,6 +301,44 @@ export function DuplicatesView() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Partial-failure "report" for the last move/trash. The backend returns
+          one line per file it couldn't act on; the old toast said "see report"
+          but nothing rendered it. This expandable list IS that report, and it
+          survives the automatic rescan that follows a resolve. */}
+      {resolveFailures && (
+        <details
+          open
+          className="m-4 panel-pad bg-accent-yellow/5 border border-accent-yellow/30"
+        >
+          <summary className="cursor-pointer text-sm font-medium text-accent-yellow flex items-center gap-2 select-none">
+            <AlertCircle className="w-4 h-4 flex-none" />
+            <span>{resolveFailures.headline}</span>
+            <button
+              className="ml-auto text-xs text-white/40 hover:text-white font-normal"
+              onClick={(e) => {
+                e.preventDefault();
+                setResolveFailures(null);
+              }}
+            >
+              dismiss
+            </button>
+          </summary>
+          <p className="text-xs text-white/50 mt-2">
+            These files stayed where they were. The others were handled normally.
+          </p>
+          <ul className="mt-2 space-y-1 max-h-64 overflow-auto text-xs font-mono text-white/60">
+            {resolveFailures.messages.slice(0, 100).map((m, i) => (
+              <li key={i} className="break-all">{m}</li>
+            ))}
+            {resolveFailures.messages.length > 100 && (
+              <li className="text-white/40 italic">
+                …and {resolveFailures.messages.length - 100} more
+              </li>
+            )}
+          </ul>
+        </details>
       )}
 
       {!report ? (
@@ -902,7 +979,7 @@ function GroupCard({
         </div>
         {!skipped && explained.criterion !== "tie" && (
           <div className="text-xs text-accent-cyan">
-            • picked by {explained.criterion}: {explained.detail}
+            • picked by {ruleShortLabel(explained.criterion)}: {explained.detail}
           </div>
         )}
         {userOverrode && (

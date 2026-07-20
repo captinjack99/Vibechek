@@ -97,8 +97,20 @@ const RULE_LABELS: Record<RuleCriterion, string> = {
   shortest_path: "Folder depth (shortest path first)",
 };
 
+/** Terse, plain-language names for the inline "picked by ..." hint on each
+ *  group. The full RULE_LABELS are too long to sit inline, and the raw
+ *  criterion enum ("shortest_path") is engineer-speak — this is the middle
+ *  ground the user actually reads. */
+const RULE_SHORT_LABELS: Record<RuleCriterion, string> = {
+  codec:         "file format",
+  bitrate:       "bitrate",
+  size:          "file size",
+  modified:      "modified date",
+  shortest_path: "folder depth",
+};
+
 const RULE_HELP: Record<RuleCriterion, string> = {
-  codec:         "Prefers lossless formats. Adjust the order in code if you want different preferences.",
+  codec:         "Prefers lossless formats (FLAC, WAV, AIFF) over compressed ones; this internal ranking isn't user-editable yet.",
   bitrate:       "Higher bitrate usually = better quality. Treats lossless as effectively infinite.",
   size:          "Larger files usually contain more data. Reliable fallback when bitrate is unknown.",
   modified:      "Picks the most recently saved copy — useful if you re-downloaded a track.",
@@ -107,6 +119,11 @@ const RULE_HELP: Record<RuleCriterion, string> = {
 
 export function ruleLabel(c: RuleCriterion): string {
   return RULE_LABELS[c];
+}
+
+/** Terse plain-language name for the inline group hint (e.g. "folder depth"). */
+export function ruleShortLabel(c: RuleCriterion): string {
+  return RULE_SHORT_LABELS[c];
 }
 
 export function ruleHelp(c: RuleCriterion): string {
@@ -242,6 +259,6 @@ function explainOne(f: FileInfo, criterion: RuleCriterion): string {
     case "bitrate":       return f.bitrate_kbps ? `${f.bitrate_kbps} kbps` : "unknown bitrate";
     case "size":          return `${f.size_mb.toFixed(1)} MB`;
     case "modified":      return f.modified_time ? new Date(f.modified_time * 1000).toLocaleDateString() : "?";
-    case "shortest_path": return `${f.path.split(/[/\\]/).length} path segments`;
+    case "shortest_path": return `${f.path.split(/[/\\]/).length} levels`;
   }
 }

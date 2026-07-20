@@ -5,6 +5,7 @@ import {
   DEFAULT_RULES,
   explainPick,
   pickKeeper,
+  ruleShortLabel,
   type KeeperRule,
 } from "./keeperRules";
 
@@ -102,6 +103,28 @@ describe("explainPick", () => {
     const b = file({ path: "/b.mp3" });
     const reason = explainPick(a, [b], DEFAULT_RULES);
     expect(reason.criterion).toBe("tie");
+  });
+
+  it("explains the folder-depth win in plain 'levels', not 'path segments'", () => {
+    // Codec/bitrate/size/mtime all tie → shortest_path decides. The shallower
+    // path wins and the detail reads in user language.
+    const deep = file({ path: "/a/b/c/d/track.mp3" });
+    const shallow = file({ path: "/track.mp3" });
+    const rules: KeeperRule[] = [{ criterion: "shortest_path", enabled: true }];
+    const reason = explainPick(shallow, [deep], rules);
+    expect(reason.criterion).toBe("shortest_path");
+    expect(reason.detail).toMatch(/levels/);
+    expect(reason.detail).not.toMatch(/segments/);
+  });
+});
+
+describe("ruleShortLabel", () => {
+  it("maps each criterion to a terse plain-language name", () => {
+    expect(ruleShortLabel("shortest_path")).toBe("folder depth");
+    expect(ruleShortLabel("codec")).toBe("file format");
+    expect(ruleShortLabel("size")).toBe("file size");
+    expect(ruleShortLabel("bitrate")).toBe("bitrate");
+    expect(ruleShortLabel("modified")).toBe("modified date");
   });
 });
 

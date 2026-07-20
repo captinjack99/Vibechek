@@ -376,6 +376,11 @@ export interface TagApplyStats {
 export interface TagBackupStats {
   total: number;
   backed_up: number;
+  /** Files written into the backup whose format has no tag reader (or whose
+   *  tags failed to read) — they carry NO tags, so a restore can't put anything
+   *  back. The backend (BackupStats.not_fully_backed_up) has always computed
+   *  this; surfacing it stops "Backup complete" from implying zero loss. */
+  not_fully_backed_up: number;
   errors: string[];
 }
 
@@ -383,6 +388,9 @@ export interface TagRestoreStats {
   total: number;
   restored: number;
   skipped_missing: number;
+  /** Backup entries whose format had no reader at backup time — there is
+   *  nothing to restore for them (distinct from "already up to date"). */
+  skipped_unsupported: number;
   errors: string[];
 }
 

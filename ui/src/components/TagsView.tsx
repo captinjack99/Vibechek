@@ -22,6 +22,7 @@ import { progressMatches } from "../stores/operation";
 import { rpc, useSidecarProgress } from "../hooks/useSidecar";
 import { ConfirmModal } from "./ConfirmModal";
 import type { AnalysisReport, BackupHistory, BackupRecord } from "../types";
+import type { TagBackupStats, TagRestoreStats } from "../api/methods";
 
 /** Result payload from `restore_tags_with_remap`. */
 interface RemapRestoreStats {
@@ -91,7 +92,25 @@ export function TagsView() {
   const notify = useNotificationStore((s) => s.notify);
 
   const [pathToBackup, setPathToBackup] = useState<string | null>(libraryPath);
-  const [lastBackup, setLastBackup] = useState<{ file: string; count: number } | null>(null);
+  const [lastBackup, setLastBackup] = useState<{
+    file: string;
+    count: number;
+    /** Files written into the backup that carry no tags (unsupported format or
+     *  read error) — NOT restorable. Surfaced so "Backup complete" is honest. */
+    notFullyBackedUp: number;
+    /** Per-file read failures (these files aren't in the backup at all). */
+    errors: string[];
+  } | null>(null);
+  // Durable in-view result for the last straight restore. Restore is the most
+  // dangerous op (overwrites tags, no undo), so which files DIDN'T come back
+  // must be visible, not buried in an auto-dismissing toast.
+  const [lastRestore, setLastRestore] = useState<{
+    restored: number;
+    total: number;
+    skippedMissing: number;
+    skippedUnsupported: number;
+    errors: string[];
+  } | null>(null);
   const [restoreCandidate, setRestoreCandidate] = useState<string | null>(null);
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [history, setHistory] = useState<BackupRecord[]>([]);
@@ -186,12 +205,17 @@ export function TagsView() {
     const opId = begin("backup");
     armStallTimer();
     try {
-      const stats = await rpc<{ total: number; backed_up: number; errors: string[] }>(
+      const stats = await rpc<TagBackupStats>(
         "backup_tags",
         { path: pathToBackup, output_path: outFile, op_id: opId },
       );
       finish();
-      setLastBackup({ file: outFile, count: stats.backed_up });
+      setLastBackup({
+        file: outFile,
+        count: stats.backed_up,
+        notFullyBackedUp: stats.not_fully_backed_up ?? 0,
+        errors: stats.errors ?? [],
+      });
       await refreshHistory();
     } catch (e) {
       fail(e);
@@ -279,21 +303,37 @@ export function TagsView() {
     const record = history.find((r) => r.backup_path === restoreCandidate);
     const restoredFor = record?.library_path ?? null;
     const opId = begin("backup"); // (operation kind: restore is a backup-class op)
+    setLastRestore(null);
     try {
-      const stats = await rpc<{
-        total: number; restored: number; skipped_missing: number; errors: string[];
-      }>("restore_tags", { backup_path: restoreCandidate, op_id: opId });
+      const stats = await rpc<TagRestoreStats>(
+        "restore_tags",
+        { backup_path: restoreCandidate, op_id: opId },
+      );
       finish();
+      const skippedUnsupported = stats.skipped_unsupported ?? 0;
+      const errors = stats.errors ?? [];
+      // Durable in-view result — a restore silently dropping files is exactly
+      // the data-trust failure this fixes.
+      setLastRestore({
+        restored: stats.restored,
+        total: stats.total,
+        skippedMissing: stats.skipped_missing,
+        skippedUnsupported,
+        errors,
+      });
       const detailLines: string[] = [];
       if (stats.skipped_missing > 0) {
         detailLines.push(`Skipped (missing on disk): ${stats.skipped_missing}`);
       }
-      if (stats.errors.length > 0) {
-        detailLines.push(`Errors: ${stats.errors.length}`);
+      if (skippedUnsupported > 0) {
+        detailLines.push(`Skipped (no tags in backup): ${skippedUnsupported}`);
+      }
+      if (errors.length > 0) {
+        detailLines.push(`Errors: ${errors.length}`);
       }
       notify(`Restored ${stats.restored} of ${stats.total} files`, {
         detail: detailLines.length > 0 ? detailLines.join("\n") : undefined,
-        kind: stats.errors.length > 0 ? "info" : "success",
+        kind: errors.length > 0 ? "warning" : "success",
       });
       await refreshLibraryAfterRestore(restoredFor);
     } catch (e) {
@@ -423,13 +463,101 @@ export function TagsView() {
           <div className="panel-pad bg-accent-green/5 border-accent-green/30 text-sm">
             <div className="flex items-start gap-2">
               <CheckCircle2 className="w-4 h-4 text-accent-green flex-none mt-0.5" />
-              <div>
+              <div className="min-w-0">
                 <div className="text-accent-green">Backup complete</div>
                 <div className="text-white/60 mt-0.5">
                   Saved tags for <strong>{lastBackup.count}</strong> files to{" "}
                   <code className="font-mono text-xs">{lastBackup.file}</code>
                 </div>
+
+                {/* Honest caveat: some files were written into the backup with
+                    no tags (unsupported format / read error). Without this the
+                    green checkmark implies "everything is safe" for formats we
+                    can't actually read back. */}
+                {lastBackup.notFullyBackedUp > 0 && (
+                  <div className="mt-2 flex items-start gap-1.5 text-accent-yellow text-xs">
+                    <AlertCircle className="w-3.5 h-3.5 flex-none mt-0.5" />
+                    <span>
+                      <strong>{lastBackup.notFullyBackedUp}</strong>{" "}
+                      file{lastBackup.notFullyBackedUp === 1 ? "" : "s"} could not be fully
+                      backed up (unsupported format or read error) — their tags won't be
+                      restorable from this backup.
+                    </span>
+                  </div>
+                )}
+
+                <ExpandableFileList
+                  label={`file${lastBackup.errors.length === 1 ? "" : "s"} couldn't be read`}
+                  entries={lastBackup.errors}
+                />
               </div>
+            </div>
+          </div>
+        )}
+
+        {lastRestore && (
+          <div
+            className={`panel-pad text-sm ${
+              lastRestore.restored === 0 && lastRestore.total > 0
+                ? "bg-accent-red/5 border-accent-red/30"
+                : lastRestore.errors.length > 0 ||
+                    lastRestore.skippedMissing > 0 ||
+                    lastRestore.skippedUnsupported > 0
+                  ? "bg-accent-yellow/5 border-accent-yellow/30"
+                  : "bg-accent-green/5 border-accent-green/30"
+            }`}
+          >
+            <div className="flex items-start gap-2">
+              {lastRestore.restored === 0 && lastRestore.total > 0 ? (
+                <AlertCircle className="w-4 h-4 text-accent-red flex-none mt-0.5" />
+              ) : lastRestore.errors.length > 0 ||
+                lastRestore.skippedMissing > 0 ||
+                lastRestore.skippedUnsupported > 0 ? (
+                <AlertCircle className="w-4 h-4 text-accent-yellow flex-none mt-0.5" />
+              ) : (
+                <CheckCircle2 className="w-4 h-4 text-accent-green flex-none mt-0.5" />
+              )}
+              <div className="min-w-0 flex-1">
+                <div className="text-white">
+                  <strong>{lastRestore.restored}</strong> of {lastRestore.total} files restored
+                </div>
+                {(lastRestore.skippedMissing > 0 ||
+                  lastRestore.skippedUnsupported > 0 ||
+                  lastRestore.errors.length > 0) && (
+                  <ul className="text-xs text-white/60 mt-1 space-y-0.5 list-disc ml-4">
+                    {lastRestore.skippedMissing > 0 && (
+                      <li>
+                        <strong>{lastRestore.skippedMissing}</strong> skipped — no longer on disk
+                        at the backed-up path.
+                      </li>
+                    )}
+                    {lastRestore.skippedUnsupported > 0 && (
+                      <li>
+                        <strong>{lastRestore.skippedUnsupported}</strong> skipped — the backup
+                        held no tags for {lastRestore.skippedUnsupported === 1 ? "it" : "them"}.
+                      </li>
+                    )}
+                    {lastRestore.errors.length > 0 && (
+                      <li className="text-accent-yellow">
+                        <strong>{lastRestore.errors.length}</strong>{" "}
+                        file{lastRestore.errors.length === 1 ? "" : "s"} couldn't be written.
+                      </li>
+                    )}
+                  </ul>
+                )}
+                <ExpandableFileList
+                  label={`file${lastRestore.errors.length === 1 ? "" : "s"} couldn't be written`}
+                  entries={lastRestore.errors}
+                />
+              </div>
+              <button
+                className="text-white/30 hover:text-white p-1 flex-none"
+                onClick={() => setLastRestore(null)}
+                title="Dismiss"
+                aria-label="Dismiss restore result"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
         )}
@@ -886,6 +1014,31 @@ function RemapDetailSection({
         )}
       </ul>
     </div>
+  );
+}
+
+/**
+ * Collapsible per-file failure list. The backend returns one line per file it
+ * couldn't read/write (`errors: string[]`); this surfaces it instead of
+ * discarding it behind a bare count. Renders nothing when there's nothing to
+ * show, so a clean success stays quiet.
+ */
+function ExpandableFileList({ label, entries }: { label: string; entries: string[] }) {
+  if (entries.length === 0) return null;
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer text-xs text-accent-yellow hover:text-accent-yellow/80 select-none">
+        {entries.length} {label} — show details
+      </summary>
+      <ul className="mt-2 max-h-40 overflow-auto text-[11px] font-mono text-white/60 space-y-0.5 bg-black/20 rounded p-2">
+        {entries.slice(0, 200).map((e, i) => (
+          <li key={i} className="break-all">{e}</li>
+        ))}
+        {entries.length > 200 && (
+          <li className="text-white/40 italic">…and {entries.length - 200} more</li>
+        )}
+      </ul>
+    </details>
   );
 }
 

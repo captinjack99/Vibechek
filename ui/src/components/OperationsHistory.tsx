@@ -52,6 +52,17 @@ export function OperationsHistory() {
   const [loadError, setLoadError] = useState<string | null>(null);
   // Path of the journal currently being reverted (disables its button + spins).
   const [revertingPath, setRevertingPath] = useState<string | null>(null);
+  // Durable result of the last undo: which files stayed put and why. The
+  // backend returns per-file `error_messages` in the revert summary; the toast
+  // only ever showed counts, so a DJ couldn't tell WHICH tracks didn't move
+  // back. This panel is that list. Kept at the modal level (not per-row) so it
+  // survives the post-revert refresh even if the journal row disappears.
+  const [revertResult, setRevertResult] = useState<{
+    reverted: number;
+    skipped: number;
+    errorMessages: string[];
+    trashedNotReverted: number;
+  } | null>(null);
 
   const isMounted = useRef(true);
   useEffect(() => {
@@ -80,9 +91,12 @@ export function OperationsHistory() {
     }
   }, []);
 
-  // Load whenever the modal opens.
+  // Load whenever the modal opens (and clear any stale undo result).
   useEffect(() => {
-    if (open) void refresh();
+    if (open) {
+      setRevertResult(null);
+      void refresh();
+    }
   }, [open, refresh]);
 
   // Esc closes.
@@ -106,6 +120,7 @@ export function OperationsHistory() {
       return;
     }
     setRevertingPath(j.path);
+    setRevertResult(null);
     // Register with the operation store so the global progress overlay shows
     // the revert AND the server-side long-op lock is mirrored client-side.
     const opId = begin("revert");
@@ -123,11 +138,27 @@ export function OperationsHistory() {
         }
         useLibraryStore.getState().updateTrackPaths(pathMap);
       }
+      // Surface the per-file detail the backend already returns, but the toast
+      // only ever counted. Show the panel whenever something didn't fully
+      // revert; a clean undo stays quiet (no panel).
+      const errorMessages = summary.error_messages ?? [];
+      if (
+        summary.skipped > 0 ||
+        errorMessages.length > 0 ||
+        summary.trashed_not_reverted > 0
+      ) {
+        setRevertResult({
+          reverted: summary.reverted,
+          skipped: summary.skipped,
+          errorMessages,
+          trashedNotReverted: summary.trashed_not_reverted,
+        });
+      }
       const parts = [`Restored ${summary.reverted}`];
       if (summary.skipped) parts.push(`skipped ${summary.skipped}`);
       if (summary.errors) parts.push(`${summary.errors} error${summary.errors === 1 ? "" : "s"}`);
       notify(`Undo complete — ${parts.join(", ")}`, {
-        kind: summary.errors > 0 ? "info" : "success",
+        kind: summary.errors > 0 || summary.skipped > 0 ? "warning" : "success",
         detail:
           summary.trashed_not_reverted > 0
             ? `${summary.trashed_not_reverted} trashed file(s) can't be auto-restored — recover them from your OS recycle bin.`
@@ -183,6 +214,58 @@ export function OperationsHistory() {
         </div>
 
         <div className="px-5 py-4 overflow-auto flex-1 space-y-2">
+          {/* Durable undo result — which files stayed put and why. Only shown
+              when something didn't fully revert; a clean undo leaves it hidden. */}
+          {revertResult && (
+            <details
+              open
+              className="panel-pad bg-accent-yellow/5 border border-accent-yellow/30"
+            >
+              <summary className="cursor-pointer text-sm font-medium text-accent-yellow flex items-center gap-2 select-none">
+                <AlertCircle className="w-4 h-4 flex-none" />
+                <span>Undo finished — some files stayed in place</span>
+                <button
+                  className="ml-auto text-xs text-white/40 hover:text-white font-normal"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setRevertResult(null);
+                  }}
+                >
+                  dismiss
+                </button>
+              </summary>
+              <div className="text-xs text-white/60 mt-2">
+                Restored {revertResult.reverted}
+                {revertResult.skipped > 0 && `, skipped ${revertResult.skipped}`}
+                {revertResult.errorMessages.length > 0 &&
+                  `, ${revertResult.errorMessages.length} error${
+                    revertResult.errorMessages.length === 1 ? "" : "s"
+                  }`}
+                .
+              </div>
+              {revertResult.trashedNotReverted > 0 && (
+                <div className="text-xs text-white/60 mt-1">
+                  {revertResult.trashedNotReverted} trashed file
+                  {revertResult.trashedNotReverted === 1 ? "" : "s"} can't be auto-restored —
+                  recover {revertResult.trashedNotReverted === 1 ? "it" : "them"} from your OS
+                  recycle bin.
+                </div>
+              )}
+              {revertResult.errorMessages.length > 0 && (
+                <ul className="mt-2 space-y-1 max-h-56 overflow-auto text-[11px] font-mono text-white/60 bg-black/20 rounded p-2">
+                  {revertResult.errorMessages.slice(0, 100).map((m, i) => (
+                    <li key={i} className="break-all">{m}</li>
+                  ))}
+                  {revertResult.errorMessages.length > 100 && (
+                    <li className="text-white/40 italic">
+                      …and {revertResult.errorMessages.length - 100} more
+                    </li>
+                  )}
+                </ul>
+              )}
+            </details>
+          )}
+
           {loading && (
             <div className="flex items-center justify-center gap-2 py-10 text-white/50 text-sm">
               <Loader2 className="w-4 h-4 animate-spin" /> Loading…

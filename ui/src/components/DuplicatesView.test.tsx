@@ -177,6 +177,78 @@ describe("<DuplicatesView /> — resolve result toast", () => {
 });
 
 // ---------------------------------------------------------------------------
+// WP-E1: partial-failure surfacing. `handle_duplicates` returns a per-file
+// `error_messages` list; the old toast said "see report" but nothing rendered
+// it. The fix promotes that list into a durable in-view expandable panel.
+// ---------------------------------------------------------------------------
+
+describe("<DuplicatesView /> — partial-failure report", () => {
+  beforeEach(() => {
+    useLibraryStore.setState({ libraryPath: "D:/Music" });
+    useConfigStore.getState().updateDuplicates({ review_folder: "D:/Review" });
+  });
+
+  it("renders the per-file failure list when some files couldn't be moved", async () => {
+    const user = userEvent.setup();
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        if (args.method === "handle_duplicates") {
+          return {
+            moved: 5,
+            deleted: 0,
+            errors: 2,
+            error_messages: [
+              "D:/Music/x.mp3: move failed — [Errno 13] Permission denied",
+              "D:/Music/y.mp3: file not found",
+            ],
+            journal_path: "D:/j.jsonl",
+          };
+        }
+        return emptyReport; // find_duplicates rescan
+      },
+    );
+    useOperationStore.setState({ duplicateReport: reportWithOneGroup() });
+
+    render(<DuplicatesView />);
+    await user.click(screen.getByRole("button", { name: /move to review folder/i }));
+    await user.click(await screen.findByRole("button", { name: /yes, move files/i }));
+
+    // Honest headline count + the actual per-file lines (the "report").
+    expect(await screen.findByText(/2 files couldn't be moved/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/\[Errno 13\] Permission denied/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/y\.mp3: file not found/i)).toBeInTheDocument();
+    // And the toast no longer promises a nonexistent "report".
+    const msgs = useNotificationStore.getState().items;
+    expect(msgs.some((n) => /see report/i.test(n.detail ?? ""))).toBe(false);
+  });
+
+  it("shows no failure panel on a clean move", async () => {
+    const user = userEvent.setup();
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        if (args.method === "handle_duplicates") {
+          return { moved: 5, deleted: 0, errors: 0, error_messages: [], journal_path: "D:/j.jsonl" };
+        }
+        return emptyReport;
+      },
+    );
+    useOperationStore.setState({ duplicateReport: reportWithOneGroup() });
+
+    render(<DuplicatesView />);
+    await user.click(screen.getByRole("button", { name: /move to review folder/i }));
+    await user.click(await screen.findByRole("button", { name: /yes, move files/i }));
+
+    await waitFor(() => {
+      const msgs = useNotificationStore.getState().items.map((n) => n.message);
+      expect(msgs).toContain("Moved 5 duplicates");
+    });
+    expect(screen.queryByText(/couldn't be moved/i)).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Audio-fingerprint-tool (fpcalc) FAILURE banner. The tool is auto-provisioned
 // now, so the banner is failure-only: it shows the classified reason + the
 // automatic-retry promise, uses plain-user language (never "fpcalc"), and is

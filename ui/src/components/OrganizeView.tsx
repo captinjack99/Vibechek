@@ -877,6 +877,14 @@ function OrganizeResultPanel({
   const notify = useNotificationStore((s) => s.notify);
   const [undoing, setUndoing] = useState(false);
   const [undone, setUndone] = useState(false);
+  // Per-file detail for a partial undo. The backend returns `error_messages`
+  // (path + reason for each file it couldn't move back); the toast only
+  // counted them. Only set when something didn't fully revert.
+  const [undoResult, setUndoResult] = useState<{
+    reverted: number;
+    skipped: number;
+    errorMessages: string[];
+  } | null>(null);
 
   const handleUndo = async () => {
     if (!result.journalPath) return;
@@ -904,14 +912,22 @@ function OrganizeResultPanel({
         }
         useLibraryStore.getState().updateTrackPaths(pathMap);
       }
+      const errorMessages = summary.error_messages ?? [];
+      if (summary.skipped > 0 || errorMessages.length > 0) {
+        setUndoResult({
+          reverted: summary.reverted,
+          skipped: summary.skipped,
+          errorMessages,
+        });
+      }
       const parts = [`Restored ${summary.reverted}`];
       if (summary.skipped) parts.push(`skipped ${summary.skipped}`);
       if (summary.errors) parts.push(`${summary.errors} error(s)`);
       notify(`Undo complete — ${parts.join(", ")}`, {
-        kind: summary.errors > 0 ? "info" : "success",
+        kind: summary.errors > 0 || summary.skipped > 0 ? "warning" : "success",
         detail:
           summary.skipped > 0 || summary.errors > 0
-            ? "Some files could not be restored — re-scan the library if paths look stale."
+            ? "Some files couldn't be moved back — see the list below."
             : undefined,
       });
     } catch (e) {
@@ -1027,6 +1043,41 @@ function OrganizeResultPanel({
                 <li className="text-white/40">... and {result.errors.length - 100} more</li>
               )}
             </ul>
+          </details>
+        )}
+
+        {/* Undo result — which files couldn't be moved back. Only shown after a
+            partial undo; a clean undo leaves it hidden. */}
+        {undoResult && (undoResult.errorMessages.length > 0 || undoResult.skipped > 0) && (
+          <details className="panel-pad bg-accent-yellow/5 border-accent-yellow/30" open>
+            <summary className="cursor-pointer text-sm font-medium text-accent-yellow flex items-center gap-2 select-none">
+              <AlertCircle className="w-4 h-4 flex-none" />
+              Undo left{" "}
+              {undoResult.skipped + undoResult.errorMessages.length} file
+              {undoResult.skipped + undoResult.errorMessages.length === 1 ? "" : "s"} in place
+            </summary>
+            <div className="text-xs text-white/60 mt-2">
+              Moved {undoResult.reverted} back
+              {undoResult.skipped > 0 && `, skipped ${undoResult.skipped}`}
+              {undoResult.errorMessages.length > 0 &&
+                `, ${undoResult.errorMessages.length} error${
+                  undoResult.errorMessages.length === 1 ? "" : "s"
+                }`}
+              . Skipped files were left where they are because the original path
+              was occupied or the file was already moved.
+            </div>
+            {undoResult.errorMessages.length > 0 && (
+              <ul className="mt-2 space-y-1 max-h-56 overflow-auto text-[11px] font-mono text-white/60 bg-black/20 rounded p-2">
+                {undoResult.errorMessages.slice(0, 100).map((m, i) => (
+                  <li key={i} className="break-all">{m}</li>
+                ))}
+                {undoResult.errorMessages.length > 100 && (
+                  <li className="text-white/40 italic">
+                    …and {undoResult.errorMessages.length - 100} more
+                  </li>
+                )}
+              </ul>
+            )}
           </details>
         )}
 
