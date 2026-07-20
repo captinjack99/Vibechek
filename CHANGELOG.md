@@ -8,6 +8,48 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Dedupe sets itself up.** The audio-fingerprint tool (fpcalc) now installs
+  itself the first time dedupe needs it — checked on PATH, then staged in the
+  app's data folder, then downloaded from the pinned official Chromaprint
+  release with its checksum verified. The old dead-end banner ("install
+  fpcalc" with nowhere to click) is gone; if provisioning genuinely fails,
+  dedupe still runs on exact + tag matching and says exactly what was skipped
+  and why.
+- **Errors now come with a way out.** Analysis-service errors carry a
+  structured plain-language envelope end to end (Python → Rust → GUI):
+  retryable failures show a "Try again" button that re-issues the exact
+  request, a dead analysis service offers "Restart Vibechek", a memory
+  refusal offers "Switch to the standard genre model" and "Give Vibechek
+  more memory" (a new `increase_wsl_memory` RPC raises the WSL memory limit
+  in `.wslconfig` — honestly telling you a restart is needed, never forcing
+  one), and a missing Linux environment offers "Install WSL" right in the
+  toast. If Vibechek's analysis service can't start at all, you now get a
+  real error dialog instead of a silently broken window.
+- **The managed engine environment heals itself too.** Linux/macOS managed
+  installs get the same detect→repair→run pre-flight the WSL path got in
+  0.8.0: a venv that stopped importing its ML stack is reinstalled in place
+  before the run, with the repair reported in the completion summary.
+
+### Fixed
+- **The progress overlay stays put.** Pinned to the bottom-right corner with
+  a fixed width: Cancel no longer wanders as text changes, and the bar no
+  longer runs off the screen edge.
+- **Partial failures are honest everywhere.** Dedupe, tag-apply, backup
+  restore, organize, and undo now report exact counts with an expandable
+  per-file list when some files fail — no more "Done!" over quiet losses.
+- **The whole app speaks DJ, not engineer.** Every user-reaching message was
+  reworded to a plain headline that says what happened and what happens next;
+  the technical details moved into expandable detail sections and the log
+  (demoted, never deleted). One vocabulary throughout: "analysis engine",
+  "analysis service", "the Linux analysis environment (WSL)". GUI errors no
+  longer recommend terminal commands; the false "switch to ONNX for GPU
+  support" claim on the native engine now tells the truth (planned, CPU
+  today); Rekordbox-import errors explain how to export the XML instead of
+  reciting parser internals.
+
 ## [0.8.0-beta] — 2026-07-11
 
 ### Added

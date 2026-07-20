@@ -190,7 +190,7 @@ Full developer setup + the platform-specific bits: [docs/INSTALL.md](docs/INSTAL
 React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]──► Python sidecar
                                                                           │
                               ┌───────────────────────────────────────────┴───────────┐
-                              │ vibechek package (50 RPC methods)                     │
+                              │ vibechek package (51 RPC methods)                     │
                               │  analyzer · tagger · duplicates · organizer · genres  │
                               │  clap_genre · genre_web · journal · profiles · config  │
                               │  cancellation · onnx_backend                           │
@@ -226,10 +226,10 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**1130 Python tests** · **50 JSON-RPC methods** · **36 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**1190 Python tests** · **51 JSON-RPC methods** · **38 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
-- 119 frontend tests across 17 files (App, rpc, ConfirmModal, DuplicatesView, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, OnnxSetupDialog, Sidebar, useApplyTags, keeperRules, review, library + operation stores)
+- 179 frontend tests across 25 files (App, rpc, AnalysisProgress, ConfirmModal, DuplicatesView, ErrorToast, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, MemoryRefusalActions, OnnxSetupDialog, OperationsHistory, OrganizeView, Settings, SettingsSystem, Sidebar, TagsView, useApplyTags, useConfigPersistence, useSidecar, keeperRules, review, library + notification + operation stores)
 - ~4,500 LOC of core logic, 5 main views, threadpool dispatch with cancellation singleton
 - Used in production by the author against a 12,000-track personal DJ library
 
