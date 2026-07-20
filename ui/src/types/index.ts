@@ -124,9 +124,14 @@ export interface DuplicateReport {
     space_recoverable_mb: number;
     /** Detection phases that actually ran ("md5", "chromaprint"). */
     phases_run?: string[];
-    /** False only when audio fingerprinting was requested but `fpcalc` was
-     *  missing, so that phase silently never ran — the view banners it. */
+    /** False only when audio fingerprinting was requested but the fingerprint
+     *  tool couldn't be made available (PATH/staged missed AND auto-provision
+     *  failed or was skipped), so that phase never ran — the view banners it. */
     fpcalc_available?: boolean;
+    /** When `fpcalc_available` is false, a short plain-user reason the audio
+     *  fingerprint tool couldn't be set up (e.g. "the download didn't
+     *  complete…"). Drives the failure banner; the retry is automatic next scan. */
+    fpcalc_error?: string | null;
   };
   exact_duplicates: DuplicateGroup[];
   audio_duplicates: DuplicateGroup[];

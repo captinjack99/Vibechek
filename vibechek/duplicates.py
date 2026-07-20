@@ -21,10 +21,14 @@ from pathlib import Path
 from mutagen import File as MutagenFile
 
 from vibechek.config import DuplicateConfig
+from vibechek.fpcalc_provision import (
+    FpcalcProvisionError,
+    ensure_fpcalc,
+    fpcalc_skip_reason,
+)
 from vibechek.utils import (
     ProgressCallback,
     find_audio_files,
-    find_fpcalc,
     report_progress,
 )
 
@@ -102,11 +106,20 @@ class DuplicateSummary:
     # otherwise look identical to a thorough clean scan — a user could reorganize
     # or delete believing a fuzzy re-encode pass ran when it never did.
     phases_run: list[str] = field(default_factory=list)
-    # False only when the user asked for audio fingerprinting but `fpcalc` wasn't
-    # found — the GUI banners "fingerprint scan skipped — fpcalc not found"
-    # instead of returning a misleading "0 near-duplicates" for a phase that
-    # never executed. True when fingerprinting ran, or wasn't requested at all.
+    # False only when the user asked for audio fingerprinting but the fingerprint
+    # tool (`fpcalc`) couldn't be made available — PATH/staged both missed AND
+    # auto-provisioning failed or was skipped. The GUI banners the near-duplicate
+    # phase as skipped (with `fpcalc_error`) instead of returning a misleading
+    # "0 near-duplicates" for a phase that never executed. True when fingerprinting
+    # ran (including after a successful one-time auto-provision), or wasn't
+    # requested at all.
     fpcalc_available: bool = True
+    # When `fpcalc_available` is False, a short plain-user reason the fingerprint
+    # tool couldn't be set up ("the download didn't complete…", "automatic setup
+    # is turned off", …). Drives the failure banner; None whenever the phase ran
+    # or wasn't requested. The retry is automatic on the next scan, so no user
+    # action is surfaced — this is honesty, not a to-do.
+    fpcalc_error: str | None = None
 
 
 @dataclass
@@ -579,15 +592,39 @@ def find_duplicates(
     # Provenance so the report can honestly say which phases ran (see below).
     phases_run: list[str] = ["md5"] if config.use_md5 else []
     fpcalc_available = True
+    fpcalc_error: str | None = None
 
     # ---------- Phase 2: chromaprint on what's left ----------
     if config.use_chromaprint:
-        fpcalc = find_fpcalc()
+        # Zero-setup self-heal (detect -> heal -> run): the fingerprint tool is
+        # resolved from PATH, then a staged copy, then auto-provisioned (a small
+        # one-time ~2 MB download of the official Chromaprint binary) — announced
+        # through the same progress channel. A dead-end "fpcalc not found" was a
+        # manual-setup trap the doctrine forbids; now the ONLY user-visible state
+        # is a banner if the DOWNLOAD itself fails (and it retries next scan).
+        fpcalc: str | None
+        try:
+            fpcalc = ensure_fpcalc(on_progress)
+        except FpcalcProvisionError as e:
+            # Provisioning was attempted and failed (network / disk / checksum /
+            # bad archive) — carry the classified plain-user reason to the GUI.
+            fpcalc = None
+            fpcalc_error = e.reason
+            log.warning("audio fingerprint tool provisioning failed: %s", e)
+        else:
+            if fpcalc is None:
+                # Provisioning SKIPPED (not failed): auto-heal off, or no
+                # prebuilt binary for this platform. Honest, distinct reason.
+                fpcalc_error = fpcalc_skip_reason()
+
         if not fpcalc:
             # Silent no-op territory: without this flag the report would show
             # "0 near-duplicates" indistinguishably from a real clean fuzzy pass.
             fpcalc_available = False
-            log.warning("fpcalc not found; skipping audio fingerprinting")
+            log.warning(
+                "audio fingerprinting unavailable (%s); ran exact-match only",
+                fpcalc_error,
+            )
         else:
             phases_run.append("chromaprint")
             exact_dupe_paths = {
@@ -693,6 +730,7 @@ def find_duplicates(
     # provenance after it so the GUI can surface a skipped-fingerprint banner.
     report.summary.phases_run = phases_run
     report.summary.fpcalc_available = fpcalc_available
+    report.summary.fpcalc_error = fpcalc_error
     return report
 
 

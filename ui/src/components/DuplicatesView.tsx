@@ -531,18 +531,20 @@ function ReportView({
       />
 
       {report.summary.fpcalc_available === false && (
-        // Audio fingerprinting was requested but fpcalc wasn't found, so the
-        // near-duplicate (re-encode/re-tag) phase silently never ran. Without
-        // this banner "0 near-duplicates" reads as a thorough clean scan — a
-        // user could reorganize believing a fuzzy pass ran when only exact-hash
-        // matching did.
+        // FAILURE-ONLY banner. The audio fingerprint tool is now auto-provisioned
+        // (a small one-time download) on the first scan that needs it, so this
+        // shows ONLY when that setup couldn't complete. Without it "0 near-
+        // duplicates" reads as a thorough clean scan — a user could reorganize
+        // believing a fuzzy pass ran when only exact-hash matching did. No action
+        // button: the retry is automatic on the next scan. Language stays plain —
+        // "audio fingerprint tool", never the binary name.
         <div className="panel-pad flex items-start gap-2 text-sm text-accent-yellow">
           <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
           <span>
-            Fingerprint scan skipped — <strong>fpcalc not found</strong>. Only
-            exact-match duplicates were detected; re-encodes and re-tags of the
-            same track were <em>not</em> compared. Install libchromaprint-tools
-            (fpcalc) and re-scan to find near-duplicates.
+            Couldn't set up the <strong>audio fingerprint tool</strong>
+            {report.summary.fpcalc_error ? ` (${report.summary.fpcalc_error})` : ""} —
+            similar-sounding duplicate detection was skipped this run; exact
+            duplicates were still found. It'll retry automatically next time.
           </span>
         </div>
       )}

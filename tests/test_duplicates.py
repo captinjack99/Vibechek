@@ -182,26 +182,58 @@ def test_find_duplicates_detects_exact_md5_match(tiny_library: Path) -> None:
     assert filenames == {"track3.mp3", "track3_dup.mp3"}
 
 
-def test_find_duplicates_flags_missing_fpcalc(tmp_path: Path, monkeypatch) -> None:
-    """When audio fingerprinting is requested but fpcalc is missing, the phase
-    silently no-ops — the report must record fpcalc_available=False so the GUI
-    can banner 'fingerprint scan skipped' instead of implying a clean fuzzy pass."""
+def test_find_duplicates_flags_failed_provision(tmp_path: Path, monkeypatch) -> None:
+    """When audio fingerprinting is requested but auto-provisioning the tool
+    FAILS, the phase no-ops — the report records fpcalc_available=False AND a
+    classified plain-user `fpcalc_error` so the GUI banners the real reason
+    (with an automatic retry) instead of implying a clean fuzzy pass."""
     from vibechek import duplicates
+    from vibechek.fpcalc_provision import FpcalcProvisionError
 
     lib = tmp_path / "lib"
     lib.mkdir()
     (lib / "a.mp3").write_bytes(b"aaaa")
     (lib / "b.mp3").write_bytes(b"bbbb")
 
-    monkeypatch.setattr(duplicates, "find_fpcalc", lambda: None)
+    def boom(on_progress=None):
+        raise FpcalcProvisionError(
+            "All 1 mirror(s) failed", reason="the download didn't complete (check your connection)",
+        )
+
+    monkeypatch.setattr(duplicates, "ensure_fpcalc", boom)
     report = duplicates.find_duplicates(
         lib, DuplicateConfig(use_md5=True, use_chromaprint=True),
     )
     assert report.summary.fpcalc_available is False
+    assert report.summary.fpcalc_error == "the download didn't complete (check your connection)"
     assert "chromaprint" not in report.summary.phases_run
     assert report.summary.phases_run == ["md5"]
-    # The field survives the wire round-trip (asdict) the RPC uses.
-    assert report.to_dict()["summary"]["fpcalc_available"] is False
+    # Both new fields survive the wire round-trip (asdict) the RPC uses.
+    wire = report.to_dict()["summary"]
+    assert wire["fpcalc_available"] is False
+    assert wire["fpcalc_error"] == "the download didn't complete (check your connection)"
+
+
+def test_find_duplicates_flags_skipped_provision(tmp_path: Path, monkeypatch) -> None:
+    """When provisioning is SKIPPED (not failed) — e.g. auto-heal off or an
+    unsupported platform — ensure_fpcalc returns None; the report still flags
+    fpcalc_available=False and surfaces the skip reason from fpcalc_skip_reason."""
+    from vibechek import duplicates
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "a.mp3").write_bytes(b"aaaa")
+
+    monkeypatch.setattr(duplicates, "ensure_fpcalc", lambda on_progress=None: None)
+    monkeypatch.setattr(
+        duplicates, "fpcalc_skip_reason", lambda: "automatic setup is turned off",
+    )
+    report = duplicates.find_duplicates(
+        lib, DuplicateConfig(use_md5=True, use_chromaprint=True),
+    )
+    assert report.summary.fpcalc_available is False
+    assert report.summary.fpcalc_error == "automatic setup is turned off"
+    assert report.summary.phases_run == ["md5"]
 
 
 def test_find_duplicates_fpcalc_available_when_not_requested(tmp_path: Path) -> None:
@@ -213,6 +245,24 @@ def test_find_duplicates_fpcalc_available_when_not_requested(tmp_path: Path) -> 
     report = find_duplicates(lib, DuplicateConfig(use_md5=True, use_chromaprint=False))
     assert report.summary.fpcalc_available is True
     assert report.summary.phases_run == ["md5"]
+    # Never requested → no error reason surfaced.
+    assert report.summary.fpcalc_error is None
+
+
+def test_duplicate_summary_roundtrip_carries_fpcalc_error() -> None:
+    """The new fpcalc_error field survives asdict() (the RPC wire) and defaults
+    to None so a healthy report never triggers the failure banner."""
+    from vibechek.duplicates import DuplicateReport, DuplicateSummary
+
+    summary = DuplicateSummary(
+        fpcalc_available=False,
+        fpcalc_error="the download didn't complete (check your connection)",
+    )
+    wire = DuplicateReport(summary=summary).to_dict()["summary"]
+    assert wire["fpcalc_available"] is False
+    assert wire["fpcalc_error"] == "the download didn't complete (check your connection)"
+    # Default report: no error (no false banner).
+    assert DuplicateReport().to_dict()["summary"]["fpcalc_error"] is None
 
 
 def test_find_duplicates_handle_move_relocates_dupes(tmp_path: Path) -> None:
@@ -335,7 +385,7 @@ def test_chromaprint_threshold_clusters_similar_fingerprints(
         str(c): [0x00000000, 0x11111111, 0x22222222],  # very different
     }
 
-    monkeypatch.setattr(duplicates, "find_fpcalc", lambda: "fpcalc")
+    monkeypatch.setattr(duplicates, "ensure_fpcalc", lambda on_progress=None: "fpcalc")
 
     def fake_raw(path, _cmd, duration=120):
         return fps.get(str(path))
@@ -414,7 +464,7 @@ def test_chromaprint_buckets_on_multiple_probes(
         str(b): [0xBBBBBBBB, *tail],  # different first frame, identical tail
     }
 
-    monkeypatch.setattr(duplicates, "find_fpcalc", lambda: "fpcalc")
+    monkeypatch.setattr(duplicates, "ensure_fpcalc", lambda on_progress=None: "fpcalc")
     monkeypatch.setattr(
         duplicates, "audio_fingerprint_raw",
         lambda path, _cmd, duration=120: fps.get(str(path)),
@@ -454,7 +504,7 @@ def test_find_duplicates_similarity_threshold_param_used(
         str(a): [0x12345678, 0xABCDEF01, 0xDEADBEEF],
         str(b): [0x12345678, 0xABCDEF01, 0xDEADBEEE],
     }
-    monkeypatch.setattr(duplicates, "find_fpcalc", lambda: "fpcalc")
+    monkeypatch.setattr(duplicates, "ensure_fpcalc", lambda on_progress=None: "fpcalc")
     monkeypatch.setattr(
         duplicates, "audio_fingerprint_raw",
         lambda path, _cmd, duration=120: fps.get(str(path)),

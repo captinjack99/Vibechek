@@ -278,6 +278,7 @@ export interface DuplicateSummary {
   space_recoverable_mb: number;
   phases_run: string[];
   fpcalc_available: boolean;
+  fpcalc_error: string | null;
 }
 
 export interface FileInfo {

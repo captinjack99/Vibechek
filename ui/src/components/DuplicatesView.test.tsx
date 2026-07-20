@@ -175,3 +175,45 @@ describe("<DuplicatesView /> — resolve result toast", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Audio-fingerprint-tool (fpcalc) FAILURE banner. The tool is auto-provisioned
+// now, so the banner is failure-only: it shows the classified reason + the
+// automatic-retry promise, uses plain-user language (never "fpcalc"), and is
+// absent when fingerprinting succeeded.
+// ---------------------------------------------------------------------------
+
+describe("<DuplicatesView /> — audio fingerprint tool banner", () => {
+  beforeEach(() => {
+    useLibraryStore.setState({ libraryPath: "D:/Music" });
+  });
+
+  it("renders the failure banner with the classified reason and retry note", () => {
+    const report = reportWithOneGroup();
+    report.summary.fpcalc_available = false;
+    report.summary.fpcalc_error = "the download didn't complete (check your connection)";
+    useOperationStore.setState({ duplicateReport: report });
+
+    render(<DuplicatesView />);
+
+    // Plain-user headline + the real reason + automatic-retry, and NEVER the
+    // bare binary name in what the user reads.
+    expect(screen.getByText(/audio fingerprint tool/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/the download didn't complete \(check your connection\)/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/retry automatically next time/i)).toBeInTheDocument();
+    expect(screen.queryByText(/fpcalc/i)).not.toBeInTheDocument();
+  });
+
+  it("shows no banner when fingerprinting succeeded", () => {
+    const report = reportWithOneGroup();
+    report.summary.fpcalc_available = true;
+    report.summary.fpcalc_error = null;
+    useOperationStore.setState({ duplicateReport: report });
+
+    render(<DuplicatesView />);
+
+    expect(screen.queryByText(/audio fingerprint tool/i)).not.toBeInTheDocument();
+  });
+});
