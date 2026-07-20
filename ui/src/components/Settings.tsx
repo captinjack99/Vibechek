@@ -612,6 +612,7 @@ export function Settings() {
             ? preflightResult.analyze_via
             : null
         }
+        engine={cfg.analysis.inference_engine}
         preflight={preflightResult}
         onRefreshEngine={() => {
           const distro = preflightResult?.wsl?.usable_distro ?? null;
@@ -875,12 +876,15 @@ export function Settings() {
             </div>
           )}
           <Hint>
-            <strong>Essentia · TensorFlow</strong> is the default (NVIDIA-only
-            GPU).{" "}
-            <strong>ONNX Runtime</strong> runs the same models with cross-vendor
-            GPU — AMD, Intel, and Apple Silicon via DirectML/CoreML — and drops
-            the end-of-life TensorFlow runtime entirely. Validated to match the
-            default engine's output.
+            <strong>Essentia · TensorFlow</strong> uses NVIDIA GPUs only (the
+            default on macOS/Linux).{" "}
+            <strong>ONNX Runtime</strong> runs the same models and drops the
+            end-of-life TensorFlow runtime — NVIDIA-accelerated today, with
+            cross-vendor GPU (AMD, Intel, and Apple Silicon via DirectML/CoreML)
+            planned but not available yet.{" "}
+            <strong>Native · no WSL</strong> is the zero-setup Windows default:
+            fully in-process, CPU today with GPU support planned. All three are
+            validated to match the same reference output.
           </Hint>
         </Field>
 

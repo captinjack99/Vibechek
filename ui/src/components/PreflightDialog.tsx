@@ -468,7 +468,7 @@ function WindowsFlow({
         ok={false}
         title="The Linux analysis environment (WSL)"
         sub="Not enabled on this machine"
-        info="Vibechek runs the ML analysis inside a small Linux environment (WSL, a Windows-native feature). Setup takes 5-15 minutes and triggers a Windows permission prompt (click Yes to continue)."
+        info="This engine runs the ML analysis inside a small Linux environment (WSL, a Windows-native feature). Setup takes 5-15 minutes and triggers a Windows permission prompt (click Yes to continue). The zero-setup Native engine skips WSL entirely — switch to it in Settings › Analysis if you'd rather not install this."
         action={
           <ActionButton
             label="Install WSL + Ubuntu"

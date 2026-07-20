@@ -327,6 +327,7 @@ export function ResourcesSection({
   engineGpu,
   engineProbing,
   analyzeVia,
+  engine,
   preflight,
   budget,
   onRefreshEngine,
@@ -337,6 +338,9 @@ export function ResourcesSection({
   engineGpu: EngineGpuInfo | null;
   engineProbing: boolean;
   analyzeVia: "native" | "native_venv" | "wsl" | null;
+  /** Selected inference engine ("essentia_tf" | "onnx" | "native") — drives the
+   *  engine-aware GPU story in the cross-vendor inventory below. */
+  engine?: string;
   preflight: PreflightResult | null;
   /** Backend worker budget — carries which RAM pool was measured so the Memory
    *  stat can show the WSL VM's RAM (the real ceiling), not just the host. */
@@ -444,9 +448,9 @@ export function ResourcesSection({
       />
 
       {/* Cross-vendor inventory + honesty callout. Surfaces every GPU the
-          host has, not just the NVIDIA one TF can use. Renders nothing
+          host has, not just the one the selected engine can use. Renders nothing
           (and shows nothing in the UI) when no GPUs of any kind exist. */}
-      <CrossVendorGpuInventory sysInfo={sysInfo} />
+      <CrossVendorGpuInventory sysInfo={sysInfo} engine={engine} />
 
       {/* troubleshooting affordance for the broken
           venv shim case (pre-beta.10 cuda-env.sh patch). Tiny low-visibility
@@ -957,14 +961,45 @@ function EngineGpuBlock({
  *
  * Vendor icons are intentionally text glyphs (no logo files needed); the
  * intent is to be honest about which vendor a row belongs to, not to brand.
+ *
+ * Engine-aware: the callout + explainer describe the GPU story of the engine
+ * the user has SELECTED (`engine`, the config's `inference_engine`). The three
+ * engines have different GPU capabilities today — essentia_tf (NVIDIA-CUDA
+ * only), onnx (NVIDIA-CUDA today; DirectML/CoreML planned), native (CPU-only
+ * today; DirectML planned) — so a single hardcoded "essentia-tensorflow /
+ * CUDA-only" story was flat wrong for the ONNX and (Windows-default) native
+ * engines. See vibechek/config.py + docs/ROADMAP.md "engines".
  */
-function CrossVendorGpuInventory({ sysInfo }: { sysInfo: SystemResources }) {
+export function CrossVendorGpuInventory({
+  sysInfo,
+  engine,
+}: {
+  sysInfo: SystemResources;
+  /** Selected inference engine: "essentia_tf" | "onnx" | "native". */
+  engine?: string;
+}) {
   const [showExplainer, setShowExplainer] = useState(false);
 
   const devices = sysInfo.gpu_devices ?? [];
   if (devices.length === 0) return null;
 
   const hasUnsupported = (sysInfo.unsupported_gpu_count ?? 0) > 0;
+
+  // Normalize to the three real engines; anything unknown behaves like the
+  // historical default (essentia_tf).
+  const eng: "essentia_tf" | "onnx" | "native" =
+    engine === "onnx" ? "onnx" : engine === "native" ? "native" : "essentia_tf";
+
+  // Always-visible callout — one line per engine, every claim true today.
+  // native must NOT imply NVIDIA would work (it's CPU-only for every vendor) —
+  // this reuses the WP-B native phrasing ("runs on CPU today — GPU support is
+  // planned but not available yet") so the two blocks stay consistent.
+  const callout =
+    eng === "native"
+      ? "This engine runs on CPU today — GPU support is planned but not available yet, so no GPU is used whatever the vendor."
+      : eng === "onnx"
+        ? "This engine (ONNX Runtime) accelerates NVIDIA GPUs today. On AMD, Intel, or Apple GPUs it runs on CPU — DirectML and CoreML support is planned but isn't available yet."
+        : "This engine (Essentia · TensorFlow) can only use NVIDIA GPUs. On AMD, Intel, or Apple GPUs it runs on CPU. Support for those GPUs is planned through ONNX Runtime but isn't available yet.";
 
   return (
     <div className="mt-4 border-t border-white/10 pt-3">
@@ -978,15 +1013,13 @@ function CrossVendorGpuInventory({ sysInfo }: { sysInfo: SystemResources }) {
       </div>
 
       {/* Cross-vendor honesty callout. Only shows when there's at least one
-          non-NVIDIA card the user might reasonably expect to be used. */}
+          non-NVIDIA card the user might reasonably expect to be used. (The
+          native engine's NVIDIA-not-used story is carried by EngineGpuBlock's
+          `note` branch above, so this callout doesn't duplicate it.) */}
       {hasUnsupported && (
         <div className="mt-3 flex items-start gap-2 text-xs rounded border border-white/10 bg-white/5 p-2.5">
           <AlertTriangle className="w-4 h-4 flex-none text-accent-yellow mt-0.5" />
-          <div className="text-white/70">
-            Right now the analysis engine can only use NVIDIA GPUs. On AMD,
-            Intel, or Apple GPUs it runs on CPU. Support for those GPUs is
-            planned but not available yet.
-          </div>
+          <div className="text-white/70">{callout}</div>
         </div>
       )}
 
@@ -1007,24 +1040,48 @@ function CrossVendorGpuInventory({ sysInfo }: { sysInfo: SystemResources }) {
           </button>
           {showExplainer && (
             <div className="mt-2 text-[11px] text-white/60 leading-relaxed pl-5 max-w-3xl">
-              <p>
-                Vibechek runs all music analysis through{" "}
-                <span className="font-mono">essentia-tensorflow</span>, which
-                vendors TensorFlow 2.5 built only with CUDA support. There is
-                no public TF 2.5 build that ships ROCm (AMD), oneDNN-GPU (Intel),
-                or Metal (Apple) backends — so even though your card is
-                detected, the inference graph has no way to dispatch to it.
-              </p>
+              {/* Paragraph 1 — engine-specific "why your card isn't used".
+                  This is the demoted/technical layer, so it can name the
+                  runtime, but every claim must be true for THIS engine. */}
+              {eng === "native" ? (
+                <p>
+                  This engine — the WSL-free Windows default — runs analysis
+                  in-process on a CPU-only <span className="font-mono">ONNX
+                  Runtime</span> build. That bundled runtime ships no GPU
+                  execution providers, so every card (NVIDIA included) runs on
+                  CPU today.
+                </p>
+              ) : eng === "onnx" ? (
+                <p>
+                  This engine runs analysis through{" "}
+                  <span className="font-mono">ONNX Runtime</span>. The bundled
+                  GPU build accelerates NVIDIA cards through CUDA today; the AMD
+                  (DirectML/ROCm), Intel (DirectML), and Apple (CoreML) execution
+                  providers are wired but not yet shipped and hardware-validated
+                  — so your card is detected, but inference still dispatches to
+                  CPU.
+                </p>
+              ) : (
+                <p>
+                  This engine runs analysis through{" "}
+                  <span className="font-mono">essentia-tensorflow</span>, which
+                  vendors TensorFlow 2.5 built only with CUDA support. There is
+                  no public TF 2.5 build that ships ROCm (AMD), oneDNN-GPU (Intel),
+                  or Metal (Apple) backends — so even though your card is
+                  detected, the inference graph has no way to dispatch to it.
+                </p>
+              )}
               <p className="mt-1.5">
                 Cross-vendor GPU support — DirectML on Windows (any DX12 GPU,
                 including AMD &amp; Intel), CoreML on macOS (Apple Silicon &amp;
                 AMD eGPUs), and ROCm/OpenVINO on Linux — is planned through ONNX
-                Runtime, but it isn&apos;t available in this build yet.
+                Runtime, but it isn&apos;t available yet.
               </p>
               <p className="mt-1.5">
-                Until then, analysis falls back to CPU — which is still fast
-                on a modern multi-core machine. Bump the worker count in the
-                Analysis section above to use all your cores.
+                Until then, analysis runs on CPU — still fast on a modern
+                multi-core machine. The workers slider in the Analysis section
+                above is already capped to what your memory can support, so it&apos;s
+                set up to use your cores without manual tuning.
               </p>
             </div>
           )}
