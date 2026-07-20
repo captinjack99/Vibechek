@@ -8,7 +8,7 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ---
 
-## [Unreleased]
+## [0.8.1-beta] — 2026-07-20
 
 ### Added
 - **Dedupe sets itself up.** The audio-fingerprint tool (fpcalc) now installs
@@ -49,6 +49,15 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
   support" claim on the native engine now tells the truth (planned, CPU
   today); Rekordbox-import errors explain how to export the XML instead of
   reciting parser internals.
+- **The progress overlay tells you what's actually running.** Installing WSL,
+  a Linux distribution, or the analysis engine from the setup dialog used to
+  show "Downloading ML models" the whole time; each step now shows its own
+  label ("Installing WSL", "Setting up the analysis engine").
+- **"Couldn't read the saved analysis" now has a Try again.** When a library's
+  saved analysis is momentarily locked (antivirus, cloud sync), the error
+  offers a Try again button that genuinely re-loads the library — not just a
+  message telling you to retry by hand. Permanent failures (missing or
+  corrupt files) stay honestly non-retryable.
 
 ## [0.8.0-beta] — 2026-07-11
 
