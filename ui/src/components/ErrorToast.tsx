@@ -22,13 +22,16 @@ import {
   FileText,
   RotateCcw,
   RefreshCw,
+  Download,
 } from "lucide-react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { isTauri } from "@tauri-apps/api/core";
 
 import { useNotificationStore, useOperationStore } from "../stores";
 import { rpc, sidecarStatus } from "../hooks/useSidecar";
+import { installWSL } from "../api/rpc";
 import { LogsViewer } from "./LogsViewer";
+import { MemoryRefusalActions } from "./MemoryRefusalActions";
 
 const ISSUES_URL = "https://github.com/captinjack99/Vibechek/issues/new";
 
@@ -51,6 +54,11 @@ export function ErrorToast() {
   const { headline, detail, raw, kind } = errorInfo;
   const canRetry = kind === "retryable" && !!errorInfo.retry;
   const canRestart = kind === "engine_dead";
+  // Backend-attached recovery affordances (from error.data). Each gates its own
+  // action button; the two memory ones are rendered by the shared component.
+  const canSwitchClassifier = !!errorInfo.options?.canSwitchClassifier;
+  const canIncreaseMemory = !!errorInfo.options?.canIncreaseMemory;
+  const canInstallWsl = !!errorInfo.options?.canInstallWsl;
 
   // Mid-analyze death: how many tracks had been analyzed when it stopped.
   // Phrased honestly — analyzed, not necessarily saved.
@@ -78,6 +86,35 @@ export function ErrorToast() {
       await rpc(retry.method, retry.params);
     } catch (e) {
       useOperationStore.getState().fail(e);
+    }
+  };
+
+  // "Install WSL" runs the existing install_wsl self-heal, reusing the app's
+  // long-op progress idiom: begin("install-wsl") hands the global AnalysisProgress
+  // overlay the running state (and clears this banner), the RPC emits progress,
+  // and we notify on completion. A failure re-surfaces through fail(). We never
+  // stand up a bespoke install UI here.
+  const handleInstallWsl = async () => {
+    const { begin, finish, fail } = useOperationStore.getState();
+    const opId = begin("install-wsl");
+    try {
+      const res = await installWSL({}, opId);
+      finish();
+      if (res.ok) {
+        notify("Windows' Linux environment installed", {
+          kind: "success",
+          detail: res.note
+            ? String(res.note)
+            : "Try your analysis again. Windows may ask you to restart first.",
+        });
+      } else {
+        notify("Couldn't install the Linux environment", {
+          kind: "info",
+          detail: res.error ? String(res.error) : undefined,
+        });
+      }
+    } catch (e) {
+      fail(e);
     }
   };
 
@@ -181,6 +218,27 @@ export function ErrorToast() {
                   {restarting ? "Restarting…" : "Restart Vibechek"}
                 </button>
               )}
+            </div>
+          )}
+
+          {/* Memory-refusal recovery — the SAME two buttons Settings' worker
+              slider shows, from one shared component (no duplicated handlers). */}
+          <MemoryRefusalActions
+            canSwitchClassifier={canSwitchClassifier}
+            canIncreaseMemory={canIncreaseMemory}
+            className="mt-3 flex flex-wrap items-center gap-2"
+          />
+
+          {/* WSL-missing recovery — reuse the install self-heal + progress overlay. */}
+          {canInstallWsl && (
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                onClick={handleInstallWsl}
+                className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded px-2.5 py-1 inline-flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Install WSL
+              </button>
             </div>
           )}
 

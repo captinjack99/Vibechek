@@ -96,6 +96,11 @@ export interface AnalysisReport {
   /** Set when GPU libraries couldn't be restored during that auto-repair, so
    *  the run fell back to CPU. A caution — GPU acceleration needs a re-setup. */
   runtime_heal_warning?: string | null;
+  /** Set when online genre lookup was requested but its backend wasn't reachable
+   *  this run, so genres used tags + audio only. A post-run degradation flag (WP-G5)
+   *  the GUI banners like the sibling warnings, since the transient progress line
+   *  is easy to miss. */
+  genre_web_unavailable_warning?: string | null;
 }
 
 // ---------------------------------------------------------------------------

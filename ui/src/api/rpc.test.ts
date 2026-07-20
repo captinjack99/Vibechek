@@ -48,6 +48,7 @@ const PYTHON_METHODS = [
   "install_essentia_native",
   "native_venv_status",
   "repair_wsl_shim",
+  "increase_wsl_memory",
   "scan_directory",
   "scan_only",
   "analyze_directory",

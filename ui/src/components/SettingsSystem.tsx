@@ -331,6 +331,7 @@ export function ResourcesSection({
   budget,
   onRefreshEngine,
   onRefreshPreflight,
+  onOpenSetup,
 }: {
   sysInfo: SystemResources | null;
   engineGpu: EngineGpuInfo | null;
@@ -342,6 +343,9 @@ export function ResourcesSection({
   budget?: WorkerBudget | null;
   onRefreshEngine: () => void;
   onRefreshPreflight: () => void;
+  /** Opens the setup walkthrough — passed to the engine-GPU probe-failed block
+   *  so it can offer a real jump-link even when the top banner is green. */
+  onOpenSetup?: () => void;
 }) {
   if (!sysInfo) {
     return (
@@ -435,6 +439,7 @@ export function ResourcesSection({
         analyzeVia={analyzeVia}
         preflightDistro={preflight?.wsl?.usable_distro ?? null}
         onRefresh={onRefreshEngine}
+        onOpenSetup={onOpenSetup}
       />
 
       {/* Cross-vendor inventory + honesty callout. Surfaces every GPU the
@@ -642,9 +647,9 @@ function EngineGpuFixableBlock({
       <div className="flex-1">
         <div className="text-accent-yellow/90">
           {engineGpu.devices.length > 0
-            ? `${engineGpu.devices.map((g) => g.name).join(", ")} is visible to WSL`
-            : "GPU hardware is visible to WSL"}
-          , but TensorFlow can&apos;t use it — required CUDA libraries are missing.
+            ? `Your ${engineGpu.devices.map((g) => g.name).join(", ")} is visible, but the analysis engine can't use it yet`
+            : "Your GPU is visible, but the analysis engine can't use it yet"}
+          {" "}— some accelerator files are missing.
         </div>
         {engineGpu.missing_cuda_libs.length > 0 && (
           <div className="text-white/40 mt-1 font-mono">
@@ -652,10 +657,10 @@ function EngineGpuFixableBlock({
           </div>
         )}
         <div className="text-white/40 mt-1">
-          Analysis will fall back to CPU. Click below and Vibechek will install
-          NVIDIA&apos;s CUDA runtime wheels from PyPI into the WSL venv
-          (~200&nbsp;MB, ~30&nbsp;sec). Works on any Ubuntu, no apt repo
-          configuration needed.
+          Analysis will run on CPU until then. Click below and Vibechek installs
+          NVIDIA&apos;s CUDA runtime wheels from PyPI into the analysis
+          environment (~200&nbsp;MB, ~30&nbsp;sec). Works on any Ubuntu, no apt
+          repo configuration needed.
         </div>
 
         {installing && latestProgress && (
@@ -679,7 +684,7 @@ function EngineGpuFixableBlock({
               onClick={handleInstall}
               disabled={installing}
             >
-              {installing ? "Installing… (~30 sec)" : "Enable GPU (install CUDA wheels)"}
+              {installing ? "Installing… (~30 sec)" : "Enable GPU acceleration"}
             </button>
           )}
           {installing && (
@@ -712,6 +717,7 @@ function EngineGpuBlock({
   analyzeVia,
   preflightDistro,
   onRefresh,
+  onOpenSetup,
 }: {
   sysInfo: SystemResources;
   engineGpu: EngineGpuInfo | null;
@@ -719,6 +725,10 @@ function EngineGpuBlock({
   analyzeVia: "native" | "native_venv" | "wsl" | null;
   preflightDistro: string | null;
   onRefresh: () => void;
+  /** Opens the setup walkthrough. A probe can fail while preflight is green
+   *  (so the top banner shows no "Set up now"), so this block offers its own
+   *  explicit jump-link to it (WP-B1). */
+  onOpenSetup?: () => void;
 }) {
   // No engine probe yet — show host view but tell the user the truth.
   if (!engineGpu && !engineProbing) {
@@ -766,23 +776,41 @@ function EngineGpuBlock({
 
   if (!engineGpu) return null; // shouldn't happen
 
-  // Probe failed
+  // Probe failed — plain headline; the raw probe string (exit code, stderr,
+  // "TF probe JSON" parse error) is DEMOTED to a details toggle (WP-B1).
   if (!engineGpu.ok) {
     return (
       <div className="mt-3 flex items-start gap-2 text-xs text-accent-yellow">
         <AlertTriangle className="w-4 h-4 flex-none mt-0.5" />
-        <div>
-          <div>Engine GPU probe failed: {engineGpu.error ?? "unknown"}.</div>
-          {sysInfo.gpu_available && (
-            <div className="text-white/40 mt-0.5">
-              Host has {sysInfo.gpu_devices.map((g) => g.name).join(", ")}{" "}
-              but the analyze engine couldn&apos;t enumerate it. Analysis will
-              fall back to CPU.
-            </div>
+        <div className="min-w-0">
+          <div className="text-accent-yellow/90">
+            Couldn&apos;t check whether your GPU is usable.
+          </div>
+          <div className="text-white/40 mt-0.5">
+            {sysInfo.gpu_available
+              ? `Your ${sysInfo.gpu_devices.map((g) => g.name).join(", ")} is here, but the analysis engine couldn't confirm it can use it — analysis will run on CPU until it can.`
+              : "The analysis engine couldn't confirm GPU support — analysis will run on CPU."}
+          </div>
+          {engineGpu.error && (
+            <details className="mt-1 text-[11px] text-white/40">
+              <summary className="cursor-pointer hover:text-white/60">
+                Technical details
+              </summary>
+              <pre className="mt-1 font-mono whitespace-pre-wrap break-all max-h-32 overflow-auto">
+                {engineGpu.error}
+              </pre>
+            </details>
           )}
-          <button className="btn-ghost text-xs mt-1" onClick={onRefresh}>
-            Re-probe
-          </button>
+          <div className="flex gap-2 mt-1">
+            {onOpenSetup && (
+              <button className="btn-ghost text-xs" onClick={onOpenSetup}>
+                Set up the analysis environment
+              </button>
+            )}
+            <button className="btn-ghost text-xs" onClick={onRefresh}>
+              Re-probe
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -802,8 +830,8 @@ function EngineGpuBlock({
           {engineGpu.gpu_hardware_visible && sysInfo.gpu_available && (
             <div className="text-white/40 mt-0.5">
               Your {sysInfo.gpu_devices.map((g) => g.name).join(", ")} isn&apos;t
-              used by the native engine — switch to the WSL/ONNX engine for GPU
-              acceleration.
+              used by this engine — GPU support for it is planned but not
+              available yet, so analysis runs on CPU today.
             </div>
           )}
           <button className="btn-ghost text-xs mt-1" onClick={onRefresh}>
@@ -881,17 +909,24 @@ function EngineGpuBlock({
       {engineGpu.nvidia_smi_available ? (
         <>
           <AlertTriangle className="w-4 h-4 flex-none text-accent-yellow mt-0.5" />
-          <div>
+          <div className="min-w-0">
             <div className="text-accent-yellow/90">
-              NVIDIA driver {engineGpu.nvidia_driver} is present
-              {engineGpu.engine === "wsl" ? ` inside ${engineGpu.distro}` : ""},
-              but TensorFlow can&apos;t see the GPU.
+              Your graphics driver doesn&apos;t match what the analysis engine
+              expects, so it can&apos;t use the GPU.
             </div>
-            <div className="text-white/40 mt-0.5">
-              Usually means CUDA / cuDNN version mismatch with the bundled TF
-              ({engineGpu.tf_version ?? "unknown"}). Analysis will fall back
-              to CPU.
-            </div>
+            <div className="text-white/40 mt-0.5">Analysis will run on CPU.</div>
+            {/* Driver / TensorFlow / CUDA-cuDNN specifics DEMOTED to detail (WP-B2). */}
+            <details className="mt-1 text-[11px] text-white/40">
+              <summary className="cursor-pointer hover:text-white/60">
+                Technical details
+              </summary>
+              <div className="mt-1 font-mono break-all">
+                NVIDIA driver {engineGpu.nvidia_driver ?? "?"} present
+                {engineGpu.engine === "wsl" ? ` inside ${engineGpu.distro}` : ""},
+                but TensorFlow {engineGpu.tf_version ?? "?"} can&apos;t register
+                it — usually a CUDA / cuDNN version mismatch with the bundled TF.
+              </div>
+            </details>
             <button className="btn-ghost text-xs mt-1" onClick={onRefresh}>
               Re-probe
             </button>
@@ -946,10 +981,9 @@ function CrossVendorGpuInventory({ sysInfo }: { sysInfo: SystemResources }) {
         <div className="mt-3 flex items-start gap-2 text-xs rounded border border-white/10 bg-white/5 p-2.5">
           <AlertTriangle className="w-4 h-4 flex-none text-accent-yellow mt-0.5" />
           <div className="text-white/70">
-            Vibechek&apos;s ML engine (essentia-tensorflow) only supports NVIDIA
-            GPUs today. AMD/Intel/Apple GPU acceleration is on the roadmap via
-            ONNX Runtime — see{" "}
-            <span className="font-mono text-white/50">docs/ONNX_MIGRATION.md</span>.
+            Right now the analysis engine can only use NVIDIA GPUs. On AMD,
+            Intel, or Apple GPUs it runs on CPU. Support for those GPUs is
+            planned but not available yet.
           </div>
         </div>
       )}
@@ -980,11 +1014,10 @@ function CrossVendorGpuInventory({ sysInfo }: { sysInfo: SystemResources }) {
                 detected, the inference graph has no way to dispatch to it.
               </p>
               <p className="mt-1.5">
-                The migration to ONNX Runtime will fix this. ONNX Runtime
-                supports DirectML on Windows (any DX12 GPU, including AMD &amp;
-                Intel), CoreML on macOS (Apple Silicon &amp; AMD eGPUs), and
-                ROCm/OpenVINO on Linux. Tracking issue and progress live in{" "}
-                <span className="font-mono">docs/ONNX_MIGRATION.md</span>.
+                Cross-vendor GPU support — DirectML on Windows (any DX12 GPU,
+                including AMD &amp; Intel), CoreML on macOS (Apple Silicon &amp;
+                AMD eGPUs), and ROCm/OpenVINO on Linux — is planned through ONNX
+                Runtime, but it isn&apos;t available in this build yet.
               </p>
               <p className="mt-1.5">
                 Until then, analysis falls back to CPU — which is still fast
@@ -1040,7 +1073,7 @@ function GpuInventoryRow({ device }: { device: GpuDevice }) {
         </span>
       ) : (
         <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-white/50 font-mono uppercase tracking-wider">
-          CPU-only (essentia limitation)
+          CPU-only (not supported by this engine yet)
         </span>
       )}
     </div>

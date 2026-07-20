@@ -25,6 +25,7 @@ import { OnnxSetupDialog, type OnnxSetupState } from "./OnnxSetupDialog";
 import { GenreSetupDialog, type GenreSetupState } from "./GenreSetupDialog";
 import { Field, Hint, Section, Toggle } from "./SettingsPrimitives";
 import { PreflightSection, ResourcesSection, UpdatesSection } from "./SettingsSystem";
+import { MemoryRefusalActions } from "./MemoryRefusalActions";
 
 // The workers slider used to cap at sysInfo.cpu_count,
 // which silently truncated a user-set value when sysInfo loaded asynchronously
@@ -172,9 +173,18 @@ export function Settings() {
       const unpinned = res.results.filter((r) => r.ok === null);
       const okCount = res.results.filter((r) => r.ok === true).length;
       if (bad.length > 0) {
+        // WP-C1: the fix (the "Download models now" button) lives ~800 lines
+        // down the same page; point at it AND give a one-click action so the
+        // failure isn't a dead end.
         notify(`${bad.length} model file(s) failed verification`, {
           kind: "info",
-          detail: bad.map((b) => `${b.name}.${b.suffix}: ${b.reason ?? "mismatch"}`).join("\n"),
+          detail:
+            bad.map((b) => `${b.name}.${b.suffix}: ${b.reason ?? "mismatch"}`).join("\n") +
+            "\n\nUse “Download models now” in the Analysis section above to re-fetch them.",
+          action: {
+            label: "Download models",
+            onClick: () => void handleDownloadModels(),
+          },
         });
       } else {
         notify("Models verified", {
@@ -601,6 +611,7 @@ export function Settings() {
           refreshEngineGpu(distro, true);
         }}
         onRefreshPreflight={refreshPreflight}
+        onOpenSetup={() => setShowPreflightDialog(true)}
       />
 
       <Section
@@ -678,9 +689,19 @@ export function Settings() {
                 )}
               </Hint>
               {refused && budget?.refusal_reason && (
-                <div className="text-xs text-accent-red/90 mt-1 flex items-start gap-1">
-                  <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
-                  <span>{budget.refusal_reason}</span>
+                <div className="mt-1">
+                  <div className="text-xs text-accent-red/90 flex items-start gap-1">
+                    <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
+                    <span>{budget.refusal_reason}</span>
+                  </div>
+                  {/* Same two recovery buttons the ErrorToast shows for this
+                      refusal, from the shared component. The flags mirror the
+                      backend's memory_refusal_options(): switch is offered when
+                      CLAP is selected, more-memory when the WSL VM is the pool. */}
+                  <MemoryRefusalActions
+                    canSwitchClassifier={cfg.analysis.genre_classifier === "clap"}
+                    canIncreaseMemory={budget?.ram_pool === "wsl_vm"}
+                  />
                 </div>
               )}
               {!refused && saved > sliderMax && (

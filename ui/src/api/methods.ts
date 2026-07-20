@@ -67,6 +67,7 @@ export const RPC_METHODS = [
   "install_cuda_libs_in_wsl",
   "install_essentia_native",
   "repair_wsl_shim",
+  "increase_wsl_memory",
   // analysis
   "scan_directory",
   "scan_only",
@@ -212,6 +213,37 @@ export interface ImportTagPriorsRequest {
 
 export interface RepairWSLShimRequest {
   distro: string;
+}
+
+/** Result of `increase_wsl_memory` — the `.wslconfig` memory self-heal (WP-D2).
+ *  The RPC reads and bumps the `memory=` line of the user's `%USERPROFILE%\
+ *  .wslconfig` (preserving all other content, never shrinking an already-larger
+ *  value). It NEVER restarts WSL — a running analysis or the user's other WSL
+ *  work could die — so `restart_required` tells the GUI to offer the restart
+ *  knowingly. On failure it carries the shared error-envelope fields
+ *  (`headline`/`detail`/`kind`). Takes no params. */
+export interface IncreaseWslMemoryResult {
+  ok: boolean;
+  /** True only when the file was actually rewritten to a higher limit. */
+  changed: boolean;
+  /** Previous / new `memory=` values (e.g. "8GB" → "24GB"). Absent on the
+   *  earliest failure paths (couldn't measure host RAM). */
+  old?: string | null;
+  new?: string | null;
+  old_mb?: number | null;
+  new_mb?: number | null;
+  /** True after a real bump — the raised limit only takes effect once the Linux
+   *  analysis environment (or Windows) restarts. */
+  restart_required: boolean;
+  /** The `.wslconfig` path that was read/written. */
+  path?: string;
+  /** Set when nothing changed because the limit was already high enough. */
+  message?: string;
+  /** Shared error-envelope fields, present only on the failure paths. */
+  headline?: string;
+  detail?: string;
+  kind?: string;
+  error?: string;
 }
 
 // --- analysis ---

@@ -51,6 +51,7 @@ import type {
   GetLogTailResult,
   HandleDuplicatesRequest,
   ImportTagPriorsRequest,
+  IncreaseWslMemoryResult,
   InstallCudaLibsInWSLRequest,
   InstallResultPayload,
   InstallVibechekInWSLRequest,
@@ -235,6 +236,17 @@ export function repairWSLShim(
   params: RepairWSLShimRequest,
 ): Promise<InstallResultPayload> {
   return rpc<InstallResultPayload>("repair_wsl_shim", params);
+}
+
+/**
+ * Raise the WSL VM's memory limit in the user's `.wslconfig` (WP-D2 self-heal).
+ * Backs the "Give Vibechek more memory" recovery action on the CLAP out-of-
+ * memory refusal. Reads + bumps the `memory=` line (never shrinking it), and
+ * returns `restart_required` so the GUI can offer the WSL/Windows restart
+ * knowingly — it NEVER restarts anything itself. Takes no params.
+ */
+export function increaseWslMemory(): Promise<IncreaseWslMemoryResult> {
+  return rpc<IncreaseWslMemoryResult>("increase_wsl_memory");
 }
 
 /** Resolve reviewed genre conflicts: "approve" accepts the reconciled genre,
@@ -603,6 +615,7 @@ const api = {
   installCudaLibsInWSL,
   installEssentiaNative,
   repairWSLShim,
+  increaseWslMemory,
   // analysis
   scanDirectory,
   scanOnly,

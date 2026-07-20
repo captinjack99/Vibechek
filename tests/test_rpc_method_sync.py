@@ -32,11 +32,11 @@ _METHODS_TS = _REPO_ROOT / "ui" / "src" / "api" / "methods.ts"
 
 # Python RPC methods whose TypeScript wiring (methods.ts RPC_METHODS + the rpc.ts
 # wrapper + the rpc.test.ts mirror) is deliberately deferred to a later frontend
-# wave. This backend-only wave registered `increase_wsl_memory` (the WP-D2
-# ".wslconfig memory" self-heal RPC) in vibechek/rpc.py:METHODS; the GUI button
-# that calls it — and its typed wrapper — land next wave. Remove the name here
-# once that wiring is added, so the sync guard re-covers it.
-_PENDING_TS_WIRING: set[str] = {"increase_wsl_memory"}
+# wave. Empty now: Wave 2 wired `increase_wsl_memory` (the WP-D2 ".wslconfig
+# memory" self-heal RPC) — typed wrapper, registry entry, and mirror all landed —
+# so the sync guard covers it directly again. Add a name here only to defer a
+# *future* backend-only method's TS wiring to a later wave.
+_PENDING_TS_WIRING: set[str] = set()
 
 
 def _parse_ts_rpc_methods(source: str) -> list[str]:

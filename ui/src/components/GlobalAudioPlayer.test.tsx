@@ -140,3 +140,20 @@ describe("<GlobalAudioPlayer /> — slow decode watchdog", () => {
     expect(screen.queryByText(/timed out loading audio/i)).not.toBeInTheDocument();
   });
 });
+
+describe("<GlobalAudioPlayer /> — failure fallback (WP-F)", () => {
+  it("shows a plain headline + Show-in-folder, and demotes the raw decoder error", () => {
+    render(<GlobalAudioPlayer />);
+    act(() => usePlayerStore.getState().play("D:/Music/bad.mp3", "Bad"));
+
+    act(() => emit("error", new Error("DEMUXER_ERROR_COULD_NOT_OPEN")));
+
+    // Plain headline leads — not the raw decoder string.
+    expect(screen.getByText("Couldn't play this track.")).toBeInTheDocument();
+    // A next step: reveal the file in the OS file manager.
+    expect(screen.getByText("Show in folder")).toBeInTheDocument();
+    // The raw error is DEMOTED behind a Details toggle, never deleted.
+    expect(screen.getByText("Details")).toBeInTheDocument();
+    expect(screen.getByText(/DEMUXER_ERROR_COULD_NOT_OPEN/)).toBeInTheDocument();
+  });
+});

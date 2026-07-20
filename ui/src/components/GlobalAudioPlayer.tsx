@@ -15,8 +15,9 @@
 import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { open as openPath } from "@tauri-apps/plugin-shell";
 import WaveSurfer from "wavesurfer.js";
-import { Play, Pause, X, AlertCircle, Loader2, Music } from "lucide-react";
+import { Play, Pause, X, AlertCircle, Loader2, Music, FolderOpen } from "lucide-react";
 
 import { usePlayerStore } from "../stores";
 import { ACCENT } from "../lib/colors";
@@ -187,6 +188,18 @@ export function GlobalAudioPlayer() {
     wsRef.current?.playPause();
   };
 
+  // Reveal the unplayable file in the OS file manager so the user can inspect it
+  // (wrong codec, 0-byte, moved). Opens the CONTAINING folder via the same
+  // shell-open capability App.tsx uses for "Open install folder". Best-effort —
+  // if the opener is unavailable the "Details" text still stands on its own.
+  const handleShowInFolder = () => {
+    if (!path) return;
+    const folder = path.replace(/[\\/][^\\/]*$/, "") || path;
+    void openPath(folder).catch(() => {
+      /* opener unavailable — no-op */
+    });
+  };
+
   return (
     <AnimatePresence>
       {visible && (
@@ -236,9 +249,28 @@ export function GlobalAudioPlayer() {
               </div>
             )}
             {error && (
-              <div className="flex items-center gap-2 text-xs text-accent-red max-h-12 overflow-y-auto">
+              <div className="flex items-center gap-2 text-xs text-accent-red min-w-0">
                 <AlertCircle className="w-4 h-4 flex-none" />
-                <span className="break-words whitespace-pre-wrap font-mono leading-snug">{error}</span>
+                <span className="flex-none">Couldn&apos;t play this track.</span>
+                {path && (
+                  <button
+                    onClick={handleShowInFolder}
+                    className="flex-none inline-flex items-center gap-1 text-white/60 hover:text-white underline underline-offset-2"
+                    title="Reveal this file in your file manager"
+                  >
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    Show in folder
+                  </button>
+                )}
+                {/* Raw decoder/browser error DEMOTED behind a toggle (WP-F). */}
+                <details className="min-w-0">
+                  <summary className="cursor-pointer text-white/50 hover:text-white/70 select-none">
+                    Details
+                  </summary>
+                  <span className="block mt-1 break-words whitespace-pre-wrap font-mono leading-snug text-white/50 max-h-16 overflow-y-auto">
+                    {error}
+                  </span>
+                </details>
               </div>
             )}
           </div>

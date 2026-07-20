@@ -39,6 +39,15 @@ export interface OperationError {
    *  the service stopped (read from the last progress frame). */
   analyzedCount?: number;
   analyzedTotal?: number;
+  /** Machine-readable recovery affordances the backend attached to `error.data`
+   *  (see vibechek/errors.py `options`). Each flag turns on ITS action button in
+   *  the ErrorToast — a memory refusal carries `canSwitchClassifier` /
+   *  `canIncreaseMemory`; a WSL-missing failure carries `canInstallWsl`. */
+  options?: {
+    canSwitchClassifier?: boolean;
+    canIncreaseMemory?: boolean;
+    canInstallWsl?: boolean;
+  };
 }
 
 /** Strip JSON-RPC protocol prefixes that are debugging noise, not user text. */
@@ -73,7 +82,21 @@ function classifyError(error: unknown): OperationError {
       error.kind === "retryable" && error.method
         ? { method: error.method, params: error.params ?? {} }
         : undefined;
-    return { headline, detail, kind: error.kind, raw: error.raw, retry };
+    // Pull the backend's recovery-option flags off `error.data` (merged there at
+    // the top level by UserFacingError.to_error_data). Only build `options` when
+    // at least one is set so an ordinary error stays flag-free.
+    const d = error.data ?? {};
+    const options =
+      d.can_switch_classifier === true ||
+      d.can_increase_memory === true ||
+      d.can_install_wsl === true
+        ? {
+            canSwitchClassifier: d.can_switch_classifier === true,
+            canIncreaseMemory: d.can_increase_memory === true,
+            canInstallWsl: d.can_install_wsl === true,
+          }
+        : undefined;
+    return { headline, detail, kind: error.kind, raw: error.raw, retry, options };
   }
   if (typeof error === "object" && error !== null && "message" in error) {
     const msg = cleanMessage(String((error as { message: unknown }).message));

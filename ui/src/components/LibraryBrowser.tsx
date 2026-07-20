@@ -625,6 +625,10 @@ export function LibraryBrowser() {
         // parallel toast).
         if (report.genre_fallback_warning) detailLines.push(report.genre_fallback_warning);
         if (report.model_degradation_warning) detailLines.push(report.model_degradation_warning);
+        // Online genre lookup requested but its backend wasn't reachable — genres
+        // used tags + audio only. Same completion toast as its sibling degradation
+        // warnings (not a parallel toast).
+        if (report.genre_web_unavailable_warning) detailLines.push(report.genre_web_unavailable_warning);
         // Engine self-heal notices (WSL drift auto-repair): a successful repair
         // is informational; a failed GPU-lib restore means the run fell back to
         // CPU — a caution. Same completion toast, no parallel one.
@@ -633,7 +637,8 @@ export function LibraryBrowser() {
         const degraded = Boolean(
           report.genre_fallback_warning ||
             report.model_degradation_warning ||
-            report.runtime_heal_warning,
+            report.runtime_heal_warning ||
+            report.genre_web_unavailable_warning,
         );
         const headline =
           errors > 0

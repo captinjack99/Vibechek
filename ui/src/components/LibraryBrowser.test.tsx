@@ -588,6 +588,24 @@ describe("<LibraryBrowser /> — analyze completion toast", () => {
     });
   });
 
+  it("folds an online-genre-lookup outage into the completion toast as a caution", async () => {
+    await reanalyzeWith({
+      summary: { total_files: 3, analyzed: 3, errors: 0 },
+      tracks: [track("D:/LibraryA/a.mp3")],
+      genre_web_unavailable_warning:
+        "Online genre lookup wasn't available this run — genres used tags and audio only. Restarting Vibechek usually restores it.",
+    });
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      // A silent degradation is a caution, not a clean success — same toast as
+      // the sibling warnings, not a parallel one.
+      expect(items[0].kind).toBe("warning");
+      expect(items[0].detail).toMatch(/Online genre lookup wasn't available/);
+    });
+  });
+
   it("notes a successful engine auto-repair without downgrading a clean run", async () => {
     await reanalyzeWith({
       summary: { total_files: 3, analyzed: 3, errors: 0 },

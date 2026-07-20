@@ -48,7 +48,7 @@ ui/
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │  `vibechek rpc` (Python sidecar)                       │
-│  - 50 RPC methods, threadpool dispatch (8 workers)     │
+│  - 51 RPC methods, threadpool dispatch (8 workers)     │
 │  - Stdout lock keeps concurrent JSON frames atomic     │
 │  - Cooperative cancellation token                      │
 │  - All real work: analyzer, tagger, dedup, organize    │
@@ -198,7 +198,7 @@ beta builds ship without them (the updater is inert until a key is enrolled). Se
 
 ## Sidecar protocol
 
-JSON-RPC 2.0, one message per line on stdin/stdout. 50 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
+JSON-RPC 2.0, one message per line on stdin/stdout. 51 methods. See [`vibechek/rpc.py`](../vibechek/rpc.py) for the authoritative list.
 
 | Method | What |
 |---|---|
@@ -207,6 +207,7 @@ JSON-RPC 2.0, one message per line on stdin/stdout. 50 methods. See [`vibechek/r
 | `worker_budget` | Computes the real worker-slider max (max_workers, per-worker RAM, which RAM pool — the WSL VM's for WSL-routed engines) for an engine × genre-classifier pair; the Settings slider and the analyzer's own sizing share this one calculation so they can't disagree |
 | `preflight`, `wsl_status`, `doctor`, `verify_models`, `native_venv_status` | Readiness checks + diagnostics |
 | `install_wsl`, `install_vibechek_in_wsl`, `install_cuda_libs_in_wsl`, `install_essentia_native`, `upgrade_vibechek_in_wsl`, `repair_wsl_shim` | Auto-setup / GPU / version-drift repair |
+| `increase_wsl_memory` | Raises the WSL VM's `memory=` limit in `.wslconfig` — the self-heal behind the "Give Vibechek more memory" recovery on a CLAP out-of-memory refusal; returns `restart_required` and never restarts WSL itself |
 | `setup_onnx_engine`, `setup_clap_engine`, `setup_genre_resolver` | One-click provisioning of the opt-in ONNX / CLAP-audio / online-resolver engines (cancellable, progress-emitting) |
 | `scan_directory`, `scan_only`, `count_new_tracks` | List files / shallow track records (no ML) |
 | `analyze_directory` | Full ML pass (CPU/GPU/hybrid; supports `skip_paths` for incremental) |

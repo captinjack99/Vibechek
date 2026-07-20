@@ -101,4 +101,57 @@ describe("<ErrorToast />", () => {
     render(<ErrorToast />);
     expect(screen.queryByText("Technical details")).not.toBeInTheDocument();
   });
+
+  it("renders both memory-refusal buttons when their option flags are set", () => {
+    setError({
+      headline: "Not enough memory to run the advanced genre model right now.",
+      kind: "fatal",
+      raw: "{}",
+      options: { canSwitchClassifier: true, canIncreaseMemory: true },
+    });
+    render(<ErrorToast />);
+    expect(screen.getByText("Switch to the standard genre model")).toBeInTheDocument();
+    expect(screen.getByText("Give Vibechek more memory")).toBeInTheDocument();
+    expect(screen.queryByText("Install WSL")).not.toBeInTheDocument();
+  });
+
+  it("shows only the classifier switch when increase-memory isn't offered", () => {
+    setError({
+      headline: "Not enough memory to run analysis right now.",
+      kind: "fatal",
+      raw: "{}",
+      options: { canSwitchClassifier: true },
+    });
+    render(<ErrorToast />);
+    expect(screen.getByText("Switch to the standard genre model")).toBeInTheDocument();
+    expect(screen.queryByText("Give Vibechek more memory")).not.toBeInTheDocument();
+  });
+
+  it("shows Install WSL for a can_install_wsl error and firing it calls install_wsl", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockClear();
+    setError({
+      headline: "Windows' Linux environment isn't installed on this PC yet.",
+      kind: "fatal",
+      raw: "{}",
+      options: { canInstallWsl: true },
+    });
+    render(<ErrorToast />);
+    const btn = screen.getByText("Install WSL");
+    expect(btn).toBeInTheDocument();
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith(
+        "rpc_call",
+        expect.objectContaining({ method: "install_wsl" }),
+      );
+    });
+  });
+
+  it("renders no recovery-option buttons when the error carries no options", () => {
+    setError({ headline: "Something specific failed.", raw: "{}" });
+    render(<ErrorToast />);
+    expect(screen.queryByText("Switch to the standard genre model")).not.toBeInTheDocument();
+    expect(screen.queryByText("Give Vibechek more memory")).not.toBeInTheDocument();
+    expect(screen.queryByText("Install WSL")).not.toBeInTheDocument();
+  });
 });

@@ -9,7 +9,7 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 (the authoritative method list), and the "Sidecar protocol" section of
 [`ui/README.md`](../ui/README.md).
 
-> **The method surface is 50.** `worker_budget` computes the effective worker plan
+> **The method surface is 51.** `worker_budget` computes the effective worker plan
 > (slider max + per-worker RAM + which RAM pool was measured) for a given engine ×
 > genre classifier, so the Settings slider binds its max to what actually fits and can
 > never disagree with the run — both call the one pure `resources.compute_worker_budget`.
@@ -28,7 +28,10 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 > scripts, Linux/macOS → `native_install.setup_clap_native`/`setup_resolver_native`
 > (same venv + artifact paths, so analyze-time consumers don't care which ran).
 > Engine/genre selection also **added params to existing methods** (they cross the
-> wire) — see "Engine-aware params" below.
+> wire) — see "Engine-aware params" below. The UX-audit memory self-heal added
+> `increase_wsl_memory` (raises the WSL VM's `memory=` limit in `.wslconfig` for a
+> CLAP out-of-memory refusal; returns `{ok, changed, old, new, restart_required}`
+> and never restarts WSL itself).
 
 ## Engine-aware params (ONNX inference engine)
 
