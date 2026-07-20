@@ -72,9 +72,12 @@ def test_discogs_same_env_stays_high() -> None:
     assert b.effective_workers == 14
 
 
-def test_clap_8gb_refuses_with_actionable_message() -> None:
-    """8 GB WSL VM, CLAP → nothing fits: refuse (naming the classifier + RAM)
-    instead of launching one doomed OOM-killed worker."""
+def test_clap_8gb_refuses_with_plain_headline_and_demoted_detail() -> None:
+    """8 GB WSL VM, CLAP → nothing fits: refuse. WP-D3: `refusal_reason` is now a
+    PLAIN headline (no GB math / no "CLAP"/"Discogs" jargon — those move to the
+    detail helper), and the machine-readable options drive the refusal buttons."""
+    from vibechek.resources import memory_refusal_detail, memory_refusal_options
+
     b = compute_worker_budget(
         "essentia_tf", "clap", 16,
         total_ram_mb=8192, free_vram_mb=None, gpu_registrable=None,
@@ -82,9 +85,26 @@ def test_clap_8gb_refuses_with_actionable_message() -> None:
     )
     assert b.max_workers == 0
     assert b.effective_workers == 0
-    assert b.refusal_reason is not None
-    assert "CLAP" in b.refusal_reason
-    assert "Discogs" in b.refusal_reason  # the actionable suggestion
+    # Plain headline — no engineer-speak, no numbers.
+    assert b.refusal_reason == "Not enough memory to run the advanced genre model right now."
+    assert "CLAP" not in b.refusal_reason
+    assert "GB" not in b.refusal_reason
+    # The technical explanation is DEMOTED to the detail, not deleted.
+    detail = memory_refusal_detail(b, "clap")
+    assert "GB" in detail
+    assert ".wslconfig" in detail  # the mechanism, in the detail only
+    # Machine-readable action flags for the next-wave buttons.
+    opts = memory_refusal_options("clap", under_wsl=True)
+    assert opts == {"can_switch_classifier": True, "can_increase_memory": True}
+
+
+def test_memory_refusal_options_essentia_host() -> None:
+    """Discogs on a native host → no classifier switch, no WSL memory bump."""
+    from vibechek.resources import memory_refusal_options
+
+    assert memory_refusal_options("discogs", under_wsl=False) == {
+        "can_switch_classifier": False, "can_increase_memory": False,
+    }
 
 
 def test_ram_cap_never_floors_to_one_doomed_worker() -> None:

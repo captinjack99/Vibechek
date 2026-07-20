@@ -67,6 +67,33 @@ log = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, int, str], None]
 
 
+def wsl_missing_error() -> dict:
+    """The ONE structured result every ``wsl.exe not found`` site returns.
+
+    Six helpers used to each return a bare ``{"ok": False, "error": "wsl.exe not
+    found"}`` — engineer-speak, and a dead end: the app can actually install WSL
+    for the user (the ``install_wsl`` RPC), but nothing connected that self-heal
+    to this error string. This centralizes the shape so:
+
+      * the user reads a plain headline, not a filename;
+      * ``kind`` + ``can_install_wsl`` let the shell offer the in-app Install
+        action (wired next wave) instead of leaving a close-button dead end;
+      * ``error`` is kept verbatim so existing callers / logs / bug reports that
+        read ``.get("error")`` don't change behaviour.
+    """
+    return {
+        "ok": False,
+        "error": "wsl.exe not found",  # kept for logs + backward-compat callers
+        "kind": "fatal",
+        "headline": "Windows' Linux environment isn't installed on this PC yet.",
+        "detail": (
+            "wsl.exe was not found. Vibechek runs its analysis engine inside the "
+            "Windows Subsystem for Linux (WSL); it can install WSL for you."
+        ),
+        "can_install_wsl": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -1655,7 +1682,7 @@ def install_vibechek_in_wsl(
 
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
     if not wsl:
-        return {"ok": False, "error": "wsl.exe not found"}
+        return wsl_missing_error()
 
     from vibechek import cancellation  # noqa: PLC0415
 
@@ -1869,7 +1896,7 @@ def upgrade_vibechek_in_wsl(
         return {"ok": False, "error": "Not running on Windows"}
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
     if not wsl:
-        return {"ok": False, "error": "wsl.exe not found"}
+        return wsl_missing_error()
 
     from vibechek import cancellation  # noqa: PLC0415
 
@@ -2018,7 +2045,21 @@ CKPT="$HOME/.vibechek/clap/music_clap.pt"
 # failure instead of an indefinite hang (the Python-side timeout only starts
 # counting after stdout EOF).
 trap 'rm -f "$CKPT.partial"' EXIT
-if [ ! -s "$CKPT" ]; then
+# Re-download unless a cached file is present AND passes its integrity check.
+# A bare `[ ! -s "$CKPT" ]` (size/existence only) silently KEPT a corrupt-but-
+# full-size checkpoint, so the "re-run CLAP setup" remedy the load-time error
+# suggests was a no-op — the file that failed load_clap_model's SHA256 gate got
+# reused verbatim. Verify the cached file's hash too, and re-fetch on mismatch.
+NEED_DOWNLOAD=1
+if [ -s "$CKPT" ]; then
+  if echo "{ckpt_sha256}  $CKPT" | sha256sum -c - >/dev/null 2>&1; then
+    NEED_DOWNLOAD=0
+  else
+    echo "Cached checkpoint failed its integrity check — re-downloading..." >&2
+    rm -f "$CKPT"
+  fi
+fi
+if [ "$NEED_DOWNLOAD" -eq 1 ]; then
   curl -fSL --speed-limit 1024 --speed-time 60 "{ckpt_url}" -o "$CKPT.partial"
   SIZE=$(stat -c%s "$CKPT.partial" 2>/dev/null || echo 0)
   if [ "$SIZE" -lt 1500000000 ]; then
@@ -2091,7 +2132,7 @@ def _run_managed_wsl_script(
         return {"ok": False, "error": "Not running on Windows"}
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
     if not wsl:
-        return {"ok": False, "error": "wsl.exe not found"}
+        return wsl_missing_error()
 
     import re as _re  # noqa: PLC0415
     import tempfile as _tempfile  # noqa: PLC0415
@@ -2519,7 +2560,7 @@ def repair_wsl_shim(distro: str) -> dict:
 
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
     if not wsl:
-        return {"ok": False, "error": "wsl.exe not found"}
+        return wsl_missing_error()
 
     # Use a staged tempfile so the bash one-liner doesn't trip wsl.exe's
     # variable-substitution quirk.
@@ -2631,7 +2672,7 @@ def install_cuda_libs_in_wsl(
 
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
     if not wsl:
-        return {"ok": False, "error": "wsl.exe not found"}
+        return wsl_missing_error()
 
     # Translate missing .so names to PyPI wheel names. Routes to cu12 wheels
     # automatically when TF dlopens .so.12 / .so.9 — future-proofs against
@@ -2639,11 +2680,27 @@ def install_cuda_libs_in_wsl(
     pip_packages, unknown = _resolve_cuda_packages(missing_libs)
 
     if not pip_packages:
+        # We couldn't map the missing GPU libraries to installable wheels, so we
+        # can't set up GPU acceleration automatically. This is NOT fatal: analyze
+        # keeps running on CPU (the caller already rendered a CPU-fallback line
+        # above). Plain headline; the raw `.so` names are demoted to `detail`.
+        # `unknown` (the subset with no wheel mapping) now rides in `detail`
+        # instead of the previously-unread `unknown_libs` field.
+        unresolved = unknown or missing_libs
         return {
             "ok": False,
             "error": (
                 f"No PyPI wheels mapped for: {', '.join(missing_libs)}. "
                 f"You may need to install them manually."
+            ),
+            "kind": "fatal",
+            "headline": (
+                "Couldn't set up GPU acceleration automatically. "
+                "Analysis will keep running on CPU."
+            ),
+            "detail": (
+                "No PyPI CUDA wheels are mapped for these GPU libraries: "
+                f"{', '.join(unresolved)}."
             ),
             "unknown_libs": unknown,
         }
@@ -2932,7 +2989,7 @@ def ensure_engine_runtime(
         return {"ok": True, "skipped": "not-windows"}
     wsl = shutil.which("wsl") or shutil.which("wsl.exe")
     if not wsl:
-        return {"ok": False, "error": "wsl.exe not found"}
+        return wsl_missing_error()
 
     from vibechek import cancellation  # noqa: PLC0415
 
@@ -2948,8 +3005,18 @@ def ensure_engine_runtime(
                 "ok": False,
                 "error": (
                     f"The {engine} engine can't import its ML stack in {distro}: "
-                    f"{detail}. Automatic repair is disabled (VIBECHEK_NO_AUTOHEAL); "
-                    f"re-run Settings -> Set up WSL to fix it."
+                    f"{detail}. Automatic repair is disabled (VIBECHEK_NO_AUTOHEAL)."
+                ),
+                "kind": "fatal",
+                "headline": (
+                    "The analysis engine can't start, and automatic repair is "
+                    "turned off."
+                ),
+                "detail": (
+                    f"The {engine} engine couldn't import its ML libraries in "
+                    f"{distro}: {detail}. Automatic repair is disabled "
+                    "(VIBECHEK_NO_AUTOHEAL) — turn it back on, or reinstall the "
+                    "analysis environment from Vibechek's setup screen."
                 ),
                 "stack_error": detail,
                 "autoheal_disabled": True,
@@ -2985,7 +3052,18 @@ def ensure_engine_runtime(
                 "phase": "stack-repair",
                 "error": (
                     f"The {engine} engine still can't import its ML stack after an "
-                    f"in-place reinstall: {detail2}. Re-run Settings -> Set up WSL."
+                    f"in-place reinstall: {detail2}."
+                ),
+                "kind": "fatal",
+                "headline": (
+                    "The analysis engine still isn't working after an automatic "
+                    "repair."
+                ),
+                "detail": (
+                    f"The {engine} engine still couldn't import its ML libraries "
+                    f"in {distro} after an in-place reinstall: {detail2}. "
+                    "Reinstalling the analysis environment from Vibechek's setup "
+                    "screen may fix it."
                 ),
                 "stack_error": detail2,
             }
@@ -3392,6 +3470,261 @@ def wsl_vm_memory_mb(distro: str, *, force: bool = False) -> int | None:
     return mem
 
 
+# ---------------------------------------------------------------------------
+# .wslconfig memory self-heal (WP-D / the doctrine's flagship self-heal)
+# ---------------------------------------------------------------------------
+#
+# The CLAP genre model needs ~4.5 GB per worker; under WSL the workers draw from
+# the VM's RAM slice, which Windows caps at ~50% of host by default. When that
+# slice is too small the analyzer REFUSES the run (resources.compute_worker_
+# budget). One real fix is to raise the VM's memory limit — the `memory=` line
+# in `%USERPROFILE%\.wslconfig`. Nothing in the app wrote that file before; a GUI
+# user was told to edit a hidden dotfile by hand. These functions read and bump
+# it for the user (a plain "Increase memory available to Vibechek" action wires
+# to `bump_wslconfig_memory` next wave). They NEVER run `wsl --shutdown`: a live
+# analysis — or the user's other WSL work — would die. The RPC returns
+# restart_required so the GUI can offer the restart knowingly instead.
+
+# WSL `.wslconfig` size units → MB multiplier. WSL accepts values like `8GB` or
+# `8192MB`; a bare number is bytes per the docs, but we only ever WRITE a clean
+# `<N>GB`, so bare/unknown units are a best-effort read used for display only.
+_WSL_SIZE_UNITS_MB: dict[str, float] = {
+    "TB": 1024 * 1024, "T": 1024 * 1024,
+    "GB": 1024, "G": 1024,
+    "MB": 1.0, "M": 1.0,
+    "KB": 1 / 1024, "K": 1 / 1024,
+    "B": 1 / (1024 * 1024),
+}
+_WSL_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*$")
+
+
+def wslconfig_path() -> Path:
+    """`%USERPROFILE%\\.wslconfig` — where WSL2 global settings live."""
+    return Path(os.path.expanduser("~")) / ".wslconfig"
+
+
+def _parse_wsl_size_to_mb(value: str | None) -> int | None:
+    """Parse a `.wslconfig` size (`8GB`, `8192MB`, `16G`) to whole MB, or None."""
+    if not value:
+        return None
+    m = _WSL_SIZE_RE.match(value)
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = m.group(2).upper()
+    factor = _WSL_SIZE_UNITS_MB.get(unit)
+    if factor is None:
+        # Unknown/absent unit — WSL treats a bare number as bytes. Best-effort.
+        factor = 1 / (1024 * 1024) if unit == "" else None
+    if factor is None:
+        return None
+    return int(num * factor)
+
+
+def _choose_wslconfig_memory_target_mb(host_total_mb: int | None) -> int | None:
+    """Pick a safe `memory=` target (whole GB, in MB) from measured host RAM.
+
+    Give WSL the LESSER of 75% of host RAM and (host − 8 GB). The 8 GB floor for
+    Windows is what matters on small machines: on a 16 GB box that yields 8 GB to
+    WSL (not 12), so Windows + the GUI + the browser aren't starved — the same
+    shared-physical-pool reasoning behind the analyzer's 4 GB WSL reserve.
+    Rounds DOWN to a whole GB for a clean value. None when RAM is unmeasurable or
+    the machine is too small to spare a whole GB.
+    """
+    if not host_total_mb or host_total_mb <= 0:
+        return None
+    target = min(int(host_total_mb * 0.75), host_total_mb - 8192)
+    target_gb = target // 1024
+    if target_gb < 1:
+        return None
+    return target_gb * 1024
+
+
+def _rewrite_wslconfig_memory(text: str, new_value: str) -> str:
+    """Return `text` with the `[wsl2]` `memory=` set to `new_value`, PRESERVING
+    every other line (comments, other keys, other sections, blank lines).
+
+    Deliberately line-based, not configparser: configparser drops comments and
+    reformats the file, which would clobber user content. Creates the `[wsl2]`
+    section (and the file, via an empty `text`) when absent.
+    """
+    newline = "\r\n" if "\r\n" in text else "\n"
+    had_trailing_nl = text.endswith(("\n", "\r"))
+    lines = text.splitlines()
+    out: list[str] = []
+    in_wsl2 = False
+    wrote = False
+    for raw in lines:
+        stripped = raw.strip()
+        is_header = stripped.startswith("[") and stripped.endswith("]")
+        if is_header:
+            # Leaving a section: if we were inside [wsl2] and never found a
+            # memory= key, insert one before this next header.
+            if in_wsl2 and not wrote:
+                out.append(f"memory={new_value}")
+                wrote = True
+            in_wsl2 = stripped[1:-1].strip().lower() == "wsl2"
+            out.append(raw)
+            continue
+        if (
+            in_wsl2 and not wrote and "=" in stripped
+            and not stripped.startswith((";", "#"))
+            and stripped.split("=", 1)[0].strip().lower() == "memory"
+        ):
+            out.append(f"memory={new_value}")
+            wrote = True
+            continue
+        out.append(raw)
+    if in_wsl2 and not wrote:
+        # [wsl2] was the last section and had no memory= key.
+        out.append(f"memory={new_value}")
+        wrote = True
+    if not wrote:
+        # No [wsl2] section anywhere — append one (keep a blank separator if the
+        # existing content didn't end on one).
+        if out and out[-1].strip() != "":
+            out.append("")
+        out.append("[wsl2]")
+        out.append(f"memory={new_value}")
+    result = newline.join(out)
+    if had_trailing_nl or not text:
+        result += newline
+    return result
+
+
+def read_wslconfig_memory(*, path: Path | None = None) -> dict:
+    """Read the current `[wsl2] memory=` from `.wslconfig`.
+
+    Returns {ok, path, exists, memory (raw string|None), memory_mb (int|None)}.
+    `path` is injectable for tests; defaults to the real `%USERPROFILE%`.
+    """
+    p = path or wslconfig_path()
+    if not p.exists():
+        return {"ok": True, "path": str(p), "exists": False,
+                "memory": None, "memory_mb": None}
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return {"ok": False, "path": str(p), "exists": True,
+                "error": str(e), "memory": None, "memory_mb": None}
+    value = _read_wslconfig_memory_value(text)
+    return {
+        "ok": True, "path": str(p), "exists": True,
+        "memory": value, "memory_mb": _parse_wsl_size_to_mb(value),
+    }
+
+
+def _read_wslconfig_memory_value(text: str) -> str | None:
+    """Return the raw `memory=` value under `[wsl2]`, or None."""
+    in_wsl2 = False
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith((";", "#")):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_wsl2 = stripped[1:-1].strip().lower() == "wsl2"
+            continue
+        if in_wsl2 and "=" in stripped:
+            key, _, val = stripped.partition("=")
+            if key.strip().lower() == "memory":
+                return val.strip() or None
+    return None
+
+
+def bump_wslconfig_memory(
+    *,
+    path: Path | None = None,
+    target_mb: int | None = None,
+    host_total_mb: int | None = None,
+) -> dict:
+    """Raise the WSL VM's `memory=` limit in `.wslconfig` for the user.
+
+    Read-modify-write PRESERVING all other file content; creates the file (with
+    just `[wsl2]` + `memory=`) when absent. NEVER shrinks an existing larger
+    value. NEVER runs `wsl --shutdown` — the returned `restart_required` tells the
+    GUI to offer the restart knowingly (a running analysis or other WSL work
+    would otherwise die).
+
+    `target_mb`/`host_total_mb`/`path` are injectable for tests. In production the
+    target is computed from measured host RAM (`_choose_wslconfig_memory_target_
+    mb`). Returns {ok, changed, old, new, old_mb, new_mb, restart_required, path}
+    (+ headline/detail/kind on failure, per the shared error shape).
+    """
+    p = path or wslconfig_path()
+
+    if target_mb is None:
+        if host_total_mb is None:
+            from vibechek.resources import _memory_total_mb  # noqa: PLC0415
+            host_total_mb = _memory_total_mb()
+        target_mb = _choose_wslconfig_memory_target_mb(host_total_mb)
+    if not target_mb or target_mb <= 0:
+        return {
+            "ok": False, "changed": False, "path": str(p),
+            "restart_required": False,
+            "kind": "fatal",
+            "headline": "Couldn't work out a safe memory limit for this PC.",
+            "detail": (
+                "Vibechek couldn't measure this computer's total memory, so it "
+                "can't choose a safe value for the Linux analysis environment."
+            ),
+            "error": "could not determine a memory target",
+        }
+
+    text = ""
+    try:
+        if p.exists():
+            text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return {
+            "ok": False, "changed": False, "path": str(p),
+            "restart_required": False, "kind": "fatal",
+            "headline": "Couldn't open the Windows Subsystem for Linux settings file.",
+            "detail": f"Reading {p} failed: {e}",
+            "error": str(e),
+        }
+
+    old_value = _read_wslconfig_memory_value(text)
+    old_mb = _parse_wsl_size_to_mb(old_value)
+    new_value = f"{target_mb // 1024}GB"
+
+    # Never shrink a limit the user already set higher than our target.
+    if old_mb is not None and old_mb >= target_mb:
+        return {
+            "ok": True, "changed": False, "path": str(p),
+            "old": old_value, "new": old_value,
+            "old_mb": old_mb, "new_mb": old_mb,
+            "restart_required": False,
+            "message": (
+                "The Linux analysis environment is already allowed "
+                f"{old_value}, which is enough."
+            ),
+        }
+
+    new_text = _rewrite_wslconfig_memory(text, new_value)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Write atomically so a crash mid-write can't corrupt the user's config.
+        tmp = p.parent / (p.name + ".vibechek-tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as e:
+        return {
+            "ok": False, "changed": False, "path": str(p),
+            "restart_required": False, "kind": "fatal",
+            "headline": "Couldn't save the Windows Subsystem for Linux settings.",
+            "detail": f"Writing {p} failed: {e}",
+            "error": str(e),
+        }
+
+    return {
+        "ok": True, "changed": True, "path": str(p),
+        "old": old_value, "new": new_value,
+        "old_mb": old_mb, "new_mb": target_mb,
+        # NOT auto-restarting on purpose — the GUI offers it knowingly.
+        "restart_required": True,
+    }
+
+
 def _wsl_run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess:
     """Run a wsl.exe command, decoding the UTF-16-or-UTF-8 output Windows uses."""
     result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
@@ -3428,6 +3761,10 @@ __all__ = [
     "run_vibechek_in_wsl",
     "probe_engine_gpu",
     "wsl_vm_memory_mb",
+    "wsl_missing_error",
+    "wslconfig_path",
+    "read_wslconfig_memory",
+    "bump_wslconfig_memory",
     "engine_gpu_info_to_dict",
     "win_to_wsl_path",
     "wsl_to_win_path",

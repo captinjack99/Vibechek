@@ -251,6 +251,7 @@ def install_essentia_native(
     *,
     vibechek_source: str | None = None,
     engine: str = "essentia_tf",
+    _verify_retry: bool = False,
 ) -> dict:
     """Create the managed venv and install the ML stack + vibechek.
 
@@ -451,12 +452,49 @@ def install_essentia_native(
     )
 
     if version_result.returncode != 0 or essentia_result.returncode != 0:
+        verify_detail = (
+            f"vibechek --version → rc={version_result.returncode}: "
+            f"{version_result.stderr[:300]}\n"
+            f"import essentia → rc={essentia_result.returncode}: "
+            f"{essentia_result.stderr[:300]}"
+        )
+        if not _verify_retry:
+            # Self-heal (WP-J1): the venv we just built (possibly reusing a
+            # pre-existing broken one at Step 1) can't run. A plain re-click
+            # reused the SAME broken venv, so retry failed identically. Wipe the
+            # venv and reinstall from scratch ONCE; the `_verify_retry` marker
+            # guards against an infinite reinstall loop.
+            log.warning(
+                "Native install verify failed — wiping venv %s and reinstalling "
+                "once from scratch", vd,
+            )
+            if on_progress:
+                on_progress(
+                    96, 100,
+                    "Verification failed — reinstalling the analysis engine from "
+                    "scratch…",
+                )
+            shutil.rmtree(vd, ignore_errors=True)
+            if cancellation.is_cancelled():
+                return {"ok": False, "error": "Cancelled by user", "cancelled": True}
+            return install_essentia_native(
+                on_progress,
+                vibechek_source=vibechek_source,
+                engine=engine,
+                _verify_retry=True,
+            )
+        # Second attempt (a fresh venv) STILL failed — genuinely broken. Plain
+        # headline; rc/command/stderr demoted to detail.
         return {
             "ok": False,
             "error": (
-                f"Install completed but verification failed.\n"
-                f"vibechek --version → rc={version_result.returncode}: {version_result.stderr[:300]}\n"
-                f"import essentia → rc={essentia_result.returncode}: {essentia_result.stderr[:300]}"
+                f"Install completed but verification failed.\n{verify_detail}"
+            ),
+            "kind": "fatal",
+            "headline": "Setup finished, but the analysis engine still isn't working.",
+            "detail": (
+                "The analysis engine didn't pass its post-install check even "
+                f"after a clean reinstall.\n{verify_detail}"
             ),
         }
 
@@ -891,7 +929,24 @@ def setup_clap_native(
     # ---- 2. checkpoint (idempotent; the downloader stages to .partial,
     # validates Content-Length, and aborts mid-stream on cancel).
     ckpt = Path.home() / ".vibechek" / "clap" / _CHECKPOINT_NAME
+    from vibechek.clap_genre import _CHECKPOINT_SHA256  # noqa: PLC0415
+    from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
+
+    # Reuse a cached checkpoint ONLY if it also passes its integrity check. A
+    # bare size-floor reuse (WP-I2) silently KEPT a corrupt-but-full-size file,
+    # so the "re-run CLAP setup" remedy the load-time error suggests was a no-op.
+    # Verify the cached file too; on mismatch, delete it and fall through to a
+    # forced re-download.
+    cached_ok = False
     if ckpt.exists() and ckpt.stat().st_size >= _CLAP_MIN_CKPT_BYTES:
+        try:
+            verify_model_sha256(ckpt, _CHECKPOINT_SHA256)
+            cached_ok = True
+        except RuntimeError:
+            _step(48, "Cached CLAP checkpoint failed its integrity check — "
+                      "re-downloading…")
+            ckpt.unlink(missing_ok=True)
+    if cached_ok:
         _step(90, "CLAP checkpoint already present, reusing")
     else:
         _step(50, "[2/3] Downloading CLAP checkpoint (~2.2 GB, one-time)...")
@@ -918,10 +973,8 @@ def setup_clap_native(
         # Content-hash gate: the checkpoint is a torch pickle (executable on
         # load), so a size floor alone is not integrity. Mismatch → delete +
         # fail the setup loudly instead of staging a poisoned file for
-        # load_clap_model to trip on mid-analyze.
-        from vibechek.clap_genre import _CHECKPOINT_SHA256  # noqa: PLC0415
-        from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
-
+        # load_clap_model to trip on mid-analyze. (_CHECKPOINT_SHA256 +
+        # verify_model_sha256 imported above for the cached-file reuse check.)
         _step(92, "Verifying checkpoint SHA256…")
         try:
             verify_model_sha256(ckpt, _CHECKPOINT_SHA256)

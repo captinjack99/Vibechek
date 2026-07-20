@@ -46,6 +46,7 @@ from vibechek.config import (
     VibechekConfig,
     engine_venv_subdir,
 )
+from vibechek.errors import UserFacingError
 
 log = logging.getLogger(__name__)
 
@@ -728,6 +729,20 @@ def _wsl_status(params: dict) -> dict:
     # contradicts the preflight rendered next to it.
     venv_subdir = engine_venv_subdir(engine)
     return to_dict(detect_wsl(quick=quick, venv_subdir=venv_subdir))
+
+
+def _increase_wsl_memory(params: dict) -> dict:
+    """Raise the WSL VM's memory limit in `%USERPROFILE%\\.wslconfig` (WP-D2).
+
+    The self-heal behind the "Increase memory available to Vibechek" action on
+    the CLAP out-of-memory refusal. Reads + bumps the `memory=` line (preserving
+    all other content; creates the file if absent), choosing a safe target from
+    measured host RAM. Returns {ok, changed, old, new, restart_required}. It does
+    NOT restart WSL — a running analysis or the user's other WSL work could die —
+    so `restart_required: true` tells the GUI to offer the restart knowingly.
+    """
+    from vibechek.wsl import bump_wslconfig_memory
+    return bump_wslconfig_memory()
 
 
 def _install_wsl(params: dict) -> dict:
@@ -2044,6 +2059,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "preflight": _preflight,
     "wsl_status": _wsl_status,
     "install_wsl": _install_wsl,
+    "increase_wsl_memory": _increase_wsl_memory,
     "install_vibechek_in_wsl": _install_vibechek_in_wsl,
     "upgrade_vibechek_in_wsl": _upgrade_vibechek_in_wsl,
     "install_cuda_libs_in_wsl": _install_cuda_libs_in_wsl,
@@ -2214,6 +2230,17 @@ def _dispatch(request: dict[str, Any]) -> None:
         # every error branch so a failed notification stays silent.
         if req_id is not None:
             _err(req_id, APP_ERROR, str(e), data={"cancelled": True})
+    except UserFacingError as e:
+        # A handler shaped this error deliberately: a plain headline, the
+        # technical detail DEMOTED (not deleted — logs still get the full
+        # traceback), a recovery `kind`, and any machine-readable option flags.
+        # The shell renders `data.headline` + a "Try again"/"Restart"/details
+        # affordance keyed off `data.kind`; the message stays the headline so a
+        # consumer that ignores `data` still shows something readable.
+        log.warning("User-facing error in method %s: %s", method, e.headline)
+        log.debug("User-facing error detail for %s: %s", method, e.detail)
+        if req_id is not None:
+            _err(req_id, APP_ERROR, e.headline, data=e.to_error_data())
     except (FileNotFoundError, NotADirectoryError) as e:
         # A missing folder / file or unmounted drive is user input, not a
         # server fault — surface a clean param error, not an APP_ERROR carrying

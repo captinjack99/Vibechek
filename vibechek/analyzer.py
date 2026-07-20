@@ -33,6 +33,7 @@ from mutagen.id3 import ID3
 from vibechek import cancellation
 from vibechek import resources as _resources
 from vibechek.config import AnalysisConfig, engine_venv_subdir
+from vibechek.errors import UserFacingError
 from vibechek.filename import extract_from_filename
 from vibechek.genres import GenreResult, get_best_genre
 from vibechek.io import atomic_write_json
@@ -1742,11 +1743,18 @@ def _run_hybrid_pool(
                     break
                 except multiprocessing.TimeoutError:
                     if _time.monotonic() > deadline:
-                        raise RuntimeError(
-                            f"Analyze stalled — no track completed in "
-                            f"{STALL_TIMEOUT}s. The hybrid worker pool is dead "
-                            f"(likely OOM or essentia init crash). Check the "
-                            f"sidecar log for VIBECHEK_WORKER_INIT_FAIL lines."
+                        raise UserFacingError(
+                            "Analysis stalled and had to stop — the analysis "
+                            "engine likely ran out of memory. Try again with "
+                            "fewer workers (Settings → Performance), or run "
+                            "Doctor.",
+                            detail=(
+                                f"No track completed in {STALL_TIMEOUT}s; the "
+                                "hybrid worker pool is dead (likely OOM or an "
+                                "essentia init crash). Check the analysis-service "
+                                "log for VIBECHEK_WORKER_INIT_FAIL lines."
+                            ),
+                            kind="fatal",
                         ) from None
                     if cancellation.is_cancelled():
                         raise cancellation.CancelledError("Analysis cancelled by user") from None
@@ -2017,12 +2025,22 @@ def analyze_directory(
         ram_pool="wsl_vm" if under_wsl else "host",
     )
 
-    # Nothing fits — refuse with the actionable message (naming the classifier +
-    # measured RAM) instead of launching one worker the budget says is doomed.
+    # Nothing fits — refuse instead of launching one worker the budget says is
+    # doomed. Plain headline (budget.refusal_reason); the GB math / classifier /
+    # .wslconfig are demoted to the detail, and the machine-readable options let
+    # the shell offer "Switch to the standard genre model" / "Increase memory"
+    # buttons on the refusal (WP-D3 + WP-D options).
     if budget.refusal_reason is not None:
         _emit_event("stage", name="worker_budget_refused",
                     message=budget.refusal_reason)
-        raise RuntimeError(budget.refusal_reason)
+        raise UserFacingError(
+            budget.refusal_reason,
+            detail=_resources.memory_refusal_detail(budget, config.genre_classifier),
+            kind="fatal",
+            options=_resources.memory_refusal_options(
+                config.genre_classifier, under_wsl,
+            ),
+        )
 
     if not budget.ram_measured and budget.cap_reason:
         # psutil-missing path: was a bare `pass`; now a real diagnostic line.
@@ -2170,12 +2188,18 @@ def analyze_directory(
                         return iterator.next(timeout=10)  # type: ignore[attr-defined]
                     except multiprocessing.TimeoutError:
                         if _time.monotonic() > deadline:
-                            raise RuntimeError(
-                                f"Analyze stalled — no track completed in "
-                                f"{STALL_TIMEOUT}s. The worker pool is dead "
-                                f"(likely OOM or essentia init crash). Check "
-                                f"the sidecar log for VIBECHEK_WORKER_INIT_FAIL "
-                                f"lines."
+                            raise UserFacingError(
+                                "Analysis stalled and had to stop — the analysis "
+                                "engine likely ran out of memory. Try again with "
+                                "fewer workers (Settings → Performance), or run "
+                                "Doctor.",
+                                detail=(
+                                    f"No track completed in {STALL_TIMEOUT}s; the "
+                                    "worker pool is dead (likely OOM or an essentia "
+                                    "init crash). Check the analysis-service log "
+                                    "for VIBECHEK_WORKER_INIT_FAIL lines."
+                                ),
+                                kind="fatal",
                             ) from None
                         if cancellation.is_cancelled():
                             raise cancellation.CancelledError(
@@ -2412,15 +2436,29 @@ def _analyze_via_native_venv(
         if skip_paths_file is not None:
             skip_paths_file.unlink(missing_ok=True)
 
+    # PARITY NOTE (WP-G2): unlike the WSL sibling (_analyze_via_wsl), this
+    # managed-venv path has NO pre-run detect→self-heal (no ensure_engine_runtime
+    # equivalent). A broken managed venv (ML stack import failure after an OS/
+    # Python upgrade) therefore surfaces as the honest exit-non-zero error below
+    # instead of auto-repairing first. Adding parity — probe the venv's stack
+    # import and reinstall via native_install before dispatch, loop-guarded — is
+    # tracked as follow-up (see the background task), not done here to keep this
+    # change to messaging + the shared error shape.
     if result.returncode != 0:
-        raise RuntimeError(
-            f"vibechek analyze in managed venv exited with "
-            f"{result.returncode}. stdout tail:\n{result.stdout[-1500:]}"
+        raise UserFacingError(
+            "Analysis stopped unexpectedly.",
+            detail=(
+                f"The analysis engine (managed environment) exited with code "
+                f"{result.returncode}.\n\nOutput tail:\n{result.stdout[-1500:]}"
+            ),
+            kind="retryable",
         )
 
     if not local_output.exists() or local_output.stat().st_size == 0:
-        raise RuntimeError(
-            f"managed-venv analyze finished but wrote no output to {local_output}"
+        raise UserFacingError(
+            "Analysis finished but didn't produce any results.",
+            detail=f"The managed environment wrote no output to {local_output}.",
+            kind="retryable",
         )
 
     # Read bytes once + decode defensively (a truncated multibyte sequence
@@ -2430,10 +2468,14 @@ def _analyze_via_native_venv(
     try:
         report = _json.loads(raw_text)
     except _json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"managed-venv analyze wrote {len(raw_bytes)} bytes to "
-            f"{local_output} but they don't parse as JSON: {e}. "
-            f"First 200 bytes: {raw_text[:200]!r}"
+        raise UserFacingError(
+            "Analysis results were corrupted while saving.",
+            detail=(
+                f"The managed environment wrote {len(raw_bytes)} bytes to "
+                f"{local_output} but they don't parse as JSON: {e}. "
+                f"First 200 bytes: {raw_text[:200]!r}"
+            ),
+            kind="retryable",
         ) from e
 
     if output_path is None:
@@ -2634,11 +2676,21 @@ def _analyze_via_wsl(
             # below instead of dead-ending. Any OTHER upgrade failure (the code
             # re-pull itself failed) is genuinely fatal.
             if not up.get("ok") and not up.get("stack_broken"):
-                raise RuntimeError(
-                    f"WSL vibechek was out of date ({wsl_vibechek_version} < "
-                    f"{_sidecar_version}) and the automatic in-place update "
-                    f"failed: {up.get('error', 'unknown error')}. Re-run "
-                    f"Settings → \"Set up WSL\" to repair it."
+                # Phantom-pointer fix (WP-H1): the old text pointed at a Settings
+                # control that doesn't exist in the UI. Describe the real
+                # remediation (reinstall from the setup screen) and demote the
+                # version/exit detail.
+                raise UserFacingError(
+                    "Couldn't update the analysis engine, so this analysis can't "
+                    "run. Reinstall the analysis environment from Vibechek's setup "
+                    "screen to fix it.",
+                    detail=(
+                        f"The analysis engine in {distro} was out of date "
+                        f"({wsl_vibechek_version} < {_sidecar_version}) and the "
+                        f"automatic in-place update failed: "
+                        f"{up.get('error', 'unknown error')}."
+                    ),
+                    kind="fatal",
                 )
             # DETECT → SELF-HEAL → RUN (zero-setup doctrine): after the code
             # update, verify the venv can import its ML stack and that the GPU
@@ -2653,21 +2705,27 @@ def _analyze_via_wsl(
             if heal.get("cancelled"):
                 raise cancellation.CancelledError("Analysis cancelled by user")
             if not heal.get("ok"):
-                raise RuntimeError(
-                    f"The {config.inference_engine} analysis engine in {distro} "
-                    f"could not be repaired automatically: "
-                    f"{heal.get('error', 'unknown error')}. Re-run Settings → "
-                    f"\"Set up WSL\" to repair it."
+                # ensure_engine_runtime now carries a plain headline + demoted
+                # detail (WP-H self-heal messages); reuse them, with a generic
+                # fallback for the repair-subprocess-failed branches that don't.
+                raise UserFacingError(
+                    heal.get("headline")
+                    or "The analysis engine still isn't working after an "
+                    "automatic repair. Reinstall the analysis environment from "
+                    "Vibechek's setup screen to fix it.",
+                    detail=heal.get("detail") or heal.get("error"),
+                    kind=heal.get("kind") or "fatal",
                 )
             # ok=True but something was repaired (or a GPU-lib restore failed and
             # we deliberately ran on CPU rather than failing). Capture an honest
             # notice to surface on the finished report; the analyze itself is
             # about to proceed on a now-working engine.
             if heal.get("gpu_heal_failed"):
+                # Phantom-pointer fix (WP-H1): the removed control didn't exist.
                 runtime_heal_warning = (
-                    "GPU libraries could not be restored automatically — this run "
-                    f"used the CPU ({heal['gpu_heal_failed']}). Re-run Settings → "
-                    "\"Set up WSL\" to restore GPU acceleration."
+                    "GPU acceleration couldn't be restored automatically, so this "
+                    "run used the CPU. Reinstall the analysis environment from "
+                    "Vibechek's setup screen to restore GPU acceleration."
                 )
             elif heal.get("healed"):
                 runtime_healed = (
@@ -2710,11 +2768,15 @@ def _analyze_via_wsl(
 
     if result.returncode != 0:
         stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"
-        raise RuntimeError(
-            f"vibechek analyze inside WSL ({distro}) exited with "
-            f"{result.returncode}.\n\n"
-            f"stderr tail:\n{stderr_blob}\n\n"
-            f"stdout tail:\n{result.stdout[-1500:] if result.stdout else '(empty)'}"
+        raise UserFacingError(
+            "Analysis stopped unexpectedly while processing your library.",
+            detail=(
+                f"The analysis engine in {distro} exited with code "
+                f"{result.returncode}.\n\nstderr tail:\n{stderr_blob}\n\n"
+                f"stdout tail:\n"
+                f"{result.stdout[-1500:] if result.stdout else '(empty)'}"
+            ),
+            kind="retryable",
         )
 
     # Read the analysis.json the WSL side wrote and rewrite paths.
@@ -2725,12 +2787,17 @@ def _analyze_via_wsl(
     # the unhelpful "Expecting value: line 1 column 1 (char 0)" toast.
     if not local_output.exists() or local_output.stat().st_size == 0:
         stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"
-        raise RuntimeError(
-            f"WSL analyze ({distro}) returned exit 0 but wrote no output to "
-            f"{local_output}. This usually means the venv's `vibechek` shim "
-            f"is corrupted (a pre-beta.10 CUDA install bug). Try re-running "
-            f"the GUI — the next `wsl_status` call auto-repairs the shim.\n\n"
-            f"stderr tail:\n{stderr_blob}"
+        raise UserFacingError(
+            "Analysis didn't produce results because of a corrupted setup file. "
+            "Restart Vibechek to repair it automatically.",
+            detail=(
+                f"The analysis engine in {distro} returned exit 0 but wrote no "
+                f"output to {local_output}. This usually means the venv's launch "
+                "shim is corrupted (a pre-beta.10 CUDA install bug); the next "
+                "wsl_status call auto-repairs it.\n\n"
+                f"stderr tail:\n{stderr_blob}"
+            ),
+            kind="engine_dead",
         )
 
     # Read the bytes ONCE. A truncated multibyte sequence raises
@@ -2743,10 +2810,14 @@ def _analyze_via_wsl(
     try:
         report = _json.loads(raw_text)
     except _json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"WSL analyze ({distro}) wrote {len(raw_bytes)} bytes "
-            f"to {local_output} but they don't parse as JSON: {e}. "
-            f"First 200 bytes: {raw_text[:200]!r}"
+        raise UserFacingError(
+            "Analysis results were corrupted while saving.",
+            detail=(
+                f"The analysis engine in {distro} wrote {len(raw_bytes)} bytes to "
+                f"{local_output} but they don't parse as JSON: {e}. "
+                f"First 200 bytes: {raw_text[:200]!r}"
+            ),
+            kind="retryable",
         ) from e
     for track in report.get("tracks", []):
         if "path" in track:
@@ -2981,6 +3052,7 @@ def _build_report(
     # Reconcile ML genre against existing tags on the FINAL report only (partial
     # checkpoints stay raw-ML — they're transient). _reconcile_record_genre is
     # idempotent, so the final pass produces the configured result regardless.
+    web_unavailable = False
     if not in_progress:
         pol, override = genre_policy
         # Online web-synthesis genre lookup is per-track network+LLM I/O, so only
@@ -3000,11 +3072,15 @@ def _build_report(
                     "Online genre lookup enabled but the local LLM backend is "
                     "not reachable — falling back to tags + audio only",
                 )
+                # WP-G5: plain wording ("a small AI model" not "local LLM"). This
+                # is a transient progress line; the persistent, post-run banner is
+                # the genre_web_unavailable_warning report field set below.
                 _emit_event(
                     "stage", name="genre_web_unavailable",
-                    message="Online genre lookup unavailable (local LLM not "
-                            "reachable) — using tags + audio only",
+                    message="Online genre lookup isn't available right now — "
+                            "using tags + audio only",
                 )
+                web_unavailable = True
                 web_cache = None
                 web_cfg = None
         n = len(results)
@@ -3068,24 +3144,36 @@ def _build_report(
     if not in_progress:
         if degraded_heads:
             fields = _degraded_head_fields(degraded_heads)
+            # Plain wording naming the affected FIELDS; the raw head names ride
+            # only on the diagnostic event (heads=…) and the log, not the banner.
             warning = (
-                "Some ML models failed to load this run ("
-                + ", ".join(sorted(degraded_heads))
-                + f") — {fields} used a fallback for every track. Re-run the "
-                "model download; if it persists the model files may be corrupt."
+                f"{fields} used a fallback for every track this run. Use "
+                "Download models in Settings to re-fetch them."
             )
             report["model_degradation_warning"] = warning
+            log.warning("ML heads failed to load this run: %s",
+                        ", ".join(sorted(degraded_heads)))
             _emit_event("stage", name="model_load_degraded", message=warning,
                         heads=sorted(degraded_heads))
         if clap_fallbacks:
+            # Mirror the Settings genre-model picker labels (advanced/standard);
+            # "CLAP"/"Discogs" stay on the diagnostic event only.
             warning = (
-                f"CLAP genre unavailable for {clap_fallbacks} of {total} track"
-                f"{'' if clap_fallbacks == 1 else 's'} — they were scored by the "
-                "weaker Discogs model. Re-run CLAP setup if this repeats."
+                f"The advanced genre model wasn't available for {clap_fallbacks} "
+                f"of {total} track{'' if clap_fallbacks == 1 else 's'} — they used "
+                "the standard model."
             )
             report["genre_fallback_warning"] = warning
             _emit_event("stage", name="genre_classifier_degraded", message=warning,
                         fallbacks=clap_fallbacks, total=total)
+        if web_unavailable:
+            # WP-G5: persistent post-run degradation flag (like the two above),
+            # so the online-lookup fallback is more than a transient progress
+            # line the user may have missed.
+            report["genre_web_unavailable_warning"] = (
+                "Online genre lookup wasn't available this run — genres used tags "
+                "and audio only. Restarting Vibechek usually restores it."
+            )
 
     return report
 

@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibechek import analyzer
+from vibechek.errors import UserFacingError
 
 # ---------------------------------------------------------------------------
 # _normalize_version — canonical form check
@@ -209,10 +210,15 @@ def test_drift_auto_update_failure_surfaces_clean_error(
          patch("vibechek.wsl.upgrade_vibechek_in_wsl",
                return_value={"ok": False, "error": "pip failed"}):
         from vibechek.config import AnalysisConfig
-        with pytest.raises(RuntimeError, match="update.*failed|out of date"):
+        # WP-H1: now a UserFacingError with a plain headline; the version/exit
+        # detail (and the "Set up WSL" phantom pointer) are gone from the headline.
+        with pytest.raises(UserFacingError) as ei:
             analyzer.analyze_directory(
                 tmp_path, config=AnalysisConfig(workers=1, use_gpu="off"),
             )
+        assert ei.value.kind == "fatal"
+        assert "Couldn't update the analysis engine" in ei.value.headline
+        assert "out of date" in (ei.value.detail or "")
 
 
 def test_drift_stack_broken_upgrade_self_heals_then_analyzes(
@@ -267,11 +273,16 @@ def test_drift_self_heal_failure_surfaces_clean_error(
          patch("vibechek.wsl.ensure_engine_runtime",
                return_value={"ok": False, "error": "still broken after reinstall"}):
         from vibechek.config import AnalysisConfig
-        with pytest.raises(RuntimeError, match="could not be repaired|still broken"):
+        # WP-H1: a UserFacingError with a plain headline; the raw repair error is
+        # demoted to detail. (This mock returns no headline, so the analyzer's
+        # generic fallback headline is used.)
+        with pytest.raises(UserFacingError) as ei:
             analyzer.analyze_directory(
                 tmp_path,
                 config=AnalysisConfig(workers=1, use_gpu="off", inference_engine="onnx"),
             )
+        assert "isn't working" in ei.value.headline
+        assert "still broken after reinstall" in (ei.value.detail or "")
 
 
 def test_drift_guard_silent_when_versions_match(

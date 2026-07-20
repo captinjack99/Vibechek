@@ -372,6 +372,12 @@ def test_setup_clap_native_reuses_existing_checkpoint(
     ckpt.parent.mkdir(parents=True)
     ckpt.write_bytes(b"y" * 64)
 
+    # WP-I2: reuse now also requires the cached file to PASS its integrity check
+    # (a size floor alone silently kept corrupt files). Stub verify to pass so
+    # this "valid cached file → reuse, no re-download" case still holds.
+    monkeypatch.setattr(
+        "vibechek.model_download.verify_model_sha256", lambda path, expected: None,
+    )
     monkeypatch.setattr(
         native_install, "_run_with_progress", lambda *a, **k: (0, []),
     )

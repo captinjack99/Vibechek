@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from vibechek.errors import UserFacingError
 
 log = logging.getLogger(__name__)
 
@@ -172,6 +175,46 @@ def clap_checkpoint_path() -> Path:
     return Path.home() / ".vibechek" / "clap" / _CHECKPOINT_NAME
 
 
+def _reheal_checkpoint(ckpt: Path) -> bool:
+    """Delete a corrupt CLAP checkpoint and re-download it via the shared mirror
+    downloader, then re-verify (WP-I1 self-heal — no hand-deletion, no CLI).
+
+    Race-safe for multiple analyze workers hitting the same corrupt file: first
+    re-checks whether a sibling already healed it (avoids a redundant 2.2 GB
+    fetch), then stages to a per-process temp and atomically replaces the corrupt
+    file. Returns True iff a valid checkpoint is now in place.
+    """
+    from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
+
+    # A sibling worker may have re-downloaded a good file between our failed
+    # verify and now — don't pay for a redundant fetch.
+    try:
+        verify_model_sha256(ckpt, _CHECKPOINT_SHA256)
+        return True
+    except (RuntimeError, OSError):
+        pass
+
+    log.warning("CLAP checkpoint failed its integrity check — re-downloading %s", ckpt)
+    tmp = ckpt.with_name(ckpt.name + f".reheal.{os.getpid()}")
+    try:
+        from vibechek.analyzer import _download_from_mirrors  # noqa: PLC0415
+
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        _download_from_mirrors([_CHECKPOINT_URL], tmp, label=_CHECKPOINT_NAME)
+        verify_model_sha256(tmp, _CHECKPOINT_SHA256)
+        os.replace(tmp, ckpt)  # atomic swap replaces the corrupt file in place
+        return True
+    except Exception as e:  # noqa: BLE001 — any failure → honest fallback
+        log.warning("CLAP checkpoint auto-redownload failed: %s", e)
+        return False
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
 def load_clap_model(checkpoint: Path | None = None, use_gpu: str = "auto") -> Any:
     """Load the CLAP model (LAZY laion_clap + torch). Opt-in heavy dependency.
 
@@ -201,19 +244,37 @@ def load_clap_model(checkpoint: Path | None = None, use_gpu: str = "auto") -> An
         try:
             verify_model_sha256(ckpt, _CHECKPOINT_SHA256)
         except RuntimeError as e:
-            # Do NOT interpolate verify_model_sha256's message: it tells the user
-            # to run `vibechek verify-models`, which only checks the essentia .pb
-            # weight set and never looks at the CLAP checkpoint — so it would
-            # report all-OK and the user would hit this same error again. Build a
-            # CLAP-specific message; the real checksum detail stays on the chained
-            # cause (`from e`) for logs/tracebacks.
+            # Self-heal (WP-I1) + plain error (WP-I3). The checkpoint is a torch
+            # pickle (executable on load), corrupt/truncated. Instead of telling a
+            # GUI user to hand-delete ~/.vibechek/clap/music_clap.pt and run a CLI
+            # command (`vibechek verify-models` doesn't even cover this file — it
+            # only checks the essentia .pb set — so the old advice looped forever),
+            # DELETE + re-download through the shared mirror downloader. Opt out
+            # with VIBECHEK_NO_AUTOHEAL (reuses wsl's helper): detection + an
+            # honest error still happen. While the re-download runs the analyze
+            # worker's model-load blocks (the GUI shows the run still starting up).
+            # On success load proceeds; on failure the plain error below is caught
+            # by _maybe_load_clap → standard Discogs fallback + the post-run
+            # "advanced genre model wasn't available" banner.
             log.debug("CLAP checkpoint SHA256 mismatch: %s", e)
-            raise RuntimeError(
-                f"CLAP checkpoint at {ckpt} failed its integrity check — the file "
-                "is corrupted or truncated. `vibechek verify-models` does NOT "
-                "cover the CLAP checkpoint and cannot fix this: delete the file "
-                "and re-run the CLAP genre setup to re-download it."
-            ) from e
+            from vibechek.wsl import _autoheal_disabled  # noqa: PLC0415
+
+            healed = False if _autoheal_disabled() else _reheal_checkpoint(ckpt)
+            if not healed:
+                raise UserFacingError(
+                    "The advanced genre model file is damaged.",
+                    detail=(
+                        f"The genre model file at {ckpt} failed its integrity "
+                        f"check ({e})."
+                        + (
+                            " Automatic repair is turned off (VIBECHEK_NO_AUTOHEAL)."
+                            if _autoheal_disabled()
+                            else " Automatic re-download didn't succeed — check "
+                            "your network connection and try again."
+                        )
+                    ),
+                    kind="retryable",
+                ) from e
     try:
         import laion_clap  # noqa: PLC0415
     except ImportError as e:

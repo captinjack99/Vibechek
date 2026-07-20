@@ -451,18 +451,15 @@ def compute_worker_budget(
     if memory_cap <= 0:
         # Refuse rather than force a single worker the budget itself says won't
         # fit (the old max(1, ...) launched one and got it OOM-killed silently).
+        # `refusal_reason` is now a PLAIN headline (shown verbatim on the Settings
+        # slider + the refused-run event). The GB math / classifier name /
+        # .wslconfig mechanism are DEMOTED to `memory_refusal_detail()`, and the
+        # machine-readable action flags come from `memory_refusal_options()` — the
+        # analyzer packs both into the UserFacingError it raises (WP-D3).
         refusal = (
-            f"Not enough memory for even one {classifier_label} worker: it needs "
-            f"~{pw / 1024:.1f} GB each, but {pool_label} has only "
-            f"{usable / 1024:.1f} GB usable ({ram_seen / 1024:.1f} GB total − "
-            f"{reserve_mb / 1024:.1f} GB reserved for "
-            f"{'the Windows host' if (under_wsl or ram_pool == 'wsl_vm') else 'the OS'}). "
-        )
-        refusal += (
-            "Switch the genre classifier to Discogs, or raise the WSL memory "
-            "limit in .wslconfig."
+            "Not enough memory to run the advanced genre model right now."
             if genre_classifier == "clap"
-            else "Free memory or close other apps and retry."
+            else "Not enough memory to run analysis right now."
         )
         return WorkerBudget(
             max_workers=0, effective_workers=0, per_worker_mb=pw,
@@ -488,6 +485,58 @@ def compute_worker_budget(
         gpu_registrable=gpu_registrable, ram_pool=ram_pool,
         cap_reason=cap_reason, ram_measured=True,
     )
+
+
+def memory_refusal_detail(budget: WorkerBudget, genre_classifier: str) -> str:
+    """The technical explanation behind a memory refusal — DEMOTED to the toast
+    detail toggle (the plain headline is `budget.refusal_reason`, WP-D3).
+
+    Rebuilt from the budget's own measured numbers so the GB math can never
+    diverge from the cap that produced it. Names CLAP + `.wslconfig` here (in the
+    detail), not in the headline.
+    """
+    pw_gb = budget.per_worker_mb / 1024
+    ram_gb = budget.ram_seen_mb / 1024
+    reserve_gb = budget.reserve_mb / 1024
+    usable_gb = max(0, budget.ram_seen_mb - budget.reserve_mb) / 1024
+    under_wsl = budget.ram_pool == "wsl_vm"
+    pool_label = (
+        "the Linux analysis environment (WSL)" if under_wsl else "this computer"
+    )
+    reserve_for = "Windows and the rest of your PC" if under_wsl else "the operating system"
+    model_label = (
+        "the advanced genre model (CLAP)" if genre_classifier == "clap"
+        else "each analysis worker"
+    )
+    detail = (
+        f"{model_label} needs about {pw_gb:.1f} GB per worker, but {pool_label} "
+        f"has only {usable_gb:.1f} GB usable ({ram_gb:.1f} GB total minus "
+        f"{reserve_gb:.1f} GB held back for {reserve_for})."
+    )
+    if genre_classifier == "clap":
+        detail += (
+            " Fixes: switch to the standard genre model, or give the Linux "
+            "analysis environment more memory (its limit lives in .wslconfig)."
+            if under_wsl
+            else " Fix: switch to the standard genre model, or free some memory."
+        )
+    else:
+        detail += " Free some memory or close other apps, then try again."
+    return detail
+
+
+def memory_refusal_options(genre_classifier: str, under_wsl: bool) -> dict[str, bool]:
+    """Machine-readable flags the shell keys the refusal's action buttons off of.
+
+    `can_switch_classifier` — the run used CLAP; the standard (Discogs) model
+    needs far less RAM, so a one-click switch can unblock the run.
+    `can_increase_memory` — under WSL the VM's `memory=` limit can be raised
+    (the `increase_wsl_memory` RPC / `bump_wslconfig_memory`).
+    """
+    return {
+        "can_switch_classifier": genre_classifier == "clap",
+        "can_increase_memory": bool(under_wsl),
+    }
 
 
 def _finish_budget(
@@ -559,5 +608,7 @@ __all__ = [
     "to_dict",
     "apply_gpu_preference",
     "compute_worker_budget",
+    "memory_refusal_detail",
+    "memory_refusal_options",
     "per_worker_mb",
 ]
