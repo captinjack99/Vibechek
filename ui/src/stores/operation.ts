@@ -35,6 +35,13 @@ export interface OperationError {
   raw: string;
   /** For a retryable error, the exact call to re-issue on "Try again". */
   retry?: { method: string; params: object };
+  /** A component-owned retry closure for a failure whose result must land back
+   *  in a store (so the generic `retry` re-issue — which discards the result —
+   *  can't work). Created by the component (stores stay transport-free) and
+   *  passed to `fail(error, { retryAction })`; ErrorToast prefers it over
+   *  `retry`. The closure owns its own error handling (it calls `fail()` on a
+   *  fresh failure), so callers must not double-wrap it. */
+  retryAction?: () => Promise<void>;
   /** For an engine death mid-analyze: how many tracks had been analyzed when
    *  the service stopped (read from the last progress frame). */
   analyzedCount?: number;
@@ -171,8 +178,11 @@ interface OperationState {
   begin: (kind: Exclude<OperationKind, null>) => string;
   setProgress: (p: ProgressEvent) => void;
   finish: () => void;
-  /** Set the error state. User-cancellations are detected and silently dropped. */
-  fail: (error: unknown) => void;
+  /** Set the error state. User-cancellations are detected and silently dropped.
+   *  `extras.retryAction` attaches a component-owned retry closure (and defaults
+   *  the kind to "retryable" when the error carried none) — for failures whose
+   *  result must land in a store, which the generic `retry` path can't do. */
+  fail: (error: unknown, extras?: { retryAction?: () => Promise<void> }) => void;
   clearError: () => void;
 
   setDuplicateReport: (r: DuplicateReport | null) => void;
@@ -218,7 +228,7 @@ export const useOperationStore = create<OperationState>((set, get) => ({
   //
   //   3. Mid-analyze engine deaths get the "N tracks were analyzed" count read
   //      from the last progress frame — captured here before we clear it.
-  fail: (error) => {
+  fail: (error, extras) => {
     // Cancellation detection. `RpcError.cancelled` is the reliable signal
     // (set from the server's structured `data.cancelled`). We also accept a
     // raw JSON string carrying `"cancelled":true` for the rare path where a
@@ -251,6 +261,15 @@ export const useOperationStore = create<OperationState>((set, get) => ({
     if (prev.active === "analyze" && prev.progress && prev.progress.current > 0) {
       info.analyzedCount = prev.progress.current;
       if (prev.progress.total > 0) info.analyzedTotal = prev.progress.total;
+    }
+
+    // A component-owned retry closure (for a failure whose result must land back
+    // in a store — the generic `retry` re-issue discards the result). Attach it
+    // and, since a plain-string reason carries no envelope `kind`, default to
+    // "retryable" so ErrorToast renders the Try-again button.
+    if (extras?.retryAction) {
+      info.retryAction = extras.retryAction;
+      info.kind = info.kind ?? "retryable";
     }
 
     set({

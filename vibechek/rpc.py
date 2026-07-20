@@ -1821,6 +1821,11 @@ def _load_recent_analysis(params: dict) -> dict:
                         params["library_path"], e.cause)
             return {
                 "loaded": False,
+                # A locked/transient read failure — genuinely worth retrying once
+                # the lock clears, so flag it for the GUI's "Try again" affordance.
+                # (The other failure branches below — not-in-recents, missing,
+                # malformed — are terminal and stay non-retryable.)
+                "retryable": True,
                 "reason": (
                     "Vibechek couldn't read the saved analysis for this library "
                     "right now — close anything that might be locking the file "

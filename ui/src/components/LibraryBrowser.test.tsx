@@ -14,7 +14,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -755,5 +755,118 @@ describe("<LibraryBrowser /> — Import Rekordbox XML (tag priors)", () => {
     // …and library A's record was NOT appended into library B's list.
     const paths = useLibraryStore.getState().tracks.map((t) => t.path);
     expect(paths).toEqual(["D:/LibraryB/other.mp3"]);
+  });
+});
+
+describe("<LibraryBrowser /> — retryable load-recent failure", () => {
+  beforeEach(() => {
+    useLibraryFiltersStore.getState().clearFilters();
+    useOperationStore.setState({
+      active: null, opId: null, progress: null, startedAt: null,
+      error: null, errorInfo: null,
+    });
+  });
+
+  // Same header-switcher drive as the state-reset suite (that helper is local
+  // to its own describe block).
+  async function switchToLibraryB(user: ReturnType<typeof userEvent.setup>) {
+    const switcher = await screen.findByRole("button", { name: /^Library/i });
+    await user.click(switcher);
+    await user.click(await screen.findByRole("option", { name: /LibraryB/ }));
+  }
+
+  it("does NOT attach a retryAction when the load failure isn't retryable", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [recordB], active: null };
+          case "load_recent_analysis":
+            // Terminal failure — no `retryable` flag.
+            return { loaded: false, reason: "library not in recents" };
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/remix.mp3")],
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await switchToLibraryB(user);
+
+    await waitFor(() => {
+      expect(useOperationStore.getState().error).toBe("library not in recents");
+    });
+    const info = useOperationStore.getState().errorInfo;
+    expect(info?.retryAction).toBeUndefined();
+    expect(info?.kind).toBeUndefined();
+  });
+
+  it("attaches a retryAction on a retryable failure; invoking it re-issues the load and populates tracks", async () => {
+    const recordBTracks = [track("D:/LibraryB/c1.mp3"), track("D:/LibraryB/c2.mp3")];
+    let loadCalls = 0;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [recordB], active: null };
+          case "load_recent_analysis":
+            loadCalls += 1;
+            // Fail the first attempt with a locked-file (retryable) failure,
+            // succeed on the retry.
+            return loadCalls === 1
+              ? {
+                  loaded: false,
+                  retryable: true,
+                  reason:
+                    "Vibechek couldn't read the saved analysis for this library right now — try again.",
+                }
+              : { loaded: true, report: { tracks: recordBTracks } };
+          case "count_new_tracks":
+            return { new_count: 0, total_count: 2 };
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/remix.mp3")],
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await switchToLibraryB(user);
+
+    // First attempt failed retryably → fail() received a component-owned closure.
+    await waitFor(() => {
+      const info = useOperationStore.getState().errorInfo;
+      expect(info?.retryAction).toBeTypeOf("function");
+      expect(info?.kind).toBe("retryable");
+    });
+    expect(loadCalls).toBe(1);
+
+    // Invoke the closure — the same thing ErrorToast's "Try again" does. It must
+    // re-enter the full load path and, on the successful second response,
+    // populate the library's tracks.
+    const retryAction = useOperationStore.getState().errorInfo!.retryAction!;
+    await act(async () => {
+      await retryAction();
+    });
+
+    await waitFor(() => {
+      const paths = useLibraryStore.getState().tracks.map((t) => t.path);
+      expect(paths).toEqual(["D:/LibraryB/c1.mp3", "D:/LibraryB/c2.mp3"]);
+    });
+    expect(loadCalls).toBe(2);
+    expect(useLibraryStore.getState().libraryPath).toBe("D:/LibraryB");
   });
 });

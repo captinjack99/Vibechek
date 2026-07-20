@@ -194,12 +194,27 @@ export function LibraryBrowser() {
     analyzeGen.current++;
     begin("analyze");
     try {
-      const result = await rpc<{ loaded: boolean; report?: AnalysisReport; reason?: string }>(
+      const result = await rpc<{
+        loaded: boolean;
+        report?: AnalysisReport;
+        reason?: string;
+        retryable?: boolean;
+      }>(
         "load_recent_analysis",
         { library_path: record.path },
       );
       if (!result.loaded || !result.report) {
-        fail(result.reason ?? "Could not load saved analysis");
+        // A locked/transient read (backend flags `retryable`) is worth a real
+        // "Try again" — but the generic rpc-replay retry can't help here (its
+        // result would be discarded, never reaching the store). Hand fail() a
+        // component-owned closure that re-enters this SAME load path for the
+        // SAME record — including the analyzeGen/invalidation guards and the
+        // setTracks below — so a successful retry actually loads the library.
+        // The closure runs its own fail() on a fresh failure (single owner).
+        fail(
+          result.reason ?? "Could not load saved analysis",
+          result.retryable ? { retryAction: () => handleOpenRecent(record) } : undefined,
+        );
         await refreshRecent();
         return;
       }

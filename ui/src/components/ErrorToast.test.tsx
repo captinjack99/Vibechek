@@ -56,6 +56,38 @@ describe("<ErrorToast />", () => {
     expect(useOperationStore.getState().errorInfo).toBeNull();
   });
 
+  it("shows a Try again button for a retryAction-only error (no generic retry)", () => {
+    setError({
+      headline: "Vibechek couldn't read the saved analysis for this library right now.",
+      kind: "retryable",
+      raw: "{}",
+      retryAction: async () => {},
+    });
+    render(<ErrorToast />);
+    expect(screen.getByText("Try again")).toBeInTheDocument();
+  });
+
+  it("invokes the retryAction closure when Try again is clicked (not the generic rpc)", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockClear();
+    const retryAction = vi.fn(async () => {});
+    setError({
+      headline: "Vibechek couldn't read the saved analysis for this library right now.",
+      kind: "retryable",
+      raw: "{}",
+      retryAction,
+    });
+    render(<ErrorToast />);
+    fireEvent.click(screen.getByText("Try again"));
+    await waitFor(() => {
+      expect(retryAction).toHaveBeenCalledTimes(1);
+    });
+    // The closure owns re-issuing the call — the toast must not also fire the
+    // generic rpc replay path.
+    expect(invoke).not.toHaveBeenCalled();
+    // The banner clears itself before running the closure.
+    expect(useOperationStore.getState().errorInfo).toBeNull();
+  });
+
   it("shows a Restart Vibechek button for an engine_dead error (and no Retry)", () => {
     setError({
       headline: "The analysis service stopped unexpectedly.",

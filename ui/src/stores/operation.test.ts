@@ -180,4 +180,36 @@ describe("useOperationStore.fail() error classification", () => {
     expect(s.error).toBeNull();
     expect(s.errorInfo).toBeNull();
   });
+
+  it("attaches an extras.retryAction and defaults kind to 'retryable' on a plain error", () => {
+    const retryAction = async () => {};
+    useOperationStore.getState().fail("Couldn't read the saved analysis", { retryAction });
+    const info = useOperationStore.getState().errorInfo!;
+    expect(info.retryAction).toBe(retryAction);
+    // A plain-string reason carries no envelope kind — the retry closure defaults it.
+    expect(info.kind).toBe("retryable");
+    expect(info.headline).toBe("Couldn't read the saved analysis");
+  });
+
+  it("does NOT override an existing envelope kind when attaching a retryAction", () => {
+    const retryAction = async () => {};
+    useOperationStore.getState().fail(
+      rpcError({ message: "boom", data: { kind: "engine_dead", headline: "boom" } }),
+      { retryAction },
+    );
+    const info = useOperationStore.getState().errorInfo!;
+    expect(info.retryAction).toBe(retryAction);
+    // Only defaults when unset — a real envelope kind wins.
+    expect(info.kind).toBe("engine_dead");
+  });
+
+  it("cancellation still exits silently even when a retryAction is supplied", () => {
+    const retryAction = async () => {};
+    useOperationStore.getState().begin("analyze");
+    useOperationStore.getState().fail({ cancelled: true }, { retryAction });
+    const s = useOperationStore.getState();
+    expect(s.error).toBeNull();
+    expect(s.errorInfo).toBeNull();
+    expect(s.active).toBeNull();
+  });
 });

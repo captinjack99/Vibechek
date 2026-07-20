@@ -52,7 +52,8 @@ export function ErrorToast() {
   if (!errorInfo) return null;
 
   const { headline, detail, raw, kind } = errorInfo;
-  const canRetry = kind === "retryable" && !!errorInfo.retry;
+  const canRetry =
+    kind === "retryable" && (!!errorInfo.retry || !!errorInfo.retryAction);
   const canRestart = kind === "engine_dead";
   // Backend-attached recovery affordances (from error.data). Each gates its own
   // action button; the two memory ones are rendered by the shared component.
@@ -75,11 +76,21 @@ export function ErrorToast() {
     setTimeout(() => setCopied(false), 1500);
   };
 
-  // "Try again" re-issues the exact call that failed (captured by the shared
-  // rpc wrapper). We clear the banner first, then re-fire; a fresh failure
-  // re-surfaces via fail(). Generic by design — no per-component retry wiring.
+  // "Try again". Two paths:
+  //   - retryAction: a component-owned closure (for a failure whose result must
+  //     land back in a store). It owns its own error handling — it calls fail()
+  //     on a fresh failure — so we clear the banner, await it, and DON'T wrap it
+  //     (double-wrapping would fail() twice on the same error).
+  //   - retry: the generic re-issue of the exact call the shared rpc wrapper
+  //     captured. We clear the banner, re-fire, and surface a fresh failure via
+  //     fail() ourselves (the generic path has no owner but us).
   const handleRetry = async () => {
-    const retry = errorInfo.retry;
+    const { retry, retryAction } = errorInfo;
+    if (retryAction) {
+      clearError();
+      await retryAction();
+      return;
+    }
     if (!retry) return;
     clearError();
     try {

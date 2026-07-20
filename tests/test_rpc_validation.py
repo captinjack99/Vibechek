@@ -332,6 +332,78 @@ def test_active_engine_honors_request_param() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _load_recent_analysis — the `retryable` flag (drives the GUI "Try again")
+# ---------------------------------------------------------------------------
+#
+# Only a LOCKED/transient read (AnalysisUnreadable) is worth retrying — the
+# GUI shows a "Try again" for it. Every terminal branch (not-in-recents,
+# file-not-found, missing/corrupt) must NOT carry the flag, so the GUI doesn't
+# offer a retry that can never succeed.
+
+
+def test_load_recent_analysis_unreadable_is_retryable(monkeypatch) -> None:
+    """A present-but-unreadable saved analysis (transient lock / AV / cloud
+    sync) is flagged retryable so the library view can offer a real Try-again."""
+    from vibechek import library_state
+
+    lib = "/lib"
+    rec = library_state.LibraryRecord(path=lib, analysis_path="/lib/a.json")
+    monkeypatch.setattr(
+        library_state, "load_state",
+        lambda: library_state.LibraryState(recent=[rec]),
+    )
+
+    def unreadable(_record):
+        raise library_state.AnalysisUnreadable("/lib/a.json", "sharing violation")
+
+    monkeypatch.setattr(library_state, "load_analysis", unreadable)
+
+    out = rpc._load_recent_analysis({"library_path": lib})
+    assert out["loaded"] is False
+    assert out["retryable"] is True
+    assert "try again" in out["reason"].lower()
+
+
+def test_load_recent_analysis_not_in_recents_not_retryable(monkeypatch) -> None:
+    from vibechek import library_state
+
+    monkeypatch.setattr(
+        library_state, "load_state",
+        lambda: library_state.LibraryState(recent=[]),
+    )
+    out = rpc._load_recent_analysis({"library_path": "/nope"})
+    assert out["loaded"] is False
+    assert out["reason"] == "library not in recents"
+    assert "retryable" not in out
+
+
+def test_load_recent_analysis_missing_report_not_retryable(monkeypatch) -> None:
+    """load_analysis returning None (file gone / empty) is terminal, not a
+    transient lock — no retry flag."""
+    from vibechek import library_state
+
+    lib = "/lib"
+    rec = library_state.LibraryRecord(path=lib, analysis_path="/lib/a.json")
+    monkeypatch.setattr(
+        library_state, "load_state",
+        lambda: library_state.LibraryState(recent=[rec]),
+    )
+    monkeypatch.setattr(library_state, "load_analysis", lambda _r: None)
+
+    out = rpc._load_recent_analysis({"library_path": lib})
+    assert out["loaded"] is False
+    assert out["reason"] == "analysis file missing or corrupt"
+    assert "retryable" not in out
+
+
+def test_load_recent_analysis_file_not_found_not_retryable() -> None:
+    out = rpc._load_recent_analysis({"analysis_path": "/does/not/exist.json"})
+    assert out["loaded"] is False
+    assert out["reason"] == "file not found"
+    assert "retryable" not in out
+
+
+# ---------------------------------------------------------------------------
 # _save_config payload-type guard
 # ---------------------------------------------------------------------------
 
