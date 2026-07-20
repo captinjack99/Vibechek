@@ -618,7 +618,7 @@ def _reattach_skipped_records(
     return rebuilt
 
 
-def _system_info(_params: dict) -> dict:
+def _system_info(params: dict) -> dict:
     """Report detected CPU / memory / GPU resources to the GUI.
 
     The base payload is the host-side view from `vibechek.resources.detect()`.
@@ -626,9 +626,20 @@ def _system_info(_params: dict) -> dict:
     inside WSL is the ground truth — but probing it costs ~10s of TF import.
     We do NOT probe TF here so this RPC stays snappy. The GUI calls
     `engine_gpu_status` separately after the first render.
+
+    The per-device acceleration verdict is engine-specific (native = CPU-only
+    for every vendor, NVIDIA included; essentia_tf/onnx = NVIDIA-accelerated
+    with engine-accurate reasons for the rest), so resolve which engine the
+    GPU inventory should describe. The GUI passes its LIVE selection (and
+    re-fetches on switch); fall back to the saved config when the param is
+    absent so a plain call still reports the configured engine's truth.
     """
     from vibechek.resources import detect, to_dict
-    return to_dict(detect())
+    engine = _valid_engine(
+        params.get("inference_engine"),
+        default=_valid_engine(VibechekConfig.load().analysis.inference_engine),
+    )
+    return to_dict(detect(engine))
 
 
 def _engine_gpu_status(params: dict) -> dict:

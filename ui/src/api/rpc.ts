@@ -137,9 +137,16 @@ export function version(): Promise<VersionResult> {
   return rpc<VersionResult>("version");
 }
 
-/** Host-side CPU / memory / GPU detection. Fast (~ms). */
-export function systemInfo(): Promise<SystemResources> {
-  return rpc<SystemResources>("system_info");
+/** Host-side CPU / memory / GPU detection. Fast (~ms).
+ *
+ * `engine` (the live inference-engine selection) drives the per-device GPU
+ * acceleration verdict — native is CPU-only for every vendor, so an NVIDIA card
+ * reports as CPU-only under it. Omitted → the backend uses the saved config. */
+export function systemInfo(engine?: string): Promise<SystemResources> {
+  return rpc<SystemResources>(
+    "system_info",
+    engine ? { inference_engine: engine } : undefined,
+  );
 }
 
 /**

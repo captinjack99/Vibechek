@@ -5,15 +5,20 @@ regardless of whether Vibechek's analyze engine can actually accelerate
 inference on it. The point is to give the UI an honest picture so we never
 silently fall back to CPU after telling the user "GPU is available".
 
-Reality check (as of the essentia-tensorflow vendored TF 2.5 build):
+The `accelerated_by_vibechek` verdict is ENGINE-AWARE. Enumeration (vendor /
+name / kind / VRAM) is identical whatever the engine, but *which* cards are
+actually accelerated depends on the selected inference engine — so
+`detect_all_gpus(engine=...)` applies the verdict as a final pass:
 
-  - NVIDIA: CUDA-accelerated, works via the engine probe.
-  - AMD: ROCm path doesn't ship in the bundled TF; user-installed AMD
-    drivers can't be hooked. The card shows up here for transparency, but
-    `accelerated_by_vibechek=False`.
-  - Intel iGPU / Arc: same story — no oneDNN-GPU / DirectML path in our TF.
-  - Apple Metal: TF-Metal exists but is a separate wheel; the essentia
-    bundle doesn't link against it.
+  - essentia_tf: NVIDIA only. The vendored TF 2.5 ships CUDA alone; there is
+    no public TF 2.5 with ROCm (AMD), oneDNN-GPU (Intel), or Metal (Apple).
+  - onnx: NVIDIA (CUDA) today. The AMD/Intel (DirectML) and Apple (CoreML)
+    execution providers are wired but not yet shipped/hardware-validated.
+  - native (the WSL-free Windows default): CPU-only for EVERY vendor today —
+    the bundled ONNX Runtime is CPU-only, NVIDIA included. GPU is planned.
+
+Callers that don't pass an engine get the essentia_tf verdict, preserving the
+historical NVIDIA-accelerated default.
 
 Every helper here returns `[]` on failure and never raises. Subprocess
 timeouts are short (5s) because this runs synchronously on the Settings
@@ -43,7 +48,11 @@ GpuKind = str    # Literal["discrete", "integrated", "external"]
 
 
 # User-facing copy for `unsupported_reason`. Centralized so the UI strings stay
-# consistent and the migration doc reference points to a single place.
+# consistent and the doc references point to a single place. Grouped by the
+# engine each set describes — the essentia_tf strings are the default (no-engine)
+# verdict; the onnx/native strings are applied when that engine is selected.
+#
+# essentia_tf (vendored TF 2.5, CUDA-only):
 _REASON_AMD = (
     "AMD GPUs need ROCm/DirectML; essentia-tensorflow only supports CUDA today. "
     "See docs/ONNX_MIGRATION.md."
@@ -61,13 +70,39 @@ _REASON_UNKNOWN = (
     "See docs/ONNX_MIGRATION.md."
 )
 
+# onnx (ONNX Runtime; NVIDIA-CUDA accelerated today, cross-vendor EPs planned):
+_REASON_ONNX_AMD = (
+    "AMD GPUs need the DirectML/ROCm execution provider, which the ONNX engine "
+    "doesn't ship yet. See docs/ROADMAP.md."
+)
+_REASON_ONNX_INTEL = (
+    "Intel GPUs need the DirectML execution provider, which the ONNX engine "
+    "doesn't ship yet. See docs/ROADMAP.md."
+)
+_REASON_ONNX_APPLE = (
+    "Apple GPUs need the CoreML execution provider, which the ONNX engine "
+    "doesn't ship yet. See docs/ROADMAP.md."
+)
+_REASON_ONNX_UNKNOWN = (
+    "The ONNX engine accelerates NVIDIA GPUs today; cross-vendor GPU support is "
+    "planned but not available yet. See docs/ROADMAP.md."
+)
+
+# native (bundled CPU-only ONNX Runtime; no GPU for any vendor today):
+_REASON_NATIVE = (
+    "This engine runs on CPU today — GPU support is planned but not available "
+    "yet, so no GPU is used whatever the vendor. See docs/ROADMAP.md."
+)
+
 
 @dataclass
 class DetectedGpu:
     """A single GPU/APU enumerated on the host.
 
     `accelerated_by_vibechek` is the honest answer to "will analyze be
-    faster on this card?". Currently True only for NVIDIA cards.
+    faster on this card?". It is set by `detect_all_gpus(engine=...)` per the
+    selected engine (see the module docstring): True for NVIDIA under
+    essentia_tf/onnx, never True under the CPU-only native engine.
     """
     vendor: GpuVendor                       # nvidia | amd | intel | apple | unknown
     name: str
@@ -82,12 +117,46 @@ class DetectedGpu:
 # ---------------------------------------------------------------------------
 
 
-def detect_all_gpus() -> list[DetectedGpu]:
+def _acceleration_verdict(vendor: str, engine: str) -> tuple[bool, str | None]:
+    """Engine-aware answer to "is this vendor's GPU accelerated, and if not, why?".
+
+    Hardware enumeration is engine-independent, but the acceleration verdict is
+    not — the three shipping engines have different GPU stories today (see the
+    module docstring). A single hardcoded "NVIDIA=accelerated / essentia-
+    tensorflow" verdict was flat wrong for the ONNX engine's reasons and — worse
+    — for the Windows-default native engine, where NVIDIA is NOT accelerated.
+    """
+    if engine == "native":
+        # CPU-only for every vendor today, NVIDIA included.
+        return False, _REASON_NATIVE
+    if vendor == "nvidia":
+        # essentia_tf (CUDA) and onnx (CUDA EP) both accelerate NVIDIA today.
+        return True, None
+    if engine == "onnx":
+        return False, {
+            "amd": _REASON_ONNX_AMD,
+            "intel": _REASON_ONNX_INTEL,
+            "apple": _REASON_ONNX_APPLE,
+        }.get(vendor, _REASON_ONNX_UNKNOWN)
+    # essentia_tf, plus any unrecognized engine → the historical default.
+    return False, {
+        "amd": _REASON_AMD,
+        "intel": _REASON_INTEL,
+        "apple": _REASON_APPLE,
+    }.get(vendor, _REASON_UNKNOWN)
+
+
+def detect_all_gpus(engine: str | None = None) -> list[DetectedGpu]:
     """Return every GPU/APU we can discover, across vendors.
 
-    Order: NVIDIA first (the only currently-accelerated path), then AMD,
-    Intel, Apple. Within a vendor, dedupe by name (e.g. lspci + wmic may
-    both report the same device on weird WSL setups).
+    Order: NVIDIA first, then AMD, Intel, Apple. Within a vendor, dedupe by
+    name (e.g. lspci + wmic may both report the same device on weird WSL
+    setups).
+
+    `engine` selects whose acceleration story the verdict describes
+    ("essentia_tf" | "onnx" | "native"); None (or anything unrecognized) uses
+    the essentia_tf default, preserving the historical NVIDIA-accelerated
+    behavior for callers that don't care about the engine.
     """
     devices: list[DetectedGpu] = []
     devices.extend(_detect_nvidia())
@@ -106,6 +175,16 @@ def detect_all_gpus() -> list[DetectedGpu]:
             continue
         seen.add(key)
         deduped.append(d)
+
+    # Final pass: overwrite each device's acceleration verdict + reason for the
+    # SELECTED engine. The per-vendor detectors set the essentia_tf-default
+    # verdict inline (so their direct-call unit tests stay meaningful); this is
+    # the single place the engine-specific truth is applied.
+    eng = engine if engine in ("essentia_tf", "onnx", "native") else "essentia_tf"
+    for d in deduped:
+        d.accelerated_by_vibechek, d.unsupported_reason = _acceleration_verdict(
+            d.vendor, eng,
+        )
     return deduped
 
 

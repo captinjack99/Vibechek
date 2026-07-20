@@ -474,6 +474,23 @@ export function Settings() {
       .catch(() => {});
   };
 
+  // Fetch host CPU/mem/GPU detection for the given engine. The per-device GPU
+  // acceleration verdict is engine-specific server-side (native = CPU-only for
+  // every vendor, NVIDIA included), so re-fetch on engine switch to keep the
+  // GPU inventory badges consistent with the (already-live) cross-vendor
+  // callout. `setWorkers` seeds the worker slider only on the initial load.
+  const loadSysInfo = (engine: string, setWorkers = false) => {
+    rpc<SystemResources>("system_info", { inference_engine: engine })
+      .then((info) => {
+        if (!isMounted.current) return;
+        setSysInfo(info);
+        if (setWorkers && cfgRef.current.analysis.workers === 0) {
+          updateAnalysis({ workers: info.recommended_workers });
+        }
+      })
+      .catch(() => {});
+  };
+
   const validateModelsDir = async (path: string) => {
     if (!path.trim()) {
       setModelsDirWarning(null);
@@ -511,15 +528,7 @@ export function Settings() {
         if (isMounted.current) setSidecarBinary(s.binary);
       })
       .catch(() => {});
-    rpc<SystemResources>("system_info")
-      .then((info) => {
-        if (!isMounted.current) return;
-        setSysInfo(info);
-        if (cfg.analysis.workers === 0) {
-          updateAnalysis({ workers: info.recommended_workers });
-        }
-      })
-      .catch(() => {});
+    loadSysInfo(cfg.analysis.inference_engine, true);
     refreshPreflight();
     refreshWorkerBudget();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -551,6 +560,10 @@ export function Settings() {
     // force=true so the engine-keyed server cache for the NEW engine is fetched
     // rather than returning the prior engine's cached probe.
     refreshEngineGpu(distro, true);
+    // Re-fetch host detection so the cross-vendor GPU inventory's per-device
+    // "accelerated / CPU-only" badges reflect the NEW engine (native shows every
+    // card CPU-only; essentia_tf/onnx keep NVIDIA accelerated).
+    loadSysInfo(cfg.analysis.inference_engine);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cfg.analysis.inference_engine]);
 
@@ -846,10 +859,10 @@ export function Settings() {
             <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
               <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
               <span>
-                Experimental. ONNX runs in a separate engine (plain Essentia +
-                ONNX Runtime, no TensorFlow). Click <strong>Set up ONNX
-                engine</strong> below to install it (one-time), then re-analyze
-                your library so every track is scored by the same engine.
+                Opt-in — one-time setup. ONNX runs in a separate engine (plain
+                Essentia + ONNX Runtime, no TensorFlow). Click <strong>Set up ONNX
+                engine</strong> below to install it, then re-analyze your library
+                so every track is scored by the same engine.
               </span>
             </div>
           )}
@@ -867,11 +880,12 @@ export function Settings() {
             <div className="text-xs text-accent-yellow/90 mt-1 flex items-start gap-1">
               <AlertTriangle className="w-3 h-3 flex-none mt-0.5" />
               <span>
-                Experimental (Windows). Runs the whole ML pipeline <strong>in-process
-                — no WSL</strong> (ONNX inference + a NumPy mel frontend + a native
-                Essentia build for decode/BPM/key). Requires the native engine bundled
-                with the app; if analyze reports it's not ready, this build doesn't ship
-                it yet — use Essentia · TensorFlow or ONNX in the meantime.
+                The zero-setup Windows default. Runs the whole ML pipeline
+                <strong>in-process — no WSL</strong> (ONNX inference + a NumPy mel
+                frontend + a native Essentia build for decode/BPM/key), on CPU
+                today. If analyze reports the native engine isn&apos;t ready, this
+                build didn&apos;t bundle it — use Essentia · TensorFlow or ONNX in
+                the meantime.
               </span>
             </div>
           )}

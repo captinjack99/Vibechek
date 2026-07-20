@@ -63,16 +63,22 @@ class SystemResources:
 # ---------------------------------------------------------------------------
 
 
-def detect() -> SystemResources:
+def detect(engine: str | None = None) -> SystemResources:
     """Return a snapshot of available compute resources.
 
     `gpu_devices` now spans every vendor (NVIDIA + AMD + Intel + Apple), via
     `vibechek.gpu_detect.detect_all_gpus`. The legacy `gpu_available` flag
-    means "an *accelerated* GPU is available" — i.e. there's at least one
-    NVIDIA card the engine can actually use. This preserves the meaning the
-    rest of the code (UI Stat, analyzer worker scaling) already relies on.
+    means "an *accelerated* GPU is available" — i.e. there's at least one card
+    the selected engine can actually use. This preserves the meaning the rest
+    of the code (UI Stat, analyzer worker scaling) already relies on.
+
+    `engine` selects whose acceleration story the per-device verdict describes
+    ("essentia_tf" | "onnx" | "native"). It matters because the native engine
+    is CPU-only for every vendor today (NVIDIA included) — so under it
+    `gpu_available` is False even on an NVIDIA box. None → the essentia_tf
+    default, preserving the historical behavior for callers that don't pass one.
     """
-    cross_devices = _all_gpu_devices()
+    cross_devices = _all_gpu_devices(engine)
     accelerated = sum(1 for d in cross_devices if d.accelerated_by_vibechek)
     unsupported = len(cross_devices) - accelerated
     return SystemResources(
@@ -160,19 +166,31 @@ def _gpu_devices() -> list[GpuDevice]:
     return _gpu_devices_from_nvidia_smi()
 
 
-def _all_gpu_devices() -> list[GpuDevice]:
+def _all_gpu_devices(engine: str | None = None) -> list[GpuDevice]:
     """Cross-vendor enumeration via `vibechek.gpu_detect`.
 
     Imported lazily so a stale/broken `gpu_detect` (e.g. mid-merge) can't
     take down resource detection — falls back to the NVIDIA-only path.
+
+    `engine` threads into the engine-aware acceleration verdict (native = no GPU
+    for any vendor; essentia_tf/onnx = NVIDIA accelerated).
     """
     try:
         from vibechek.gpu_detect import detect_all_gpus  # noqa: PLC0415
     except Exception as e:  # noqa: BLE001
         log.warning("gpu_detect import failed, falling back to nvidia-smi only: %s", e)
-        return _gpu_devices_from_nvidia_smi()
+        devices = _gpu_devices_from_nvidia_smi()
+        # gpu_detect (which owns the engine-aware verdict) is unavailable; at
+        # least don't claim NVIDIA acceleration under the CPU-only native engine.
+        if engine == "native":
+            for d in devices:
+                d.accelerated_by_vibechek = False
+                d.unsupported_reason = (
+                    "The native engine runs on CPU today — GPU support is planned."
+                )
+        return devices
     out: list[GpuDevice] = []
-    for d in detect_all_gpus():
+    for d in detect_all_gpus(engine):
         # Map vendor → backend for the legacy field. "cuda" for NVIDIA;
         # "rocm"/"metal" follow the existing convention; "unknown" else.
         backend = {
