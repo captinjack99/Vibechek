@@ -48,6 +48,7 @@ vi.mock("@tauri-apps/plugin-shell", () => ({
   open: vi.fn(async () => {}),
   Command: class {
     static create() {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock: `this` is the anonymous Command class constructor
       return new (this as any)();
     }
     execute() {

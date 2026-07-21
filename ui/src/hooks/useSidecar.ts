@@ -59,7 +59,7 @@ export class RpcError extends Error {
   params?: object;
 
   constructor(raw: string) {
-    let parsed: { message?: string; code?: number; data?: any } = {};
+    let parsed: { message?: string; code?: number; data?: RpcError["data"] } = {};
     try {
       parsed = JSON.parse(raw);
     } catch {

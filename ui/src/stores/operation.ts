@@ -237,7 +237,7 @@ export const useOperationStore = create<OperationState>((set, get) => ({
     // genuine sidecar-death error whose message happened to contain that
     // phrase (e.g. an install path) would be wrongly suppressed.
     const cancelled =
-      (typeof error === "object" && error !== null && (error as any).cancelled === true) ||
+      (typeof error === "object" && error !== null && (error as { cancelled?: unknown }).cancelled === true) ||
       (typeof error === "string" && error.includes('"cancelled":true'));
     if (cancelled) {
       set({

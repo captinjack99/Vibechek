@@ -644,7 +644,8 @@ function ReportView({
         skippedGroups={skippedGroups}
         onToggleSkip={(key) => {
           const next = new Set(skippedGroups);
-          next.has(key) ? next.delete(key) : next.add(key);
+          if (next.has(key)) next.delete(key);
+          else next.add(key);
           setSkippedGroups(next);
         }}
         rules={rules}
@@ -1077,6 +1078,7 @@ function looksLikePath(s: string): boolean {
   if (!s.trim()) return false;
   // Reject control characters and the obviously-bogus stand-ins seen in
   // bug reports (e.g. "<<<invalid>>>").
+  // eslint-disable-next-line no-control-regex -- control chars are matched on purpose, to reject them
   if (/[\x00-\x1f<>"|?*]/.test(s)) return false;
   // Must contain at least one separator OR be an absolute-style root token.
   // (Tauri's dialog only ever yields absolute paths, so this is a sane

@@ -178,7 +178,7 @@ export function ErrorToast() {
 
     try {
       await openUrl(url);
-    } catch (e) {
+    } catch {
       // Fallback: copy URL to clipboard so the user can paste it
       void navigator.clipboard.writeText(url);
       notify("Couldn't open browser", {
