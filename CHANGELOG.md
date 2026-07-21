@@ -8,6 +8,18 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **The bundled model weights now ship with the license notice they always
+  required.** The MTG-UPF model weights (Discogs-EffNet and every
+  classification head) are CC BY-NC-SA 4.0 — not AGPL like Vibechek's own
+  code — and were being redistributed in the repo and installers without the
+  attribution and license notice that license requires. `THIRD_PARTY_MODELS.md`
+  now carries the full inventory (including the ONNX conversions as adaptations,
+  the CC0 CLAP checkpoint, Apache-2.0 Qwen, and LGPL fpcalc), and the README
+  points to it.
+
 ## [0.8.2-beta] — 2026-07-21
 
 ### Fixed

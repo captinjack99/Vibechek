@@ -252,7 +252,7 @@ If you're more of an ideas person than a code person — [open an issue](https:/
 ## Acknowledgements
 
 - [Essentia](https://essentia.upf.edu/) — the open ML audio library from UPF Barcelona that powers everything
-- [Discogs-EffNet](https://essentia.upf.edu/models.html) — the default genre classification model
+- [Discogs-EffNet](https://essentia.upf.edu/models.html) — the default genre classification model. The bundled MTG model weights are **CC BY-NC-SA 4.0**, not AGPL — full inventory, attribution, and license notices in [THIRD_PARTY_MODELS.md](THIRD_PARTY_MODELS.md)
 - [LAION-CLAP](https://github.com/LAION-AI/CLAP) — the audio-embedding model behind the opt-in CLAP genre classifier
 - [Ollama](https://ollama.com/) — the local LLM runtime behind the opt-in online genre lookup
 - [Chromaprint](https://acoustid.org/chromaprint) — acoustic fingerprinting
