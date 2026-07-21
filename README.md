@@ -2,7 +2,7 @@
 
 **Open-source ML for your DJ library.** Auto-tag genre, mood, energy, BPM, and key. Find duplicates the way your ears would. Organize 10,000 tracks in an afternoon. Keep every Rekordbox cue point intact.
 
-> **Status:** `v0.8.1-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux); on Windows the WSL-free native analysis engine bundled into the installer is now the default. Free forever under AGPL-3.0.
+> **Status:** `v0.8.2-beta` — public beta, feature-complete, headed for stable. Battle-tested on a real 12,000-track personal library. Cross-platform (Windows / macOS / Linux); on Windows the WSL-free native analysis engine bundled into the installer is now the default. Free forever under AGPL-3.0.
 
 ---
 
@@ -226,7 +226,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**1201 Python tests** · **51 JSON-RPC methods** · **38 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**1202 Python tests** · **51 JSON-RPC methods** · **38 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
 - 197 frontend tests across 26 files (App, rpc, AnalysisProgress, ConfirmModal, DuplicatesView, ErrorToast, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, MemoryRefusalActions, OnnxSetupDialog, OperationsHistory, OrganizeView, PreflightDialog, Settings, SettingsSystem, Sidebar, TagsView, useApplyTags, useConfigPersistence, useSidecar, keeperRules, review, library + notification + operation stores)

@@ -8,9 +8,16 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ---
 
-## [Unreleased]
+## [0.8.2-beta] — 2026-07-21
 
 ### Fixed
+- **`vibechek doctor` tells the truth about engine readiness.** Its readiness
+  section used a quick probe that can't see inside the Linux analysis
+  environment, so a perfectly healthy setup was reported as "not set up yet".
+  It now runs the same full check the app itself uses. The CLI's analyze also
+  joins the durable run history (doctor's "last analyze run" section was blind
+  to command-line runs), and the CLI's engine help drops the same stale
+  "cross-vendor GPU" claim the app lost in this release.
 - **GPU claims are engine-aware and factually current.** The Settings
   "Why is my AMD/Intel GPU not used?" explainer still described the pre-0.6
   world where everything ran through essentia-tensorflow; it now tells the
