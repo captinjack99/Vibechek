@@ -8,6 +8,34 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **GPU claims are engine-aware and factually current.** The Settings
+  "Why is my AMD/Intel GPU not used?" explainer still described the pre-0.6
+  world where everything ran through essentia-tensorflow; it now tells the
+  truth for the engine you actually have selected (TensorFlow = NVIDIA-only,
+  ONNX = NVIDIA today with DirectML/CoreML planned, Native = CPU today for
+  every card). The per-device "accelerated" badge follows the same rule — an
+  NVIDIA card under the CPU-only native engine no longer wears a badge it
+  hasn't earned — and refreshes when you switch engines. The engine picker
+  stops calling essentia_tf "the default" (native is, on Windows), stops
+  claiming present-tense cross-vendor GPU, and drops the stale "Experimental"
+  label from the shipped Windows-default native engine.
+
+### Changed
+- **Dependency refresh — the entire dependabot queue (11 PRs) handled.**
+  React 19, Tailwind CSS 4 (CSS-first theme, vite plugin, pixel-preserving
+  class migration), typescript-eslint 8 with a newly wired-up, actually
+  functioning lint (it had no config since inception — now 0 errors with
+  real signal), lucide-react 1.x (all 56 icons verified), tauri 2.11.3 /
+  tauri-build 2.6.3 / anyhow 1.0.104, postcss 8.5.20, and the GitHub Actions
+  majors (checkout v7, upload-artifact v7, download-artifact v8) with every
+  call site audited. One real migration regression was caught in a live
+  style audit and fixed: Tailwind 4's layer semantics stacked a second
+  focus outline onto buttons; keyboard focus once again shows the single
+  ring it always did.
+
 ## [0.8.1-beta] — 2026-07-20
 
 ### Added
