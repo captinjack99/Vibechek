@@ -97,7 +97,9 @@ def test_model_integrity_verified_when_sha_table_populated(monkeypatch) -> None:
 
 def test_engine_readiness_section_uses_saved_engine(monkeypatch) -> None:
     """doctor must probe the SAVED config's engine, not a hardcoded essentia_tf —
-    else a native/onnx GUI gets a diagnostic describing the wrong engine."""
+    else a native/onnx GUI gets a diagnostic describing the wrong engine.
+    It must also use the FULL WSL probe: the quick probe can't see the
+    per-distro engine venv, so it reported "not set up" on healthy boxes."""
     from vibechek import config as cfg_module
     from vibechek import preflight as _pf
 
@@ -105,7 +107,10 @@ def test_engine_readiness_section_uses_saved_engine(monkeypatch) -> None:
         json.dumps({"analysis": {"inference_engine": "onnx"}}), encoding="utf-8"
     )
 
+    seen: dict = {}
+
     def fake_pf(models_dir=None, *, quick_wsl=True, engine="essentia_tf"):
+        seen["quick_wsl"] = quick_wsl
         return _pf.PreflightResult(
             ready=False,
             essentia=_pf.EssentiaCheck(installed=True),
@@ -122,6 +127,7 @@ def test_engine_readiness_section_uses_saved_engine(monkeypatch) -> None:
     er = report.engine_readiness
     assert er is not None
     assert er["engine"] == "onnx"
+    assert seen["quick_wsl"] is False  # full probe — quick lies on healthy WSL
     assert er["ready"] is False
     assert er["models_missing"] == 1
     assert er["reasons_not_ready"]  # populated (missing engine + missing model)

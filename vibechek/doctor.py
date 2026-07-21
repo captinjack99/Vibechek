@@ -172,10 +172,10 @@ def _collect_log_tail(n: int = 50) -> list[str]:
 def _collect_wsl() -> dict[str, Any] | None:
     """Return a redacted WSL status dict on Windows; None elsewhere.
 
-    Uses the existing `detect_wsl(quick=True)` so we don't pay the
-    per-distro probe cost in doctor — that probe takes 30+ seconds and the
-    diagnostic is supposed to be quick. The user can run
-    `vibechek preflight` for the full picture.
+    Uses the full `detect_wsl(quick=False)` probe — doctor is the
+    "full picture" diagnostic, so it pays the per-distro probe cost
+    (booting Stopped distros can take 30+ seconds) in exchange for
+    reporting what's actually installed.
     """
     if sys.platform != "win32":
         return None
@@ -234,8 +234,12 @@ def _collect_engine_readiness() -> dict[str, Any] | None:
     doctor was blind to the ONNX/native model set + `essentia_usable` because
     the old `preflight` default checked essentia_tf only — so a native-engine
     Windows box (the GUI default) got a diagnostic describing the wrong engine.
-    Uses the quick WSL probe (the full per-distro detail is already in the WSL
-    section); models/essentia_usable/native-venv are disk-fast either way.
+
+    Uses the FULL WSL probe (quick_wsl=False). The quick probe can't see the
+    per-distro engine venv, so on a perfectly healthy WSL box it reported
+    "Ready: False — the analysis engine isn't set up yet" — a diagnostic tool
+    lying about the one thing it exists to diagnose. The extra ~10-30s is the
+    cost of a verdict that matches what analyze will actually do.
 
     Lazy-imports preflight so doctor stays importable without the ML stack (the
     essentia import inside preflight is itself guarded).
@@ -245,7 +249,7 @@ def _collect_engine_readiness() -> dict[str, Any] | None:
         from vibechek.preflight import preflight as run_preflight
 
         engine = VibechekConfig.load().analysis.inference_engine
-        r = run_preflight(quick_wsl=True, engine=engine)
+        r = run_preflight(quick_wsl=False, engine=engine)
         nv = r.native_venv
         return {
             "engine": engine,

@@ -449,6 +449,47 @@ def test_analyze_empty_dir_warns_instead_of_false_done(tmp_path: Path) -> None:
     assert "Done. Analyzed" not in result.output
 
 
+def test_analyze_cli_appends_run_history(monkeypatch, tmp_path: Path) -> None:
+    """The CLI analyze must append to the durable run history like the RPC
+    path does — doctor's "last analyze run" was blind to CLI runs (the
+    0.8.0 changelog promised "every analyze appends")."""
+    from vibechek import analyzer, logging_setup
+
+    def fake_analyze_directory(path, *, config, on_progress=None, output_path=None,
+                               skip=0, limit=None, skip_paths=None):
+        return {
+            "summary": {"analyzed": 2, "errors": 0, "total_files": 2},
+            "run_meta": {
+                "engine": "onnx",
+                "genre_classifier": "clap",
+                "requested_workers": 4,
+                "effective_workers": 2,
+                "gpu_workers": 1,
+                "cpu_workers": 1,
+                "gpu_reason": None,
+            },
+            "tracks": [],
+        }
+
+    monkeypatch.setattr(analyzer, "analyze_directory", fake_analyze_directory)
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    out = tmp_path / "out.json"
+    result = CliRunner().invoke(main, ["analyze", str(lib), "-o", str(out)])
+    assert result.exit_code == 0, result.output
+
+    history = logging_setup.read_run_history()
+    assert history, "CLI analyze appended nothing to the run history"
+    last = history[-1]
+    assert last["engine"] == "onnx"
+    assert last["genre_classifier"] == "clap"
+    assert last["effective_workers"] == 2
+    assert last["gpu_workers"] == 1
+    assert last["analyzed"] == 2
+    assert isinstance(last["duration_sec"], (int, float))
+
+
 def test_tag_wrong_shape_json_no_traceback(tmp_path: Path) -> None:
     """`tag` on a bare-list / wrong-shape analysis must NOT dump a Python
     traceback (regression: apply_ml_tags did analysis_data.get on a list)."""

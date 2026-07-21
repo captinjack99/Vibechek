@@ -120,6 +120,57 @@ def append_run_summary(entry: dict[str, Any], *, cap: int = _RUN_HISTORY_CAP) ->
         log.warning("Could not append run-history summary: %s", e)
 
 
+def record_run_history(
+    report: dict[str, Any],
+    *,
+    duration_sec: float,
+    fallback_engine: str | None = None,
+    fallback_classifier: str | None = None,
+    fallback_workers: int | None = None,
+) -> None:
+    """Build + append the run-history entry for one completed analyze report.
+
+    Shared by BOTH analyze routes — the RPC/GUI path and the CLI — so
+    "every analyze appends to the durable run history" is actually true
+    (the CLI silently skipped it until 0.8.2). Prefers the analyzer-stamped
+    `run_meta` (the plan the run ACTUALLY used — effective workers, GPU
+    split, why the GPU was/wasn't used) and falls back to the requested
+    values when an older WSL analyzer didn't stamp it. Best-effort like
+    `append_run_summary` itself.
+    """
+    import time as _time  # noqa: PLC0415 — keep module import-light
+
+    meta = report.get("run_meta") or {}
+    summary = report.get("summary") or {}
+    warnings = {
+        k: report[k]
+        for k in (
+            "persist_error",
+            "priors_warning",
+            "genre_fallback_warning",
+            "model_degradation_warning",
+            "runtime_healed",
+            "runtime_heal_warning",
+        )
+        if report.get(k)
+    }
+    append_run_summary({
+        "ts": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "engine": meta.get("engine", fallback_engine),
+        "genre_classifier": meta.get("genre_classifier", fallback_classifier),
+        "requested_workers": meta.get("requested_workers", fallback_workers),
+        "effective_workers": meta.get("effective_workers"),
+        "gpu_workers": meta.get("gpu_workers"),
+        "cpu_workers": meta.get("cpu_workers"),
+        "gpu_reason": meta.get("gpu_reason"),
+        "analyzed": summary.get("analyzed"),
+        "errors": summary.get("errors"),
+        "total": summary.get("total_files"),
+        "duration_sec": duration_sec,
+        "warnings": warnings,
+    })
+
+
 def read_run_history(n: int = _RUN_HISTORY_CAP) -> list[dict[str, Any]]:
     """Return up to the last `n` run summaries (oldest first). Never raises."""
     if not RUN_HISTORY_FILE.exists():

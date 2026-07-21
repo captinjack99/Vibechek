@@ -514,43 +514,19 @@ def _record_run_history(report: dict, config: AnalysisConfig, duration_sec: floa
     """Append a compact summary of this completed analyze run to the durable
     run-history log (`doctor`'s "last analyze run" section reads it back).
 
-    Prefers the analyzer-stamped `run_meta` (the plan the run ACTUALLY used —
-    effective workers, GPU split, why the GPU was/wasn't used) and falls back to
-    the requested config when an older WSL analyzer didn't stamp it. Best-effort:
-    `append_run_summary` swallows write errors, so a diagnostics-log failure
-    never touches the analyze result the user just waited on.
+    The entry construction lives in `logging_setup.record_run_history` so the
+    CLI analyze appends the identical shape (it used to skip run history
+    entirely, leaving doctor's "last analyze run" blind to CLI runs).
     """
     from vibechek import logging_setup  # noqa: PLC0415
 
-    meta = report.get("run_meta") or {}
-    summary = report.get("summary") or {}
-    warnings = {
-        k: report[k]
-        for k in (
-            "persist_error",
-            "priors_warning",
-            "genre_fallback_warning",
-            "model_degradation_warning",
-            "runtime_healed",
-            "runtime_heal_warning",
-        )
-        if report.get(k)
-    }
-    logging_setup.append_run_summary({
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "engine": meta.get("engine", config.inference_engine),
-        "genre_classifier": meta.get("genre_classifier", config.genre_classifier),
-        "requested_workers": meta.get("requested_workers", config.workers),
-        "effective_workers": meta.get("effective_workers"),
-        "gpu_workers": meta.get("gpu_workers"),
-        "cpu_workers": meta.get("cpu_workers"),
-        "gpu_reason": meta.get("gpu_reason"),
-        "analyzed": summary.get("analyzed"),
-        "errors": summary.get("errors"),
-        "total": summary.get("total_files"),
-        "duration_sec": duration_sec,
-        "warnings": warnings,
-    })
+    logging_setup.record_run_history(
+        report,
+        duration_sec=duration_sec,
+        fallback_engine=config.inference_engine,
+        fallback_classifier=config.genre_classifier,
+        fallback_workers=config.workers,
+    )
 
 
 def _reattach_skipped_records(

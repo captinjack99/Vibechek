@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -149,7 +150,8 @@ def main() -> None:
 @click.option("--engine", type=click.Choice(["essentia_tf", "onnx", "native"]),
               default=None,
               help="Inference engine: essentia_tf (bundled TensorFlow, NVIDIA-only "
-                   "GPU), onnx (TF-free ONNX Runtime, cross-vendor GPU), or native "
+                   "GPU), onnx (TF-free ONNX Runtime; NVIDIA GPU today, cross-vendor "
+                   "planned), or native "
                    "(in-process ONNX + native essentia — the Windows GUI default; "
                    "needs essentia importable in this Python). Omitted → the saved "
                    "config's engine, then the platform default (native on Windows, "
@@ -212,6 +214,7 @@ def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
         def on_progress(current: int, total: int, message: str) -> None:
             progress.update(task, completed=current, total=total, description=message[:40])
 
+        _t0 = time.monotonic()
         try:
             report = analyze_directory(
                 path,
@@ -225,6 +228,17 @@ def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
         except RuntimeError as e:
             console.print(f"[red]Error:[/] {e}")
             raise click.Abort() from e
+
+    # Same durable run history the GUI path writes — doctor's "last analyze
+    # run" section must see CLI runs too, or it reports a stale picture.
+    from vibechek import logging_setup  # noqa: PLC0415
+    logging_setup.record_run_history(
+        report,
+        duration_sec=round(time.monotonic() - _t0, 1),
+        fallback_engine=config.inference_engine,
+        fallback_classifier=config.genre_classifier,
+        fallback_workers=config.workers,
+    )
 
     summary = report["summary"]
     if summary["total_files"] == 0:
