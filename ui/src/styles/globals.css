@@ -139,10 +139,15 @@
 }
 
 /* ---------------------------------------------------------------------------
- * Base — unlayered (as in v3, where CSS after @tailwind directives was
- * unlayered and thus higher-priority than any @layer). Keeping it unlayered
- * preserves the v3 cascade: e.g. the global :focus-visible outline below stays
- * higher-priority than the buttons' focus-visible:outline-hidden.
+ * Base — unlayered, EXCEPT the :focus-visible rule below. v3 compiled its
+ * "@layer" directives away, so every rule competed on specificity alone and
+ * the buttons' `.btn:focus-visible { outline: none }` (0,2,0) beat the global
+ * `:focus-visible` (0,1,0) — buttons showed their ring with no outline. In v4
+ * utilities live in a REAL `@layer utilities`, and unlayered rules beat any
+ * layer regardless of specificity — so an unlayered global outline would
+ * stack a second focus rectangle onto every button/track-row that suppresses
+ * it. The global rule therefore sits in `@layer base` (base < utilities), and
+ * everything else here stays unlayered as in v3.
  * ------------------------------------------------------------------------- */
 
 :root {
@@ -188,11 +193,16 @@ code,
 /* Keyboard a11y: a clearly visible focus ring, only for keyboard navigation
  * (mouse clicks don't flash it). Applies app-wide so even unstyled icon
  * buttons give keyboard users a position fix — previously the app had ZERO
- * visible focus treatment on a dark background. */
-:focus-visible {
-  outline: 2px solid --alpha(var(--color-accent) / 70%);
-  outline-offset: 2px;
-  border-radius: 4px;
+ * visible focus treatment on a dark background.
+ * In @layer base ON PURPOSE (see the header comment): utilities must be able
+ * to suppress it (`focus-visible:outline-hidden` on btn/track-row show their
+ * own ring instead), which matches how v3's specificity resolved this. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid --alpha(var(--color-accent) / 70%);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
 }
 
 /* Respect prefers-reduced-motion for the CSS keyframe animations (framer-
