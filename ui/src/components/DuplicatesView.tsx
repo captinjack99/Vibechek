@@ -399,7 +399,7 @@ export function DuplicatesView() {
               ) : (
                 <>
                   <p className="text-xs text-white/60">Files will be moved to:</p>
-                  <code className="block font-mono text-xs text-white/70 bg-surface-300 p-2 rounded break-all">
+                  <code className="block font-mono text-xs text-white/70 bg-surface-300 p-2 rounded-sm break-all">
                     {pendingResolve.reviewFolder}
                   </code>
                 </>

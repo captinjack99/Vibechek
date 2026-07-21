@@ -536,7 +536,7 @@ function CamelotKeyButton({
     <button
       type="button"
       onClick={onClick}
-      className={`text-[11px] font-mono py-1 rounded ${cls}`}
+      className={`text-[11px] font-mono py-1 rounded-sm ${cls}`}
       title={label}
     >
       {label}
@@ -568,7 +568,7 @@ function FilterDropdown<V extends string | number>({
           {options.map((opt) => (
             <label
               key={String(opt.value)}
-              className="flex items-center gap-2 px-2 py-1.5 rounded cursor-pointer hover:bg-white/5 text-sm"
+              className="flex items-center gap-2 px-2 py-1.5 rounded-sm cursor-pointer hover:bg-white/5 text-sm"
             >
               <input
                 type="checkbox"

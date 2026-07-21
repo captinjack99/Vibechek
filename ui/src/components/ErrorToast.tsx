@@ -213,7 +213,7 @@ export function ErrorToast() {
               {canRetry && (
                 <button
                   onClick={handleRetry}
-                  className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded px-2.5 py-1 inline-flex items-center gap-1.5"
+                  className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded-sm px-2.5 py-1 inline-flex items-center gap-1.5"
                 >
                   <RotateCcw className="w-3.5 h-3.5" />
                   Try again
@@ -223,7 +223,7 @@ export function ErrorToast() {
                 <button
                   onClick={handleRestart}
                   disabled={restarting}
-                  className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded px-2.5 py-1 inline-flex items-center gap-1.5 disabled:opacity-60"
+                  className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded-sm px-2.5 py-1 inline-flex items-center gap-1.5 disabled:opacity-60"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${restarting ? "animate-spin" : ""}`} />
                   {restarting ? "Restarting…" : "Restart Vibechek"}
@@ -245,7 +245,7 @@ export function ErrorToast() {
             <div className="mt-3 flex items-center gap-2">
               <button
                 onClick={handleInstallWsl}
-                className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded px-2.5 py-1 inline-flex items-center gap-1.5"
+                className="text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 border border-accent-red/40 rounded-sm px-2.5 py-1 inline-flex items-center gap-1.5"
               >
                 <Download className="w-3.5 h-3.5" />
                 Install WSL

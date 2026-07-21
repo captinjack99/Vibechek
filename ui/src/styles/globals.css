@@ -1,9 +1,148 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@theme {
+  /* Dark DJ-friendly surface palette */
+  --color-surface-50: #1e1e2e; /* lightest panels */
+  --color-surface-100: #181825;
+  --color-surface-200: #11111b; /* base background */
+  --color-surface-300: #0a0a13; /* deepest */
+
+  --color-accent: #a855f7; /* purple */
+  --color-accent-cyan: #06b6d4;
+  --color-accent-green: #10b981;
+  --color-accent-yellow: #f59e0b;
+  --color-accent-red: #ef4444;
+
+  /* Energy gradient (1-5) */
+  --color-energy-1: #10b981;
+  --color-energy-2: #84cc16;
+  --color-energy-3: #f59e0b;
+  --color-energy-4: #f97316;
+  --color-energy-5: #ef4444;
+
+  /* Inter Variable is BUNDLED (main.tsx imports @fontsource-variable/inter),
+   * so body + headings render identically on every OS instead of the Segoe-UI
+   * / SF-Pro / DejaVu lottery. The system stack remains as fallback for the
+   * pre-font-load frame. */
+  --font-sans:
+    "Inter Variable", "Inter", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", "Helvetica Neue", "Arial", sans-serif;
+  --font-display:
+    "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
+  /* JetBrains Mono is bundled too — consistent metrics for the BPM / key / size
+   * columns across platforms. */
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+
+  --animate-fade-in: fade-in 0.2s ease-out;
+  --animate-slide-up: slide-up 0.3s ease-out;
+
+  @keyframes fade-in {
+    0% {
+      opacity: 0;
+    }
+    100% {
+      opacity: 1;
+    }
+  }
+  @keyframes slide-up {
+    0% {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+/*
+  The default border color changed to `currentcolor` in Tailwind CSS v4. Every
+  bordered element in this app already sets an explicit `border-*` color, so
+  this compatibility layer is a no-op today — but it keeps the v3 default
+  (gray-200) for any element that ever relies on a bare `border` utility, so
+  the look can never silently drift.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
 
 /* ---------------------------------------------------------------------------
- * Base
+ * Reusable component classes
+ *
+ * v4 note: these are `@utility` (not `@layer components`) because v4's `@apply`
+ * can only reference registered utilities — `@apply panel` / `@apply btn`
+ * below require panel/btn to be utilities.
+ * ------------------------------------------------------------------------- */
+
+@utility panel {
+  @apply bg-surface-100 border border-white/5 rounded-xl;
+}
+
+@utility panel-pad {
+  @apply panel p-4;
+}
+
+@utility btn {
+  @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
+         transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed
+         focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-accent/70
+         focus-visible:ring-offset-2 focus-visible:ring-offset-surface-200;
+}
+
+/* Small-button modifier: ~10 call sites faked this with ad-hoc text-xs
+ * paddings, and one referenced .btn-sm before it existed. */
+@utility btn-sm {
+  @apply px-3 py-1.5 text-xs;
+}
+
+@utility btn-primary {
+  @apply btn bg-accent text-white hover:bg-accent/90;
+}
+
+@utility btn-ghost {
+  @apply btn text-white/80 hover:text-white hover:bg-white/5;
+}
+
+/* Solid red: a destructive CTA ("Send to trash") used to render QUIETER than
+ * the purple primary next to it — inverted visual weight for the one button
+ * that deletes things. */
+@utility btn-danger {
+  @apply btn bg-accent-red text-white hover:bg-accent-red/90;
+}
+
+@utility input {
+  @apply bg-surface-200 border border-white/10 rounded-lg px-3 py-2 text-sm
+         placeholder-white/40
+         focus:outline-hidden focus:border-accent/60
+         focus-visible:ring-2 focus-visible:ring-accent/40;
+}
+
+@utility label {
+  @apply block text-xs font-medium text-white/60 uppercase tracking-wider mb-1.5;
+}
+
+@utility track-row {
+  @apply flex items-center px-4 py-2 border-b border-white/5
+         hover:bg-white/[0.03] cursor-pointer transition-colors
+         focus-visible:outline-hidden focus-visible:bg-white/[0.06];
+
+  &.selected {
+    @apply bg-accent/10 border-accent/30;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Base — unlayered (as in v3, where CSS after @tailwind directives was
+ * unlayered and thus higher-priority than any @layer). Keeping it unlayered
+ * preserves the v3 cascade: e.g. the global :focus-visible outline below stays
+ * higher-priority than the buttons' focus-visible:outline-hidden.
  * ------------------------------------------------------------------------- */
 
 :root {
@@ -13,19 +152,22 @@
   color-scheme: dark;
 }
 
-html, body, #root {
+html,
+body,
+#root {
   height: 100%;
   margin: 0;
   padding: 0;
 }
 
-html, body {
+html,
+body {
   /* Stop macOS rubber-band / scroll-chaining bounce on the app shell. */
   overscroll-behavior: none;
 }
 
 body {
-  font-family: theme('fontFamily.sans');
+  font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   /* Desktop-app feel: UI chrome (labels, buttons, badges) isn't selectable —
@@ -35,7 +177,11 @@ body {
   user-select: none;
 }
 
-input, textarea, pre, code, [contenteditable] {
+input,
+textarea,
+pre,
+code,
+[contenteditable] {
   user-select: text;
 }
 
@@ -44,7 +190,7 @@ input, textarea, pre, code, [contenteditable] {
  * buttons give keyboard users a position fix — previously the app had ZERO
  * visible focus treatment on a dark background. */
 :focus-visible {
-  outline: 2px solid theme('colors.accent.DEFAULT' / 70%);
+  outline: 2px solid --alpha(var(--color-accent) / 70%);
   outline-offset: 2px;
   border-radius: 4px;
 }
@@ -52,7 +198,9 @@ input, textarea, pre, code, [contenteditable] {
 /* Respect prefers-reduced-motion for the CSS keyframe animations (framer-
  * motion is handled by <MotionConfig reducedMotion="user"> in App.tsx). */
 @media (prefers-reduced-motion: reduce) {
-  *, ::before, ::after {
+  *,
+  ::before,
+  ::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
@@ -60,84 +208,35 @@ input, textarea, pre, code, [contenteditable] {
 }
 
 /* Scrollbar — subtle on dark background */
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
 ::-webkit-scrollbar-thumb {
-  background: rgba(255,255,255,0.08);
+  background: rgba(255, 255, 255, 0.08);
   border-radius: 5px;
   /* Padding trick: keep the thumb off the content edge. */
   border: 2px solid transparent;
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); background-clip: padding-box; }
-/* The corner where H+V scrollbars meet rendered as a white square on
- * WebView2 when content overflowed both ways (e.g. the log viewer). */
-::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: padding-box;
+}
+/* The corner where H+V scrollbars meet rendered as a white square on WebView2
+ * when content overflowed both ways (e.g. the log viewer). */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
 
 /* <summary> disclosure: Chromium hides the marker under display:flex, but
  * WebKitGTK (Linux) still painted a stray triangle before our icons. */
-summary { list-style: none; }
-summary::-webkit-details-marker { display: none; }
-
-/* ---------------------------------------------------------------------------
- * Reusable component classes
- * ------------------------------------------------------------------------- */
-
-@layer components {
-  .panel {
-    @apply bg-surface-100 border border-white/5 rounded-xl;
-  }
-
-  .panel-pad {
-    @apply panel p-4;
-  }
-
-  .btn {
-    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
-           transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed
-           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70
-           focus-visible:ring-offset-2 focus-visible:ring-offset-surface-200;
-  }
-
-  /* Small-button modifier: ~10 call sites faked this with ad-hoc text-xs
-   * paddings, and one referenced .btn-sm before it existed. */
-  .btn-sm {
-    @apply px-3 py-1.5 text-xs;
-  }
-
-  .btn-primary {
-    @apply btn bg-accent text-white hover:bg-accent/90;
-  }
-
-  .btn-ghost {
-    @apply btn text-white/80 hover:text-white hover:bg-white/5;
-  }
-
-  /* Solid red: a destructive CTA ("Send to trash") used to render QUIETER
-   * than the purple primary next to it — inverted visual weight for the one
-   * button that deletes things. */
-  .btn-danger {
-    @apply btn bg-accent-red text-white hover:bg-accent-red/90;
-  }
-
-  .input {
-    @apply bg-surface-200 border border-white/10 rounded-lg px-3 py-2 text-sm
-           placeholder-white/40
-           focus:outline-none focus:border-accent/60
-           focus-visible:ring-2 focus-visible:ring-accent/40;
-  }
-
-  .label {
-    @apply block text-xs font-medium text-white/60 uppercase tracking-wider mb-1.5;
-  }
-
-  .track-row {
-    @apply flex items-center px-4 py-2 border-b border-white/5
-           hover:bg-white/[0.03] cursor-pointer transition-colors
-           focus-visible:outline-none focus-visible:bg-white/[0.06];
-  }
-
-  .track-row.selected {
-    @apply bg-accent/10 border-accent/30;
-  }
+summary {
+  list-style: none;
+}
+summary::-webkit-details-marker {
+  display: none;
 }

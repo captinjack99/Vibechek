@@ -138,7 +138,7 @@ export function LogsViewer({ open, onClose }: Props) {
               <button
                 key={lvl}
                 onClick={() => setFilter(lvl)}
-                className={`px-2 py-0.5 rounded text-[11px] font-mono ${
+                className={`px-2 py-0.5 rounded-sm text-[11px] font-mono ${
                   filter === lvl
                     ? "bg-accent text-white"
                     : "text-white/60 hover:bg-white/5"

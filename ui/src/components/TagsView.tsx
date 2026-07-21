@@ -677,7 +677,7 @@ export function TagsView() {
         message={
           <div className="space-y-2">
             <p>You're about to overwrite every tag on every file referenced by:</p>
-            <code className="block font-mono text-xs text-white/70 bg-surface-300 p-2 rounded break-all">
+            <code className="block font-mono text-xs text-white/70 bg-surface-300 p-2 rounded-sm break-all">
               {restoreCandidate}
             </code>
             <p>This includes title, artist, genre, BPM, key, energy, mood, custom tags, and any
@@ -701,7 +701,7 @@ export function TagsView() {
           <div className="space-y-2">
             <p>The backup file itself stays where it is — only its entry in this list is removed.</p>
             {forgetCandidate && (
-              <code className="block font-mono text-xs text-white/70 bg-surface-300 p-2 rounded break-all">
+              <code className="block font-mono text-xs text-white/70 bg-surface-300 p-2 rounded-sm break-all">
                 {forgetCandidate.backup_path}
               </code>
             )}
@@ -995,7 +995,7 @@ function RemapDetailSection({
     <div>
       <div className="text-xs text-white/70 font-medium">{title}</div>
       <div className="text-[11px] text-white/40 mb-1">{hint}</div>
-      <ul className="text-[11px] text-white/60 space-y-0.5 max-h-40 overflow-auto bg-black/20 rounded p-2 font-mono">
+      <ul className="text-[11px] text-white/60 space-y-0.5 max-h-40 overflow-auto bg-black/20 rounded-sm p-2 font-mono">
         {shown.map((m, i) => (
           <li key={`${m.original}-${i}`} className="break-all">
             <span className="text-white/80">{m.original}</span>
@@ -1030,7 +1030,7 @@ function ExpandableFileList({ label, entries }: { label: string; entries: string
       <summary className="cursor-pointer text-xs text-accent-yellow hover:text-accent-yellow/80 select-none">
         {entries.length} {label} — show details
       </summary>
-      <ul className="mt-2 max-h-40 overflow-auto text-[11px] font-mono text-white/60 space-y-0.5 bg-black/20 rounded p-2">
+      <ul className="mt-2 max-h-40 overflow-auto text-[11px] font-mono text-white/60 space-y-0.5 bg-black/20 rounded-sm p-2">
         {entries.slice(0, 200).map((e, i) => (
           <li key={i} className="break-all">{e}</li>
         ))}

@@ -448,7 +448,7 @@ function CompatibleKeysSection({ mlKey }: { mlKey: string | null | undefined }) 
             key={k}
             type="button"
             onClick={() => onPick(k)}
-            className="text-[11px] font-mono px-2 py-1 rounded bg-white/5 text-white/80 border border-white/10 hover:bg-accent/20 hover:text-accent hover:border-accent/30"
+            className="text-[11px] font-mono px-2 py-1 rounded-sm bg-white/5 text-white/80 border border-white/10 hover:bg-accent/20 hover:text-accent hover:border-accent/30"
             title={`Filter library to ${k}`}
           >
             {k}

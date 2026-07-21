@@ -1067,7 +1067,7 @@ function OrganizeResultPanel({
               was occupied or the file was already moved.
             </div>
             {undoResult.errorMessages.length > 0 && (
-              <ul className="mt-2 space-y-1 max-h-56 overflow-auto text-[11px] font-mono text-white/60 bg-black/20 rounded p-2">
+              <ul className="mt-2 space-y-1 max-h-56 overflow-auto text-[11px] font-mono text-white/60 bg-black/20 rounded-sm p-2">
                 {undoResult.errorMessages.slice(0, 100).map((m, i) => (
                   <li key={i} className="break-all">{m}</li>
                 ))}

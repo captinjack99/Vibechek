@@ -27,7 +27,7 @@ import { increaseWslMemory } from "../api/rpc";
 
 const BUTTON_CLASS =
   "text-xs font-medium text-white bg-accent-red/30 hover:bg-accent-red/50 " +
-  "border border-accent-red/40 rounded px-2.5 py-1 inline-flex items-center " +
+  "border border-accent-red/40 rounded-sm px-2.5 py-1 inline-flex items-center " +
   "gap-1.5 disabled:opacity-60";
 
 export function MemoryRefusalActions({

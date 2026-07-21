@@ -1606,7 +1606,7 @@ function Header({
                   onCloseSwitcher?.();
                 }}
                 className={cx(
-                  "w-full text-left px-2 py-2 rounded text-sm flex items-center gap-2",
+                  "w-full text-left px-2 py-2 rounded-sm text-sm flex items-center gap-2",
                   disabled
                     ? "opacity-50 cursor-not-allowed"
                     : "hover:bg-white/5 cursor-pointer",
@@ -1864,7 +1864,7 @@ function RecentLibraryCard({
             {((record as LibraryRecord & { tags?: string[] }).tags ?? []).map((t) => (
               <span
                 key={t}
-                className="px-1.5 py-0.5 rounded text-[10px] bg-accent/10 text-accent border border-accent/20"
+                className="px-1.5 py-0.5 rounded-sm text-[10px] bg-accent/10 text-accent border border-accent/20"
               >
                 {t}
               </span>
@@ -1873,7 +1873,7 @@ function RecentLibraryCard({
         )}
       </div>
       <button
-        className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent p-1.5 rounded transition-opacity"
+        className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent p-1.5 rounded-sm transition-opacity"
         onClick={beginEdit}
         title="Rename / tag this library"
         aria-label={`Rename ${displayName(record)}`}
@@ -1882,7 +1882,7 @@ function RecentLibraryCard({
         <Pencil className="w-4 h-4" />
       </button>
       <button
-        className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent-red p-1.5 rounded transition-opacity"
+        className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/40 hover:text-accent-red p-1.5 rounded-sm transition-opacity"
         onClick={(e) => {
           e.stopPropagation();
           if (!disabled) onForget();

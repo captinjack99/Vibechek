@@ -34,7 +34,7 @@ function Skeleton({ rows = 2 }: { rows?: number }) {
       {Array.from({ length: rows }, (_, i) => (
         <div
           key={i}
-          className="h-3 rounded bg-white/10 animate-pulse"
+          className="h-3 rounded-sm bg-white/10 animate-pulse"
           style={{ width: `${72 - i * 16}%` }}
         />
       ))}
@@ -1017,7 +1017,7 @@ export function CrossVendorGpuInventory({
           native engine's NVIDIA-not-used story is carried by EngineGpuBlock's
           `note` branch above, so this callout doesn't duplicate it.) */}
       {hasUnsupported && (
-        <div className="mt-3 flex items-start gap-2 text-xs rounded border border-white/10 bg-white/5 p-2.5">
+        <div className="mt-3 flex items-start gap-2 text-xs rounded-sm border border-white/10 bg-white/5 p-2.5">
           <AlertTriangle className="w-4 h-4 flex-none text-accent-yellow mt-0.5" />
           <div className="text-white/70">{callout}</div>
         </div>
@@ -1127,11 +1127,11 @@ function GpuInventoryRow({ device }: { device: GpuDevice }) {
         </div>
       </div>
       {accelerated ? (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent-green/20 text-accent-green font-mono uppercase tracking-wider">
+        <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-accent-green/20 text-accent-green font-mono uppercase tracking-wider">
           accelerated
         </span>
       ) : (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-white/50 font-mono uppercase tracking-wider">
+        <span className="text-[10px] px-1.5 py-0.5 rounded-sm bg-white/10 text-white/50 font-mono uppercase tracking-wider">
           CPU-only (not supported by this engine yet)
         </span>
       )}

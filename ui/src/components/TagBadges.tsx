@@ -44,7 +44,7 @@ export function EnergyBar({ level }: { level: number }) {
         return (
           <div
             key={i}
-            className="h-1.5 w-3 rounded-sm transition-colors"
+            className="h-1.5 w-3 rounded-xs transition-colors"
             style={{
               background: filled ? color : "rgba(255,255,255,0.08)",
             }}
