@@ -999,6 +999,7 @@ def _plan_organization(params: dict) -> dict:
         "base_dir": str(plan.base_dir),
         "small_genres": sorted(plan.small_genres),
         "genre_counts": plan.genre_counts,
+        "existing_genre_counts": plan.existing_genre_counts,
         "moves": [
             {
                 "source": str(m.source),

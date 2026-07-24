@@ -300,6 +300,7 @@ export interface OrganizePlan {
   moves: PlannedMove[];
   small_genres: string[];
   genre_counts: Record<string, number>;
+  existing_genre_counts: Record<string, number>;
   errors: string[];
 }
 

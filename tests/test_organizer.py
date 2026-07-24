@@ -316,3 +316,100 @@ def test_organize_cancel_midbatch_preserves_journal_path(
     assert len(moves) == 2
     # And those two files physically moved into House/.
     assert sorted(p.name for p in (library / "House").iterdir()) == ["t0.mp3", "t1.mp3"]
+
+
+# ---------------------------------------------------------------------------
+# Destination-aware small-genre decision (incremental organize)
+# ---------------------------------------------------------------------------
+
+
+def _batch(tmp_path: Path, genre: str, n: int, sub: str | None = None) -> dict:
+    """n new tracks of one genre, as an analysis dict, files created on disk."""
+    src = tmp_path / "incoming"
+    src.mkdir(exist_ok=True)
+    tracks = []
+    for i in range(n):
+        p = src / f"{genre.lower()}_{i}.mp3"
+        p.write_bytes(b"x")
+        ml = {"ml_genre": genre}
+        if sub:
+            ml["ml_subgenre"] = sub
+        tracks.append({"path": str(p), "ml_analysis": ml})
+    return {"tracks": tracks}
+
+
+def _fill(folder: Path, n: int) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        (folder / f"existing_{i}.mp3").write_bytes(b"x")
+
+
+def test_incremental_batch_joins_established_genre_folder(tmp_path: Path) -> None:
+    """3 new House tracks + an established House/ folder must NOT go to Other/.
+
+    Regression: the small-genre decision counted only the batch, so every
+    incremental organize shoved small batches into Other/ no matter how many
+    files the destination's genre folder already held.
+    """
+    lib = tmp_path / "lib"
+    _fill(lib / "House", 11)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=10, target_root=lib)
+    plan = plan_organization(_batch(tmp_path, "House", 3), config)
+
+    assert "House" not in plan.small_genres
+    assert len(plan.moves) == 3
+    for m in plan.moves:
+        assert "Other" not in m.destination.parts
+        assert m.destination.parent == lib / "House"
+    # Census caps at min_genre_size — 10 reads as "10 or more".
+    assert plan.existing_genre_counts["House"] == 10
+
+
+def test_small_batch_plus_few_existing_still_goes_to_other(tmp_path: Path) -> None:
+    lib = tmp_path / "lib"
+    _fill(lib / "House", 4)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=10, target_root=lib)
+    plan = plan_organization(_batch(tmp_path, "House", 3), config)
+
+    assert "House" in plan.small_genres  # 3 + 4 = 7 < 10
+    assert plan.existing_genre_counts["House"] == 4
+    for m in plan.moves:
+        assert "Other" in m.destination.parts
+
+
+def test_existing_genre_dir_casing_is_reused(tmp_path: Path) -> None:
+    """A batch genre 'House' with an on-disk 'house/' must reuse 'house/' —
+    not create a case-duplicate sibling on case-sensitive filesystems."""
+    lib = tmp_path / "lib"
+    _fill(lib / "house", 12)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=10, target_root=lib)
+    plan = plan_organization(_batch(tmp_path, "House", 2), config)
+
+    assert "House" not in plan.small_genres
+    for m in plan.moves:
+        assert m.destination.parent.name == "house"
+
+
+def test_other_and_unknown_folders_do_not_establish_genres(tmp_path: Path) -> None:
+    """Files already bucketed under Other/ (or Unknown/) must not count as an
+    established genre — else Other/Techno/ would self-perpetuate forever."""
+    lib = tmp_path / "lib"
+    _fill(lib / "Other" / "Techno", 15)
+    _fill(lib / "Unknown", 15)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=10, target_root=lib)
+    plan = plan_organization(_batch(tmp_path, "Techno", 2), config)
+
+    assert "Techno" in plan.small_genres
+    assert plan.existing_genre_counts["Techno"] == 0
+
+
+def test_census_counts_nested_subgenre_layouts(tmp_path: Path) -> None:
+    """Genre/Subgenre nesting counts toward the genre's establishment."""
+    lib = tmp_path / "lib"
+    _fill(lib / "House" / "Tech House", 11)
+    config = OrganizationConfig(use_subgenres=True, min_genre_size=10, target_root=lib)
+    plan = plan_organization(_batch(tmp_path, "House", 2, sub="Bass House"), config)
+
+    assert "House" not in plan.small_genres
+    for m in plan.moves:
+        assert m.destination.parent == lib / "House" / "Bass House"

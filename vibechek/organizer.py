@@ -25,6 +25,7 @@ from mutagen.mp4 import MP4
 
 from vibechek.config import OrganizationConfig
 from vibechek.utils import (
+    SUPPORTED_EXTENSIONS,
     ProgressCallback,
     find_audio_files,
     report_progress,
@@ -57,6 +58,12 @@ class OrganizePlan:
     moves: list[PlannedMove] = field(default_factory=list)
     small_genres: set[str] = field(default_factory=set)
     genre_counts: dict[str, int] = field(default_factory=dict)
+    # Audio files ALREADY in the destination's matching genre folder, per batch
+    # genre. Counting stops at `min_genre_size` (the only decision that needs
+    # it), so values are capped there — read "10" as "10 or more". This is what
+    # keeps an incremental organize honest: 3 new House tracks into a library
+    # with an established House/ folder must NOT read as "rare genre → Other/".
+    existing_genre_counts: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
 
@@ -225,6 +232,47 @@ def ml_genre_coverage(analysis_data: dict[str, Any]) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
+def _count_existing_by_genre(base_dir: Path, cap: int) -> dict[str, tuple[str, int]]:
+    """Bounded census of the destination's existing genre folders.
+
+    Returns {casefolded dir name: (actual dir name, audio-file count capped at
+    `cap`)} for every immediate subdirectory of `base_dir` except the reserved
+    "Other"/"Unknown" buckets and dot-dirs. Counting recurses (Genre/Subgenre
+    layouts) but STOPS at `cap` per genre — the small-genre decision only needs
+    "fewer than min_genre_size or not", so a 2,000-file House/ costs a dozen
+    stat calls, not a library walk.
+
+    Casefolded keys + returned actual names let the planner match genres
+    case-insensitively (Windows) while reusing the on-disk folder's exact
+    casing for destinations — otherwise a "house/" batch next to an existing
+    "House/" would create a second directory on case-sensitive filesystems.
+    """
+    out: dict[str, tuple[str, int]] = {}
+    try:
+        subdirs = [d for d in base_dir.iterdir() if d.is_dir()]
+    except OSError:
+        return out  # unreadable/missing destination → no established genres
+    for d in subdirs:
+        name = d.name
+        if name.startswith(".") or name.casefold() in ("other", "unknown"):
+            continue
+        count = 0
+        try:
+            for _root, _dirs, files in os.walk(d):
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS:
+                        count += 1
+                        if count >= cap:
+                            break
+                if count >= cap:
+                    break
+        except OSError:
+            pass  # partially unreadable folder — keep whatever was counted
+        if count:
+            out[name.casefold()] = (name, count)
+    return out
+
+
 def plan_organization(
     analysis_data: dict[str, Any],
     config: OrganizationConfig,
@@ -263,15 +311,31 @@ def plan_organization(
         genre = sanitize_folder_name(ml.get("ml_genre"))
         genre_counts[genre] += 1
 
+    # "Small" is decided over batch + DESTINATION, not the batch alone. An
+    # incremental organize of 3 new House tracks into a library whose House/
+    # folder already holds hundreds must route them there — the old batch-only
+    # count shoved every small batch into Other/ regardless of what the
+    # destination already established.
+    existing = _count_existing_by_genre(base_dir, cap=config.min_genre_size)
+    existing_genre_counts = {
+        g: existing.get(g.casefold(), ("", 0))[1] for g in genre_counts
+    }
+
     small_genres = {
         g for g, count in genre_counts.items()
-        if count < config.min_genre_size
+        if count + existing_genre_counts[g] < config.min_genre_size
     }
+
+    def actual_genre_dir(g: str) -> str:
+        """Reuse the on-disk folder's exact casing when one already matches."""
+        hit = existing.get(g.casefold())
+        return hit[0] if hit else g
 
     plan = OrganizePlan(
         base_dir=base_dir,
         small_genres=small_genres,
         genre_counts=dict(genre_counts),
+        existing_genre_counts=existing_genre_counts,
     )
 
     # Destinations already assigned in THIS plan. Prevents two source files
@@ -296,16 +360,16 @@ def plan_organization(
 
         if genre in small_genres:
             dest_folder = base_dir / "Other" / genre
-            reason = f"rare genre (<{config.min_genre_size} tracks) → Other/"
+            reason = f"rare genre (<{config.min_genre_size} tracks here or in the library) → Other/"
         elif config.use_subgenres and subgenre and subgenre not in (genre, "Unknown"):
             # `sanitize_folder_name(None/"" )` returns the literal "Unknown"
             # sentinel, so a track with a real genre but no subgenre must NOT be
             # routed to <Genre>/Unknown/ — it falls through to the flat
             # <Genre>/ branch below.
-            dest_folder = base_dir / genre / subgenre
+            dest_folder = base_dir / actual_genre_dir(genre) / subgenre
             reason = "ML genre + subgenre"
         else:
-            dest_folder = base_dir / genre
+            dest_folder = base_dir / actual_genre_dir(genre)
             reason = "ML genre"
 
         dest = dest_folder / source.name

@@ -51,6 +51,7 @@ const PLAN: OrganizePlan = {
   ],
   small_genres: [],
   genre_counts: { House: 1 },
+  existing_genre_counts: { House: 0 },
   errors: [],
 };
 
