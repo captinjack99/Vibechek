@@ -35,6 +35,8 @@ function track(
       ml_direction: null,
       ml_vocal: null,
       ml_vocal_score: null,
+      ml_vocal_peak: null,
+      ml_vocal_frac: null,
       ml_danceability: null,
       ml_mood_scores: null,
       ml_error: null,

@@ -548,3 +548,40 @@ def test_vote_key_unparseable_reads_return_none() -> None:
     audio = np.zeros(3 * analyzer._MIN_KEY_SEGMENT_SAMPLES, dtype=np.float32)
     ke = _SeqKey([("?", "?"), ("?", "?"), ("?", "?")])
     assert analyzer._vote_key(ke, audio) is None
+
+
+def test_classify_vocal_sparse_hook_branch() -> None:
+    """Calibrated 2026-07-24 against 30 human-labeled tracks: a low MEAN with
+    strong-but-sparse vocal patches is a vocal track (chopped hook), while the
+    same peak spread across most of the track is a melodic instrumental."""
+    # Measured profiles from the labeled set (mean, p90, frac>0.5):
+    # "ghost (feat. HUMAN)" — human label Vocal, shipped label was Instrumental.
+    assert analyzer._classify_vocal(0.297, peak=0.997, frac=0.284) == "Vocal"
+    # "Night Vision" — human label Vocal.
+    assert analyzer._classify_vocal(0.226, peak=0.926, frac=0.217) == "Vocal"
+    # "Children" — melodic-lead INSTRUMENTAL anchor: p90 0.99 but voice-like
+    # for 70% of its patches → the frac cap must keep it Instrumental.
+    assert analyzer._classify_vocal(0.681, peak=0.987, frac=0.703) == "Instrumental"
+    # "Pjanoo" — same anchor class.
+    assert analyzer._classify_vocal(0.631, peak=0.984, frac=0.632) == "Instrumental"
+    # "Adagio For Strings" — true instrumental, low everything.
+    assert analyzer._classify_vocal(0.069, peak=0.207, frac=0.015) == "Instrumental"
+    # Weak peak (sampled vocals the model can't see) stays Instrumental —
+    # the feat-credit prior is the safety net for those.
+    assert analyzer._classify_vocal(0.221, peak=0.511, frac=0.116) == "Instrumental"
+
+
+def test_classify_vocal_mean_bands_unchanged_by_patch_shape() -> None:
+    """The proven mean bands outrank the sparse branch: a sustained vocal is
+    Vocal regardless of frac, and the Light Vocal band is untouched."""
+    assert analyzer._classify_vocal(0.95, peak=1.0, frac=0.98) == "Vocal"
+    assert analyzer._classify_vocal(0.80, peak=0.99, frac=0.60) == "Light Vocal"
+
+
+def test_classify_vocal_backcompat_without_patch_shape() -> None:
+    """Older analyses carry only the mean — behavior must match the historical
+    mean-only rule exactly (no peak/frac → no sparse branch)."""
+    assert analyzer._classify_vocal(0.297) == "Instrumental"
+    assert analyzer._classify_vocal(0.703) == "Instrumental"
+    assert analyzer._classify_vocal(0.80) == "Light Vocal"
+    assert analyzer._classify_vocal(0.95) == "Vocal"

@@ -223,6 +223,8 @@ export interface MLResult {
   ml_direction: string | null;
   ml_vocal: string | null;
   ml_vocal_score: number | null;
+  ml_vocal_peak: number | null;
+  ml_vocal_frac: number | null;
   ml_danceability: number | null;
   ml_mood_scores: Record<string, number> | null;
   ml_error: string | null;

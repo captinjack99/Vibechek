@@ -157,7 +157,16 @@ class MLResult:
     # Raw voice probability (0..1) from the voice/instrumental model, stored so
     # the classification can be re-derived or re-tuned without re-running the
     # model. `ml_vocal` is the label derived from this via _classify_vocal.
+    # `ml_vocal_score` is the per-patch MEAN; `ml_vocal_peak` (p90 of the patch
+    # scores) and `ml_vocal_frac` (fraction of patches > 0.5) carry the shape of
+    # the track's vocal presence — a chopped vocal hook is high-peak/low-frac,
+    # a sustained synth lead is high-peak/HIGH-frac, and the mean alone cannot
+    # tell a sparse vocal from silence (measured 2026-07-24: the mean labeled
+    # 26 of 51 feat-credited tracks "Instrumental"). Older analyses lack
+    # peak/frac; every consumer falls back to the mean-only rule then.
     ml_vocal_score: float | None = None
+    ml_vocal_peak: float | None = None
+    ml_vocal_frac: float | None = None
     ml_danceability: float | None = None
     ml_mood_scores: dict[str, float] | None = None
     ml_error: str | None = None
@@ -444,6 +453,18 @@ def load_models(
 VOCAL_INSTRUMENTAL_MAX = 0.72
 VOCAL_FULL_MIN = 0.88
 
+# Sparse-hook branch (calibrated 2026-07-24 against 30 human-labeled tracks +
+# the melodic-instrumental anchors): a track whose mean is deep in
+# "Instrumental" territory can still be a vocal track whose hook is confined
+# to a fraction of its runtime — strong vocal patches (p90 >= 0.80) covering
+# at most VOCAL_SPARSE_FRAC_MAX of the track. The frac cap is what keeps the
+# melodic-lead instrumentals out: "Children" (p90 0.99!) is voice-like for
+# 70% of its patches, real chopped-hook vocals for ~20-30%. Fit quality on the
+# labeled set: 24/30 exact, 28/30 within one class, all anchors preserved;
+# 501-track shift Instrumental 307→245 (no p90-style saturation).
+VOCAL_SPARSE_PEAK_MIN = 0.80
+VOCAL_SPARSE_FRAC_MAX = 0.45
+
 
 def _class_index(
     classes: list[str] | None,
@@ -469,12 +490,28 @@ def _classify_vocal(
     score: float,
     instrumental_max: float = VOCAL_INSTRUMENTAL_MAX,
     full_min: float = VOCAL_FULL_MIN,
+    peak: float | None = None,
+    frac: float | None = None,
 ) -> str:
-    if score < instrumental_max:
-        return "Instrumental"
-    if score < full_min:
+    """Label from the mean score, plus the sparse-hook branch when the patch
+    shape (peak p90 + frac>0.5) is available. peak/frac default to None so
+    older analyses (mean only) keep the historical behavior exactly."""
+    if score >= full_min:
+        return "Vocal"
+    if score >= instrumental_max:
         return "Light Vocal"
-    return "Vocal"
+    if (
+        peak is not None
+        and frac is not None
+        and peak >= VOCAL_SPARSE_PEAK_MIN
+        and frac <= VOCAL_SPARSE_FRAC_MAX
+    ):
+        # Strong vocal patches confined to a hook: a vocal track the mean
+        # dilutes into "Instrumental". The frac cap excludes sustained
+        # voice-like synth leads (Children/Pjanoo), which score high in MOST
+        # patches, not a sparse subset.
+        return "Vocal"
+    return "Instrumental"
 
 
 def _classify_mood(brightness: float) -> str:
@@ -796,7 +833,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
     # ---------- Voice / instrumental ----------
     if "voice_instrumental" in models:
         try:
-            pred = np.mean(models["voice_instrumental"](embeddings), axis=0)
+            preds = np.asarray(models["voice_instrumental"](embeddings))
             # Resolve the "voice" column by label NAME from the model's class
             # metadata, falling back to index 1 (the historical hardcode) when
             # metadata is unavailable. A re-ordered model release would otherwise
@@ -806,9 +843,23 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
             voice_idx = _class_index(
                 models.get("voice_instrumental_classes"), "voice", fallback=1
             )
-            voice_score = float(pred[voice_idx]) if len(pred) > 1 else float(pred[0])
+            if preds.ndim > 1 and preds.shape[1] > 1:
+                voice_col = preds[:, voice_idx]
+            else:
+                voice_col = preds.ravel()
+            # Keep the PER-PATCH shape, not just the mean: chopped vocal hooks
+            # average into "Instrumental" (the mean labeled half the
+            # feat-credited corpus Instrumental), while the p90+frac pair
+            # separates a sparse hook from a sustained voice-like synth lead.
+            voice_score = float(np.mean(voice_col))
+            voice_peak = float(np.percentile(voice_col, 90))
+            voice_frac = float(np.mean(voice_col > 0.5))
             result.ml_vocal_score = round(voice_score, 3)
-            result.ml_vocal = _classify_vocal(voice_score)
+            result.ml_vocal_peak = round(voice_peak, 3)
+            result.ml_vocal_frac = round(voice_frac, 3)
+            result.ml_vocal = _classify_vocal(
+                voice_score, peak=voice_peak, frac=voice_frac
+            )
         except Exception as e:  # noqa: BLE001
             log.debug("Vocal detection failed for %s: %s", filepath.name, e)
             result.ml_vocal = "Unknown"
@@ -3055,7 +3106,13 @@ def _reconcile_record_vocal(r: dict[str, Any]) -> None:
     score = ml.get("ml_vocal_score")
     if score is None:
         return  # model didn't run (ml_vocal stays "Unknown")
-    audio_label = _classify_vocal(float(score))
+    peak = ml.get("ml_vocal_peak")
+    frac = ml.get("ml_vocal_frac")
+    audio_label = _classify_vocal(
+        float(score),
+        peak=float(peak) if isinstance(peak, (int, float)) else None,
+        frac=float(frac) if isinstance(frac, (int, float)) else None,
+    )
     ml["ml_vocal_audio"] = audio_label
     _artist, title = _record_artist_title(r)
     if audio_label == "Instrumental" and _FEAT_CREDIT_RE.search(f"{_artist} {title}"):

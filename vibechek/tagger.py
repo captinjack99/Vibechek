@@ -985,10 +985,14 @@ def _resolve_vocal(ml: dict[str, Any], config: TaggingConfig) -> str | None:
     from vibechek.analyzer import _classify_vocal  # noqa: PLC0415
     score = ml.get("ml_vocal_score")
     if isinstance(score, (int, float)):
+        peak = ml.get("ml_vocal_peak")
+        frac = ml.get("ml_vocal_frac")
         return _classify_vocal(
             float(score),
             instrumental_max=config.vocal_instrumental_max,
             full_min=config.vocal_full_min,
+            peak=float(peak) if isinstance(peak, (int, float)) else None,
+            frac=float(frac) if isinstance(frac, (int, float)) else None,
         )
     val = ml.get("ml_vocal")
     return str(val) if val is not None else None

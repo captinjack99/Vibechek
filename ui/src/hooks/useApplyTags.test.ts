@@ -54,6 +54,8 @@ const oneTrack: TrackAnalysis[] = [
       ml_direction: "Up",
       ml_vocal: "Instrumental",
       ml_vocal_score: 0.1,
+      ml_vocal_peak: null,
+      ml_vocal_frac: null,
       ml_danceability: 0.8,
       ml_mood_scores: null,
       ml_error: null,

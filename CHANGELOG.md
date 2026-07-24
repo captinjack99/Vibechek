@@ -11,6 +11,15 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 ## [Unreleased]
 
 ### Fixed
+- **Vocal detection finally hears chopped vocal hooks.** The vocal label came
+  from the track-wide average of the model's per-segment voice score, so a
+  club track whose vocal lives in the hook — most of dance music — averaged
+  out to "Instrumental" (measured: half of a 51-track feat-credited set was
+  mislabeled). Analysis now also looks at the shape of the vocal presence:
+  strong vocal segments confined to a hook read as Vocal, while sustained
+  voice-like synth leads (the reason the old thresholds were so conservative)
+  still read as Instrumental. Calibrated against human-labeled tracks;
+  existing analyses keep their old behavior until re-analyzed.
 - **Organizing a few new tracks no longer shoves them into Other/.** The
   "rare genre" decision counted only the tracks being organized, so an
   incremental organize couldn't see that your library already has an
