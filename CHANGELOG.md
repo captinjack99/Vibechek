@@ -11,6 +11,12 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 ## [Unreleased]
 
 ### Fixed
+- **Organizing a few new tracks no longer shoves them into Other/.** The
+  "rare genre" decision counted only the tracks being organized, so an
+  incremental organize couldn't see that your library already has an
+  established folder for that genre. It now counts the destination's existing
+  genre folders too — 3 new House tracks join the House/ folder they belong
+  in, and Other/ is reserved for genres that are genuinely rare across both.
 - **The bundled model weights now ship with the license notice they always
   required.** The MTG-UPF model weights (Discogs-EffNet and every
   classification head) are CC BY-NC-SA 4.0 — not AGPL like Vibechek's own
