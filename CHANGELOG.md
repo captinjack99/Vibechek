@@ -10,6 +10,8 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+## [0.9.0-beta] — 2026-07-25
+
 ### Changed
 - **Online genre lookup now reads the store page instead of asking an AI model
   to.** The optional online lookup used to hand web-search snippets to a local
@@ -1272,7 +1274,10 @@ First public beta. Feature-complete, headed for stable.
 
 ---
 
-[Unreleased]: https://github.com/captinjack99/Vibechek/compare/v0.8.0-beta...HEAD
+[Unreleased]: https://github.com/captinjack99/Vibechek/compare/v0.9.0-beta...HEAD
+[0.9.0-beta]: https://github.com/captinjack99/Vibechek/compare/v0.8.2-beta...v0.9.0-beta
+[0.8.2-beta]: https://github.com/captinjack99/Vibechek/compare/v0.8.1-beta...v0.8.2-beta
+[0.8.1-beta]: https://github.com/captinjack99/Vibechek/compare/v0.8.0-beta...v0.8.1-beta
 [0.8.0-beta]: https://github.com/captinjack99/Vibechek/compare/v0.7.0-beta...v0.8.0-beta
 [0.7.0-beta]: https://github.com/captinjack99/Vibechek/compare/v0.6.3-beta...v0.7.0-beta
 [0.6.3-beta]: https://github.com/captinjack99/Vibechek/compare/v0.6.2-beta...v0.6.3-beta
