@@ -10,6 +10,40 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+### Changed
+- **Online genre lookup now reads the store page instead of asking an AI model
+  to.** The optional online lookup used to hand web-search snippets to a local
+  language model and ask it for the subgenre. It now does the obvious thing
+  directly: search for the artist + title, open the catalog pages the search
+  returns, and read the genre out of the page's own genre field — keeping it
+  only when that page names this exact track, quoting the field verbatim off the
+  bytes we fetched, and refusing shop categories like "Dance/Pop" that aren't
+  really genres. Measured on an 86-track adjudicated corpus: **73% exact / 87%
+  family**, against 59%/73% for the model version and 52%/71% for tags and audio
+  alone — and roughly 5× faster, because nothing loads a model. Twelve tracks
+  fixed, none broken, versus the shipping default.
+
+  What this means for you:
+  - **Setup is now two small packages** instead of a 4.7 GB model download. If
+    you set the lookup up before this release, run **Set up online lookup** once
+    more; until you do, runs will say the lookup wasn't available rather than
+    silently skipping it.
+  - **"Verified" in the Genre sources panel is a stronger claim than it was.**
+    It now means the genre was quoted off a page naming this exact artist and
+    title, not that a model said it had a source. A single catalog we couldn't
+    corroborate is shown as "single source" and can fill an empty or generic
+    tag, but never overrides a specific one.
+  - **A verified lookup can now refine a tag within its own family** — Tech
+    House → Funky House, Trance → Psytrance — where before it had to disagree at
+    the family level to be allowed to. That guard existed because "verified" used
+    to be a model's word; against the direct read it only cost accuracy (6 tracks
+    on the test corpus went from roughly-right to exactly right, none went the
+    other way). Any replaced tag is still flagged for review — nothing changes
+    behind your back.
+  - Existing analyses are untouched until you re-analyze.
+  - The `--genre-llm-backend` option and its config field are still accepted so
+    old settings load cleanly, but they no longer do anything.
+
 ### Fixed
 - **Vocal detection finally hears chopped vocal hooks.** The vocal label came
   from the track-wide average of the model's per-segment voice score, so a

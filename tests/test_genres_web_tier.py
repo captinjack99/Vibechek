@@ -51,10 +51,21 @@ def test_ungrounded_web_does_not_override_specific_tag() -> None:
     assert r.subgenre == "Tech House" and r.source == "tag"
 
 
-def test_web_same_family_keeps_specific_tag() -> None:
-    # grounded web agrees on family (House) → no override, the specific tag stays.
+def test_verified_web_overrides_inside_the_family_too() -> None:
+    """A verified catalog read replaces the tag even when both sit in the House
+    family. The old rule required a family-level disagreement, which cost 6
+    exact answers on the adjudicated corpus and prevented none — "grounded" now
+    means the lookup quoted the genre off a page naming this exact track, not
+    that a model claimed a source."""
     r = reconcile_genre("House", "Deep House", 0.5, "Tech House", policy="prefer_tag",
                         web_genre="Bass House", web_grounded=True)
+    assert r.subgenre == "Bass House" and r.source == "web_override"
+    assert r.conflict is True     # the tag changed → still goes to the review queue
+
+
+def test_verified_web_agreeing_with_the_tag_keeps_the_tag() -> None:
+    r = reconcile_genre("House", "Deep House", 0.5, "Tech House", policy="prefer_tag",
+                        web_genre="Tech House", web_grounded=True)
     assert r.subgenre == "Tech House" and r.source == "tag" and r.conflict is False
 
 

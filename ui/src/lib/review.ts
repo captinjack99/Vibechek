@@ -2,7 +2,7 @@
  * Trust-UX: surfacing genre source conflicts for one-click review.
  *
  * The analyzer reconciles three genre signals — the in-file tag, the pure-audio
- * model, and (optionally) an online web-synthesis lookup — into one effective
+ * model, and (optionally) the online catalog lookup — into one effective
  * value, stamping the record with provenance: `ml_genre_source` (which signal
  * won) and `ml_genre_conflict` (whether they disagreed on family). See
  * `vibechek/genres.py:reconcile_genre` + `analyzer._reconcile_record_genre`.
@@ -112,9 +112,11 @@ export interface GenreProvenance {
   tag: string | null;
   /** The pure-audio model's read (subgenre preferred), pre-reconcile. */
   audio: string | null;
-  /** The online web-synthesis read, if the lookup ran. */
+  /** The online catalog read, if the lookup ran. */
   web: string | null;
-  /** Whether the web read cited an explicit source (vs. an LLM guess). */
+  /** Whether the online read was verified against the page it came from: the
+   *  genre field was quoted verbatim off a catalog page naming this exact
+   *  artist and title. False means a weaker single-catalog fill. */
   webGrounded: boolean;
   /** The effective value shown to the user. */
   effective: string | null;

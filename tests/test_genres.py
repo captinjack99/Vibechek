@@ -192,10 +192,10 @@ def test_build_report_prefer_ml_records_discarded_tag_conflict() -> None:
 
 
 def test_build_report_stamps_web_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When the online resolver runs, its read + grounding flag land on the
+    """When the online lookup runs, its read + verification flag land on the
     record so the UI's 'Genre sources' panel can show the web row honestly."""
     from vibechek import analyzer, genre_web
-    monkeypatch.setattr(genre_web, "ensure_backend", lambda *a, **k: True)
+    monkeypatch.setattr(genre_web, "resolver_ready", lambda: True)
     monkeypatch.setattr(
         genre_web, "resolve",
         lambda *a, **k: {"genre": "Trance", "confidence": 0.9,

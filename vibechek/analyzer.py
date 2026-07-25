@@ -182,8 +182,14 @@ class MLResult:
     # tracks for one-click review (tag ≠ audio ≠ web).
     ml_genre_audio: str | None = None      # pure-audio genre, pre-reconcile
     ml_subgenre_audio: str | None = None   # pure-audio subgenre, pre-reconcile
-    ml_genre_web: str | None = None        # online web-synthesis genre, if run
-    ml_genre_web_grounded: bool | None = None  # web cited an explicit source
+    ml_genre_web: str | None = None        # online catalog-lookup genre, if run
+    # True when the online read was DETERMINISTICALLY VERIFIED: the genre came
+    # out of a catalog page's structured genre field, the quote naming it is a
+    # verbatim span of the page bytes we fetched, and that page names both this
+    # artist and this title. (Before the deterministic tier landed this flag only
+    # meant "a language model claimed it had a source" — same field, strictly
+    # stronger guarantee, so old records stay readable and never over-claim.)
+    ml_genre_web_grounded: bool | None = None
     ml_genre_source: str | None = None     # tag|ml|ml_override|web|web_override
     ml_genre_conflict: bool | None = None  # tag and audio/web disagreed on family
     ml_vocal_audio: str | None = None      # pure-audio vocal label, pre-reconcile
@@ -2980,8 +2986,8 @@ def _reconcile_record_genre(
     Keeps the pure-audio read in `ml_genre_audio`/`ml_subgenre_audio` and sets
     `ml_genre`/`ml_subgenre` to the effective (reconciled) value plus
     `ml_genre_source` ("tag"|"ml"|"ml_override"|"web"|"web_override") and
-    `ml_genre_conflict`. When `web_cfg` is enabled, the online web-synthesis
-    resolver supplies a grounded genre (cached per artist+title). Idempotent:
+    `ml_genre_conflict`. When `web_cfg` is enabled, the online catalog lookup
+    supplies a verified genre (cached per artist+title). Idempotent:
     always re-derives from the stashed audio values. See genres.reconcile_genre +
     AnalysisConfig.genre_source_policy / genre_web_lookup.
     """
@@ -3156,29 +3162,29 @@ def _build_report(
     web_unavailable = False
     if not in_progress:
         pol, override = genre_policy
-        # Online web-synthesis genre lookup is per-track network+LLM I/O, so only
-        # run it on the final report, cached per artist+title.
+        # Online genre lookup is per-track network I/O (a search plus a few page
+        # fetches), so only run it on the final report, cached per artist+title.
         web_cache: dict[tuple[str, str], dict[str, Any]] | None = (
             {} if (web_cfg and web_cfg.get("enabled")) else None
         )
         if web_cache is not None:
             from vibechek import genre_web  # noqa: PLC0415
 
-            # The local LLM backend dies with the WSL VM (reboot / `wsl
-            # --shutdown`); ensure_backend() restarts the managed Ollama if it
-            # can. When it can't, SKIP the web tier loudly instead of paying a
-            # wasted web search per track only to silently fall back anyway.
-            if not genre_web.ensure_backend(web_cfg.get("backend", "ollama")):
+            # The tier needs its search + page-reading packages in whichever
+            # environment analysis runs in (they arrive with the one-click
+            # setup). When they're missing, SKIP the tier loudly instead of
+            # paying a wasted web search per track only to fall back anyway.
+            if not genre_web.resolver_ready():
                 log.warning(
-                    "Online genre lookup enabled but the local LLM backend is "
-                    "not reachable — falling back to tags + audio only",
+                    "Online genre lookup enabled but its packages aren't "
+                    "installed — falling back to tags + audio only",
                 )
-                # WP-G5: plain wording ("a small AI model" not "local LLM"). This
-                # is a transient progress line; the persistent, post-run banner is
-                # the genre_web_unavailable_warning report field set below.
+                # Plain wording, no package names. This is a transient progress
+                # line; the persistent, post-run banner is the
+                # genre_web_unavailable_warning report field set below.
                 _emit_event(
                     "stage", name="genre_web_unavailable",
-                    message="Online genre lookup isn't available right now — "
+                    message="Online genre lookup isn't set up — "
                             "using tags + audio only",
                 )
                 web_unavailable = True
@@ -3273,7 +3279,7 @@ def _build_report(
             # line the user may have missed.
             report["genre_web_unavailable_warning"] = (
                 "Online genre lookup wasn't available this run — genres used tags "
-                "and audio only. Restarting Vibechek usually restores it."
+                "and audio only. Set it up in Settings, then re-analyze."
             )
 
     return report

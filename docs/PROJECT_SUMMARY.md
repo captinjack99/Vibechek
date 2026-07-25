@@ -47,9 +47,11 @@ React UI ──[Tauri invoke]──► Rust shell ──[JSON-RPC stdin/stdout]�
   `onnx_backend` (an opt-in, GPU-accelerated ONNX Runtime inference engine mirroring
   `analyzer.load_models`, via the `inference_engine` config field); and two opt-in genre
   sources — `clap_genre` (a pure-audio CLAP-embedding + kNN classifier over a bundled
-  reference, via `genre_classifier="clap"`) and `genre_web` (a fully-local LLM that reads
-  web results for artist+title, via `genre_web_lookup`) — both layered into the existing
-  tag-vs-ML reconciliation in `genres.py`.
+  reference, via `genre_classifier="clap"`) and `genre_web` (a deterministic catalog
+  lookup: search artist+title, fetch the result pages, regex their structured genre
+  field, and keep it only when the page passes an artist+title identity gate — via
+  `genre_web_lookup`) — both layered into the existing tag-vs-ML reconciliation in
+  `genres.py`.
 - **Worker sizing (`resources.compute_worker_budget`):** the single source for how many
   workers an analyze run gets. `analyzer.py` calls it before dispatch and the
   `worker_budget` RPC exposes the identical computation for the Settings slider's max, so

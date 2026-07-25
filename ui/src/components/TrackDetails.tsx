@@ -526,11 +526,11 @@ function GenreSourcesSection({
           label="Online"
           value={p.web}
           won={winnerIsWeb}
-          hint={p.webGrounded ? "cited a source" : "unverified"}
+          hint={p.webGrounded ? "verified" : "single source"}
           hintTitle={
             p.webGrounded
-              ? "The online lookup cited an explicit source (e.g. a Beatport/Discogs page) naming this genre."
-              : "The model's best guess — no explicit source was cited, so weight it accordingly."
+              ? "Read off a store page that names this exact track, quoted from the page itself."
+              : "One catalog said so, and we couldn't confirm it elsewhere — weight it accordingly."
           }
         />
       )}

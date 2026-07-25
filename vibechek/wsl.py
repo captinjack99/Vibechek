@@ -2001,11 +2001,17 @@ def upgrade_vibechek_in_wsl(
 
 
 # ---------------------------------------------------------------------------
-# Opt-in genre engines: CLAP audio student + the online web-synthesis resolver
+# Opt-in genre engines: CLAP audio student + the online (catalog) genre lookup
 # ---------------------------------------------------------------------------
 
 # Pinned no-sudo Ollama release (the WSL distro default user has no passwordless
 # sudo, so we install the standalone tarball into ~/ollama). Bump on maintenance.
+#
+# NOTE: the online genre lookup no longer installs or uses Ollama — its
+# deterministic tier measured better than the model at a fraction of the cost.
+# These pins stay because they are the single source of truth for
+# `native_install._ollama_tarball()`; nothing in the shipping setup path calls
+# them today. Retiring them is a deliberate later cleanup.
 _OLLAMA_RELEASE = "v0.30.4"
 _OLLAMA_TARBALL_URL = (
     f"https://github.com/ollama/ollama/releases/download/{_OLLAMA_RELEASE}/"
@@ -2082,37 +2088,23 @@ echo "DONE"
 """
 
 
-def _resolver_setup_script(venv_subdir: str, model: str) -> str:
-    """Install ddgs + a no-sudo Ollama + pull the model + start the server."""
+def _resolver_setup_script(venv_subdir: str) -> str:
+    """Install the online genre lookup's two packages into the analysis venv.
+
+    The tier is deterministic — it searches, fetches catalog pages and regexes
+    their structured genre field — so it needs `ddgs` (search) and
+    `beautifulsoup4` (HTML → text) and nothing else. It used to also install a
+    no-sudo Ollama and pull a 4.7 GB model; that model was measured to add
+    nothing over the deterministic read at ~5x the cost, so it is gone.
+    """
     return f"""
 set -e
 VENV="$HOME/.vibechek/{venv_subdir}"
 [ -x "$VENV/bin/pip" ] || {{ echo "ERROR: $VENV missing — run the WSL setup first" >&2; exit 2; }}
-echo "[1/4] Installing ddgs + zstandard..."
-"$VENV/bin/pip" install --quiet ddgs zstandard
-echo "[2/4] Installing Ollama (no-sudo)..."
-trap 'rm -f "$HOME/ollama.tar.zst" "$HOME/ollama.tar"' EXIT
-if [ ! -x "$HOME/ollama/bin/ollama" ]; then
-  curl -fSL --speed-limit 1024 --speed-time 60 "{_OLLAMA_TARBALL_URL}" -o "$HOME/ollama.tar.zst"
-  # Content-hash gate: this tarball is unpacked and run as a local server.
-  echo "{_OLLAMA_TARBALL_SHA256["ollama-linux-amd64.tar.zst"]}  $HOME/ollama.tar.zst" | sha256sum -c - >/dev/null || {{
-    echo "ERROR: Ollama tarball failed SHA256 verification — refusing to install it" >&2
-    exit 4
-  }}
-  "$VENV/bin/python" -c "import zstandard,sys; fi=open('$HOME/ollama.tar.zst','rb'); fo=open('$HOME/ollama.tar','wb'); zstandard.ZstdDecompressor().copy_stream(fi,fo)"
-  mkdir -p "$HOME/ollama"; tar -xf "$HOME/ollama.tar" -C "$HOME/ollama"
-  rm -f "$HOME/ollama.tar" "$HOME/ollama.tar.zst"
-fi
-echo "[3/4] Starting Ollama + pulling {model} (~4.7 GB, one-time)..."
-mkdir -p "$HOME/.vibechek"
-if ! curl -s --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-  OLLAMA_HOST=127.0.0.1:11434 nohup "$HOME/ollama/bin/ollama" serve >"$HOME/.vibechek/ollama.log" 2>&1 &
-  for i in $(seq 1 20); do curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break; sleep 1; done
-fi
-OLLAMA_HOST=127.0.0.1:11434 "$HOME/ollama/bin/ollama" pull {model}
-echo "[4/4] Verifying..."
-curl -s --max-time 5 http://127.0.0.1:11434/api/tags | head -c 60
-echo ""
+echo "[1/2] Installing ddgs + beautifulsoup4..."
+"$VENV/bin/pip" install --quiet ddgs beautifulsoup4
+echo "[2/2] Verifying..."
+"$VENV/bin/python" -c "import ddgs, bs4; print('online genre lookup import ok')"
 echo "DONE"
 """
 
@@ -2219,12 +2211,14 @@ def setup_clap_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
 
 
 def setup_resolver_in_wsl(distro: str, on_progress: ProgressCallback | None = None,
-                          engine: str = "essentia_tf", model: str = "qwen2.5:7b") -> dict:
-    """Install the online genre resolver (ddgs + Ollama + model) inside `distro`."""
+                          engine: str = "essentia_tf") -> dict:
+    """Install the online genre lookup (ddgs + beautifulsoup4) inside `distro`."""
     venv_subdir = engine_venv_subdir(engine)
+    # Two small pure-python wheels now — minutes at worst, not the multi-GB
+    # model download the old 2 h ceiling was sized for.
     return _run_managed_wsl_script(
-        distro, _resolver_setup_script(venv_subdir, model), on_progress,
-        timeout_s=60 * 120, start_msg=f"Setting up the online genre resolver in {distro}…",
+        distro, _resolver_setup_script(venv_subdir), on_progress,
+        timeout_s=60 * 15, start_msg=f"Setting up the online genre lookup in {distro}…",
     )
 
 

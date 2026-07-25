@@ -445,57 +445,60 @@ def test_setup_resolver_native_requires_engine_venv(
     assert "engine setup" in out["error"]
 
 
-def test_setup_resolver_native_reuses_installed_ollama_and_pulls_model(
+def test_setup_resolver_native_installs_only_the_two_packages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With ~/ollama/bin/ollama already present: no download, server ensured,
-    `ollama pull <model>` run with OLLAMA_HOST pinned."""
+    """The online genre lookup is deterministic: it installs `ddgs` +
+    `beautifulsoup4` and NOTHING else. No Ollama download, no model pull — that
+    model measured worse than the regex read at ~5x the cost."""
     _genre_env(tmp_path, monkeypatch)
-    ollama_bin = tmp_path / "ollama" / "bin" / "ollama"
-    ollama_bin.parent.mkdir(parents=True)
-    ollama_bin.write_text("#!/bin/sh\n")
 
-    pulls: list[tuple[list[str], dict | None]] = []
+    pip_calls: list[list[str]] = []
 
     def _fake_run_with_progress(args, on_progress, timeout, env=None):
-        pulls.append((list(args), env))
+        pip_calls.append(list(args))
         return 0, ["success"]
 
     monkeypatch.setattr(native_install, "_run_with_progress", _fake_run_with_progress)
+    verifies: list[list[str]] = []
 
-    import vibechek.genre_web as genre_web_mod
-    monkeypatch.setattr(genre_web_mod, "ensure_backend", lambda *a, **k: True)
+    def _fake_verify(args, timeout):
+        verifies.append(list(args))
+        return 0, "online genre lookup import ok", "", False
+
+    monkeypatch.setattr(native_install, "_run_subprocess_cancellable", _fake_verify)
 
     def _must_not_download(*a, **k):  # pragma: no cover
-        raise AssertionError("ollama re-downloaded despite an existing install")
+        raise AssertionError("the resolver setup downloaded an archive")
 
     import vibechek.analyzer as analyzer_mod
     monkeypatch.setattr(analyzer_mod, "_download_from_mirrors", _must_not_download)
 
-    out = native_install.setup_resolver_native(model="qwen2.5:0.5b")
+    out = native_install.setup_resolver_native()
     assert out["ok"] is True, out
-    pull_call = next(c for c, _env in pulls if "pull" in c)
-    assert "qwen2.5:0.5b" in pull_call
-    pull_env = next(env for c, env in pulls if "pull" in c)
-    assert pull_env is not None and pull_env.get("OLLAMA_HOST") == "127.0.0.1:11434"
+    assert len(pip_calls) == 1
+    install = pip_calls[0]
+    assert "ddgs" in install and "beautifulsoup4" in install
+    assert not any("ollama" in a.lower() or "pull" in a for a in install)
+    # ...and the packages are import-verified in the venv the analyzer will use.
+    assert verifies and "import ddgs, bs4" in verifies[0][-1]
 
 
-def test_setup_resolver_native_fails_when_server_never_comes_up(
+def test_setup_resolver_native_fails_when_import_verify_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """pip reporting success is not proof the packages import in that venv — a
+    silent failure would show up as "no online read" on every track."""
     _genre_env(tmp_path, monkeypatch)
-    ollama_bin = tmp_path / "ollama" / "bin" / "ollama"
-    ollama_bin.parent.mkdir(parents=True)
-    ollama_bin.write_text("#!/bin/sh\n")
-
     monkeypatch.setattr(native_install, "_run_with_progress", lambda *a, **k: (0, []))
-
-    import vibechek.genre_web as genre_web_mod
-    monkeypatch.setattr(genre_web_mod, "ensure_backend", lambda *a, **k: False)
+    monkeypatch.setattr(
+        native_install, "_run_subprocess_cancellable",
+        lambda args, timeout: (1, "", "ModuleNotFoundError: No module named 'bs4'", False),
+    )
 
     out = native_install.setup_resolver_native()
     assert out["ok"] is False
-    assert "server" in out["error"].lower()
+    assert "import-verify failed" in out["error"]
 
 
 @pytest.mark.parametrize(

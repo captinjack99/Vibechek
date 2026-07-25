@@ -172,12 +172,12 @@ def main() -> None:
               help="Audio genre model: discogs (bundled Discogs-EffNet) or clap "
                    "(pure-audio CLAP+kNN student, ~2x better; needs CLAP setup).")
 @click.option("--genre-web-lookup/--no-genre-web-lookup", default=False, show_default=True,
-              help="Resolve genre online (local LLM reads web results for "
-                   "artist+title) and layer it into reconciliation. Needs network "
-                   "+ the local LLM.")
+              help="Look the genre up online (reads the genre field off catalog "
+                   "pages for artist+title) and layer it into reconciliation. "
+                   "Needs network + the online-lookup setup.")
 @click.option("--genre-llm-backend", type=click.Choice(["ollama"]),
               default="ollama", show_default=True,
-              help="LLM backend for --genre-web-lookup (ollama = local/private).")
+              help="Deprecated, ignored: the online lookup uses no model.")
 @click.option("--genre-override-confidence", type=click.FloatRange(0.0, 1.0),
               default=0.90, show_default=True,
               help="With --genre-policy prefer_tag: minimum ML confidence for "

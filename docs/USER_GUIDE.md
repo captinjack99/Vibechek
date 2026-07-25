@@ -59,7 +59,7 @@ On Windows the desktop app ships a **bundled native analysis engine** and uses i
 default, so a fresh install just starts analyzing — nothing to install. Skip to Step 3.
 
 Setup only appears on a fallback path: the CLI zip, or after you switch to the
-essentia-tensorflow / ONNX engine, or turn on the opt-in CLAP / online-resolver genre
+essentia-tensorflow / ONNX engine, or turn on the opt-in CLAP / online-lookup genre
 engines (which still run through WSL on Windows). Then the first time you click
 **Analyze with ML** a dialog shows what's missing:
 
@@ -76,7 +76,7 @@ A progress overlay at the bottom shows current track / total + elapsed time. You
 - Hit **Cancel** to stop. Partial results aren't kept; restart from scratch when you're ready.
 
 Before dispatching to a WSL-routed engine (essentia-tensorflow, ONNX, or the opt-in
-CLAP / online-resolver genre engines), Vibechek quietly verifies that environment
+CLAP / online-lookup genre engines), Vibechek quietly verifies that environment
 still imports its ML stack and repairs it in place if not — including restoring GPU
 libraries a WSL reinstall wiped out. If that happens you'll see a line like
 "Restoring GPU libraries…" scroll through the progress overlay instead of the run
@@ -404,7 +404,7 @@ cached for 5 minutes. Click **Re-probe** to force a fresh check.
 The worker slider's maximum isn't a fixed number — it's computed for your
 *current engine + genre classifier* against measured resources, so it can
 never offer more workers than will actually fit. On a WSL-routed engine
-(essentia-tensorflow, ONNX, or the opt-in CLAP / online-resolver genre
+(essentia-tensorflow, ONNX, or the opt-in CLAP / online-lookup genre
 engines) the memory it measures is the **WSL VM's RAM**, not your host's —
 that's the pool the workers actually draw from, and the hint under the slider
 names it ("15.5 GB measured" on "the WSL VM"). On the native engine it's your
@@ -454,7 +454,7 @@ All changes auto-save 500ms after you stop typing/dragging. No "Save" button.
   inference. Bundled into the Windows desktop installer, so a fresh Windows install
   analyzes with zero setup. CPU-only (the bundle ships CPU ONNX Runtime); switch to
   ONNX for GPU. macOS/Linux don't need it — they're already native via the ONNX
-  engine. (The opt-in CLAP / online-resolver genre engines aren't supported on the
+  engine. (The opt-in CLAP / online-lookup genre engines aren't supported on the
   native engine; switch to ONNX or essentia-tensorflow to use them.)
 - **Essentia · TensorFlow** (default on macOS/Linux; runs in WSL on Windows) — the
   bundled, NVIDIA-only path.
@@ -490,12 +490,13 @@ Analysis** (BPM/key/mood are unaffected by these):
   button isn't available while you're on the native engine** (Windows default) — you'll
   see an inline hint instead of the button. Switch **Settings → Analysis → Inference
   engine** to ONNX or Essentia · TensorFlow first, then come back and set up CLAP.
-- **Online genre lookup** (toggle) — a **fully-local LLM** reads web results for each
-  track's artist + title and synthesizes the specific subgenre, distrusting commercial
-  chart buckets ("Dance/Pop") and verifying the match. It's layered in as **your tag ›
-  grounded web › audio** — the most accurate option on tagged libraries, and fully private
-  (a local model, no API key, no upload). Click **Set up online resolver** (a one-time
-  local-LLM install). It adds time per track and is **off by default**.
+- **Online genre lookup** (toggle) — searches for each track's artist + title, opens the
+  store pages the search returns, and reads the genre straight off the page. It only keeps
+  a genre when that page names this exact track, and it refuses shop categories like
+  "Dance/Pop" that aren't really genres. The result is layered in as **your tag › verified
+  web › audio** — the most accurate option on tagged libraries (73% exact on our test
+  library, against 52% for tags and audio alone). No AI model and no account: click
+  **Set up online lookup** once. It adds a few seconds per track and is **off by default**.
 - **Genre source** — how an *existing* tag is reconciled with the model read:
   **Prefer existing tag** (default — trust a specific Beatport-style tag, use the model to
   fill gaps + override only when very confident, ignore generic junk), **Prefer ML**,
@@ -543,7 +544,7 @@ doesn't trigger a false warning.)
 
 A fresh desktop install shouldn't see this — it uses the bundled native engine with
 no setup. It appears on a fallback path (the CLI zip, or after switching to the
-essentia-tensorflow / ONNX engine, or the CLAP / online-resolver genre engines).
+essentia-tensorflow / ONNX engine, or the CLAP / online-lookup genre engines).
 The Preflight dialog should be handling it for you. If you closed it, click Analyze
 again — it'll re-open. The dialog will walk you through:
 1. Installing WSL Ubuntu (one-time, ~5-15 min, UAC prompt)

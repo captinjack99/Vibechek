@@ -142,12 +142,15 @@ class AnalysisConfig:
     # student — ~2x better, needs the one-click CLAP setup; falls back to discogs
     # if unavailable). BPM/key/mood are unaffected either way.
     genre_classifier: str = "discogs"  # "discogs" | "clap"
-    # When True, an online web-synthesis resolver (local LLM reads web results for
-    # artist+title) supplies a grounded genre layered into reconciliation
-    # (tag › web › audio) — ~60% on tagged libraries. Needs network + the local
-    # LLM (one-click setup). Off by default. `genre_llm_backend` selects the LLM
-    # ("ollama" = local/private, the shipped backend).
+    # When True, an online genre lookup reads the structured genre field off
+    # catalog pages for artist+title and layers the verified result into
+    # reconciliation (tag › web › audio) — 73% exact / 87% family on the
+    # adjudicated corpus, vs 52%/71% for tags+audio alone. Needs network + the
+    # one-click setup (two small packages). Off by default.
     genre_web_lookup: bool = False
+    # DEPRECATED — no effect. The lookup is deterministic (no model), so there is
+    # no backend to choose. Still accepted, validated and round-tripped so
+    # configs written by older versions load without warnings.
     genre_llm_backend: str = "ollama"  # "ollama"
 
 

@@ -989,11 +989,16 @@ def ensure_native_engine_runtime(
 
 
 # ---------------------------------------------------------------------------
-# Opt-in genre engines (CLAP student / online resolver) — native analogs of
-# wsl.setup_clap_in_wsl / setup_resolver_in_wsl. Same venv layout, same
-# artifact paths (~/.vibechek/clap/music_clap.pt, ~/ollama/bin/ollama), so the
-# analyze-time consumers (analyzer._maybe_load_clap, genre_web.ensure_backend)
-# work unchanged on native Linux/macOS.
+# Opt-in genre engines (CLAP student / online genre lookup) — native analogs of
+# wsl.setup_clap_in_wsl / setup_resolver_in_wsl. Same venv layout, same artifact
+# paths (~/.vibechek/clap/music_clap.pt), so the analyze-time consumers
+# (analyzer._maybe_load_clap, genre_web.resolver_ready) work unchanged on native
+# Linux/macOS.
+#
+# `_ollama_tarball()` below is no longer reached by either setup: the online
+# genre lookup dropped its local model for the deterministic catalog read. It
+# stays as the single place that resolves the pinned release per OS/arch, for a
+# deliberate later cleanup.
 # ---------------------------------------------------------------------------
 
 # The 2.2 GB CLAP checkpoint; anything below this is a truncated/error download
@@ -1180,20 +1185,18 @@ def setup_clap_native(
 def setup_resolver_native(
     on_progress: ProgressCallback | None = None,
     engine: str = "essentia_tf",
-    model: str = "qwen2.5:7b",
 ) -> dict:
-    """Install the online genre resolver natively (Linux/macOS).
+    """Install the online genre lookup natively (Linux/macOS).
 
-    Mirror of `wsl.setup_resolver_in_wsl`: ddgs + zstandard into the engine's
-    venv, a no-sudo Ollama under ~/ollama (platform tarball via
-    `_ollama_tarball`), start the server (reuses `genre_web.ensure_backend` —
-    the same code that self-heals it at analyze time), pull `model`, verify.
+    Mirror of `wsl.setup_resolver_in_wsl`: `ddgs` (search) + `beautifulsoup4`
+    (HTML → text) into the engine's venv, then an import-verify inside that venv.
+    The tier is deterministic — it reads catalog pages' structured genre field —
+    so there is no model to install: the old Ollama + 4.7 GB pull measured worse
+    than the regex read at ~5x the cost.
     Cancellable; streams progress. Returns the WSL helpers' dict shape.
     """
     if not IS_SUPPORTED:
         return {"ok": False, "error": f"Native genre-engine setup not supported on {sys.platform}"}
-
-    import tempfile  # noqa: PLC0415
 
     from vibechek import cancellation  # noqa: PLC0415
 
@@ -1206,11 +1209,11 @@ def setup_resolver_native(
         if on_progress:
             on_progress(pct, 100, msg)
 
-    # ---- 1. python deps (zstandard also decompresses the linux tarball below)
-    _step(2, "[1/4] Installing ddgs + zstandard...")
+    # ---- 1. the two packages
+    _step(2, "[1/2] Installing ddgs + beautifulsoup4...")
     rc, tail = _run_with_progress(
-        [*venv_pip, "install", "--quiet", "ddgs", "zstandard"],
-        on_progress=lambda line: _step(8, line[:120]),
+        [*venv_pip, "install", "--quiet", "ddgs", "beautifulsoup4"],
+        on_progress=lambda line: _step(40, line[:120]),
         timeout=60 * 10,
     )
     if cancellation.is_cancelled():
@@ -1218,103 +1221,22 @@ def setup_resolver_native(
     if rc != 0:
         return _fail("ddgs install", rc, tail)
 
-    # ---- 2. the no-sudo Ollama under ~/ollama (idempotent)
-    ollama_bin = Path.home() / "ollama" / "bin" / "ollama"
-    if not ollama_bin.is_file():
-        url, kind, expected_sha = _ollama_tarball()
-        _step(15, f"[2/4] Installing Ollama (no-sudo, {kind})...")
-        from vibechek.analyzer import _download_from_mirrors  # noqa: PLC0415
-        from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
-
-        with tempfile.TemporaryDirectory(prefix="vibechek-ollama-") as td:
-            archive = Path(td) / f"ollama.{kind}"
-
-            def _dl_progress(done: int, total: int) -> None:
-                pct = 15 + int(25 * done / total) if total > 0 else 25
-                _step(pct, f"Ollama download ({done // 2**20} MB/{total // 2**20} MB)")
-
-            try:
-                _download_from_mirrors([url], archive, label="ollama", on_progress=_dl_progress)
-            except cancellation.CancelledError:
-                return {"ok": False, "error": "Cancelled by user", "cancelled": True}
-            except RuntimeError as e:
-                return {"ok": False, "error": f"Ollama download failed: {e}"}
-
-            # Content-hash gate: the tarball is unpacked and executed as a
-            # long-lived local server; the release is version-pinned, so pin
-            # the bytes too (same story as the CLAP checkpoint).
-            try:
-                verify_model_sha256(archive, expected_sha)
-            except RuntimeError as e:
-                return {"ok": False,
-                        "error": f"Ollama tarball failed SHA256 verification: {e}"}
-
-            _step(42, "Unpacking Ollama...")
-            target = Path.home() / "ollama"
-            if kind == "tar.zst":
-                # Decompress with the venv's zstandard (installed in step 1) —
-                # no system zstd dependency; then plain tar (linux layout has
-                # bin/ + lib/ at the archive root).
-                tar_path = Path(td) / "ollama.tar"
-                rc, out, errout, cancelled = _run_subprocess_cancellable(
-                    [str(venv_python), "-c",
-                     "import zstandard,sys;"
-                     "fi=open(sys.argv[1],'rb');fo=open(sys.argv[2],'wb');"
-                     "zstandard.ZstdDecompressor().copy_stream(fi,fo)",
-                     str(archive), str(tar_path)],
-                    timeout=60 * 10,
-                )
-                if cancelled or cancellation.is_cancelled():
-                    return {"ok": False, "error": "Cancelled by user", "cancelled": True}
-                if rc != 0:
-                    return {"ok": False, "error": f"Ollama unpack (zstd) failed:\n{errout[-500:]}"}
-                target.mkdir(parents=True, exist_ok=True)
-                rc, out, errout, cancelled = _run_subprocess_cancellable(
-                    ["tar", "-xf", str(tar_path), "-C", str(target)], timeout=60 * 10,
-                )
-            else:
-                # darwin .tgz: the bare `ollama` binary at the tar root → land
-                # it in bin/ ourselves so ensure_backend's path works.
-                (target / "bin").mkdir(parents=True, exist_ok=True)
-                rc, out, errout, cancelled = _run_subprocess_cancellable(
-                    ["tar", "-xzf", str(archive), "-C", str(target / "bin")], timeout=60 * 10,
-                )
-            if cancelled or cancellation.is_cancelled():
-                return {"ok": False, "error": "Cancelled by user", "cancelled": True}
-            if rc != 0:
-                return {"ok": False, "error": f"Ollama unpack (tar) failed:\n{errout[-500:]}"}
-        if not ollama_bin.is_file():
-            return {"ok": False,
-                    "error": f"Ollama unpacked but {ollama_bin} is missing (layout change?)"}
-        ollama_bin.chmod(0o755)
-    else:
-        _step(40, "Ollama already installed, reusing")
-
-    # ---- 3. server + model pull
-    _step(50, f"[3/4] Starting Ollama + pulling {model} (one-time)...")
-    from vibechek.genre_web import ensure_backend  # noqa: PLC0415
-
-    if not ensure_backend():
-        return {"ok": False,
-                "error": "Ollama installed but the server did not come up "
-                         "(see ~/.vibechek/ollama.log)"}
-    rc, tail = _run_with_progress(
-        [str(ollama_bin), "pull", model],
-        on_progress=lambda line: _step(70, line[:120]),
-        timeout=60 * 120,  # multi-GB model on arbitrary connections
-        env={**os.environ, "OLLAMA_HOST": "127.0.0.1:11434"},
+    # ---- 2. import-verify INSIDE the venv the analyzer will use. pip reporting
+    # success is not proof the packages import there (wrong interpreter, broken
+    # wheel), and a silent failure here would surface as "no online read" on
+    # every track with nothing to point at.
+    _step(80, "[2/2] Verifying...")
+    rc, out, errout, cancelled = _run_subprocess_cancellable(
+        [str(venv_python), "-c", "import ddgs, bs4; print('online genre lookup import ok')"],
+        timeout=120,
     )
-    if cancellation.is_cancelled():
+    if cancelled or cancellation.is_cancelled():
         return {"ok": False, "error": "Cancelled by user", "cancelled": True}
     if rc != 0:
-        return _fail(f"ollama pull {model}", rc, tail)
-
-    # ---- 4. verify
-    _step(95, "[4/4] Verifying...")
-    if not ensure_backend():
-        return {"ok": False, "error": "Ollama server unreachable after setup"}
-    _step(100, "Online genre resolver ready")
-    return {"ok": True, "tail": "\n".join(tail[-10:])}
+        return {"ok": False,
+                "error": f"Packages installed but import-verify failed:\n{errout[-800:]}"}
+    _step(100, "Online genre lookup ready")
+    return {"ok": True, "tail": out.strip()}
 
 
 __all__ = [

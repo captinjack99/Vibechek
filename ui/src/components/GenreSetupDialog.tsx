@@ -1,10 +1,10 @@
 /**
  * Generic progress dialog for the opt-in genre engine setups (CLAP audio
- * student / online web-synthesis resolver). Both `setup_clap_engine` and
+ * student / online genre lookup). Both `setup_clap_engine` and
  * `setup_genre_resolver` emit `progress` notifications (0-100) while they
- * install deps + download a multi-GB model; this modal shows a live bar + the
- * current step, and a clear success / error / cancel state. Mirrors
- * OnnxSetupDialog but parameterized by title/message.
+ * install into the analysis venv (CLAP also downloads a multi-GB model); this
+ * modal shows a live bar + the current step, and a clear success / error /
+ * cancel state. Mirrors OnnxSetupDialog but parameterized by title/message.
  *
  * A11y: role="dialog" + aria-modal; Esc closes in the done/error states (it
  * stays inert while running — Cancel is the only escape hatch then, matching

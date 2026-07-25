@@ -340,12 +340,24 @@ def reconcile_genre(
     ignores generic junk tags, and lets a confident, disagreeing ML read
     override. Pure + fully unit-testable; see AnalysisConfig.genre_source_policy.
 
-    `web_genre` (optional) is a genre resolved by the online web-synthesis
-    classifier — a stronger signal than the audio model. When present + usable it
-    SUPERSEDES the audio read as the "ML-side" source: with a specific tag it only
-    overrides when the lookup was `web_grounded` (cited an explicit source) AND
-    disagrees on family (catches stale-tag taxonomy drift, zero-regression);
-    otherwise the tiered blend is tag › web › audio.
+    `web_genre` (optional) is a genre resolved by the online genre lookup — a
+    stronger signal than the audio model. When present + usable it SUPERSEDES the
+    audio read as the "ML-side" source: with a specific tag it overrides only
+    when the lookup was `web_grounded`; otherwise the tiered blend is
+    tag › web › audio.
+
+    `web_grounded` means the lookup VERIFIED the read itself — the genre came off
+    a catalog page's structured field, quoted verbatim from the page bytes, on a
+    page naming this exact artist and title (see genre_web.resolve). That is why
+    such a read is allowed to replace a specific tag even when the two sit in the
+    SAME family: the guard used to also require a family-level disagreement,
+    because "grounded" once meant only that a language model claimed it had a
+    source. Against the deterministic read that guard is pure loss — measured on
+    the 86-track adjudicated corpus it suppressed 6 overrides, every one of which
+    turned a merely family-correct answer into an exact one, and broke nothing
+    (64.0% → 70.9% exact, family unchanged at 82.6%). An override always sets
+    `conflict`, so a replaced tag still reaches the review queue rather than
+    changing silently.
     """
     tag = (existing_tag or "").strip()
     specific = is_specific_genre(tag)
@@ -362,9 +374,11 @@ def reconcile_genre(
             return ReconciledGenre(tag_parent, tag_sub, 1.0, "tag", conflict)
         if policy == "prefer_ml":
             return ReconciledGenre(w_parent, w_sub, 0.9, "web", conflict)
-        # prefer_tag: trust the specific tag; the grounded web read overrides ONLY
-        # when it disagrees on family (the tag is probably stale/wrong).
-        if web_grounded and conflict:
+        # prefer_tag: trust the specific tag, but a VERIFIED catalog read replaces
+        # it whenever the two actually differ — including a same-family
+        # refinement like Tech House → Funky House (see the docstring for the
+        # measurement). An identical read changes nothing and stays "tag".
+        if web_grounded and (w_parent, w_sub) != (tag_parent, tag_sub):
             return ReconciledGenre(w_parent, w_sub, 0.9, "web_override", True)
         return ReconciledGenre(tag_parent, tag_sub, 0.99, "tag", conflict)
 

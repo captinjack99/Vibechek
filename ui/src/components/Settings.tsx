@@ -299,9 +299,10 @@ export function Settings() {
     }
   };
 
-  // Opt-in genre engine setups (CLAP audio student / online web resolver). Both
-  // install heavy deps + download a multi-GB model into the analysis venv, with
-  // live progress + cancellation — same shape as the ONNX setup above.
+  // Opt-in genre engine setups (CLAP audio student / online genre lookup). Both
+  // install into the analysis venv with live progress + cancellation — same
+  // shape as the ONNX setup above. CLAP also downloads a multi-GB model; the
+  // online lookup is two small packages (it uses no model).
   const handleSetupGenreEngine = async (
     kind: "clap" | "resolver",
     setState: (s: GenreSetupState) => void,
@@ -331,7 +332,7 @@ export function Settings() {
         notify(
           kind === "clap"
             ? "CLAP genre engine ready — re-analyze to use it"
-            : "Online genre resolver ready — enable it and re-analyze",
+            : "Online genre lookup ready — enable it and re-analyze",
           { kind: "success" },
         );
         refreshPreflight();
@@ -981,7 +982,7 @@ export function Settings() {
 
         <Field label="Online genre lookup">
           <Toggle
-            label="Resolve genre online (small AI model + web)"
+            label="Look each track's genre up online"
             checked={cfg.analysis.genre_web_lookup}
             onChange={(v) => updateAnalysis({ genre_web_lookup: v })}
           />
@@ -992,15 +993,18 @@ export function Settings() {
               disabled={diagBusy !== null || active !== null}
             >
               <Download className="w-4 h-4" />
-              {diagBusy === "resolver-setup" ? "Setting up resolver…" : "Set up online resolver"}
+              {diagBusy === "resolver-setup"
+                ? "Setting up online lookup…"
+                : "Set up online lookup"}
             </button>
           )}
           <Hint>
-            Looks up each track's genre online (a small AI model reads the web
-            results for the artist + title), then layers it into reconciliation
-            (tag › web › audio) — the most accurate option (~60%) on tagged
-            libraries. Needs network + a small AI model (one-time ~4.7 GB setup,
-            fully private). Adds time per track; off by default.
+            Searches for each track by artist + title and reads the genre
+            straight off the store page, keeping it only when that page names
+            this exact track. The result layers into reconciliation
+            (tag › web › audio) — the most accurate option, 73% exact on our
+            test library against 52% for tags and audio alone. Needs network and
+            a quick one-time setup. Adds a few seconds per track; off by default.
           </Hint>
         </Field>
 
@@ -1465,8 +1469,8 @@ export function Settings() {
       />
       <GenreSetupDialog
         state={resolverSetup}
-        title="Set up online genre resolver"
-        doneMessage="Online genre resolver ready. Re-analyze with online lookup enabled to use it."
+        title="Set up online genre lookup"
+        doneMessage="Online genre lookup ready. Re-analyze with it enabled to use it."
         onClose={() => setResolverSetup(null)}
         onCancel={handleCancelGenreSetup}
         opId={engineSetupOpIdRef.current}

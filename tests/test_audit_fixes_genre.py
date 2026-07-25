@@ -123,16 +123,16 @@ def _track(path: str, artist: str, title: str, tag: str | None = None) -> dict:
     }
 
 
-def test_web_phase_skipped_loudly_when_backend_unreachable(
+def test_web_phase_skipped_loudly_when_packages_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the local LLM isn't reachable (and can't be started), the web tier
-    must be skipped ENTIRELY — not pay a wasted web search per track only to
-    silently fall back."""
-    monkeypatch.setattr(genre_web, "ensure_backend", lambda *a, **k: False)
+    """When the lookup's packages aren't installed in the analysis environment,
+    the web tier must be skipped ENTIRELY — not pay a wasted web search per
+    track only to silently fall back — and the run must say so."""
+    monkeypatch.setattr(genre_web, "resolver_ready", lambda: False)
 
     def boom(*a, **k):  # resolve must never be called in this scenario
-        raise AssertionError("genre_web.resolve called despite dead backend")
+        raise AssertionError("genre_web.resolve called despite an unusable tier")
 
     monkeypatch.setattr(genre_web, "resolve", boom)
     rep = analyzer._build_report(
@@ -141,10 +141,12 @@ def test_web_phase_skipped_loudly_when_backend_unreachable(
     )
     # Reconciliation still ran (generic tag -> audio read).
     assert rep["tracks"][0]["ml_analysis"]["ml_genre_source"] == "ml"
+    # ...and the degradation is surfaced, not swallowed.
+    assert "Online genre lookup wasn't available" in rep["genre_web_unavailable_warning"]
 
 
 def test_web_phase_caches_per_artist_title(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(genre_web, "ensure_backend", lambda *a, **k: True)
+    monkeypatch.setattr(genre_web, "resolver_ready", lambda: True)
     calls = []
 
     def fake_resolve(artist, title, tag, audio, **kw):
@@ -209,50 +211,31 @@ def test_canon_never_invents_specificity(raw: str, expected: str) -> None:
     assert genre_web._canon(raw) == expected
 
 
-def test_ensure_backend_true_when_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    import urllib.request  # noqa: PLC0415
+def test_resolver_ready_needs_both_packages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Readiness is about the deterministic tier's own dependencies (search +
+    HTML parsing), not about any model server."""
+    import importlib.util  # noqa: PLC0415
 
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
-    assert genre_web.ensure_backend("ollama") is True
+    monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: object())
+    assert genre_web.resolver_ready() is True
+    monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: None)
+    assert genre_web.resolver_ready() is False
 
 
-def test_ensure_backend_false_when_unreachable_and_no_install(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+def test_grounding_requires_evidence_we_fetched_ourselves(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import urllib.request  # noqa: PLC0415
+    """No search results means no read at all.
 
-    def boom(*a, **k):
-        raise ConnectionError("refused")
-
-    monkeypatch.setattr(urllib.request, "urlopen", boom)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)   # no ~/ollama install
-    assert genre_web.ensure_backend("ollama") is False
-    assert genre_web.ensure_backend("not-a-backend") is False
-
-
-def test_grounding_requires_actual_web_results(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With ZERO web snippets the model can still claim source_matched and
-    fabricate evidence text that names the genre — so the tier is skipped
-    entirely: no genre leaks out, and it can never be labelled a grounded web
-    read. (Stronger than merely refusing the source_matched flag: an ungrounded
-    guess must not masquerade as 'an online source' at all.)"""
+    An empty draw must not produce a genre from anywhere else — the pipeline
+    would label it "Set by an online source" at 0.9 confidence, a provenance the
+    user never actually got. `source_matched` is only ever set from a page this
+    module fetched, parsed and identity-checked itself.
+    """
     def ddgs_boom(q, n=6):
         raise RuntimeError("throttled")
 
-    monkeypatch.setattr(genre_web, "_ddgs_snippets", ddgs_boom)
-    monkeypatch.setattr(
-        genre_web, "_llm_chat",
-        lambda *a, **k: {"genre": "Tech House", "confidence": 0.95,
-                         "source_matched": True,
-                         "evidence": "Beatport: Genre: Tech House"},
-    )
+    monkeypatch.setattr(genre_web, "_ddgs_results", ddgs_boom)
     r = genre_web.resolve("A", "B")
     assert r["genre"] == ""            # no ungrounded read escapes
     assert r["used_web"] is False
@@ -368,10 +351,24 @@ def test_canonical_subgenres_inherit_parent() -> None:
     assert split_tag_genre("UK Garage") == ("House", "UK Garage")
 
 
-def test_same_family_web_does_not_override_canonical_tag() -> None:
-    """Grounded web "Psytrance" vs a correct "Trance" tag is the SAME family —
-    it must keep the tag, not fire web_override (the lost-parent bug)."""
+def test_same_family_web_refines_the_tag_without_losing_its_parent() -> None:
+    """A VERIFIED web read of "Psytrance" against a broader "Trance" tag is a
+    refinement, and since the deterministic lookup verifies its own evidence it
+    is allowed to land (measured: 6 such tracks, family-correct → exact, zero
+    regressions). The parent must survive the swap — that was the original
+    lost-parent bug this case guards."""
     r = reconcile_genre("House", "Deep House", 0.4, "Trance",
+                        policy="prefer_tag", web_genre="Psytrance",
+                        web_grounded=True)
+    assert r.source == "web_override"
+    assert (r.genre, r.subgenre) == ("Trance", "Psytrance")
+    # A replaced tag is always flagged, so it reaches the review queue instead of
+    # changing behind the user's back.
+    assert r.conflict is True
+
+
+def test_web_read_identical_to_the_tag_changes_nothing() -> None:
+    r = reconcile_genre("House", "Deep House", 0.4, "Psytrance",
                         policy="prefer_tag", web_genre="Psytrance",
                         web_grounded=True)
     assert r.source == "tag"

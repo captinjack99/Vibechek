@@ -80,7 +80,7 @@ in-process; it ships CPU-only (see the GPU section for the ONNX-engine GPU path)
 Essentia itself has no Windows wheel, so the fallback path below is used when the
 native bundle isn't present — the lean CLI `.zip`, a `pip install`, or when you
 switch to the **essentia-tensorflow** or **ONNX** engines (or the opt-in CLAP /
-online-resolver genre engines, which still run through WSL on Windows). On a
+online-lookup genre engines, which still run through WSL on Windows). On a
 fallback path the desktop app sets everything up for you; the first time you click
 **Analyze** there, a setup dialog walks you through it — no terminal required:
 
@@ -220,7 +220,7 @@ one of two things to read/write audio:
 
 You only need this for `cdj-export`; nothing else in Vibechek depends on it.
 
-## The opt-in genre engines (CLAP audio model / online resolver)
+## The opt-in genre engines (CLAP audio model / online lookup)
 
 Genre has two optional accuracy upgrades over the bundled Discogs-EffNet head. Both are
 **opt-in** (the default install ships neither) and both have a one-click **Set up …** button
@@ -233,11 +233,14 @@ you're installing into your own environment.
   ~2.2 GB CLAP checkpoint once (into `~/.vibechek/clap/`). Manual: `pip install
   "vibechek[clap]"` then click **Set up CLAP genre engine** (or run the analyze with
   `--genre-classifier clap`). The small kNN reference library is bundled in the app.
-- **Online genre lookup** (`genre_web_lookup`) — a fully-local LLM reads web results for the
-  track's artist + title. The in-app setup installs `vibechek[resolver]` (`ddgs`) plus a
-  no-sudo **Ollama** + a ~4.7 GB model. Fully private — a local model, no API key, no
-  upload. Manual: `pip install "vibechek[resolver]"` then click **Set up online resolver**
-  (or analyze with `--genre-web-lookup`).
+- **Online genre lookup** (`genre_web_lookup`) — searches for the track's artist + title,
+  fetches the catalog pages the search returned, and reads the genre straight off their
+  structured genre field, keeping it only when that page names this exact track. No model
+  and no API key: the in-app setup installs `vibechek[resolver]` (`ddgs` for the keyless
+  search, `beautifulsoup4` for HTML → text) and nothing else. Manual: `pip install
+  "vibechek[resolver]"` then click **Set up online lookup** (or analyze with
+  `--genre-web-lookup`). `--genre-llm-backend` is accepted but has no effect — the earlier
+  local-LLM version of this tier was measured worse than the direct read and was removed.
 
 Both run inside the same analysis environment as Essentia (WSL on Windows, the managed
 `~/.vibechek` venv on Linux/macOS), so one worker does BPM/key/mood *and* the new genre

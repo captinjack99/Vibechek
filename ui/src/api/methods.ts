@@ -296,9 +296,10 @@ export interface AnalyzeDirectoryRequest {
   genre_source_policy?: string;
   /** Audio genre model: "discogs" | "clap". */
   genre_classifier?: string;
-  /** Resolve genre online (local LLM reads web results). */
+  /** Look the genre up online (reads catalog pages' genre field). */
   genre_web_lookup?: boolean;
-  /** LLM backend for the online genre lookup ("ollama"). */
+  /** Deprecated, no effect: the online lookup uses no model. Still sent so
+   *  configs written by older versions round-trip unchanged. */
   genre_llm_backend?: string;
   /** prefer_tag: min ML confidence to override a disagreeing specific tag. */
   genre_ml_override_confidence?: number;
@@ -487,7 +488,7 @@ export interface SetupGenreEngineRequest {
   inference_engine?: string;
 }
 
-/** Result of a one-click opt-in genre engine setup (CLAP / online resolver). */
+/** Result of a one-click opt-in genre engine setup (CLAP / online lookup). */
 export interface SetupGenreEngineResult {
   ok: boolean;
   ready: boolean;

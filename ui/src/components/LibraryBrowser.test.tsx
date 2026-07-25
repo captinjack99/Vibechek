@@ -595,7 +595,7 @@ describe("<LibraryBrowser /> — analyze completion toast", () => {
       summary: { total_files: 3, analyzed: 3, errors: 0 },
       tracks: [track("D:/LibraryA/a.mp3")],
       genre_web_unavailable_warning:
-        "Online genre lookup wasn't available this run — genres used tags and audio only. Restarting Vibechek usually restores it.",
+        "Online genre lookup wasn't available this run — genres used tags and audio only. Set it up in Settings, then re-analyze.",
     });
 
     await waitFor(() => {

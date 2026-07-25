@@ -442,8 +442,10 @@ export function setupClapEngine(
 }
 
 /**
- * One-click setup for the online web-synthesis genre resolver: installs ddgs +
- * a local Ollama and pulls the model. Cancellable; emits `progress`.
+ * One-click setup for the online genre lookup: installs its two packages (web
+ * search + HTML parsing) into the analysis environment. The lookup itself is
+ * deterministic — it reads the genre field off catalog pages, no model
+ * involved. Cancellable; emits `progress`.
  */
 export function setupGenreResolver(
   params: SetupGenreEngineRequest = {},

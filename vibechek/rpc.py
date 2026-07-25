@@ -372,7 +372,7 @@ def _analyze_directory(params: dict) -> dict:
         # Existing-tag vs ML genre reconciliation policy (see AnalysisConfig).
         # Validated so a bad value can't silently disable reconciliation.
         genre_source_policy=_valid_genre_policy(params.get("genre_source_policy")),
-        # Genre classifier (discogs|clap) + optional online web-synthesis lookup.
+        # Genre classifier (discogs|clap) + the optional online catalog lookup.
         genre_classifier=_valid_genre_classifier(params.get("genre_classifier")),
         genre_web_lookup=bool(params.get("genre_web_lookup", False)),
         genre_llm_backend=_valid_llm_backend(params.get("genre_llm_backend")),
@@ -780,7 +780,8 @@ def _valid_genre_classifier(value: Any, default: str = "discogs") -> str:
 
 
 def _valid_llm_backend(value: Any, default: str = "ollama") -> str:
-    """Whitelist the genre web-lookup LLM backend."""
+    """Whitelist the deprecated genre-lookup backend field (kept for config
+    compatibility; the online lookup is deterministic and uses no model)."""
     return value if value in ("ollama",) else default
 
 
@@ -1389,8 +1390,8 @@ def _setup_genre_engine(params: dict, *, kind: str) -> dict:
     """Shared one-click setup for the opt-in genre engines.
 
     `kind` is "clap" (pure-audio CLAP+kNN student: torch+laion-clap + 2.2 GB
-    checkpoint) or "resolver" (online web-synthesis: ddgs + Ollama + 4.7 GB
-    model). Both install into the ACTIVE analysis venv so one worker can run them
+    checkpoint) or "resolver" (online genre lookup: ddgs + beautifulsoup4, two
+    small packages). Both install into the ACTIVE analysis venv so one worker can run them
     alongside essentia/onnx. Cancellable; emits `progress`. Windows → WSL;
     Linux/macOS → the native managed venv (same paths, no WSL).
     """
@@ -1398,8 +1399,8 @@ def _setup_genre_engine(params: dict, *, kind: str) -> dict:
 
     engine = _active_engine(params)
     # The native engine analyzes IN-PROCESS in the frozen sidecar on Windows —
-    # a Python that can never import the torch/laion-clap (or reach the Ollama
-    # server) this setup would install into a WSL venv. Without this guard the
+    # a Python that can never import the torch/laion-clap (or the ddgs/bs4)
+    # this setup would install into a WSL venv. Without this guard the
     # user sat through a multi-GB "successful" setup whose feature then
     # silently never activated (_maybe_load_clap swallows the ImportError and
     # falls back to Discogs). Refuse honestly instead.
@@ -1407,8 +1408,8 @@ def _setup_genre_engine(params: dict, *, kind: str) -> dict:
         return {
             "ok": False, "ready": False,
             "error": (
-                "The CLAP / web-resolver genre engines aren't supported with "
-                "the native (in-process) engine yet: their extras install "
+                "The advanced genre model and the online genre lookup aren't "
+                "supported with the native (in-process) engine yet: their extras install "
                 "into a WSL environment the native analyzer can't use. "
                 "Switch the inference engine to ONNX Runtime or "
                 "Essentia·TensorFlow (both analyze via WSL on Windows) to "
@@ -1465,7 +1466,7 @@ def _setup_clap_engine(params: dict) -> dict:
 
 
 def _setup_genre_resolver(params: dict) -> dict:
-    """One-click setup for the online web-synthesis genre resolver (opt-in)."""
+    """One-click setup for the online genre lookup (opt-in, two small packages)."""
     return _setup_genre_engine(params, kind="resolver")
 
 

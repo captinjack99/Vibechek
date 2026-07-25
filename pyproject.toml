@@ -95,13 +95,13 @@ clap = [
     "torchvision>=0.15",
     "soundfile>=0.12",
 ]
-# Online web-synthesis genre resolver (opt-in). ddgs is the runtime dep; the
-# local LLM (Ollama) is installed by the in-app resolver setup, which also
-# needs zstandard (to unpack the Ollama release tarball) — declared here so the
-# manual install path matches the one-click setup exactly.
+# Online genre lookup (opt-in). The tier is deterministic — search, fetch the
+# catalog page, regex its structured genre field — so its whole runtime is two
+# small pure-python packages: ddgs (keyless search) and beautifulsoup4 (HTML →
+# text). Matches the in-app one-click setup exactly. No model, no Ollama.
 resolver = [
     "ddgs>=6.0",
-    "zstandard>=0.22",
+    "beautifulsoup4>=4.12",
 ]
 # Native (essentia-free / WSL-free) decode for the Windows analyze path. soundfile
 # (libsndfile, native win_amd64 wheel) decodes WAV/FLAC/OGG/MP3; soxr does the
@@ -128,6 +128,10 @@ dev = [
     # path's runtime deps). Small pure/native wheels — safe in the dev install.
     "soundfile>=0.12",
     "soxr>=0.3",
+    # The online genre lookup's HTML → text step. Its tests parse canned catalog
+    # pages offline (no network, no ddgs), so CI's `[dev]`-only install needs the
+    # parser itself. `ddgs` stays out — search is always mocked in tests.
+    "beautifulsoup4>=4.12",
 ]
 
 [project.scripts]

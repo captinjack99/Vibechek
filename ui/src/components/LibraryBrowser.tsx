@@ -579,7 +579,7 @@ export function LibraryBrowser() {
         inference_engine: analysisCfg.inference_engine,
         // How to reconcile an existing genre tag with the ML read.
         genre_source_policy: analysisCfg.genre_source_policy,
-        // Opt-in genre sources: CLAP audio model + online web-synthesis lookup.
+        // Opt-in genre sources: CLAP audio model + the online catalog lookup.
         genre_classifier: analysisCfg.genre_classifier,
         genre_web_lookup: analysisCfg.genre_web_lookup,
         genre_llm_backend: analysisCfg.genre_llm_backend,
@@ -640,8 +640,8 @@ export function LibraryBrowser() {
         // parallel toast).
         if (report.genre_fallback_warning) detailLines.push(report.genre_fallback_warning);
         if (report.model_degradation_warning) detailLines.push(report.model_degradation_warning);
-        // Online genre lookup requested but its backend wasn't reachable — genres
-        // used tags + audio only. Same completion toast as its sibling degradation
+        // Online genre lookup requested but not usable this run — genres used
+        // tags + audio only. Same completion toast as its sibling degradation
         // warnings (not a parallel toast).
         if (report.genre_web_unavailable_warning) detailLines.push(report.genre_web_unavailable_warning);
         // Engine self-heal notices (WSL drift auto-repair): a successful repair

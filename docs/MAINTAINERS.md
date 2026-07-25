@@ -50,7 +50,7 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
   picks `essentia_tf`/`onnx`, preflight **falls back to WSL** — `analyze` routes through
   `vibechek` in a WSL venv (`~/.vibechek/venv/`). Paths translate `C:\…` ↔ `/mnt/c/…` and
   that translation lives **only** in `vibechek/wsl.py` — the frontend never sees `/mnt/c`.
-  (The opt-in CLAP / online-resolver genre engines still route through WSL on Windows;
+  (The opt-in CLAP / online-lookup genre engines still route through WSL on Windows;
   the backend refuses their setup on the native engine.)
 - **Engine → venv goes through `config.engine_venv_subdir` ONLY.** `onnx` AND `native`
   both run the ONNX stack (native is the same backbone/heads in-process) and map to
