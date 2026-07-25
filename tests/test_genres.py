@@ -167,6 +167,85 @@ def test_split_tag_genre_uses_hierarchy() -> None:
         "Melodic House & Techno", "Melodic House & Techno")
 
 
+def test_every_alias_target_exists_in_the_hierarchy() -> None:
+    """An alias pointing at a name the hierarchy does not carry is worse than no
+    alias: the tag stays unplaceable while the table makes it look handled."""
+    from vibechek.genres import _GENRE_TAG_ALIASES, _KNOWN_GENRE_NAMES
+    missing = sorted(v for v in _GENRE_TAG_ALIASES.values()
+                     if v not in _KNOWN_GENRE_NAMES)
+    assert not missing, f"alias targets absent from the hierarchy: {missing}"
+
+
+def test_spelling_variants_resolve_to_the_hierarchy_name() -> None:
+    """A tag the hierarchy cannot place is usually a HIERARCHY GAP, not junk
+    (d7921d7). These are the gaps that are pure spelling: left unaliased the raw
+    string becomes the track's genre AND its own organize folder, so "Hip-Hop"
+    and "Hip Hop" are two destinations for one genre."""
+    assert split_tag_genre("Hip-Hop") == ("Hip Hop", "Hip Hop")
+    assert split_tag_genre("D&B") == ("Drum & Bass", "Drum & Bass")
+    assert split_tag_genre("Synth Pop") == ("Synth-pop", "Synth-pop")
+    assert split_tag_genre("Rock & Roll") == ("Rock", "Rock")
+    # lookups ignore case and surrounding space
+    assert split_tag_genre("  hip-hop ") == ("Hip Hop", "Hip Hop")
+
+
+def test_beatport_slash_names_resolve_to_their_family() -> None:
+    """Beatport ships these as SINGLE genre names, not lists. Each target was
+    checked against the family its files independently resolve to
+    (internal/bughunt/score_genre_aliases.py route 2)."""
+    assert split_tag_genre("Nu Disco / Disco") == ("Disco", "Nu-Disco")
+    assert split_tag_genre("Organic House / Downtempo") == ("House", "Organic House")
+    assert split_tag_genre("Indie Dance / Nu Disco") == ("Indie Dance", "Indie Dance")
+    assert split_tag_genre("UK Garage / Bassline") == ("Dubstep", "Bassline")
+    assert split_tag_genre("Bassline / Speed Garage") == ("Dubstep", "Bassline")
+
+
+def test_minimal_deep_tech_lands_in_techno_not_house() -> None:
+    """The measured one. "Minimal / Deep Tech" reads like plain "Minimal", but the
+    hierarchy files Minimal under HOUSE while 85% of the tag's tracks (22/26
+    independently resolved, 10.4x the library base rate) come back techno-family.
+    Aliasing it to "Minimal" would have moved 6 of every 7 into the wrong folder."""
+    assert split_tag_genre("Minimal / Deep Tech") == ("Techno", "Minimal Techno")
+    # the plain name keeps its existing (House) placement — untouched by this
+    assert split_tag_genre("Minimal") == ("House", "Minimal")
+
+
+def test_bracketed_beatport_qualifier_is_stripped() -> None:
+    """"Techno (Peak Time / Driving)" narrows a genre we already carry. A rule
+    beats a table here because Beatport reorganizes its qualifiers."""
+    assert split_tag_genre("Techno (Peak Time / Driving)") == ("Techno", "Techno")
+    assert split_tag_genre("Trance (Main Floor)") == ("Trance", "Trance")
+    assert split_tag_genre("Trance (Raw / Deep / Hypnotic)") == ("Trance", "Trance")
+    assert split_tag_genre("Deep House (Electronic)") == ("House", "Deep House")
+
+
+def test_bracket_rule_only_fires_when_the_remainder_is_a_genre() -> None:
+    """Self-limiting by design: strip the qualifier only if what is left is a name
+    we can place. Otherwise a track title in the genre field, or an unknown
+    bracketed genre, would silently lose half of itself."""
+    for untouched in ("Chemicals (Extended Mix)", "Reggaeton (Latin)",
+                      "Hypeddit Top Weekly Picks"):
+        assert split_tag_genre(untouched) == (untouched, untouched), untouched
+
+
+def test_french_electronic_bucket_is_content_free() -> None:
+    """"Électronique" is "Electronic" in another language — already generic, so it
+    is listed rather than aliased (15 files in a real library)."""
+    for spelling in ("Électronique", "électronique", " ÉLECTRONIQUE "):
+        assert not is_specific_genre(spelling), spelling
+        assert not is_usable_genre_label(spelling), spelling
+
+
+def test_aliases_do_not_rescue_a_genre_the_hierarchy_lacks() -> None:
+    """Scope guard. These name real genres the taxonomy has no entry for at all —
+    a product decision, not a spelling fix — so they must stay exactly as they
+    are: trusted, specific, and their own label."""
+    for gap in ("Reggaeton", "Soundtrack", "Acid Jazz", "Bossa Nova", "Salsa",
+                "Dembow", "Melodic Bass", "African"):
+        assert is_specific_genre(gap), gap
+        assert split_tag_genre(gap) == (gap, gap), gap
+
+
 def test_reconcile_prefer_tag_trusts_specific_tag() -> None:
     r = reconcile_genre("House", "Progressive House", 0.3, "Tech House")
     assert r.source == "tag" and r.subgenre == "Tech House" and r.genre == "House"

@@ -130,6 +130,101 @@ _KNOWN_GENRE_NAMES: frozenset[str] = frozenset(
     | set(DJ_GENRE_MAP.values())
 )
 
+# ---------------------------------------------------------------------------
+# Tag spelling aliases
+# ---------------------------------------------------------------------------
+
+# The measured lesson of d7921d7 is that a tag the hierarchy cannot place is
+# usually a HIERARCHY GAP, not junk — distrusting all unplaceable tags cost two
+# corpus tracks and fixed none. These are the other half of that finding: tags
+# naming a genre the hierarchy ALREADY KNOWS, under a spelling it does not list.
+# `split_tag_genre` returns (tag, tag) for those, so the raw string becomes the
+# track's genre and — via organizer's `sanitize_folder_name(ml_genre)` — its own
+# destination folder. "Hip-Hop" and "Hip Hop" are then two folders for one genre,
+# and neither can be matched, filtered or grouped against the other.
+#
+# Every entry must map onto a name the hierarchy already carries; an alias that
+# misses leaves the tag just as unplaceable while LOOKING handled, so
+# tests/test_genres.py asserts that over the whole table.
+#
+# The risk an alias carries is not accuracy in the abstract — it is landing in
+# the WRONG FAMILY, which moves organizer's destination folder and flips
+# reconcile's conflict flag. So each was checked against the family its files
+# independently resolve to (internal/bughunt/score_genre_aliases.py route 2: the
+# tag's tracks joined to the 2,577 web-resolved labels over D:\Music\Tracks; HIT
+# = share whose resolved family equals the alias target's, against that library's
+# own base rate for it). `n` below is files carrying that exact tag of 12,092.
+#
+# The 86-track adjudicated corpus cannot judge these — it carries exactly one of
+# these tags — so it was run as a REGRESSION GATE instead, and holds to the digit:
+# 53.5% exact / 72.1% family web-off and 73.3% / 86.0% web-on, in strict AND
+# accept, 0 broken, 0 conflict-flag flips.
+_GENRE_TAG_ALIASES: dict[str, str] = {
+    # -- spelling / punctuation only; no family risk to measure ----------------
+    "Hip-Hop": "Hip Hop",                    # n=105
+    "D&B": "Drum & Bass",                    # n=16
+    "Rock & Roll": "Rock",                   # n=14
+    "Synth Pop": "Synth-pop",                # n=5    HIT 67% (2/3) vs 1% base
+    # -- Beatport's own slash-joined genre names ------------------------------
+    # Single genre names on Beatport, not lists, so they are aliased here rather
+    # than left to the multi-value tag parser.
+    "Nu Disco / Disco": "Nu-Disco",          # n=70   HIT 84% (54/64) vs 10%, 8.6x
+    "Minimal / Deep Tech": "Minimal Techno",  # n=29  HIT 85% (22/26) vs 8%, 10.4x
+    #   — and that measurement is why the target is Minimal TECHNO and not plain
+    #   "Minimal": the hierarchy files "Minimal" under House, which would have put
+    #   6 of every 7 of these tracks in the wrong family and the wrong folder.
+    "Organic House / Downtempo": "Organic House",
+    "Indie Dance / Nu Disco": "Indie Dance",
+    "UK Garage / Bassline": "Bassline",       # n=4 — and the adjudicated corpus's
+    "Bassline / Speed Garage": "Bassline",    #   truth label for that same track
+    "Trap / Future Bass": "Trap",             # n=1    HIT 100% (1/1)
+}
+# REFUTED by the same measurement, and the reason it exists: "Breaks / Breakbeat
+# / UK Bass" (5 files) looks like the identical case — a slash-joined Beatport
+# name whose first component the hierarchy carries — but its 4 independently
+# resolved tracks come back house 3 / Future Garage 1 and breaks ZERO. An alias
+# there would have moved 5 files into a Breaks folder on nothing but the name.
+#
+# Also deliberately NOT guessed at: Beatport's storefront returns 403 to a fetch,
+# so only names attested in a real library, in the adjudicated corpus, or in a
+# retrieved Beatport genre listing are here. A Beatport name we have never seen
+# ("Hard Dance / Hardcore / Neo Rave") stays as unplaceable as it is today — a
+# gap, not a regression.
+
+# Beatport also qualifies a plain genre name in brackets — "Techno (Peak Time /
+# Driving)", "Trance (Raw / Deep / Hypnotic)", "Electro (Classic / Detroit /
+# Modern)". The qualifier narrows a genre we already carry, so strip it instead of
+# enumerating a list that changes whenever Beatport reorganizes. The rule is
+# self-limiting: it applies ONLY when what remains is a name the hierarchy knows,
+# so a bracketed suffix on anything else is left alone.
+_PAREN_QUALIFIER = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _alias_key(tag: str) -> str:
+    """Alias lookups ignore case and internal spacing; the hierarchy proper does not."""
+    return " ".join(tag.split()).casefold()
+
+
+_GENRE_TAG_ALIAS_LOOKUP: dict[str, str] = {
+    _alias_key(k): v for k, v in _GENRE_TAG_ALIASES.items()
+}
+
+
+def _resolve_tag_alias(tag: str) -> str:
+    """Rewrite a known spelling variant to the hierarchy's own name for it."""
+    if not tag:
+        return tag
+    direct = _GENRE_TAG_ALIAS_LOOKUP.get(_alias_key(tag))
+    if direct:
+        return direct
+    base = _PAREN_QUALIFIER.sub("", tag).strip()
+    if base and base != tag:
+        base = _GENRE_TAG_ALIAS_LOOKUP.get(_alias_key(base), base)
+        if base in _KNOWN_GENRE_NAMES:
+            return base
+    return tag
+
+
 # Discogs parent categories that map to DJ-friendly genre buckets when subgenre
 # information is too generic to use as the main genre.
 _PARENT_CATEGORY_OVERRIDES = {
@@ -295,6 +390,10 @@ _GENERIC_GENRE_TAGS: frozenset[str] = frozenset({
     "dance/pop", "dance / pop", "dance/electronica", "dance / electronica",
     "electronica/dance", "electronica / dance",
     "edm", "club", "club/dance", "pop", "music", "untagged", "no genre",
+    # Same buckets in another language. Listed rather than aliased because the
+    # translation lands on a name that is itself generic — "Électronique" says
+    # exactly as little as "Electronic" (15 files, D:\Music\Tracks).
+    "électronique", "electronique",
 })
 
 # UNTRUSTED AS A FILE TAG: labels that DO name a real genre, so a verified catalog
@@ -402,8 +501,12 @@ def is_usable_genre_label(genre: str | None) -> bool:
 def split_tag_genre(tag: str) -> tuple[str, str]:
     """Split an existing genre tag into (parent_genre, subgenre) using the
     hierarchy. 'Tech House' -> ('House', 'Tech House'); an unknown modern genre
-    -> (tag, tag) so we still surface the specific label."""
-    t = (tag or "").strip()
+    -> (tag, tag) so we still surface the specific label.
+
+    A known spelling variant ('Hip-Hop', 'Techno (Peak Time / Driving)') is
+    rewritten to the hierarchy's own name for it first — see `_GENRE_TAG_ALIASES`.
+    """
+    t = _resolve_tag_alias((tag or "").strip())
     canon = DJ_GENRE_MAP.get(t, t)
     if canon in SUBGENRE_TO_PARENT:
         parent = SUBGENRE_TO_PARENT[canon]

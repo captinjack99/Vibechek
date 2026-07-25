@@ -10,6 +10,36 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+### Fixed
+- **"Hip-Hop" and "Hip Hop" are one genre again.** The genre list matched tag
+  spellings exactly, so a tag naming a genre it already knows under a different
+  spelling was treated as an unknown genre: it became the track's label *and* its
+  own Organize folder, so one genre ended up split across two destinations that
+  couldn't be matched, filtered or grouped together. Vibechek now recognises the
+  common variants — `Hip-Hop`, `D&B`, `Synth Pop`, `Rock & Roll` — and the store
+  spellings that come with Beatport purchases, both the slash-joined names
+  (`Nu Disco / Disco`, `Organic House / Downtempo`, `Indie Dance / Nu Disco`,
+  `UK Garage / Bassline`) and the bracketed ones (`Techno (Peak Time / Driving)`,
+  `Trance (Main Floor)`, `Trance (Raw / Deep / Hypnotic)`), which are read as the
+  genre they qualify. `Électronique` joins `Electronic` as a bucket that names no
+  genre. Across a 12,000-track library that is 287 files whose analyzed genre was
+  previously a one-off label of its own. (Sorting *un-analyzed* files straight
+  from their tag still uses the tag exactly as written — that path deliberately
+  doesn't consult the genre list at all.)
+
+  Each mapping was checked against the genre those files independently resolve
+  to, because an alias into the wrong family would move Organize's destination
+  and change what shows up for review. That check earned its keep twice:
+  `Minimal / Deep Tech` reads like plain "Minimal", which Vibechek files under
+  House, but 85% of those tracks are techno — so it maps to Minimal Techno, not
+  Minimal. And `Breaks / Breakbeat / UK Bass` looked like exactly the same kind
+  of easy win and was **dropped**: none of its tracks are actually Breaks.
+  Accuracy on the 86-track test corpus is unchanged to the digit, which is the
+  point — this fixes labels and folders, not the genre read itself. Genres that
+  Vibechek's list simply doesn't have (Reggaeton, Soundtrack, Acid Jazz, Bossa
+  Nova, Salsa) are untouched and still keep their own label. Existing analyses
+  keep their current genre until re-analyzed.
+
 ## [0.9.0-beta] — 2026-07-25
 
 ### Changed

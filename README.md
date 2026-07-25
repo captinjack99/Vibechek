@@ -226,7 +226,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full breakdown, plus features com
 ## Stats
 
 <!-- STATS_LINE_START -->
-**1242 Python tests** · **51 JSON-RPC methods** · **38 Python modules** · auto-updated by `scripts/update_readme_stats.py`
+**1250 Python tests** · **51 JSON-RPC methods** · **38 Python modules** · auto-updated by `scripts/update_readme_stats.py`
 <!-- STATS_LINE_END -->
 
 - 197 frontend tests across 26 files (App, rpc, AnalysisProgress, ConfirmModal, DuplicatesView, ErrorToast, GlobalAudioPlayer, LibraryBrowser, LibraryFilters, MemoryRefusalActions, OnnxSetupDialog, OperationsHistory, OrganizeView, PreflightDialog, Settings, SettingsSystem, Sidebar, TagsView, useApplyTags, useConfigPersistence, useSidecar, keeperRules, review, library + notification + operation stores)
