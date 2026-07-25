@@ -75,7 +75,12 @@ def test_genre_hierarchy_is_consistent() -> None:
 
 # --- Existing-tag vs ML reconciliation (configurable tag-trust) -------------
 
-from vibechek.genres import is_specific_genre, reconcile_genre, split_tag_genre  # noqa: E402
+from vibechek.genres import (  # noqa: E402
+    is_specific_genre,
+    is_usable_genre_label,
+    reconcile_genre,
+    split_tag_genre,
+)
 
 
 def test_is_specific_genre_filters_generic_buckets() -> None:
@@ -84,6 +89,41 @@ def test_is_specific_genre_filters_generic_buckets() -> None:
     # the "notoriously bad" generic Beatport buckets / junk:
     for junk in ("", "Dance/Pop", "Dance / Electronica", "Electronic", "Pop", "Unknown", "EDM"):
         assert not is_specific_genre(junk), junk
+    # both spellings of the retailer's Electronica/Dance bucket
+    for junk in ("Electronica/Dance", "Electronica / Dance", "electronica/dance"):
+        assert not is_specific_genre(junk), junk
+
+
+def test_electro_is_not_a_trustworthy_file_tag() -> None:
+    """"Electro" names a real genre but is sprayed over whole pools, so it is not
+    trusted AS A TAG. Measured on the 86-track adjudicated corpus: +1 exact,
+    +1 family, zero broken (internal/bughunt/score_generic_set.py)."""
+    for spelling in ("Electro", "electro", "  ELECTRO  "):
+        assert not is_specific_genre(spelling), spelling
+    # ...but a genre we RESOLVED ourselves is still a usable answer.
+    assert is_usable_genre_label("Electro")
+
+
+def test_house_stays_a_trusted_tag() -> None:
+    """The measurement harness distrusts "House"; production must NOT. Adding it
+    cost 1 exact + 1 family and broke a track while fixing none, and it is the
+    largest tag in a real library (2,645/12,145 files) with the curation
+    agreeing. Subgenres obviously stay trusted too."""
+    for tag in ("House", "house", "Tech House", "Deep House", "Progressive House"):
+        assert is_specific_genre(tag), tag
+
+
+def test_is_usable_genre_label_is_narrower_than_tag_trust() -> None:
+    # Content-free labels are unusable from ANY source.
+    for junk in ("", None, "Unknown", "Dance / Pop", "EDM", "Electronic",
+                 "Electronica/Dance", "Other"):
+        assert not is_usable_genre_label(junk), junk
+    for good in ("Tech House", "Electro", "House", "Melodic House & Techno"):
+        assert is_usable_genre_label(good), good
+    # The two sets differ ONLY on the spray-tag entries — every label the tag
+    # test accepts must also pass the (weaker) label test.
+    for tag in ("Tech House", "House", "Techno", "Trance", "Electro"):
+        assert not is_specific_genre(tag) or is_usable_genre_label(tag), tag
 
 
 def test_split_tag_genre_uses_hierarchy() -> None:
@@ -110,6 +150,36 @@ def test_reconcile_prefer_tag_ml_overrides_when_confident_and_disagrees() -> Non
     # ...but a LOW-confidence ML does not override the specific tag.
     r2 = reconcile_genre("Trance", "Trance", 0.40, "Tech House", "prefer_tag", 0.90)
     assert r2.source == "tag" and r2.subgenre == "Tech House"
+
+
+def test_reconcile_electro_tag_defers_but_electro_web_read_stands() -> None:
+    """The asymmetry the split set buys: an "Electro" TAG is no tag at all, while
+    an "Electro" genre we resolved online is a perfectly good answer.
+
+    This is the "Ain't Giving Up" case from the adjudicated corpus — tagged
+    Electro, actually House, and the audio model had it right all along.
+    """
+    # tag side: falls through to the audio read, no conflict flag (there is no
+    # tag to be in conflict WITH)
+    r = reconcile_genre("House", "House", 0.42, "Electro", "prefer_tag")
+    assert r.source == "ml" and r.genre == "House" and not r.conflict
+
+    # web side: a verified catalog read of Electro is usable, and with no
+    # trustworthy tag in the way it simply wins
+    w = reconcile_genre("House", "Bass House", 0.8, "Electro", "prefer_tag",
+                        web_genre="Electro", web_grounded=True)
+    assert w.source == "web" and w.subgenre == "Electro"
+
+    # ...and it still overrides a genuinely specific tag
+    o = reconcile_genre("House", "Bass House", 0.8, "Tech House", "prefer_tag",
+                        web_genre="Electro", web_grounded=True)
+    assert o.source == "web_override" and o.subgenre == "Electro" and o.conflict
+
+    # a CONTENT-FREE web read is discarded from either source, tag or not
+    for tag in ("Electro", "Tech House"):
+        d = reconcile_genre("Techno", "Techno", 0.5, tag, "prefer_tag",
+                            web_genre="Dance / Pop", web_grounded=True)
+        assert d.source != "web" and "Dance" not in d.genre, tag
 
 
 def test_reconcile_policies() -> None:

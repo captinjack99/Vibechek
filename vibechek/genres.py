@@ -277,22 +277,66 @@ def get_best_genre(
 # Existing-tag vs ML reconciliation
 # ---------------------------------------------------------------------------
 
-# Generic / low-quality genre tags that must NOT be trusted over the audio model
-# — these are the "notoriously bad" Beatport broad buckets and catch-alls. A tag
-# in this set is treated as "no usable tag" so ML decides.
+# CONTENT-FREE labels: retailer sales buckets and catch-alls that name no genre at
+# all. Nothing may carry one of these as an answer — not a file tag, and not a
+# catalog read either, which is why this set also gates the online lookup below.
 _GENERIC_GENRE_TAGS: frozenset[str] = frozenset({
     "", "unknown", "other", "others", "misc", "miscellaneous", "various",
     "electronic", "electronica", "dance", "dance/electronic", "dance / electronic",
     "dance/pop", "dance / pop", "dance/electronica", "dance / electronica",
+    "electronica/dance", "electronica / dance",
     "edm", "club", "club/dance", "pop", "music", "untagged", "no genre",
+})
+
+# UNTRUSTED AS A FILE TAG: labels that DO name a real genre, so a verified catalog
+# read of one stands, but that taggers spray so indiscriminately over a whole
+# release/pool that the tag carries no information about the track.
+#
+# "Electro" is the measured case (internal/bughunt/score_generic_set.py, 86-track
+# adjudicated corpus, through this function):
+#   keep trusting it .... 52.3% exact / 70.9% family   (web off)   72.1% / 84.9% (web on)
+#   distrust it ......... 53.5% exact / 72.1% family   (web off)   73.3% / 86.0% (web on)
+# +1 exact, +1 family, ZERO broken, stable across strict/accept scoring x 2 passes.
+# None of the 4 Electro-tagged corpus tracks is actually Electro (two Electronica,
+# one Bass House, one House). At library scale (12,145 files, D:\Music\Tracks) the
+# tag is on 299 files (2.5%) and only 14 of those 299 sit in an Electro folder —
+# 285 are filed under Techno / Progressive House / Tech Trance / Bassline, so the
+# tag disagrees with the curation 95% of the time.
+#
+# "House" was the other candidate (the measurement harness distrusts it) and is
+# REFUTED: -1 exact / -1 family, breaks 1 and fixes 0, in every cell. It is the
+# library's largest tag (2,645 files, 21.9%) and 2,357 of those sit in the House
+# folder — the tag and the curation agree. build_reference.py found the same thing
+# from the other side: applying the harness's tag-distrust set to LABEL validity
+# deleted all 407 "House" reference vectors and cost 4.1 exact points.
+_UNTRUSTED_GENRE_TAGS: frozenset[str] = _GENERIC_GENRE_TAGS | frozenset({
+    "electro",
 })
 
 
 def is_specific_genre(tag: str | None) -> bool:
-    """True if `tag` is a usable, specific genre (not a generic bucket / junk)."""
+    """True if `tag` is a usable, specific genre (not a generic bucket / junk).
+
+    This is the FILE-TAG question, so it uses the wider untrusted set — a label
+    like "Electro" is a real genre but not a trustworthy tag. Use
+    `is_usable_genre_label` for a genre coming off a catalog page or the model.
+    """
     if not tag:
         return False
-    return tag.strip().lower() not in _GENERIC_GENRE_TAGS
+    return tag.strip().lower() not in _UNTRUSTED_GENRE_TAGS
+
+
+def is_usable_genre_label(genre: str | None) -> bool:
+    """True if `genre` names an actual genre — the test for a read we RESOLVED
+    (online catalog field, audio model) rather than a tag we inherited.
+
+    Deliberately narrower than `is_specific_genre`: a tag we distrust because
+    taggers spray it is still a perfectly good answer when a verified catalog
+    field says it.
+    """
+    if not genre:
+        return False
+    return genre.strip().lower() not in _GENERIC_GENRE_TAGS
 
 
 def split_tag_genre(tag: str) -> tuple[str, str]:
@@ -363,7 +407,9 @@ def reconcile_genre(
     specific = is_specific_genre(tag)
 
     web = (web_genre or "").strip()
-    web_usable = bool(web) and web.lower() not in _GENERIC_GENRE_TAGS and web.lower() != "unknown"
+    # A RESOLVED read, not an inherited tag: judged by content-freeness only, so a
+    # verified catalog "Electro" stands even though the file tag isn't trusted.
+    web_usable = is_usable_genre_label(web)
     if web_usable:
         w_parent, w_sub = split_tag_genre(web)
         if policy == "ml_only" or not specific:
@@ -420,6 +466,7 @@ __all__ = [
     "parse_discogs_genre",
     "get_best_genre",
     "is_specific_genre",
+    "is_usable_genre_label",
     "split_tag_genre",
     "reconcile_genre",
 ]

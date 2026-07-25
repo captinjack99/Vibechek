@@ -45,6 +45,24 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
     old settings load cleanly, but they no longer do anything.
 
 ### Fixed
+- **An "Electro" genre tag no longer outranks what the track actually is.**
+  Vibechek trusts a specific genre tag over its own read, because a specific tag
+  is usually somebody's deliberate choice. "Electro" is the exception: taggers
+  and record pools spray it across whole releases, so it says almost nothing
+  about the track. It's now treated the way "Dance" and "EDM" already were — as
+  no tag at all, leaving the online lookup or the audio model to answer. Across
+  a 12,000-track library the tag sits on 299 files and only 14 of those are
+  actually filed under Electro; on the 86-track test corpus none of the
+  Electro-tagged tracks were Electro, and dropping the tag fixed one outright
+  and broke nothing (72% → 73% exact, 85% → 86% family with the online lookup
+  on; 52% → 54% exact without it).
+
+  "Electro" remains a perfectly good *answer* — if the online lookup reads
+  Electro off a catalog page, or the audio model hears it, that stands. Only the
+  inherited tag is distrusted. **"House" was considered for the same treatment
+  and rejected**: it's the most common tag in a real library and it agrees with
+  how those tracks are actually filed, and distrusting it measured worse.
+  Existing analyses keep their current genre until re-analyzed.
 - **Vocal detection finally hears chopped vocal hooks.** The vocal label came
   from the track-wide average of the model's per-segment voice score, so a
   club track whose vocal lives in the hook — most of dance music — averaged
