@@ -113,6 +113,40 @@ def test_house_stays_a_trusted_tag() -> None:
         assert is_specific_genre(tag), tag
 
 
+def test_playlist_phrase_in_the_genre_field_is_not_a_genre() -> None:
+    """A long phrase naming no genre we know is a playlist / record-pool label that
+    landed in the genre field. Left trusted it becomes the track's genre AND an
+    organize destination folder. Measured non-harmful on the adjudicated corpus and
+    zero-false-positive over a 12,145-file library
+    (internal/bughunt/score_unplaceable_rule.py)."""
+    for junk in ("Hypeddit Top Weekly Picks",
+                 "Electronic Pop Pop Rock Soft Rock Synth-Pop",
+                 "Dance Deep House House Edm",
+                 "Chillwave Electronic Downtempo Future Bass Dream Pop Trip-Hop"):
+        assert not is_specific_genre(junk), junk
+
+
+def test_playlist_phrase_rule_stays_narrow() -> None:
+    """The boundaries that keep the rule from eating real genres. Every case here
+    is a tag that occurs in a real library; wider variants of this rule were
+    measured and refuted (they broke "Stutter House" and a 4-genre list whose
+    first member was family-correct)."""
+    # placeable in the hierarchy, however many words
+    assert is_specific_genre("Melodic House & Techno")
+    # carries a list separator -> a list of genres still names genres
+    for sep in ("Techno (Peak Time / Driving)", "Bassline / Speed Garage",
+                "Dubstep, House, Electronic, Trance", "UK Garage / Bassline",
+                "Minimal / Deep Tech", "Juke X Footwork X D&B"):
+        assert is_specific_genre(sep), sep
+    # under the word threshold — an obscure genre is still a genre
+    for short in ("Reggaeton", "Stutter House", "Electro Swing Jazz", "Donk"):
+        assert is_specific_genre(short), short
+    # single-token pool labels are NOT caught by this rule (by design — nothing
+    # structural separates "TMU" from "Donk"); they would need their own evidence
+    for pool in ("TMU", "Urban", "White Label", "Essentials"):
+        assert is_specific_genre(pool), pool
+
+
 def test_is_usable_genre_label_is_narrower_than_tag_trust() -> None:
     # Content-free labels are unusable from ANY source.
     for junk in ("", None, "Unknown", "Dance / Pop", "EDM", "Electronic",

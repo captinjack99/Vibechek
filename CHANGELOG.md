@@ -45,6 +45,22 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
     old settings load cleanly, but they no longer do anything.
 
 ### Fixed
+- **A playlist name in the genre field no longer becomes a genre — or a folder.**
+  Record pools and download sites often write their own playlist name into the
+  genre tag ("Hypeddit Top Weekly Picks"). Vibechek trusted that as a curated
+  genre, so the track kept it *and* Organize created a top-level folder named
+  after the playlist. A genre tag of four or more words that names nothing in the
+  genre list is now treated as no tag at all, and the online lookup or the audio
+  model answers instead.
+
+  The rule is deliberately narrow, because the obvious wider versions measured
+  worse: distrusting every tag the genre list doesn't recognize threw away real
+  but obscure genres, and distrusting comma-separated tags threw away lists whose
+  first genre was right. Only the long-phrase rule left accuracy untouched on the
+  86-track test corpus, and across a 12,000-track library it fires on 187 files
+  and nothing else. Short pool labels like "TMU" or "White Label" are *not*
+  covered — nothing distinguishes them from a genuine niche genre by shape alone.
+  Existing analyses keep their current genre until re-analyzed.
 - **An "Electro" genre tag no longer outranks what the track actually is.**
   Vibechek trusts a specific genre tag over its own read, because a specific tag
   is usually somebody's deliberate choice. "Electro" is the exception: taggers

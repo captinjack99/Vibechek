@@ -11,6 +11,7 @@ essentia installed.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -120,6 +121,14 @@ for _parent, _subs in GENRE_HIERARCHY.items():
         if _canon_name not in SUBGENRE_TO_PARENT:
             SUBGENRE_TO_PARENT[_canon_name] = _parent
 del _parent, _subs, _canon_name
+
+# Every genre name the taxonomy recognizes in any position — parent, subgenre, or
+# Discogs alias. Used to tell "a genre we don't happen to list" (Reggaeton) apart
+# from "not a genre name at all" (see `_is_playlist_phrase`).
+_KNOWN_GENRE_NAMES: frozenset[str] = frozenset(
+    set(GENRE_HIERARCHY) | set(SUBGENRE_TO_PARENT) | set(DJ_GENRE_MAP)
+    | set(DJ_GENRE_MAP.values())
+)
 
 # Discogs parent categories that map to DJ-friendly genre buckets when subgenre
 # information is too generic to use as the main genre.
@@ -313,6 +322,55 @@ _UNTRUSTED_GENRE_TAGS: frozenset[str] = _GENERIC_GENRE_TAGS | frozenset({
     "electro",
 })
 
+# A tag can also fail STRUCTURALLY, with no denylist entry: a long phrase naming
+# no genre we know is a playlist or record-pool name that landed in the genre
+# field ("Hypeddit Top Weekly Picks"). Left trusted, it becomes the track's genre
+# AND — via organizer's `sanitize_folder_name(ml_genre)` — a destination folder
+# named after a playlist.
+#
+# The rule is deliberately narrow: 4+ words, NO list separator, and unplaceable in
+# the hierarchy. Wider structural rules were measured and REFUTED on the 86-track
+# adjudicated corpus (internal/bughunt/score_unplaceable_rule.py, through
+# reconcile_genre, strict|accept x web off|on):
+#   distrust ALL unplaceable ....... 53.5->52.3% exact, 72.1->70.9% family, BROKE 2
+#       "Stutter House" (truth House, exact via the tag) -> audio said Bassline;
+#       "Dubstep, House, Electronic, Trance" (truth Melodic Dubstep, family-right
+#       because the canon picked the Dubstep member) -> audio said Hands Up.
+#   distrust unplaceable LISTS ..... breaks that same track, fixes none. A list of
+#       genres still names genres; parsing it beats discarding it.
+#   distrust 4+ WORD phrases ....... exact AND family UNCHANGED in all four cells,
+#       0 broken. The one corpus track it touches was a miss either way.
+# So the corpus licenses this rule as harmless, not as an accuracy win; the reason
+# to ship it is correctness — a playlist name is not a genre, the same argument
+# that put "Dance / Pop" in the generic set. Library check (12,145 files, run
+# through THIS predicate): it fires on 187 files across 3 tags — "Hypeddit Top
+# Weekly Picks" (185), "Electronic Pop Pop Rock Soft Rock Synth-Pop", "Dance Deep
+# House House Edm" — and on nothing else, so zero false positives at that scale.
+# No real genre name is caught: the long ones ("Melodic House & Techno", "Techno
+# (Peak Time / Driving)", "Bassline / Speed Garage") are either placeable or carry
+# a separator, and single-token pool labels ("TMU", "Urban") are NOT caught — no
+# structural rule separates those from "Donk", so they need their own evidence.
+_GENRE_LIST_SEP = re.compile(r"[,;/]|\s+[&x]\s+", re.IGNORECASE)
+_MIN_JUNK_PHRASE_WORDS = 4
+
+
+def _placeable_in_hierarchy(tag: str) -> bool:
+    """True if the hierarchy recognizes `tag` — as a subgenre, a parent, or an alias."""
+    parent, sub = split_tag_genre(tag)
+    if parent != sub:
+        return True          # split found a parent, so the subgenre is known
+    return parent in _KNOWN_GENRE_NAMES
+
+
+def _is_playlist_phrase(tag: str) -> bool:
+    """A multi-word phrase that names no genre we know — a playlist / pool label."""
+    t = tag.strip()
+    return (
+        len(t.split()) >= _MIN_JUNK_PHRASE_WORDS
+        and not _GENRE_LIST_SEP.search(t)
+        and not _placeable_in_hierarchy(t)
+    )
+
 
 def is_specific_genre(tag: str | None) -> bool:
     """True if `tag` is a usable, specific genre (not a generic bucket / junk).
@@ -323,7 +381,9 @@ def is_specific_genre(tag: str | None) -> bool:
     """
     if not tag:
         return False
-    return tag.strip().lower() not in _UNTRUSTED_GENRE_TAGS
+    if tag.strip().lower() in _UNTRUSTED_GENRE_TAGS:
+        return False
+    return not _is_playlist_phrase(tag)
 
 
 def is_usable_genre_label(genre: str | None) -> bool:
