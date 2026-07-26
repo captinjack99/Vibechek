@@ -150,19 +150,28 @@ def validate_organize_target(
     resolved = candidate.resolve()
     result["resolved"] = str(resolved)
 
+    # Target == source is RE-ORGANIZING IN PLACE, which is a legitimate — and
+    # for an already-sorted library, the primary — workflow: re-analyze, some
+    # genres get corrected, those tracks move into the right folder and every
+    # other track no-ops on the `source == dest` check in plan_organization.
+    # This used to be a hard block, which made "my library is sorted, fix the
+    # ones that are wrong" impossible: blocked if you named the root, and
+    # silently nested the whole tree under one genre folder if you left the
+    # field blank. Warn instead — the one real side effect is that two files
+    # sharing a basename in different genre folders can collide into one
+    # destination, where the never-clobber rule renames the second.
     if source_library is not None:
         try:
             src = Path(source_library).resolve()
         except OSError:
             src = None
         if src is not None and src == resolved:
-            result["ok"] = False
-            result["error"] = (
-                "Target root is the same folder as the source library. "
-                "Pick a different folder (or leave the field blank to use "
-                "the default)."
+            result["warnings"].append(
+                "Target root is the library itself — tracks will be "
+                "re-organized in place. Only tracks whose genre changed will "
+                "move. Two tracks with the same filename in different genre "
+                "folders would collide; the second is renamed, never replaced."
             )
-            return result
 
     # Writability probe: ensure we can mkdir + create a file. Don't require
     # the folder to pre-exist — many users type a new path — but remove
@@ -273,17 +282,47 @@ def _count_existing_by_genre(base_dir: Path, cap: int) -> dict[str, tuple[str, i
     return out
 
 
+def _infer_library_root(tracks: list[dict[str, Any]]) -> Path:
+    """Best-effort library root from the analyzed track paths alone.
+
+    The parent of the FIRST track is wrong the moment the library is already
+    sorted: for `Root/Techno/a.mp3` it yields `Root/Techno`, so every genre
+    folder gets planned INSIDE Techno/ and correctly-filed tracks are moved for
+    no reason. The common ancestor of every track's folder is right for both
+    shapes — a flat library (all parents equal) and a sorted one (parents are
+    the genre folders, whose ancestor is the library root).
+
+    Still a heuristic: a library whose analyzed tracks all sit in ONE genre
+    folder is indistinguishable from a flat library by paths alone. Callers who
+    know the real root should pass `library_root` instead of relying on this.
+    """
+    parents = [Path(t["path"]).parent for t in tracks]
+    try:
+        return Path(os.path.commonpath([str(p) for p in parents]))
+    except ValueError:
+        # Mixed drives / mixed absolute-relative (Windows raises here).
+        return parents[0]
+
+
 def plan_organization(
     analysis_data: dict[str, Any],
     config: OrganizationConfig,
     base_dir: Path | None = None,
+    *,
+    library_root: Path | str | None = None,
 ) -> OrganizePlan:
     """Compute the file moves `organize_from_analysis` would perform.
 
     Resolution order for `base_dir`:
       1. Explicit argument (test / GUI override).
       2. `config.target_root`.
-      3. Parent of the first track's path in the analysis.
+      3. `library_root` — the folder the user actually loaded. Authoritative
+         when the caller knows it (the sidecar does); beats any path guess.
+      4. Common ancestor of the analyzed tracks' folders (`_infer_library_root`).
+
+    Re-organizing IN PLACE is a supported case: point `base_dir` at the library
+    root of an already-sorted tree and only the tracks whose genre CHANGED move
+    (everything else hits the `source == dest` skip below).
     """
     raw_tracks = (
         analysis_data.get("tracks", []) if isinstance(analysis_data, dict)
@@ -297,8 +336,10 @@ def plan_organization(
     if base_dir is None:
         if config.target_root is not None:
             base_dir = Path(config.target_root)
+        elif library_root is not None:
+            base_dir = Path(library_root)
         elif tracks:
-            base_dir = Path(tracks[0]["path"]).parent
+            base_dir = _infer_library_root(tracks)
         else:
             raise ValueError("No tracks in analysis and no base_dir / target_root set")
 
@@ -413,9 +454,13 @@ def organize_from_analysis(
     on_progress: ProgressCallback | None = None,
     dry_run: bool = False,
     base_dir: Path | None = None,
+    *,
+    library_root: Path | str | None = None,
 ) -> OrganizeStats:
     """Plan and execute the genre-folder reorganization."""
-    plan = plan_organization(analysis_data, config, base_dir=base_dir)
+    plan = plan_organization(
+        analysis_data, config, base_dir=base_dir, library_root=library_root,
+    )
     stats = OrganizeStats(planned=len(plan.moves))
 
     if dry_run:
@@ -495,11 +540,36 @@ def route_new_tracks(
     different staging track that happens to share a basename is never silently
     dropped. (Byte-identical re-imports still get a harmless `_1` copy; dedupe
     handles those separately.)
+
+    This command files by YOUR tags, deliberately: it does not analyze, and it
+    does not second-guess what a tag says. Two narrow exceptions, because both
+    are about the FOLDER rather than about the genre:
+
+    - **Spelling is canonicalized** (`split_tag_genre`, i.e. `_GENRE_TAG_ALIASES`
+      + the bracket-qualifier rule). `Hip-Hop` and `Hip Hop` are one genre, so
+      they must be one folder. Without this, routing disagreed with the analyzed
+      path — which normalizes — and a library fed by both grew both folders.
+    - **A content-free tag goes to `Other/<tag>`** (`is_usable_genre_label`).
+      "Dance", "EDM" and "Unknown" name no genre, and letting them mint
+      top-level folders is how `Dance/` reached 878 files in a real library.
+
+    What is deliberately NOT applied: `is_specific_genre`'s wider distrust —
+    spray tags ("Electro") and playlist phrases ("Hypeddit Top Weekly Picks").
+    Those override what the tag SAYS, and overriding the tag is the one thing
+    this command must not do. They still reach their own folders here.
     """
+    from vibechek.genres import is_usable_genre_label, split_tag_genre
+
     staging_dir = Path(staging_dir)
     library_root = Path(library_root)
     files = find_audio_files(staging_dir)
-    summary = {"copied": 0, "skipped_no_genre": 0, "skipped_exists": 0, "errors": 0}
+    summary = {
+        "copied": 0,
+        "skipped_no_genre": 0,
+        "skipped_exists": 0,
+        "routed_to_other": 0,
+        "errors": 0,
+    }
 
     from vibechek import cancellation
 
@@ -523,7 +593,19 @@ def route_new_tracks(
             log.info("No genre tag, skipping: %s", fp.name)
             continue
 
-        dest_folder = library_root / sanitize_folder_name(genre)
+        # Canonical spelling, keeping the SPECIFIC name: split_tag_genre returns
+        # (parent, specific), and routing files by what the tag actually says —
+        # "Tech House", not its parent "House" — so take the specific half.
+        _parent, genre = split_tag_genre(genre)
+
+        if is_usable_genre_label(genre):
+            dest_folder = library_root / sanitize_folder_name(genre)
+        else:
+            # Content-free ("Dance", "EDM", "Unknown"): keep the label, but under
+            # Other/ so it never becomes a top-level genre folder. Same shape
+            # plan_organization uses for rare genres.
+            dest_folder = library_root / "Other" / sanitize_folder_name(genre)
+            summary["routed_to_other"] += 1
         dest_file = dest_folder / fp.name
         if dest_file in claimed or dest_file.exists():
             # A different track shouldn't be lost just because the names collide.

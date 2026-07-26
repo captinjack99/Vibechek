@@ -204,16 +204,17 @@ export function OrganizeView() {
   const validateTarget = (value: string | null | undefined) => {
     const trimmed = (value ?? "").trim();
     if (!trimmed) {
-      // Empty == "use default (parent of analyzed tracks)". Always valid.
+      // Empty == "use default", which is the loaded library's own root (the
+      // sidecar anchors there via library_path). Always valid.
       setTargetError(null);
       setTargetWarnings([]);
       return;
     }
     setValidatingTarget(true);
     try {
-      const error = clientValidateTarget(trimmed, libraryPath);
+      const error = clientValidateTarget(trimmed);
       setTargetError(error);
-      setTargetWarnings(error ? [] : detectTargetWarnings(trimmed));
+      setTargetWarnings(error ? [] : detectTargetWarnings(trimmed, libraryPath));
     } finally {
       setValidatingTarget(false);
     }
@@ -224,6 +225,10 @@ export function OrganizeView() {
       use_subgenres: orgCfg.use_subgenres,
       min_genre_size: orgCfg.min_genre_size,
       target_root: orgCfg.target_root,
+      // The loaded library's root. With no target_root set, the sidecar anchors
+      // the genre tree here instead of guessing from track paths — a guess that
+      // lands one level too deep as soon as the library is already sorted.
+      library_path: libraryPath,
     };
     if (source?.kind === "file") base.analysis_path = source.path;
     else if (source?.kind === "in-memory") base.analysis = { tracks };
@@ -236,7 +241,7 @@ export function OrganizeView() {
     // validator covers normal flow, but a user can edit and immediately hit
     // Preview without triggering blur (Enter, keyboard nav, etc.).
     if (orgCfg.target_root && orgCfg.target_root.trim()) {
-      const error = clientValidateTarget(orgCfg.target_root.trim(), libraryPath);
+      const error = clientValidateTarget(orgCfg.target_root.trim());
       if (error) {
         setTargetError(error);
         setTargetWarnings([]);
@@ -785,9 +790,10 @@ function folderForMove(move: PlannedMove, baseDir: string): string {
  *
  * Catches the footguns:
  *   - Relative paths (would land in sidecar CWD silently)
- *   - Same-folder-as-source organize (creates collision-renamed duplicates)
+ *
+ * Same-folder-as-source is NOT an error — see `detectTargetWarnings`.
  */
-function clientValidateTarget(value: string, sourceLibraryPath: string | null): string | null {
+function clientValidateTarget(value: string): string | null {
   // Heuristic absolute-path detection that covers both major shells:
   //   - Windows: drive letter (C:\, D:/) or UNC path (\\server\share)
   //   - POSIX:   leading slash
@@ -802,16 +808,18 @@ function clientValidateTarget(value: string, sourceLibraryPath: string | null): 
     );
   }
 
-  if (sourceLibraryPath) {
-    const normalize = (p: string) => p.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
-    if (normalize(value) === normalize(sourceLibraryPath)) {
-      return (
-        "Target root is the same folder as the loaded library. " +
-        "Pick a different folder or leave the field blank to use the default."
-      );
-    }
-  }
+  // Target == the loaded library is NOT an error: it means "re-organize this
+  // library in place", which is how you fix a sorted library after a re-analyze
+  // corrects some genres. Only the tracks whose genre changed move. Surfaced as
+  // a warning by detectTargetWarnings instead.
   return null;
+}
+
+/** True when `value` points at the loaded library itself. */
+function isSameFolder(value: string, sourceLibraryPath: string | null): boolean {
+  if (!sourceLibraryPath) return false;
+  const normalize = (p: string) => p.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+  return normalize(value) === normalize(sourceLibraryPath);
 }
 
 /**
@@ -820,19 +828,31 @@ function clientValidateTarget(value: string, sourceLibraryPath: string | null): 
  * `_RISKY_PATH_SUBSTRINGS` so we warn before the user organizes a 10k-track
  * library into a OneDrive folder and watches sync re-upload every byte.
  */
-function detectTargetWarnings(value: string): string[] {
+function detectTargetWarnings(value: string, sourceLibraryPath: string | null = null): string[] {
+  const warnings: string[] = [];
+
+  if (isSameFolder(value, sourceLibraryPath)) {
+    warnings.push(
+      "Target root is the library itself — tracks will be re-organized in " +
+      "place. Only tracks whose genre changed will move. Two tracks with the " +
+      "same filename in different genre folders would collide; the second is " +
+      "renamed, never replaced.",
+    );
+  }
+
   const lower = value.replace(/\\/g, "/").toLowerCase();
   const needles = ["my drive", "googledrive", "onedrive", "icloud", "dropbox"];
   for (const n of needles) {
     if (lower.includes(n)) {
-      return [
+      warnings.push(
         `Target root looks like a cloud-sync folder (matches '${n}'). ` +
         "Moves may be slow and may conflict with online sync. " +
         "Consider organizing to a local folder first, then syncing.",
-      ];
+      );
+      break;
     }
   }
-  return [];
+  return warnings;
 }
 
 function Section({

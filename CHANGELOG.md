@@ -11,6 +11,35 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 ## [Unreleased]
 
 ### Fixed
+- **Re-organizing a library you've already sorted now works.** If your library
+  is already in genre folders and you re-analyze it, the tracks whose genre came
+  back corrected can now be moved into the right folder — which is what Organize
+  looked like it should already do. Two things prevented it. Naming your library
+  as the target root was rejected outright ("pick a different folder"), even
+  though organizing a library into itself is exactly what re-filing means. And
+  leaving the target blank was worse than useless: Vibechek guessed the
+  destination from the first track's folder, so for a sorted library it picked
+  *a genre folder* and planned to move your whole library inside it —
+  `House/track.mp3` to `Techno/House/track.mp3`.
+
+  Organizing into your library is now allowed, with a note explaining what it
+  does, and leaving the target blank uses the library you have loaded. Only
+  tracks whose genre actually changed move; everything already in the right
+  place stays put and isn't touched. As always you see the full plan in Preview
+  before anything moves, and the run is undoable.
+- **Sorting straight from tags spells genres the same way analysis does.**
+  `vibechek route`, which files staged tracks by their existing genre tag
+  without analyzing them, read the tag literally — so it made a `Hip-Hop` folder
+  while analyzing the same track made `Hip Hop`, and a library fed by both ended
+  up with two folders for one genre. It now applies the same spelling rules
+  analysis uses. It also stops letting a tag that names no genre ("Dance",
+  "EDM", "Unknown") create a top-level folder — those go to `Other/<tag>`, which
+  is where a 12,000-track library's 878-file `Dance/` folder came from.
+
+  It still files by *your* tags: an unusual or obscure genre tag keeps its own
+  folder, and tags Vibechek distrusts when analyzing — "Electro", or a record
+  pool's playlist name — are still taken at their word here, because overriding
+  what your tag says is the one thing this command shouldn't do.
 - **"Hip-Hop" and "Hip Hop" are one genre again.** The genre list matched tag
   spellings exactly, so a tag naming a genre it already knows under a different
   spelling was treated as an unknown genre: it became the track's label *and* its

@@ -995,7 +995,13 @@ def _plan_organization(params: dict) -> dict:
         target_root=Path(params["target_root"]) if params.get("target_root") else None,
     )
     analysis_data = _load_analysis_payload(params)
-    plan = plan_organization(analysis_data, config)
+    # The loaded library's own root is authoritative for where the genre tree
+    # goes when no explicit target is set. Without it, planning falls back to
+    # guessing from the track paths, which lands one level too deep the moment
+    # the library is already sorted into genre folders.
+    plan = plan_organization(
+        analysis_data, config, library_root=params.get("library_path"),
+    )
     return {
         "base_dir": str(plan.base_dir),
         "small_genres": sorted(plan.small_genres),
@@ -1038,6 +1044,7 @@ def _organize(params: dict) -> dict:
             config,
             on_progress=_emit_progress,
             dry_run=bool(params.get("dry_run", False)),
+            library_root=params.get("library_path"),
         )
     except cancellation.CancelledError as e:
         # A cancelled organize has usually already moved SOME files and written a

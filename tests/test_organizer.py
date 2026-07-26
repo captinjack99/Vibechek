@@ -12,6 +12,7 @@ from vibechek.organizer import (
     organize_from_analysis,
     plan_organization,
     route_new_tracks,
+    validate_organize_target,
 )
 
 
@@ -413,3 +414,215 @@ def test_census_counts_nested_subgenre_layouts(tmp_path: Path) -> None:
     assert "House" not in plan.small_genres
     for m in plan.moves:
         assert m.destination.parent == lib / "House" / "Bass House"
+
+
+# ---------------------------------------------------------------------------
+# Re-organizing an ALREADY-SORTED library in place
+#
+# The workflow: a library is already filed into genre folders, gets re-analyzed,
+# and some genres come back corrected. Those tracks must move into the right
+# folder and everything else must stay put. Both guards around this were wrong.
+# ---------------------------------------------------------------------------
+
+
+def _sorted_library(root: Path) -> None:
+    """A library already filed as Root/<Genre>/track.mp3."""
+    for genre, names in (("Techno", ["a.mp3", "b.mp3"]), ("House", ["c.mp3"])):
+        (root / genre).mkdir(parents=True)
+        for n in names:
+            (root / genre / n).write_bytes(b"x")
+
+
+def _retag_analysis(root: Path) -> dict:
+    """a.mp3 was re-analyzed as Minimal Techno; b and c are correctly filed."""
+    return {"tracks": [
+        {"path": str(root / "Techno" / "a.mp3"),
+         "ml_analysis": {"ml_genre": "Minimal Techno"}},
+        {"path": str(root / "Techno" / "b.mp3"), "ml_analysis": {"ml_genre": "Techno"}},
+        {"path": str(root / "House" / "c.mp3"), "ml_analysis": {"ml_genre": "House"}},
+    ]}
+
+
+def test_sorted_library_infers_root_not_first_tracks_genre_folder(tmp_path: Path) -> None:
+    """With no target_root, base_dir must be the LIBRARY, not Root/<first genre>.
+
+    Regression: the fallback was `Path(tracks[0]["path"]).parent`, which for a
+    sorted library is a genre folder. That didn't merely fail to move the
+    re-tagged track — it planned to move every CORRECTLY-filed track into a tree
+    nested under that one genre (House/c.mp3 -> Techno/House/c.mp3).
+    """
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    plan = plan_organization(_retag_analysis(lib), config)
+
+    assert plan.base_dir == lib
+    # Exactly one move: the re-tagged track. The other two are already correct.
+    assert [m.source.name for m in plan.moves] == ["a.mp3"]
+    assert plan.moves[0].destination == lib / "Minimal Techno" / "a.mp3"
+
+
+def test_explicit_library_root_beats_path_inference(tmp_path: Path) -> None:
+    """`library_root` is authoritative — it settles the case paths cannot.
+
+    All analyzed tracks sitting in ONE genre folder is indistinguishable from a
+    flat library by paths alone, so the common-ancestor guess returns the genre
+    folder. The caller that knows the real root must win.
+    """
+    lib = tmp_path / "lib"
+    (lib / "Techno").mkdir(parents=True)
+    (lib / "Techno" / "a.mp3").write_bytes(b"x")
+    analysis = {"tracks": [
+        {"path": str(lib / "Techno" / "a.mp3"),
+         "ml_analysis": {"ml_genre": "Minimal Techno"}},
+    ]}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    guessed = plan_organization(analysis, config)
+    assert guessed.base_dir == lib / "Techno"  # the ambiguity, documented
+
+    told = plan_organization(analysis, config, library_root=lib)
+    assert told.base_dir == lib
+    assert told.moves[0].destination == lib / "Minimal Techno" / "a.mp3"
+
+
+def test_target_root_still_beats_library_root(tmp_path: Path) -> None:
+    """An explicit target_root must not be overridden by library_root."""
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    elsewhere = tmp_path / "sorted"
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=elsewhere)
+
+    plan = plan_organization(_retag_analysis(lib), config, library_root=lib)
+
+    assert plan.base_dir == elsewhere
+
+
+def test_organize_in_place_moves_only_the_retagged_track(tmp_path: Path) -> None:
+    """End-to-end: re-organizing in place relocates the corrected track only."""
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    stats = organize_from_analysis(_retag_analysis(lib), config, library_root=lib)
+
+    assert stats.moved == 1
+    assert stats.errors == []
+    assert (lib / "Minimal Techno" / "a.mp3").exists()
+    # Correctly-filed tracks never moved.
+    assert (lib / "Techno" / "b.mp3").exists()
+    assert (lib / "House" / "c.mp3").exists()
+    assert not (lib / "Techno" / "a.mp3").exists()
+
+
+def test_validate_allows_target_equal_to_library_with_a_warning(tmp_path: Path) -> None:
+    """Organizing into the library itself is in-place reorganization, not an error.
+
+    It used to be a hard block, which made "my library is sorted, just fix the
+    wrong ones" impossible via the only path that names the root explicitly.
+    """
+    lib = tmp_path / "lib"
+    lib.mkdir()
+
+    check = validate_organize_target(lib, source_library=lib)
+
+    assert check["ok"] is True
+    assert check["error"] is None
+    assert any("in place" in w for w in check["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# route_new_tracks: canonical spelling + content-free bucketing
+#
+# `vibechek route` files by the user's tags on purpose. It normalizes the
+# SPELLING of a tag (so it agrees with the analyzed path) and refuses to let a
+# content-free tag mint a top-level folder — but it never overrides what a tag
+# says.
+# ---------------------------------------------------------------------------
+
+
+def _staged(tmp_path: Path, tag: str, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    from vibechek import organizer
+
+    staging = tmp_path / "staging"
+    library = tmp_path / "library"
+    staging.mkdir()
+    (staging / "track.mp3").write_bytes(b"x")
+    monkeypatch.setattr(organizer, "_read_genre_tag", lambda _fp: tag)
+    return staging, library
+
+
+@pytest.mark.parametrize(("tag", "folder"), [
+    ("Hip-Hop", "Hip Hop"),                       # spelling alias
+    ("D&B", "Drum & Bass"),                       # punctuation alias
+    ("Techno (Peak Time / Driving)", "Techno"),   # bracket qualifier
+    ("Minimal / Deep Tech", "Minimal Techno"),    # measured, not the obvious guess
+])
+def test_route_canonicalizes_tag_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str, folder: str,
+) -> None:
+    """Routing must agree with the analyzed path on how a genre is SPELLED.
+
+    Otherwise a library fed by both `vibechek route` and analyze+organize grows
+    two folders for one genre — exactly what the alias table exists to prevent.
+    """
+    staging, library = _staged(tmp_path, tag, monkeypatch)
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["copied"] == 1
+    assert (library / folder / "track.mp3").exists()
+
+
+def test_route_keeps_the_specific_genre_not_its_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """"Tech House" files under Tech House/, not its parent House/.
+
+    Canonicalization must not silently coarsen the user's tag — this command
+    files by what the tag says.
+    """
+    staging, library = _staged(tmp_path, "Tech House", monkeypatch)
+
+    route_new_tracks(staging, library)
+
+    assert (library / "Tech House" / "track.mp3").exists()
+    assert not (library / "House" / "track.mp3").exists()
+
+
+@pytest.mark.parametrize("tag", ["Dance", "EDM", "Unknown"])
+def test_route_sends_content_free_tags_to_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str,
+) -> None:
+    """A tag that names no genre must not mint a top-level folder.
+
+    This is how `Dance/` reached 878 files in a real library. The label is kept
+    (under Other/) rather than discarded — the file is still findable.
+    """
+    staging, library = _staged(tmp_path, tag, monkeypatch)
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["routed_to_other"] == 1
+    assert (library / "Other" / tag / "track.mp3").exists()
+    assert not (library / tag).exists()
+
+
+@pytest.mark.parametrize("tag", ["Electro", "Hypeddit Top Weekly Picks"])
+def test_route_does_not_apply_tag_distrust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str,
+) -> None:
+    """Spray tags and playlist phrases still get their own folder here.
+
+    `is_specific_genre` distrusts both, but that distrust OVERRIDES what the tag
+    says, and overriding the tag is the one thing this command must not do.
+    Deliberate: `vibechek route` is a literal "file by my tags".
+    """
+    staging, library = _staged(tmp_path, tag, monkeypatch)
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["copied"] == 1
+    assert summary["routed_to_other"] == 0
+    assert (library / tag / "track.mp3").exists()
