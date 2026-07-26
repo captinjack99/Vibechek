@@ -626,3 +626,154 @@ def test_route_does_not_apply_tag_distrust(
     assert summary["copied"] == 1
     assert summary["routed_to_other"] == 0
     assert (library / tag / "track.mp3").exists()
+
+
+# ---------------------------------------------------------------------------
+# Pruning the folders an in-place re-organize empties
+#
+# The only place Vibechek removes a directory, so the envelope is tight:
+# confined to the library root, strictly-empty only, never deletes a file.
+# ---------------------------------------------------------------------------
+
+
+def test_organize_reports_emptied_dirs_without_removing_them(tmp_path: Path) -> None:
+    """Organize REPORTS empty folders; removal is a separate, confirmed step."""
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    # a.mp3 is Techno's only remaining track once b is removed from the analysis,
+    # so moving it empties Techno/.
+    (lib / "Techno" / "b.mp3").unlink()
+    analysis = {"tracks": [
+        {"path": str(lib / "Techno" / "a.mp3"),
+         "ml_analysis": {"ml_genre": "Minimal Techno"}},
+    ]}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    stats = organize_from_analysis(analysis, config, library_root=lib)
+
+    assert stats.emptied_dirs == [str((lib / "Techno").resolve())]
+    assert (lib / "Techno").exists()  # reported, NOT removed
+
+
+def test_organize_does_not_report_a_folder_that_still_has_tracks(tmp_path: Path) -> None:
+    """A folder that kept a track is not a prune candidate."""
+    lib = tmp_path / "lib"
+    _sorted_library(lib)  # Techno/ holds a.mp3 AND b.mp3
+    analysis = {"tracks": [
+        {"path": str(lib / "Techno" / "a.mp3"),
+         "ml_analysis": {"ml_genre": "Minimal Techno"}},
+    ]}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    stats = organize_from_analysis(analysis, config, library_root=lib)
+
+    assert stats.emptied_dirs == []
+
+
+def test_prune_removes_empty_dirs_and_cascades_to_parents(tmp_path: Path) -> None:
+    """Emptying House/Tech House/ leaves House/ empty — both go in one pass."""
+    from vibechek.organizer import prune_empty_dirs
+
+    lib = tmp_path / "lib"
+    nested = lib / "House" / "Tech House"
+    nested.mkdir(parents=True)
+
+    summary = prune_empty_dirs([nested], lib)
+
+    assert sorted(summary["removed"]) == sorted([
+        str(nested.resolve()), str((lib / "House").resolve()),
+    ])
+    assert not (lib / "House").exists()
+    assert lib.exists()  # the root itself is never removed
+
+
+def test_prune_never_removes_a_non_empty_dir(tmp_path: Path) -> None:
+    """Re-checked at prune time: a folder that gained a file is left alone."""
+    from vibechek.organizer import prune_empty_dirs
+
+    lib = tmp_path / "lib"
+    genre = lib / "Techno"
+    genre.mkdir(parents=True)
+    (genre / "late_arrival.mp3").write_bytes(b"x")
+
+    summary = prune_empty_dirs([genre], lib)
+
+    assert summary["removed"] == []
+    assert genre.exists()
+    assert "not empty" in summary["skipped"][0]["reason"]
+
+
+def test_prune_treats_os_cruft_as_not_empty(tmp_path: Path) -> None:
+    """A folder holding only .DS_Store stays: removing it means deleting a FILE.
+
+    Deliberate — pruning is allowed to remove directories, never file content.
+    """
+    from vibechek.organizer import prune_empty_dirs
+
+    lib = tmp_path / "lib"
+    genre = lib / "Techno"
+    genre.mkdir(parents=True)
+    (genre / ".DS_Store").write_bytes(b"x")
+
+    summary = prune_empty_dirs([genre], lib)
+
+    assert summary["removed"] == []
+    assert (genre / ".DS_Store").exists()
+
+
+def test_prune_refuses_paths_outside_the_root(tmp_path: Path) -> None:
+    """Confinement: a path outside the library root is refused, not removed."""
+    from vibechek.organizer import prune_empty_dirs
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    outsider = tmp_path / "not_my_library"
+    outsider.mkdir()
+
+    summary = prune_empty_dirs([outsider, lib], lib)
+
+    assert summary["removed"] == []
+    assert outsider.exists()
+    assert lib.exists()
+    assert {s["reason"] for s in summary["skipped"]} == {"outside the library root"}
+
+
+def test_prune_is_idempotent(tmp_path: Path) -> None:
+    """Running it twice reports the second pass as gone, not as an error."""
+    from vibechek.organizer import prune_empty_dirs
+
+    lib = tmp_path / "lib"
+    genre = lib / "Techno"
+    genre.mkdir(parents=True)
+
+    first = prune_empty_dirs([genre], lib)
+    second = prune_empty_dirs([genre], lib)
+
+    assert first["removed"] == [str(genre.resolve())]
+    assert second["removed"] == []
+    assert second["errors"] == []
+    assert second["skipped"][0]["reason"] == "no longer exists"
+
+
+def test_undo_after_prune_restores_the_folder(tmp_path: Path) -> None:
+    """Pruning must not break Undo — revert recreates the parent directory."""
+    from vibechek.journal import revert_journal
+    from vibechek.organizer import prune_empty_dirs
+
+    lib = tmp_path / "lib"
+    (lib / "Techno").mkdir(parents=True)
+    (lib / "Techno" / "a.mp3").write_bytes(b"x")
+    analysis = {"tracks": [
+        {"path": str(lib / "Techno" / "a.mp3"),
+         "ml_analysis": {"ml_genre": "Minimal Techno"}},
+    ]}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    stats = organize_from_analysis(analysis, config, library_root=lib)
+    prune_empty_dirs(stats.emptied_dirs, lib)
+    assert not (lib / "Techno").exists()
+
+    summary = revert_journal(stats.journal_path)
+
+    assert summary["reverted"] == 1
+    assert (lib / "Techno" / "a.mp3").exists()

@@ -136,3 +136,104 @@ describe("<OrganizeView /> — undo partial-failure list", () => {
     expect(screen.queryByText(/in place/i)).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Empty-folder pruning after an in-place re-organize.
+ *
+ * Removing a directory is the most destructive thing this view does, so the
+ * contract under test is the GATE: organize alone must never remove anything,
+ * and the RPC must not fire until the user confirms.
+ */
+describe("<OrganizeView /> — pruning the folders an organize emptied", () => {
+  beforeEach(() => {
+    useLibraryStore.setState({
+      libraryPath: "D:/Music",
+      tracks: [track("D:/Music/a.mp3", "House")],
+    });
+    (save as MockFn).mockResolvedValue("D:/backup.json");
+  });
+
+  /** Mount and organize to completion. `emptied` is the sidecar's emptied_dirs. */
+  async function organizeWithEmptied(emptied: string[]) {
+    const user = userEvent.setup();
+    const prune = vi.fn().mockResolvedValue({
+      removed: emptied,
+      skipped: [],
+      errors: [],
+    });
+    (invoke as MockFn).mockImplementation(
+      async (_cmd: string, args: { method: string; params?: unknown }) => {
+        switch (args.method) {
+          case "plan_organization":
+            return PLAN;
+          case "backup_tags":
+            return { total: 1, backed_up: 1, not_fully_backed_up: 0, errors: [] };
+          case "organize":
+            return {
+              planned: 1,
+              moved: 1,
+              errors: [],
+              journal_path: "D:/journals/organize-1.jsonl",
+              moved_pairs: [["D:/Music/a.mp3", "D:/Music/House/a.mp3"]],
+              emptied_dirs: emptied,
+            };
+          case "prune_empty_folders":
+            return prune(args.params);
+          default:
+            return {};
+        }
+      },
+    );
+
+    render(<OrganizeView />);
+    await user.click(await screen.findByRole("button", { name: /preview plan/i }));
+    await user.click(await screen.findByRole("button", { name: /execute \(1 moves\)/i }));
+    await user.click(await screen.findByRole("button", { name: /yes, move files/i }));
+    return { user, prune };
+  }
+
+  it("offers to remove emptied folders but does not touch them on its own", async () => {
+    const { prune } = await organizeWithEmptied(["D:/Music/Techno"]);
+
+    expect(await screen.findByText(/1 folder is now empty/i)).toBeInTheDocument();
+    // The organize itself must not have removed anything.
+    expect(prune).not.toHaveBeenCalled();
+  });
+
+  it("does not prune until the user confirms", async () => {
+    const { user, prune } = await organizeWithEmptied(["D:/Music/Techno"]);
+
+    await user.click(await screen.findByRole("button", { name: /remove empty folders/i }));
+    // Confirm dialog is up — still nothing removed.
+    expect(prune).not.toHaveBeenCalled();
+
+    await user.click(await screen.findByRole("button", { name: /^remove folders$/i }));
+
+    await waitFor(() => expect(prune).toHaveBeenCalledTimes(1));
+    expect(prune).toHaveBeenCalledWith(
+      expect.objectContaining({ root: "D:/Music", dirs: ["D:/Music/Techno"] }),
+    );
+    expect(await screen.findByText(/removed 1 empty folder/i)).toBeInTheDocument();
+  });
+
+  it("cancelling the confirm removes nothing", async () => {
+    const { user, prune } = await organizeWithEmptied(["D:/Music/Techno"]);
+
+    await user.click(await screen.findByRole("button", { name: /remove empty folders/i }));
+    await user.click(await screen.findByRole("button", { name: /cancel/i }));
+
+    expect(prune).not.toHaveBeenCalled();
+    // The offer is still there — cancelling declines, it doesn't dismiss.
+    expect(screen.getByText(/1 folder is now empty/i)).toBeInTheDocument();
+  });
+
+  it("says nothing when no folder was emptied", async () => {
+    await organizeWithEmptied([]);
+
+    await screen.findByText(/library organized/i);
+    expect(screen.queryByText(/now empty/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /remove empty folders/i }),
+    ).not.toBeInTheDocument();
+  });
+});

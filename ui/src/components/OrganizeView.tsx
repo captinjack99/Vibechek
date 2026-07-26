@@ -20,7 +20,8 @@ import {
   useConfigStore, useLibraryStore, useNotificationStore, useOperationStore, useUIStore,
 } from "../stores";
 import { rpc, isCancellation } from "../hooks/useSidecar";
-import { revertJournal } from "../api/rpc";
+import { revertJournal, pruneEmptyFolders } from "../api/rpc";
+import type { PruneEmptyFoldersResponse } from "../api/methods";
 import type { OrganizePlan, PlannedMove as GeneratedPlannedMove } from "../types";
 import { TagBadge } from "./TagBadges";
 import { ConfirmModal } from "./ConfirmModal";
@@ -57,6 +58,8 @@ interface OrganizeResult {
   folderCounts: [string, number][];
   /** undo-journal path for this run (null if nothing moved / journal failed) */
   journalPath: string | null;
+  /** folders this run emptied — candidates for pruning, nothing removed yet */
+  emptiedDirs: string[];
 }
 
 export function OrganizeView() {
@@ -312,6 +315,8 @@ export function OrganizeView() {
         planned: number; moved: number; errors: string[]; journal_path: string | null;
         moved_pairs?: string[][];
         cancelled?: boolean;
+        /** Optional: an older sidecar doesn't send it. */
+        emptied_dirs?: string[];
       }>(
         "organize",
         { ...buildParams(), dry_run: false, op_id: opId },
@@ -359,6 +364,7 @@ export function OrganizeView() {
         backupPath,
         folderCounts: [...folderCounts.entries()].sort((a, b) => b[1] - a[1]),
         journalPath: stats.journal_path ?? null,
+        emptiedDirs: stats.emptied_dirs ?? [],
       });
       setPlan(null);
       setPlanParams(null);
@@ -906,6 +912,10 @@ function OrganizeResultPanel({
     errorMessages: string[];
   } | null>(null);
 
+  const [pruning, setPruning] = useState(false);
+  const [showPruneConfirm, setShowPruneConfirm] = useState(false);
+  const [pruneResult, setPruneResult] = useState<PruneEmptyFoldersResponse | null>(null);
+
   const handleUndo = async () => {
     if (!result.journalPath) return;
     // Register the revert as the global active op: without begin(), every
@@ -962,6 +972,48 @@ function OrganizeResultPanel({
       }
     } finally {
       setUndoing(false);
+    }
+  };
+
+  // --- Prune the folders this organize emptied -----------------------------
+  // Deleting a directory is the most destructive thing this view does, so it
+  // is never part of the organize itself: the user sees the count, confirms,
+  // and only then does the sidecar remove anything (re-checking emptiness).
+  const handlePrune = async () => {
+    setShowPruneConfirm(false);
+    if (!result.emptiedDirs.length) return;
+    if (useOperationStore.getState().active !== null) {
+      notify("Another operation is running — wait for it to finish first.", { kind: "info" });
+      return;
+    }
+    setPruning(true);
+    try {
+      const summary = await pruneEmptyFolders({
+        root: result.baseDir,
+        dirs: result.emptiedDirs,
+      });
+
+      setPruneResult(summary);
+      const kept = summary.skipped.length + summary.errors.length;
+      notify(
+        `Removed ${summary.removed.length} empty folder${summary.removed.length === 1 ? "" : "s"}` +
+          (kept > 0 ? ` — ${kept} kept` : ""),
+        {
+          kind: summary.errors.length > 0 ? "warning" : "success",
+          detail: kept > 0 ? "Folders that weren't empty are listed below." : undefined,
+        },
+      );
+    } catch (e) {
+      if (!isCancellation(e)) {
+        notify(
+          typeof e === "object" && e !== null && "message" in e
+            ? `Couldn't remove folders: ${String((e as { message: unknown }).message)}`
+            : `Couldn't remove folders: ${String(e)}`,
+          { kind: "info" },
+        );
+      }
+    } finally {
+      setPruning(false);
     }
   };
 
@@ -1100,6 +1152,84 @@ function OrganizeResultPanel({
             )}
           </details>
         )}
+
+        {/* Folders this organize emptied. Re-filing a sorted library moves the
+            last track out of a genre folder and leaves the folder behind. We
+            never delete one as part of the organize — offer it, with the list
+            visible, and let the user decide. Hidden once undone: undo puts the
+            files back, so the folders aren't empty any more. */}
+        {result.emptiedDirs.length > 0 && !undone && !pruneResult && (
+          <div className="panel-pad space-y-2">
+            <div className="text-sm text-white">
+              {result.emptiedDirs.length} folder
+              {result.emptiedDirs.length === 1 ? " is" : "s are"} now empty
+            </div>
+            <p className="text-xs text-white/50">
+              Every track moved out of{" "}
+              {result.emptiedDirs.length === 1 ? "this folder" : "these folders"}. Removing
+              them is optional and only removes the folders themselves — never a file.
+            </p>
+            <details className="text-xs">
+              <summary className="cursor-pointer text-white/60 hover:text-white">
+                Show folders
+              </summary>
+              <ul className="mt-2 space-y-0.5 font-mono text-white/50 max-h-40 overflow-auto">
+                {result.emptiedDirs.map((d) => (
+                  <li key={d} className="break-all">{d}</li>
+                ))}
+              </ul>
+            </details>
+            <button
+              className="btn-ghost"
+              onClick={() => setShowPruneConfirm(true)}
+              disabled={pruning}
+            >
+              {pruning ? <Loader2 className="w-4 h-4 animate-spin" /> : <FolderTree className="w-4 h-4" />}
+              Remove empty folders
+            </button>
+          </div>
+        )}
+
+        {pruneResult && (
+          <div className="panel-pad space-y-2">
+            <div className="text-sm text-white">
+              Removed {pruneResult.removed.length} empty folder
+              {pruneResult.removed.length === 1 ? "" : "s"}
+            </div>
+            {(pruneResult.skipped.length > 0 || pruneResult.errors.length > 0) && (
+              <details className="text-xs" open>
+                <summary className="cursor-pointer text-accent-yellow">
+                  {pruneResult.skipped.length + pruneResult.errors.length} kept
+                </summary>
+                <ul className="mt-2 space-y-0.5 text-white/60 max-h-40 overflow-auto">
+                  {pruneResult.skipped.map((s) => (
+                    <li key={s.path} className="break-all">
+                      <span className="font-mono">{s.path}</span> — {s.reason}
+                    </li>
+                  ))}
+                  {pruneResult.errors.map((e) => (
+                    <li key={e} className="break-all text-accent-yellow">{e}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        )}
+
+        <ConfirmModal
+          open={showPruneConfirm}
+          variant="danger"
+          destructive
+          title="Remove empty folders?"
+          message={
+            `${result.emptiedDirs.length} folder${result.emptiedDirs.length === 1 ? "" : "s"} ` +
+            "will be removed. Only the folders go — no files are deleted, and any folder " +
+            "that isn't actually empty is left alone. This is not covered by Undo."
+          }
+          confirmLabel="Remove folders"
+          onConfirm={handlePrune}
+          onCancel={() => setShowPruneConfirm(false)}
+        />
 
         {/* Actions */}
         <div className="flex items-center gap-2 pt-4">

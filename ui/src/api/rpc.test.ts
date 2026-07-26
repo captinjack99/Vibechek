@@ -56,6 +56,7 @@ const PYTHON_METHODS = [
   "handle_duplicates",
   "plan_organization",
   "organize",
+  "prune_empty_folders",
   "apply_ml_tags",
   "backup_tags",
   "restore_tags",

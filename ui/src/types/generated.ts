@@ -312,6 +312,7 @@ export interface OrganizeStats {
   errors: string[];
   journal_path: string | null;
   moved_pairs: string[][];
+  emptied_dirs: string[];
 }
 
 export interface PlannedMove {

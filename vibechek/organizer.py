@@ -83,6 +83,12 @@ class OrganizeStats:
     # store paths to files that never moved (phantom locations that then break
     # preview / re-tag / dedupe until a re-scan).
     moved_pairs: list[tuple[str, str]] = field(default_factory=list)
+    # Folders THIS run emptied — a source folder every track left. Re-organizing
+    # a sorted library in place is what produces them (move the last Techno
+    # track out and an empty Techno/ stays behind). Candidates only: nothing is
+    # deleted by organize. `prune_empty_dirs` removes them after the user says
+    # so, re-checking each one at that point.
+    emptied_dirs: list[str] = field(default_factory=list)
 
 
 # Substrings (case-insensitive) that almost always mean the chosen target is
@@ -521,8 +527,113 @@ def organize_from_analysis(
 
     # Expose the journal path so the GUI can offer "Undo this organize".
     stats.journal_path = str(jrnl.path) if jrnl.entries > 0 else None
+    stats.emptied_dirs = _find_emptied_dirs(plan, stats.moved_pairs)
 
     return stats
+
+
+def _find_emptied_dirs(plan: OrganizePlan, moved_pairs: list[tuple[str, str]]) -> list[str]:
+    """Source folders left empty by the moves that actually completed.
+
+    Only folders we moved OUT of, only inside `base_dir`, never `base_dir`
+    itself. Cascading parents (emptying `House/Tech House/` can leave `House/`
+    empty once the child is gone) are deliberately NOT resolved here — that
+    depends on removals that haven't happened yet, so `prune_empty_dirs` walks
+    it at prune time.
+    """
+    base = plan.base_dir.resolve()
+    candidates: set[Path] = set()
+    for src, _dst in moved_pairs:
+        parent = Path(src).parent
+        try:
+            resolved = parent.resolve()
+        except OSError:
+            continue
+        if resolved == base or base not in resolved.parents:
+            continue
+        candidates.add(resolved)
+
+    emptied = []
+    for d in candidates:
+        try:
+            if d.is_dir() and not any(d.iterdir()):
+                emptied.append(str(d))
+        except OSError:
+            continue
+    return sorted(emptied)
+
+
+def prune_empty_dirs(dirs: list[str | Path], root: str | Path) -> dict[str, Any]:
+    """Remove empty directories under `root`. Never removes a file.
+
+    Confined and conservative on purpose — this is the only place Vibechek
+    deletes a directory:
+
+    - every path must be strictly inside `root`; `root` itself is never removed
+    - a directory is removed ONLY if it is genuinely empty at this moment,
+      re-checked here rather than trusted from whenever the list was built
+    - deepest-first, and each removal re-tests the parent, so a genre folder
+      that only held now-empty subgenre folders is cleaned up in one pass
+    - a folder holding only OS cruft (`.DS_Store`, `desktop.ini`, `Thumbs.db`)
+      is NOT empty and is reported as skipped. Removing it would mean deleting
+      a file, which this is not allowed to do.
+
+    Returns {removed: [...], skipped: [{path, reason}], errors: [...]}.
+    """
+    root_resolved = Path(root).resolve()
+    removed: list[str] = []
+    skipped: list[dict[str, str]] = []
+    errors: list[str] = []
+    seen: set[Path] = set()
+
+    # Deepest first so children are gone before a parent is tested.
+    queue: list[Path] = []
+    for d in dirs:
+        try:
+            queue.append(Path(d).resolve())
+        except OSError as e:
+            errors.append(f"{d}: {e}")
+    queue.sort(key=lambda p: len(p.parts), reverse=True)
+
+    while queue:
+        d = queue.pop(0)
+        if d in seen:
+            continue
+        seen.add(d)
+
+        if d == root_resolved or root_resolved not in d.parents:
+            skipped.append({"path": str(d), "reason": "outside the library root"})
+            continue
+        if not d.is_dir():
+            skipped.append({"path": str(d), "reason": "no longer exists"})
+            continue
+        try:
+            leftovers = [p.name for p in d.iterdir()]
+        except OSError as e:
+            errors.append(f"{d}: {e}")
+            continue
+        if leftovers:
+            preview = ", ".join(sorted(leftovers)[:3])
+            skipped.append({
+                "path": str(d),
+                "reason": f"not empty ({len(leftovers)} item(s): {preview})",
+            })
+            continue
+
+        try:
+            d.rmdir()
+            removed.append(str(d))
+        except OSError as e:
+            errors.append(f"{d}: {e}")
+            continue
+
+        # The parent may have just become empty. Re-test it (bounded by root).
+        parent = d.parent
+        if parent != root_resolved and root_resolved in parent.parents:
+            queue.append(parent)
+            queue.sort(key=lambda p: len(p.parts), reverse=True)
+
+    return {"removed": removed, "skipped": skipped, "errors": errors}
 
 
 def route_new_tracks(
@@ -691,4 +802,5 @@ __all__ = [
     "route_new_tracks",
     "validate_organize_target",
     "ml_genre_coverage",
+    "prune_empty_dirs",
 ]

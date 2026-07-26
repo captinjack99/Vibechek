@@ -10,6 +10,20 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+### Added
+- **Organize can clear up the folders it empties — if you say so.** Re-filing a
+  sorted library moves the last track out of a genre folder and leaves the empty
+  folder behind. Organize now tells you how many folders that was and lists
+  them, with a button to remove them. Nothing is removed as part of the organize
+  itself: you see the list first, and confirm.
+
+  It only ever removes folders, never a file. A folder that turns out not to be
+  empty after all is left alone and reported with the reason, including one
+  holding nothing but a hidden `.DS_Store` or `desktop.ini` — clearing that would
+  mean deleting a file. A genre folder left holding only empty subgenre folders
+  is cleared in the same pass. Nothing outside the library is touched. Undo still
+  works afterwards: putting the files back recreates the folders.
+
 ### Fixed
 - **Re-organizing a library you've already sorted now works.** If your library
   is already in genre folders and you re-analyze it, the tracks whose genre came

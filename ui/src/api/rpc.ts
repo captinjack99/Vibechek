@@ -77,6 +77,8 @@ import type {
   VerifyModelsResult,
   NativeVenvStatus,
   OrganizeRequest,
+  PruneEmptyFoldersRequest,
+  PruneEmptyFoldersResponse,
   OrganizeStats,
   OrganizePlan,
   PingResult,
@@ -360,6 +362,18 @@ export function organize(
   return rpc<OrganizeStats>("organize", withOpId(params, opId));
 }
 
+/**
+ * Remove the folders an organize emptied. Requires the user to have confirmed:
+ * this is the only call that deletes a directory. Nothing outside `root` is
+ * touched, a folder that isn't empty is reported rather than removed, and no
+ * file is ever deleted.
+ */
+export function pruneEmptyFolders(
+  params: PruneEmptyFoldersRequest,
+): Promise<PruneEmptyFoldersResponse> {
+  return rpc<PruneEmptyFoldersResponse>("prune_empty_folders", params);
+}
+
 // ---------------------------------------------------------------------------
 // Tags
 // ---------------------------------------------------------------------------
@@ -635,6 +649,7 @@ const api = {
   // organize
   planOrganization,
   organize,
+  pruneEmptyFolders,
   // tags
   applyMlTags,
   backupTags,

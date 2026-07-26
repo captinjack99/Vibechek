@@ -1061,6 +1061,27 @@ def _organize(params: dict) -> dict:
     return asdict(stats)
 
 
+def _prune_empty_folders(params: dict) -> dict:
+    """Remove folders an organize emptied. Requires explicit user confirmation.
+
+    Params: {root: str, dirs: [str]}. `dirs` is normally `emptied_dirs` straight
+    off the organize result. Deliberately a SEPARATE call rather than an
+    organize flag: this is the one place Vibechek removes a directory, so it
+    only ever runs because the user asked for it after seeing the list.
+
+    Returns {removed: [...], skipped: [{path, reason}], errors: [...]}.
+    """
+    from vibechek.organizer import prune_empty_dirs
+
+    root = params.get("root")
+    if not root:
+        raise InvalidParams("prune_empty_folders needs the library root ('root').")
+    dirs = params.get("dirs") or []
+    if not isinstance(dirs, list):
+        raise InvalidParams("'dirs' must be a list of folder paths.")
+    return prune_empty_dirs(dirs, root)
+
+
 def _apply_ml_tags(params: dict) -> dict:
     from vibechek.tagger import apply_ml_tags
 
@@ -2087,6 +2108,7 @@ METHODS: dict[str, Callable[[dict], Any]] = {
     "handle_duplicates": _handle_duplicates,
     "plan_organization": _plan_organization,
     "organize": _organize,
+    "prune_empty_folders": _prune_empty_folders,
     "apply_ml_tags": _apply_ml_tags,
     "backup_tags": _backup_tags,
     "restore_tags": _restore_tags,

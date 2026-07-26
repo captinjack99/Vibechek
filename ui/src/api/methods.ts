@@ -78,6 +78,7 @@ export const RPC_METHODS = [
   // organize
   "plan_organization",
   "organize",
+  "prune_empty_folders",
   // tags
   "apply_ml_tags",
   "backup_tags",
@@ -355,6 +356,25 @@ export type OrganizeRequest = PlanOrganizationRequest & {
   /** Default false. */
   dry_run?: boolean;
 };
+
+/**
+ * Remove folders an organize emptied. Separate from `organize` on purpose:
+ * removing a directory is the most destructive thing the organize flow does,
+ * so it only ever runs after the user confirms the list.
+ */
+export type PruneEmptyFoldersRequest = {
+  /** Library root. Nothing outside it is ever removed, and it is never removed. */
+  root: string;
+  /** Normally `emptied_dirs` straight off the organize result. */
+  dirs: string[];
+};
+
+export interface PruneEmptyFoldersResponse {
+  removed: string[];
+  /** Folders left in place, each with the reason (not empty / gone / outside root). */
+  skipped: { path: string; reason: string }[];
+  errors: string[];
+}
 
 // --- tags ---
 
