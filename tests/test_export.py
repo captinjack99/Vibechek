@@ -164,8 +164,12 @@ def test_export_counts_only_the_rows_it_wrote(tmp_path: Path) -> None:
     result = runner.invoke(main, ["export", str(analysis_file), "--format", "m3u8",
                                   "--output", str(output)])
     assert result.exit_code == 0, result.output
-    assert "Exported 1 tracks" in result.output
-    assert "3 unusable entries skipped" in result.output
+    # rich wraps the console at 80 columns and macOS's pytest tmp paths are
+    # long enough to push "skipped" onto the next line — compare on collapsed
+    # whitespace so the assertion is about the words, not the line breaks.
+    flat = " ".join(result.output.split())
+    assert "Exported 1 tracks" in flat
+    assert "3 unusable entries skipped" in flat
 
 
 def test_export_rejects_a_non_list_tracks_field(tmp_path: Path) -> None:

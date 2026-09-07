@@ -314,7 +314,11 @@ def test_find_executable_survives_an_unreadable_cwd(
     real.write_bytes(b"real")
     monkeypatch.setattr(utils.shutil, "which", lambda _cmd: str(real))
 
-    class _NoCwd(Path):
+    # Subclass the CONCRETE flavour (`WindowsPath`/`PosixPath`), not `Path`:
+    # before Python 3.12 a bare `Path` subclass has no `_flavour` and every
+    # instantiation dies with AttributeError — which is what took the 3.10 CI
+    # legs down when this test first shipped.
+    class _NoCwd(type(Path())):
         @classmethod
         def cwd(cls):  # noqa: D102
             raise OSError("the working directory was deleted")
