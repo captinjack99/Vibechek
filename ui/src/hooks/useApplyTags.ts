@@ -13,6 +13,7 @@ import { useCallback } from "react";
 
 import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
 import { rpc, RpcError } from "./useSidecar";
+import type { TagApplyStats } from "../api/methods";
 import type { TrackAnalysis } from "../types";
 import { KIND_LABELS } from "../components/AnalysisProgress";
 
@@ -25,18 +26,17 @@ function opLabel(kind: string): string {
 export interface ApplyTagsResult {
   /** Files where the genre was written (confidence >= threshold). */
   applied: number;
+  /** Files where the SUBgenre was too uncertain but the parent-genre family
+   *  cleared its (lower) threshold — the parent genre WAS written. These are
+   *  neither `applied` nor `skipped`; reporting only those two hides them. */
+  parentOnly: number;
   /** Files where genre was skipped because confidence was too low. */
   skipped: number;
+  /** Files whose genre was confident enough but wasn't written because the
+   *  `write_genre` toggle is off — neither applied nor low-confidence. */
+  skippedWriteDisabled: number;
   /** Files where non-genre tags (energy/mood/timeslot/etc.) were written. */
   other: number;
-  errors: string[];
-}
-
-interface RpcStats {
-  total: number;
-  genre_applied: number;
-  genre_skipped_low_confidence: number;
-  other_tags_applied: number;
   errors: string[];
 }
 
@@ -91,7 +91,9 @@ export function useApplyTags(): UseApplyTagsReturn {
           ml_analysis: t.ml_analysis ?? null,
         }));
 
-        const stats = await rpc<RpcStats>("apply_ml_tags", {
+        // The generated asdict() shape of tagger.ApplyStats — no local copy, so
+        // a renamed or dropped field is a compile error, not a silent zero.
+        const stats = await rpc<TagApplyStats>("apply_ml_tags", {
           op_id: opId,
           analysis: { tracks: slim },
           confidence: taggingCfg.genre_confidence_threshold,
@@ -119,7 +121,9 @@ export function useApplyTags(): UseApplyTagsReturn {
         finish();
         return {
           applied: stats.genre_applied,
+          parentOnly: stats.genre_applied_parent_only,
           skipped: stats.genre_skipped_low_confidence,
+          skippedWriteDisabled: stats.genre_skipped_write_disabled,
           other: stats.other_tags_applied,
           errors: stats.errors,
         };

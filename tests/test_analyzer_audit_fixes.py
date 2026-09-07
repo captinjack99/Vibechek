@@ -281,3 +281,566 @@ def test_timeslot_old_parent_match_was_dead() -> None:
     # Matching the parent against the old ("Hard Techno",) tuple is a no-op,
     # but matching the subgenre forces Peak.
     assert analyzer._pick_timeslot(res.genre, res.subgenre, 3, 130.0) == "Peak"
+
+
+# ---------------------------------------------------------------------------
+# F031 — a run where every ML pass failed must NOT report "N/N, 0 errors"
+# ---------------------------------------------------------------------------
+
+
+def _ml_failed_record(name: str) -> dict:
+    """The record shape `analyze_track` produces for an ML failure: a truthy
+    `ml_analysis` carrying only `ml_error`, and a record-level `error` of None
+    (nothing anywhere promotes one to the other)."""
+    return {
+        "path": f"/lib/{name}",
+        "filename": name,
+        "extension": ".mp3",
+        "size_mb": 4.2,
+        "error": None,
+        "ml_analysis": {"ml_error": "Could not decode audio: boom"},
+    }
+
+
+def _ml_ok_record(name: str) -> dict:
+    return {
+        "path": f"/lib/{name}",
+        "filename": name,
+        "extension": ".mp3",
+        "size_mb": 4.2,
+        "error": None,
+        "ml_analysis": {"ml_genre": "Techno", "ml_bpm": 130.0, "ml_energy": 4},
+    }
+
+
+def test_ml_error_records_count_as_errors_not_as_analyzed() -> None:
+    """Every track failed to decode: the summary must say so, or the GUI shows a
+    green "Analyzed 5/5" toast over a library with no BPM, key or genre."""
+    results = [_ml_failed_record(f"t{i}.mp3") for i in range(5)]
+    summary = analyzer._build_report(results, 5, in_progress=False)["summary"]
+    assert summary == {"total_files": 5, "analyzed": 0, "errors": 5}
+
+
+def test_partial_ml_failure_splits_the_counts() -> None:
+    results = [_ml_ok_record("a.mp3"), _ml_failed_record("b.mp3"),
+               _ml_ok_record("c.mp3")]
+    summary = analyzer._build_report(results, 3, in_progress=False)["summary"]
+    assert summary == {"total_files": 3, "analyzed": 2, "errors": 1}
+
+
+def test_record_level_error_is_still_counted_once() -> None:
+    """A worker-death record (record-level `error`, no ml_analysis) keeps its
+    old meaning, and a record carrying BOTH is not double-counted."""
+    both = _ml_failed_record("d.mp3")
+    both["error"] = "analysis worker died repeatedly on this track — skipped"
+    results = [
+        {"path": "/lib/e.mp3", "filename": "e.mp3", "extension": ".mp3",
+         "size_mb": 0.0, "error": "boom"},
+        both,
+    ]
+    summary = analyzer._build_report(results, 2, in_progress=False)["summary"]
+    assert summary == {"total_files": 2, "analyzed": 0, "errors": 2}
+
+
+@pytest.mark.parametrize("corrupt", ["legacy string", 42, ["ml_error"]])
+def test_a_non_dict_ml_analysis_is_a_failure_not_a_crash(corrupt: object) -> None:
+    """A hand-edited or half-written analysis JSON can carry a truthy
+    `ml_analysis` that is not a dict. `(x or {}).get(...)` raised AttributeError
+    on it, and that escaped as far as the dedupe path's summary recompute — which
+    reports a failure AFTER the duplicates were already trashed. A row we cannot
+    read is a row we cannot call analyzed."""
+    row = _ml_ok_record("weird.mp3")
+    row["ml_analysis"] = corrupt
+    assert analyzer._record_failed(row) is True
+
+
+@pytest.mark.parametrize("corrupt", ["legacy string", 42, ["ml_error"]])
+def test_reconcile_skips_a_non_dict_ml_analysis_instead_of_crashing(corrupt: object) -> None:
+    """The offline re-reconcile (priors import, conflict resolution, the
+    incremental-analyze merge) walks every saved row; one corrupt row must not
+    abort the whole pass with AttributeError. It is left untouched."""
+    row = _ml_ok_record("weird.mp3")
+    row["ml_analysis"] = corrupt
+    analyzer._reconcile_record_genre(row, "prefer_tag", 0.90)
+    assert row["ml_analysis"] == corrupt
+
+
+# ---------------------------------------------------------------------------
+# F044 — the online genre tier must say when it never reached the web
+# ---------------------------------------------------------------------------
+
+
+def _web_record(name: str, artist: str, title: str) -> dict:
+    return {
+        "path": f"/lib/{name}",
+        "filename": name,
+        "extension": ".mp3",
+        "size_mb": 4.2,
+        "existing_tags": {"artist": artist, "title": title},
+        "ml_analysis": {"ml_genre": "House", "ml_genre_raw_confidence": 0.5},
+    }
+
+
+def _build_web_report(monkeypatch, resolve, records):
+    from vibechek import genre_web
+
+    monkeypatch.setattr(genre_web, "resolver_ready", lambda: True)
+    monkeypatch.setattr(genre_web, "resolve", resolve)
+    return analyzer._build_report(
+        records, len(records), in_progress=False,
+        web_cfg={"enabled": True, "backend": "ollama"},
+    )
+
+
+_RATELIMIT = "RatelimitException: Ratelimit: 202 https://duckduckgo.com/"
+_DNS = "gaierror: [Errno -3] Temporary failure in name resolution"
+
+
+def test_zero_web_reads_sets_the_degradation_warning(monkeypatch) -> None:
+    """Packages installed, every search rate-limited: `resolve` returns
+    used_web=False plus a REASON for every track. The progress line claims the
+    tier ran, so the report has to carry the correction — and name the reason,
+    because "you're rate-limited" and "you're offline" need opposite responses.
+    """
+    def resolve(_artist, _title, _tag, _audio, **_kw):
+        return {"genre": "", "subgenre": "", "source_matched": False,
+                "used_web": False, "web_unavailable": _RATELIMIT}
+
+    records = [_web_record(f"t{i}.mp3", f"Artist {i}", f"Title {i}")
+               for i in range(3)]
+    events: list[tuple] = []
+    monkeypatch.setattr(analyzer, "_emit_event",
+                        lambda kind, **kw: events.append((kind, kw)))
+
+    report = _build_web_report(monkeypatch, resolve, records)
+
+    warning = report["genre_web_unavailable_warning"]
+    assert "3 tracks" in warning
+    assert _RATELIMIT in warning
+    degraded = [kw for _k, kw in events if kw.get("name") == "genre_web_degraded"]
+    assert degraded and degraded[0]["reason"] == _RATELIMIT
+    assert degraded[0]["attempted"] == 3 and degraded[0]["unavailable"] == 3
+
+
+def test_degradation_warning_names_the_most_common_reason(monkeypatch) -> None:
+    """Mixed failures still get ONE banner; it must name the reason that hit the
+    most tracks rather than whichever happened to come last."""
+    calls = {"n": 0}
+
+    def resolve(_artist, _title, _tag, _audio, **_kw):
+        calls["n"] += 1
+        # 3 rate-limited, then 1 DNS failure — every track unavailable.
+        reason = _DNS if calls["n"] == 4 else _RATELIMIT
+        return {"genre": "", "subgenre": "", "source_matched": False,
+                "used_web": False, "web_unavailable": reason}
+
+    records = [_web_record(f"t{i}.mp3", f"Artist {i}", f"Title {i}")
+               for i in range(4)]
+    warning = _build_web_report(
+        monkeypatch, resolve, records,
+    )["genre_web_unavailable_warning"]
+    assert _RATELIMIT in warning
+    assert _DNS not in warning
+
+
+def test_empty_searches_are_a_clean_miss_not_a_degradation(monkeypatch) -> None:
+    """Every search RAN and came back empty (`web_unavailable=""`). The web was
+    reachable, so telling the user to check their connection sends them to fix a
+    network that is working — the tier simply found no evidence."""
+    def resolve(_artist, _title, _tag, _audio, **_kw):
+        return {"genre": "", "subgenre": "", "source_matched": False,
+                "used_web": False, "web_unavailable": ""}
+
+    records = [_web_record(f"t{i}.mp3", f"Artist {i}", f"Title {i}")
+               for i in range(3)]
+    report = _build_web_report(monkeypatch, resolve, records)
+    assert "genre_web_unavailable_warning" not in report
+
+
+def test_a_partial_degradation_is_reported_with_its_proportion(monkeypatch) -> None:
+    """One lucky early read must NOT silence the banner for everything after it.
+
+    This is the real rate-limit shape: DuckDuckGo answers the first few tracks of
+    a long run and throttles the rest. Gating the banner on "every track failed"
+    meant a 2000-track library where 1999 were throttled reported nothing at all,
+    and the user believed the verified-web tier had run on the whole library. The
+    wording has to name the proportion — "couldn't reach the web" over a run that
+    partly worked would overclaim in the other direction.
+    """
+    calls = {"n": 0}
+
+    def resolve(_artist, _title, _tag, _audio, **_kw):
+        calls["n"] += 1
+        used = calls["n"] == 1
+        return {"genre": "", "subgenre": "", "source_matched": False,
+                "used_web": used,
+                "web_unavailable": "" if used else _RATELIMIT}
+
+    records = [_web_record(f"t{i}.mp3", f"Artist {i}", f"Title {i}")
+               for i in range(10)]
+    events: list[tuple] = []
+    monkeypatch.setattr(analyzer, "_emit_event",
+                        lambda kind, **kw: events.append((kind, kw)))
+
+    report = _build_web_report(monkeypatch, resolve, records)
+
+    warning = report["genre_web_unavailable_warning"]
+    assert "9 of 10 tracks" in warning
+    assert "any of" not in warning          # 1 track DID reach the web
+    assert _RATELIMIT in warning
+    degraded = [kw for _k, kw in events if kw.get("name") == "genre_web_degraded"]
+    assert degraded and degraded[0]["attempted"] == 10
+    assert degraded[0]["unavailable"] == 9 and degraded[0]["used"] == 1
+
+
+def test_one_blip_in_a_long_run_is_recorded_but_not_warned_about(monkeypatch) -> None:
+    """The banner is folded into the GUI's `degraded` flag, which turns the whole
+    completion toast to "warning". Firing it on ANY non-zero count meant a single
+    transient failure in a 2000-track run reported the entire analysis as
+    degraded. The count is still recorded honestly — it just isn't announced."""
+    calls = {"n": 0}
+
+    def resolve(_artist, _title, _tag, _audio, **_kw):
+        calls["n"] += 1
+        failed = calls["n"] == 1
+        return {"genre": "", "subgenre": "", "source_matched": False,
+                "used_web": not failed,
+                "web_unavailable": _RATELIMIT if failed else ""}
+
+    records = [_web_record(f"t{i}.mp3", f"Artist {i}", f"Title {i}")
+               for i in range(50)]
+    events: list[tuple] = []
+    monkeypatch.setattr(analyzer, "_emit_event",
+                        lambda kind, **kw: events.append((kind, kw)))
+
+    report = _build_web_report(monkeypatch, resolve, records)
+
+    assert "genre_web_unavailable_warning" not in report
+    assert not [kw for _k, kw in events if kw.get("name") == "genre_web_degraded"]
+    # ...but the honest number is still in the report.
+    assert report["genre_web_unavailable_count"] == 1
+    assert report["genre_web_attempted"] == 50
+
+
+@pytest.mark.parametrize(("unavailable", "attempted", "material"), [
+    (1, 1, True),        # the whole (tiny) run failed
+    (3, 3, True),
+    (1, 50, False),      # one blip
+    (2, 50, False),      # still under the floor of 3
+    (3, 50, True),       # floor reached
+    (2, 10, False),      # under the floor even though it is 20% of the run
+    (5, 200, False),     # under 5%
+    (10, 200, True),     # exactly 5%
+    (0, 100, False),     # nothing failed
+])
+def test_the_degradation_threshold_is_a_share_with_a_floor(
+    unavailable: int, attempted: int, material: bool,
+) -> None:
+    """Everything failing is always material; below that it takes 5% of the run,
+    never fewer than three tracks."""
+    assert analyzer._web_degradation_is_material(unavailable, attempted) is material
+
+
+def test_web_lookup_off_never_claims_a_degradation(monkeypatch) -> None:
+    records = [_web_record("t0.mp3", "A", "B")]
+    report = analyzer._build_report(records, 1, in_progress=False)
+    assert "genre_web_unavailable_warning" not in report
+
+
+# ---------------------------------------------------------------------------
+# Both confidence fields must describe the genre that was actually STORED
+# ---------------------------------------------------------------------------
+
+
+def _reconciled(ml: dict, tag: str | None, policy: str = "prefer_tag") -> dict:
+    """Run one reconcile pass over a record built from `ml` + `tag`, in place."""
+    rec = {"path": "/lib/a.mp3", "filename": "a.mp3",
+           "existing_tags": {"genre": tag, "artist": "A", "title": "T"},
+           "ml_analysis": ml}
+    analyzer._reconcile_record_genre(rec, policy, 0.90)
+    return rec["ml_analysis"]
+
+
+def test_tag_sourced_genre_carries_the_tags_confidence_not_the_audios() -> None:
+    """A curated tag is what gets stored, so `ml_genre_raw_confidence` must stop
+    reporting the audio model's 0.2 for it — read as "how sure are we about this
+    genre?" it was answering about a genre that isn't in the record."""
+    ml = _reconciled(
+        {"ml_genre": "House", "ml_subgenre": "Deep House",
+         "ml_genre_confidence": 0.55, "ml_genre_raw_confidence": 0.2},
+        "Techno",
+    )
+    assert ml["ml_genre_source"] == "tag"
+    assert ml["ml_genre"] == "Techno"
+    assert ml["ml_genre_raw_confidence"] == ml["ml_genre_confidence"] == 0.99
+    # The audio read itself is not lost — it moves to the pure-audio stash.
+    assert ml["ml_genre_audio"] == "House"
+    assert ml["ml_genre_audio_confidence"] == 0.2
+
+
+def test_audio_sourced_genre_keeps_the_audio_confidence() -> None:
+    """No usable tag → the audio read IS the stored genre, so the field keeps
+    describing it (and stays the single-class score the gate was tuned on)."""
+    ml = _reconciled(
+        {"ml_genre": "House", "ml_subgenre": "Deep House",
+         "ml_genre_confidence": 0.55, "ml_genre_raw_confidence": 0.2},
+        None,
+    )
+    assert ml["ml_genre_source"] == "ml"
+    assert ml["ml_genre_raw_confidence"] == 0.2
+
+
+def test_reconcile_is_idempotent_after_rewriting_the_confidence() -> None:
+    """The rewritten field must never be fed back in as the AUDIO confidence: a
+    tag's 0.99 clears the 0.90 ml_override gate, so a second pass (priors import,
+    incremental-analyze merge, conflict resolution) would overturn the tag it
+    just stored and re-open the review queue on a record nothing changed."""
+    ml = {"ml_genre": "House", "ml_subgenre": "Deep House",
+          "ml_genre_confidence": 0.55, "ml_genre_raw_confidence": 0.2}
+    first = dict(_reconciled(ml, "Techno"))
+    second = _reconciled(ml, "Techno")
+    assert second["ml_genre_source"] == "tag"
+    assert second["ml_genre"] == "Techno"
+    assert second == first
+
+
+def test_legacy_record_without_a_raw_confidence_never_gains_one() -> None:
+    """Its ABSENCE is how tagger.py/genreGate.ts detect a pre-two-stage report
+    and hold back the parent-genre fallback; inventing one here would silently
+    write coarser genres to files on a plain re-apply."""
+    ml = _reconciled(
+        {"ml_genre": "House", "ml_subgenre": "Deep House",
+         "ml_genre_confidence": 0.55},
+        "Techno",
+    )
+    assert ml["ml_genre_source"] == "tag"
+    assert "ml_genre_raw_confidence" not in ml
+    assert "ml_genre_audio_confidence" not in ml
+
+
+# ---------------------------------------------------------------------------
+# F005 — cancel / stall-abort must not throw away every completed track
+# ---------------------------------------------------------------------------
+
+
+def _cancel_after(n: int, records: list):
+    """An `analyze_track` stand-in that requests cancellation after `n` files."""
+    from vibechek import cancellation
+
+    def fake(filepath, _models):
+        rec = analyzer.TrackAnalysis(
+            path=str(filepath), filename=filepath.name,
+            extension=filepath.suffix.lower(), size_mb=1.0,
+            ml_analysis={"ml_genre": "Techno", "ml_bpm": 130.0},
+        )
+        records.append(rec.path)
+        if len(records) >= n:
+            cancellation.cancel()
+        return rec
+    return fake
+
+
+def _run_cancelled_analyze(tmp_path, monkeypatch, output_path):
+    """Drive the real in-process single-worker loop until a cancel fires."""
+    from unittest.mock import MagicMock, patch
+
+    from vibechek import cancellation
+    from vibechek.config import AnalysisConfig
+
+    files = []
+    for i in range(4):
+        f = tmp_path / f"t{i}.flac"
+        f.write_bytes(b"\x00")
+        files.append(f)
+
+    done: list[str] = []
+    monkeypatch.setattr(analyzer, "load_models", lambda *a, **kw: {"effnet": object()})
+    monkeypatch.setattr(analyzer, "analyze_track", _cancel_after(2, done))
+
+    cancellation.begin("analyze", "op-test")
+    try:
+        with patch("vibechek.preflight.preflight",
+                   return_value=MagicMock(ready=True, analyze_via="native",
+                                          reasons_not_ready=[])), \
+             patch("vibechek.utils.find_audio_files", return_value=files):
+            with pytest.raises(cancellation.CancelledError) as excinfo:
+                analyzer.analyze_directory(
+                    tmp_path,
+                    config=AnalysisConfig(workers=1, use_gpu="off",
+                                          inference_engine="essentia_tf"),
+                    output_path=output_path,
+                )
+    finally:
+        cancellation.end()
+    return excinfo.value, done
+
+
+def test_cancel_writes_the_partial_report_to_output_path(tmp_path, monkeypatch) -> None:
+    """The two finished tracks must be on disk before the exception unwinds —
+    a checkpoint that only exists on the happy path is not a checkpoint."""
+    import json
+
+    output = tmp_path / "analysis.json"
+    exc, done = _run_cancelled_analyze(tmp_path, monkeypatch, output)
+
+    assert len(done) == 2
+    assert output.exists(), "cancel discarded the finished tracks"
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["status"] == "in_progress"
+    assert [t["path"] for t in saved["tracks"]] == done
+
+
+def test_cancel_attaches_the_partial_report_even_without_an_output_path(
+    tmp_path, monkeypatch,
+) -> None:
+    """The GUI's caller may not have configured a file; it still needs the
+    finished records, so they ride out on the exception."""
+    exc, done = _run_cancelled_analyze(tmp_path, monkeypatch, None)
+
+    partial = getattr(exc, "partial_report", None)
+    assert partial is not None, "no partial_report attached to the cancel"
+    assert partial["status"] == "in_progress"
+    assert [t["path"] for t in partial["tracks"]] == done
+    assert partial["summary"]["total_files"] == 4
+
+
+def test_partial_build_does_not_re_raise_the_cancel(tmp_path) -> None:
+    """`_build_report(in_progress=True)` skips the reconcile loop's own
+    cancellation.check(), so building the partial can't raise the very cancel
+    we're already handling."""
+    from vibechek import cancellation
+
+    results = [_ml_ok_record("a.mp3")]
+    cancellation.begin("analyze", "op-1")
+    cancellation.cancel()
+    try:
+        report = analyzer._build_report(results, 3, in_progress=True)
+        assert len(report["tracks"]) == 1
+        # ...while the FINAL build is still a cancel point, as designed.
+        with pytest.raises(cancellation.CancelledError):
+            analyzer._build_report(results, 3, in_progress=False)
+    finally:
+        cancellation.end()
+
+
+def test_abort_before_any_track_does_not_overwrite_an_existing_report(
+    tmp_path,
+) -> None:
+    """An abort during model load has nothing to save. Writing a zero-track
+    report over the user's previous analysis.json would be worse than the loss
+    this whole path exists to prevent."""
+    import json
+
+    from vibechek import cancellation
+
+    output = tmp_path / "analysis.json"
+    output.write_text(json.dumps({"status": "complete", "tracks": [{"path": "old"}]}),
+                      encoding="utf-8")
+
+    exc = cancellation.CancelledError("cancelled")
+    analyzer._persist_partial_on_abort(exc, output, [], 12)
+
+    assert json.loads(output.read_text(encoding="utf-8"))["tracks"] == [{"path": "old"}]
+    assert not hasattr(exc, "partial_report")
+
+
+# ---------------------------------------------------------------------------
+# A partial ML read is DEGRADED, not FAILED (R03)
+# ---------------------------------------------------------------------------
+
+
+def _ml_degraded_record(name: str) -> dict:
+    """The shape `_finish_ml_result` produces when the EffNet embedding fails
+    but the model-free BPM/key extractors succeeded."""
+    return {
+        "path": f"/lib/{name}",
+        "filename": name,
+        "extension": ".flac",
+        "size_mb": 32.0,
+        "error": None,
+        "ml_analysis": {
+            "ml_bpm": 128.0,
+            "ml_key": "8A",
+            "ml_error": None,
+            "ml_degraded_heads": [analyzer.EMBEDDING_HEAD],
+        },
+    }
+
+
+def test_embedding_failure_that_kept_bpm_and_key_is_degraded_not_failed() -> None:
+    """The record `analyze_audio_features` goes out of its way to keep — real
+    BPM, real key, no embedding — must NOT be counted as an error.
+
+    It used to carry `ml_error`, which `_record_failed` counts as a failure and
+    the library view mirrors as "never analyzed": every incremental "Analyze
+    new" re-decoded the same broken file forever and the counter never drained.
+    """
+    row = _ml_degraded_record("broken.flac")
+    assert analyzer._record_failed(row) is False
+
+    summary = analyzer._build_report(
+        [_ml_ok_record("a.mp3"), row], 2, in_progress=False,
+    )["summary"]
+    assert summary == {"total_files": 2, "analyzed": 2, "errors": 0}
+
+
+def test_a_read_with_nothing_usable_still_counts_as_an_error() -> None:
+    """The other half of the same rule: no BPM and no key means nothing came out
+    of the file, so `ml_error` stands and the track is a failure."""
+    row = _ml_failed_record("dead.flac")
+    assert analyzer._record_failed(row) is True
+    summary = analyzer._build_report([row], 1, in_progress=False)["summary"]
+    assert summary == {"total_files": 1, "analyzed": 0, "errors": 1}
+
+
+def test_finish_ml_result_keeps_bpm_and_names_the_missing_head() -> None:
+    """The producer side of both shapes, straight through the helper."""
+    partial = analyzer.MLResult(ml_bpm=128.0, ml_key="8A")
+    out = analyzer._finish_ml_result(partial, {}, "EffNet embedding failed: boom")
+    assert out.ml_error is None
+    assert out.ml_degraded_heads == [analyzer.EMBEDDING_HEAD]
+
+    total = analyzer.MLResult()
+    out2 = analyzer._finish_ml_result(total, {}, "EffNet embedding failed: boom")
+    assert out2.ml_error == "EffNet embedding failed: boom"
+    assert out2.ml_degraded_heads is None
+
+
+def test_finish_ml_result_still_stamps_worker_wide_load_failures() -> None:
+    """Heads that failed to LOAD are worker-wide and must keep riding out on
+    every track, embedding failure or not."""
+    ok = analyzer._finish_ml_result(
+        analyzer.MLResult(ml_bpm=120.0), {"_degraded_heads": ["happy"]}, None,
+    )
+    assert ok.ml_degraded_heads == ["happy"]
+    assert ok.ml_error is None
+
+    both = analyzer._finish_ml_result(
+        analyzer.MLResult(ml_bpm=120.0), {"_degraded_heads": ["happy"]},
+        "EffNet embedding model not loaded",
+    )
+    assert both.ml_degraded_heads == ["happy", analyzer.EMBEDDING_HEAD]
+
+
+def test_per_track_embedding_failure_does_not_claim_every_track_used_a_fallback() -> None:
+    """`degraded_heads` drives a "re-download your models" banner about the
+    WHOLE run — the right message for a head that failed to load, and a lie for
+    one damaged file in a library. The two are counted separately."""
+    results = [_ml_ok_record(f"ok{i}.mp3") for i in range(4)]
+    results.append(_ml_degraded_record("broken.flac"))
+    report = analyzer._build_report(results, 5, in_progress=False)
+    warning = report["model_degradation_warning"]
+    assert "1 of 5 tracks couldn't be fully analyzed" in warning
+    assert "Download models in Settings" not in warning
+    # And it is a degradation notice, not an error count.
+    assert report["summary"] == {"total_files": 5, "analyzed": 5, "errors": 0}
+
+
+def test_a_head_that_failed_to_load_still_gets_its_own_banner() -> None:
+    row = _ml_ok_record("a.mp3")
+    row["ml_analysis"]["ml_degraded_heads"] = ["happy", "sad"]
+    warning = analyzer._build_report(
+        [row], 1, in_progress=False,
+    )["model_degradation_warning"]
+    assert "Download models in Settings" in warning
+    assert "couldn't be fully analyzed" not in warning

@@ -17,10 +17,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 
 import { GlobalAudioPlayer } from "./GlobalAudioPlayer";
-import { usePlayerStore } from "../stores";
+import { open as openPath } from "@tauri-apps/plugin-shell";
+
+import { useNotificationStore, usePlayerStore } from "../stores";
 
 // ---------------------------------------------------------------------------
 // WaveSurfer mock. One shared "instance" per test captures registered event
@@ -155,5 +157,54 @@ describe("<GlobalAudioPlayer /> — failure fallback (WP-F)", () => {
     // The raw error is DEMOTED behind a Details toggle, never deleted.
     expect(screen.getByText("Details")).toBeInTheDocument();
     expect(screen.getByText(/DEMUXER_ERROR_COULD_NOT_OPEN/)).toBeInTheDocument();
+  });
+});
+
+/**
+ * "Show in folder" is the recovery step offered when a preview won't play, and
+ * it used to swallow every rejection from the shell opener (`.catch(() => {})`).
+ * A dead button at the exact moment something is already broken is the worst
+ * possible time to fail silently.
+ */
+describe("<GlobalAudioPlayer /> — Show in folder reports its own failures", () => {
+  /** Put the player into its error state (which is what renders the button). */
+  function playerInErrorState() {
+    render(<GlobalAudioPlayer />);
+    act(() => usePlayerStore.getState().play("D:/Music/bad.mp3", "Bad"));
+    act(() => emit("error", new Error("DEMUXER_ERROR_COULD_NOT_OPEN")));
+    return screen.getByText("Show in folder");
+  }
+
+  it("surfaces a toast carrying the opener's rejection message", async () => {
+    (openPath as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("no application is registered to open this path"),
+    );
+
+    const button = playerInErrorState();
+    await act(async () => {
+      button.click();
+    });
+
+    await waitFor(() => {
+      const failure = useNotificationStore
+        .getState()
+        .items.find((n) => n.message === "Couldn't open the folder");
+      expect(failure).toBeTruthy();
+      expect(failure!.kind).toBe("warning");
+      expect(failure!.detail).toMatch(/no application is registered/);
+      // The containing folder is what we asked the shell to open.
+      expect(failure!.detail).toMatch(/D:\/Music/);
+    });
+  });
+
+  it("stays quiet when the folder opens", async () => {
+    (openPath as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+    const button = playerInErrorState();
+    await act(async () => {
+      button.click();
+    });
+
+    expect(useNotificationStore.getState().items).toHaveLength(0);
   });
 });

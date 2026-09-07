@@ -34,6 +34,7 @@ import { Virtuoso } from "react-virtuoso";
 
 import { useOperationStore, useConfigStore, useLibraryStore, useNotificationStore } from "../stores";
 import { rpc } from "../hooks/useSidecar";
+import type { HandleDuplicatesResult } from "../api/methods";
 import type { DuplicateGroup, DuplicateReport, FileInfo } from "../types";
 import {
   DEFAULT_RULES,
@@ -48,8 +49,56 @@ import { ConfirmModal } from "./ConfirmModal";
 
 type Action = "report" | "move" | "trash";
 
+/** A duplicate group paired with the id the UI keys its state on. */
+interface KeyedGroup {
+  group: DuplicateGroup;
+  id: string;
+}
+
+/**
+ * Stable, UNIQUE id for a group.
+ *
+ * The backend's `g.key` is `keeper.audio_fingerprint` and is NOT unique: with
+ * `keep_all_formats` on, one acoustic cluster emits a group PER format, and two
+ * lossless containers that decode to identical PCM produce the identical
+ * chromaprint hash — so the WAV group and the FLAC group carry the same key.
+ * Keying overrides / skips / the auto-keeper cache / Virtuoso's item key on it
+ * coupled the twins: "don't change this group" on one card silently dropped the
+ * other from both the list and `applyChoices`, the second card rendered with no
+ * keeper highlighted, and React got duplicate keys. Position within its own list
+ * disambiguates them.
+ */
+function groupId(kind: "exact" | "audio", index: number, g: DuplicateGroup): string {
+  return `${kind}:${index}:${g.key}`;
+}
+
+/**
+ * True when `path` sits under `root`.
+ *
+ * Separator-agnostic and case-insensitive, like OrganizeView's `stripBaseDir`:
+ * the sidecar spells destinations with the OS separator while the library path
+ * came from a folder picker, and Windows compares paths case-insensitively.
+ * With no library open (`root` null) nothing can be inside one.
+ */
+function isInsideLibrary(path: string, root: string | null): boolean {
+  if (!root) return false;
+  const normRoot = root.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  if (!normRoot) return false;
+  return path.replace(/\\/g, "/").toLowerCase().startsWith(normRoot + "/");
+}
+
+/** Pair every group in a report with its `groupId`, exact groups first. */
+export function keyGroups(report: DuplicateReport): KeyedGroup[] {
+  return [
+    ...report.exact_duplicates.map((g, i) => ({ group: g, id: groupId("exact", i, g) })),
+    ...report.audio_duplicates.map((g, i) => ({ group: g, id: groupId("audio", i, g) })),
+  ];
+}
+
 export function DuplicatesView() {
   const libraryPath = useLibraryStore((s) => s.libraryPath);
+  const removeTracks = useLibraryStore((s) => s.removeTracks);
+  const updateTrackPaths = useLibraryStore((s) => s.updateTrackPaths);
 
   const active = useOperationStore((s) => s.active);
   const begin = useOperationStore((s) => s.begin);
@@ -103,7 +152,9 @@ export function DuplicatesView() {
     if (typeof selected === "string") setScanPath(selected);
   };
 
-  const handleScan = useCallback(async () => {
+  // The return type is annotated so the catch below can reference `handleScan`
+  // from inside its own initializer without TS declaring the type circular.
+  const handleScan: () => Promise<void> = useCallback(async () => {
     if (!scanPath) return;
     // Synchronous guard against double-click. The store's `active` flag is
     // checked by the `disabled` prop, but React's re-render is async — a
@@ -133,7 +184,14 @@ export function DuplicatesView() {
     } catch (e) {
       // Pass the raw error — the store's typed-error handling preserves
       // RpcError.cancelled (which is the silent-exit path). Don't pre-stringify.
-      fail(e);
+      //
+      // `find_duplicates` is on the store's NON_REPLAYABLE_METHODS list (the
+      // generic replay resolves the DuplicateReport and throws it away, so the
+      // scan would run again for minutes and land nowhere), which means without
+      // an explicit retryAction a failed scan offers no Try-again at all. This
+      // closure re-enters the real path — begin() → RPC → setReport — and owns
+      // its own failure handling, so it must not be double-wrapped.
+      fail(e, { retryAction: () => handleScan() });
     } finally {
       scanningRef.current = false;
     }
@@ -168,9 +226,16 @@ export function DuplicatesView() {
         updateDuplicates({ review_folder: folder });
         reviewFolder = folder;
       } else if (!looksLikePath(trimmed)) {
+        // Name the actual rule. The sidecar refuses a relative review folder
+        // outright (rpc.py `_validated_review_folder`), so "looks invalid" left
+        // the user guessing at a constraint we already know exactly.
         setPreconditionError(
-          `Review folder in Settings looks invalid: "${trimmed}". ` +
-          `Pick a valid folder, or clear the setting to be prompted.`,
+          `Review folder in Settings must be an absolute path — got "${trimmed}". ` +
+          "A relative path resolves against Vibechek's working directory, not " +
+          "your library, so the duplicates would land somewhere you can't find " +
+          "them. Type the full path (e.g. C:\\Music\\dupes on Windows, " +
+          "/Users/you/Music/dupes on macOS), pick a folder, or clear the " +
+          "setting to be prompted.",
         );
         return;
       } else {
@@ -190,19 +255,30 @@ export function DuplicatesView() {
     // A new action supersedes any earlier failure list.
     setResolveFailures(null);
 
-    const opId = begin("dedupe");
+    // A destructive move/trash is NOT the read-only scan. The sidecar already
+    // gives it its own kind ("dedupe-handle", vibechek/rpc.py::_CANCELLABLE_
+    // METHODS); reusing "dedupe" meant the only global indicator visible while
+    // files were being irreversibly trashed read "Finding duplicates".
+    const opId = begin("dedupe-handle");
     try {
-      const summary = await rpc<
-        Record<string, number> & {
-          journal_path?: string | null;
-          // The backend has always returned a per-file failure list here; the
-          // old `Record<string, number>` type structurally hid it, so the toast
-          // pointed at a "report" that was never rendered. Surface it instead.
-          error_messages?: string[];
-        }
-      >(
+      // The shared wire type (api/methods.ts) rather than a third inline copy —
+      // it declares every non-numeric key the handler sends, including the ones
+      // a bare `Record<string, number>` used to hide.
+      const summary = await rpc<HandleDuplicatesResult>(
         "handle_duplicates",
-        { report: filtered, action, review_folder: reviewFolder, op_id: opId },
+        {
+          report: filtered,
+          action,
+          review_folder: reviewFolder,
+          op_id: opId,
+          // Name the library so the sidecar's post-dedupe analysis sync
+          // (rpc.py::_prune_analysis_after_dedupe) works on THIS library's
+          // saved report. Omitted, it falls back to guessing the library by
+          // testing recents entries for path-ancestry over the trashed/moved
+          // files. Omit the key entirely when no library is loaded so that
+          // fallback still runs rather than matching the empty string.
+          ...(libraryPath ? { library_path: libraryPath } : {}),
+        },
       );
       finish();
       const word = action === "trash" ? "Trashed" : "Moved";
@@ -233,14 +309,93 @@ export function DuplicatesView() {
         );
       }
       if (action === "move" && summary.journal_path) {
-        detailParts.push('Undo available in "Recent operations" (sidebar).');
+        detailParts.push(
+          summary.journal_incomplete
+            ? 'Undo is in "Recent operations" (sidebar), but the undo record is ' +
+              "incomplete — undo will restore only part of this run."
+            : 'Undo available in "Recent operations" (sidebar).',
+        );
       } else if (action === "trash" && count > 0) {
         detailParts.push("Restore from your OS recycle bin if needed.");
       }
-      notify(`${word} ${count} duplicate${count === 1 ? "" : "s"}`, {
-        detail: detailParts.length > 0 ? detailParts.join(" ") : undefined,
-        kind: errors > 0 ? "warning" : "success",
-      });
+      // A cancelled batch stopped early. Reporting it with the same green
+      // "Trashed 1400 duplicates" as a completed run hid the fact that 3,600
+      // were never touched — mirror OrganizeView's cancelled branch instead.
+      const total = countDuplicates(filtered);
+      if (summary.cancelled) {
+        notify(
+          `${word} ${count} of ${total} duplicate${total === 1 ? "" : "s"} — cancelled before finishing`,
+          {
+            detail: detailParts.length > 0 ? detailParts.join(" ") : undefined,
+            kind: "info",
+          },
+        );
+      } else {
+        notify(`${word} ${count} duplicate${count === 1 ? "" : "s"}`, {
+          detail: detailParts.length > 0 ? detailParts.join(" ") : undefined,
+          // A half-written journal is the user's safety net failing, so it
+          // downgrades the toast the same way a per-file error does.
+          kind: errors > 0 || summary.journal_incomplete ? "warning" : "success",
+        });
+      }
+      // Reconcile the in-memory library with what just left it. The duplicates
+      // scan defaults to the loaded library folder, so the files we trashed /
+      // moved to review are normally rows in the Library tab — leaving them
+      // there means Play loads a nonexistent file, Apply-tags fails per file,
+      // and the next Organize preview lists them as "File not found".
+      // Prefer the sidecar's OWN record of what it touched. `resolvedDuplicate
+      // Paths` reconstructs the list from counts + ordering assumptions and
+      // deliberately returns [] whenever the arithmetic doesn't reproduce
+      // `count` — an exact list is both more accurate and never bails out.
+      // (Both keys are optional; an older sidecar still gets the inference.)
+      //
+      // A MOVE is not a removal: `moved_pairs` carries the real destination,
+      // so the row FOLLOWS the file (exactly like organize) instead of
+      // vanishing. Dropping it would hide the track when the review folder
+      // sits inside the library. Only trash — and the count-based fallback,
+      // which knows sources but no destinations — removes rows.
+      //
+      // ...but a row only follows the file while the file is still IN the
+      // library. The review folder is REQUIRED to be absolute and is normally
+      // OUTSIDE it (D:/Music → D:/Dupes), and a live row pointing at a
+      // quarantined copy inverts the point of quarantining: organize plans
+      // every row it can resolve into `<target>/<Genre>/`, so the next
+      // Organize files those 300 duplicates straight back into the library
+      // under genre folders where they no longer even collide with their
+      // keepers. Outside the library IS a removal. The sidecar applies the
+      // same rule to the saved analysis.
+      const movedPairs = action === "move" ? (summary.moved_pairs ?? []) : [];
+      if (movedPairs.length > 0) {
+        const pathMap: Record<string, string> = {};
+        const departed: string[] = [];
+        for (const [from, to] of movedPairs) {
+          if (isInsideLibrary(to, libraryPath)) pathMap[from] = to;
+          else departed.push(from);
+        }
+        if (Object.keys(pathMap).length > 0) updateTrackPaths(pathMap);
+        if (departed.length > 0) removeTracks(departed);
+      } else {
+        // Trash — or a move from a sidecar too old to report destinations, in
+        // which case we know the sources but not where they landed and can
+        // only drop the rows.
+        const reported =
+          action === "trash"
+            ? summary.deleted_paths
+            : summary.moved_pairs?.map(([from]) => from);
+        const resolved =
+          reported ?? resolvedDuplicatePaths(filtered, count, errors, failures);
+        if (resolved.length > 0) {
+          removeTracks(resolved);
+        } else if (count > 0) {
+          // We couldn't map the counts back onto specific files (the sidecar
+          // returns totals, not pairs). Say so rather than silently leaving —
+          // or silently guessing at — stale rows.
+          notify("Library view may list files that were just removed", {
+            detail: "Re-open the library folder to refresh it.",
+            kind: "info",
+          });
+        }
+      }
       // Clear the stale report immediately so the user can't act on
       // already-trashed entries, then await the rescan so the loading
       // state is visible while it runs.
@@ -483,10 +638,10 @@ function ReportView({
   active,
   onResolve,
 }: ReportViewProps) {
-  const allGroups = useMemo(
-    () => [...report.exact_duplicates, ...report.audio_duplicates],
-    [report],
-  );
+  // Every piece of per-group UI state (overrides, skips, the auto-keeper
+  // cache, Virtuoso's item key) is keyed on `groupId`, NOT on `g.key`. See
+  // `groupId` for why the backend key isn't unique.
+  const allGroups = useMemo(() => keyGroups(report), [report]);
 
   // ---- Lazy auto-keeper resolution ---------------------------------------
   // We DO NOT precompute auto-keepers for every group at render time. On a
@@ -518,30 +673,30 @@ function ReportView({
   }
 
   const computeAutoKeeper = useCallback(
-    (g: DuplicateGroup): string => {
+    ({ group, id }: KeyedGroup): string => {
       const cache = autoCacheRef.current.map;
-      const cached = cache.get(g.key);
+      const cached = cache.get(id);
       if (cached !== undefined) return cached;
-      const files = [g.keep, ...g.duplicates];
+      const files = [group.keep, ...group.duplicates];
       const picked = pickKeeper(files, rules).path;
-      cache.set(g.key, picked);
+      cache.set(id, picked);
       return picked;
     },
     [rules],
   );
 
   const currentKeeper = useCallback(
-    (g: DuplicateGroup): string => {
-      const override = keeperOverrides[g.key];
+    (kg: KeyedGroup): string => {
+      const override = keeperOverrides[kg.id];
       if (override !== undefined) {
         // Override might be stale (e.g. file renamed/removed since the pick).
         // If the path isn't in the group anymore, fall through to the auto
         // pick instead of trusting it — same defensive guard `applyChoices`
         // applies before sending to the backend.
-        const validPaths = [g.keep.path, ...g.duplicates.map((d) => d.path)];
+        const validPaths = [kg.group.keep.path, ...kg.group.duplicates.map((d) => d.path)];
         if (validPaths.includes(override)) return override;
       }
-      return computeAutoKeeper(g);
+      return computeAutoKeeper(kg);
     },
     [keeperOverrides, computeAutoKeeper],
   );
@@ -571,12 +726,12 @@ function ReportView({
   // keeper) and only adjust where the user has overridden the keeper —
   // overrides are typically a handful of groups, not 10k.
   const activeGroups = useMemo(
-    () => allGroups.filter((g) => !skippedGroups.has(g.key)),
+    () => allGroups.filter((kg) => !skippedGroups.has(kg.id)),
     [allGroups, skippedGroups],
   );
 
   const filesToAct = useMemo(
-    () => activeGroups.reduce((s, g) => s + g.duplicates.length, 0),
+    () => activeGroups.reduce((s, kg) => s + kg.group.duplicates.length, 0),
     [activeGroups],
   );
 
@@ -589,9 +744,9 @@ function ReportView({
     // to a file of a different size) left this figure stale. `rulesSig` is in
     // the deps so a rule change recomputes.
     let total = 0;
-    for (const g of activeGroups) {
-      const keeperPath = currentKeeper(g);
-      for (const f of [g.keep, ...g.duplicates]) {
+    for (const kg of activeGroups) {
+      const keeperPath = currentKeeper(kg);
+      for (const f of [kg.group.keep, ...kg.group.duplicates]) {
         if (f.path !== keeperPath) total += f.size_mb;
       }
     }
@@ -878,11 +1033,11 @@ function ActionBar({
 // ---------------------------------------------------------------------------
 
 interface GroupsListProps {
-  groups: DuplicateGroup[];
-  currentKeeper: (g: DuplicateGroup) => string;
-  onPickKeeper: (groupKey: string, path: string) => void;
+  groups: KeyedGroup[];
+  currentKeeper: (kg: KeyedGroup) => string;
+  onPickKeeper: (groupId: string, path: string) => void;
   skippedGroups: Set<string>;
-  onToggleSkip: (groupKey: string) => void;
+  onToggleSkip: (groupId: string) => void;
   rules: KeeperRule[];
   onReset: () => void;
 }
@@ -919,15 +1074,15 @@ function GroupsList({
       <div className="flex-1 min-h-0">
         <Virtuoso
           data={groups}
-          computeItemKey={(_, g) => g.key}
-          itemContent={(_, g) => (
+          computeItemKey={(_, kg) => kg.id}
+          itemContent={(_, kg) => (
             <div className="pb-2">
               <GroupCard
-                group={g}
-                currentKeeperPath={currentKeeper(g)}
-                onPickKeeper={(path) => onPickKeeper(g.key, path)}
-                skipped={skippedGroups.has(g.key)}
-                onToggleSkip={() => onToggleSkip(g.key)}
+                group={kg.group}
+                currentKeeperPath={currentKeeper(kg)}
+                onPickKeeper={(path) => onPickKeeper(kg.id, path)}
+                skipped={skippedGroups.has(kg.id)}
+                onToggleSkip={() => onToggleSkip(kg.id)}
                 rules={rules}
               />
             </div>
@@ -1068,36 +1223,110 @@ function FileMeta({ file }: { file: FileInfo }) {
 
 /**
  * Lightweight sanity check on a user-typed review-folder path. We don't have
- * the Tauri fs plugin available, so we can't existsSync the path — but we
- * can at least catch the obvious cases (whitespace-only, no path separator,
- * control chars). The backend will still hard-validate before doing anything
- * destructive; this is just a UX guard so the user gets feedback before the
- * 10s RPC round-trip.
+ * the Tauri fs plugin available, so we can't existsSync the path — but we can
+ * reject everything the sidecar is now guaranteed to reject, so the user hears
+ * about it before the round trip instead of after it.
+ *
+ * ABSOLUTE ONLY. The old rule ("contains a separator") accepted `dupes/review`,
+ * which the sidecar resolves against ITS working directory — the duplicates
+ * left the library and landed somewhere the user couldn't find. `rpc.py`'s
+ * `_validated_review_folder` now raises INVALID_PARAMS for a relative path, so
+ * accepting one here only buys a 10s wait before the same refusal. The
+ * absolute-path regexes mirror OrganizeView's `clientValidateTarget`, which
+ * guards the equally destructive organize target.
  */
 function looksLikePath(s: string): boolean {
-  if (!s.trim()) return false;
+  const value = s.trim();
+  if (!value) return false;
   // Reject control characters and the obviously-bogus stand-ins seen in
-  // bug reports (e.g. "<<<invalid>>>").
+  // bug reports (e.g. "<<<invalid>>>"). `:` is deliberately absent — a Windows
+  // drive letter needs it.
   // eslint-disable-next-line no-control-regex -- control chars are matched on purpose, to reject them
-  if (/[\x00-\x1f<>"|?*]/.test(s)) return false;
-  // Must contain at least one separator OR be an absolute-style root token.
-  // (Tauri's dialog only ever yields absolute paths, so this is a sane
-  // floor for "user typed something that could plausibly be a folder".)
-  return /[\\/]/.test(s) || /^[A-Za-z]:$/.test(s);
+  if (/[\x00-\x1f<>"|?*]/.test(value)) return false;
+  //   - Windows: drive letter (C:\, D:/) or UNC path (\\server\share)
+  //   - POSIX:   leading slash
+  const isWindowsAbs = /^[a-zA-Z]:[\\/]/.test(value) || /^[\\/][\\/]/.test(value);
+  const isPosixAbs = value.startsWith("/");
+  return isWindowsAbs || isPosixAbs;
+}
+
+// ---------------------------------------------------------------------------
+// Reconciling the library store with what handle_duplicates actually did
+// ---------------------------------------------------------------------------
+
+/**
+ * The duplicate paths `handle_duplicates` will act on, in the sidecar's own
+ * order. Mirrors `vibechek/duplicates.py::handle_duplicates`'s `all_dupes`
+ * exactly: exact groups then audio groups, each group's `duplicates` in order,
+ * never a file that is the keeper of ANY group, each path at most once.
+ */
+export function plannedDuplicatePaths(report: DuplicateReport): string[] {
+  const keeperPaths = new Set<string>();
+  for (const g of [...report.exact_duplicates, ...report.audio_duplicates]) {
+    if (g.keep) keeperPaths.add(g.keep.path);
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const g of [...report.exact_duplicates, ...report.audio_duplicates]) {
+    for (const d of g.duplicates) {
+      if (keeperPaths.has(d.path) || seen.has(d.path)) continue;
+      seen.add(d.path);
+      out.push(d.path);
+    }
+  }
+  return out;
+}
+
+/** How many files a resolve of this report would act on. */
+export function countDuplicates(report: DuplicateReport): number {
+  return plannedDuplicatePaths(report).length;
+}
+
+/**
+ * Which files the sidecar actually resolved, derived from the counts it does
+ * return. `handle_duplicates` reports totals, not per-file pairs (unlike
+ * organize's `moved_pairs`), so we reconstruct: it processes entries in
+ * `plannedDuplicatePaths` order, stops early on cancel, and names every failure
+ * in `error_messages` as "<path>: reason". So the first `succeeded + errors`
+ * entries were processed, and the ones not named as failures succeeded.
+ *
+ * Returns [] — never a guess — when that arithmetic doesn't reproduce
+ * `succeeded`, because removing the wrong rows would delete a track the user
+ * still has from their view. The caller tells them to reopen the folder instead.
+ */
+export function resolvedDuplicatePaths(
+  report: DuplicateReport,
+  succeeded: number,
+  errors: number,
+  errorMessages: string[],
+): string[] {
+  if (succeeded <= 0) return [];
+  const planned = plannedDuplicatePaths(report);
+  const processed = planned.slice(0, succeeded + errors);
+  if (processed.length < succeeded) return [];
+  // Failure lines are "<absolute path>: reason" — match on the path prefix so a
+  // reason containing ": " can't shorten it.
+  const failed = new Set<string>();
+  for (const msg of errorMessages) {
+    const hit = processed.find((p) => msg.startsWith(`${p}: `));
+    if (hit) failed.add(hit);
+  }
+  const resolved = processed.filter((p) => !failed.has(p));
+  return resolved.length === succeeded ? resolved : [];
 }
 
 // ---------------------------------------------------------------------------
 // Apply user choices: rebuild the report so the backend sees the user's picks
 // ---------------------------------------------------------------------------
 
-function applyChoices(
+export function applyChoices(
   report: DuplicateReport,
   rules: KeeperRule[],
   keeperOverrides: Record<string, string>,
   skippedGroups: Set<string>,
 ): DuplicateReport {
-  const rebuild = (g: DuplicateGroup): DuplicateGroup | null => {
-    if (skippedGroups.has(g.key)) return null;
+  const rebuild = (g: DuplicateGroup, id: string): DuplicateGroup | null => {
+    if (skippedGroups.has(id)) return null;
 
     const allFiles = [g.keep, ...g.duplicates];
     const validPaths = new Set(allFiles.map((f) => f.path));
@@ -1108,7 +1337,7 @@ function applyChoices(
     // and got trashed/moved. Drop the override in that case and fall back
     // to the rule-picked keeper.
     let keeperPath: string;
-    const override = keeperOverrides[g.key];
+    const override = keeperOverrides[id];
     if (override !== undefined && validPaths.has(override)) {
       keeperPath = override;
     } else {
@@ -1130,8 +1359,12 @@ function applyChoices(
     };
   };
 
-  const exact = report.exact_duplicates.map(rebuild).filter((g): g is DuplicateGroup => !!g);
-  const audio = report.audio_duplicates.map(rebuild).filter((g): g is DuplicateGroup => !!g);
+  const exact = report.exact_duplicates
+    .map((g, i) => rebuild(g, groupId("exact", i, g)))
+    .filter((g): g is DuplicateGroup => !!g);
+  const audio = report.audio_duplicates
+    .map((g, i) => rebuild(g, groupId("audio", i, g)))
+    .filter((g): g is DuplicateGroup => !!g);
 
   return {
     summary: {

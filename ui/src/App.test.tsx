@@ -13,9 +13,10 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openPath } from "@tauri-apps/plugin-shell";
 
 import App from "./App";
 import { useConfigStore, useNotificationStore } from "./stores";
@@ -119,5 +120,126 @@ describe("<App /> — sidecar:notify install-path warning", () => {
     // App-breaking → must not auto-dismiss, and must offer an in-view next step.
     expect(item.persistent).toBe(true);
     expect(item.action?.label).toBe("Open install folder");
+  });
+});
+
+/**
+ * "Open install folder" used to swallow every rejection from the shell opener
+ * (`.catch(() => {})`), so a click that couldn't open anything — no registered
+ * file manager, a path that has since moved, a sandbox refusal — looked exactly
+ * like a click that worked. The user's only remaining next step silently did
+ * nothing, twice.
+ */
+describe("<App /> — the install-folder action reports its own failures", () => {
+  beforeEach(() => {
+    const validConfig = useConfigStore.getState().config;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method?: string }) => {
+        if (args?.method === "get_config") return validConfig;
+        if (args?.method === "library_state") return { recent: [], active: null };
+        return {};
+      },
+    );
+  });
+
+  /** Emit the risky-install-path warning and return its action button. */
+  async function installWarningAction() {
+    render(<App />);
+    await waitFor(() => {
+      expect(captureListener("sidecar:notify")).toBeTypeOf("function");
+    });
+    await act(async () => {
+      captureListener("sidecar:notify")!({
+        payload: {
+          level: "warning",
+          message: "Vibechek is installed in a location that may cause launch issues.",
+          path: "C:/Users/dj/My Drive/Vibechek/vibechek.exe",
+        },
+      });
+    });
+    await waitFor(() => {
+      expect(
+        useNotificationStore.getState().items.some((n) => n.action),
+      ).toBe(true);
+    });
+    return useNotificationStore.getState().items.find((n) => n.action)!.action!;
+  }
+
+  it("surfaces a toast carrying the opener's rejection message", async () => {
+    (openPath as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("no application is registered to open this path"),
+    );
+
+    const action = await installWarningAction();
+    await act(async () => {
+      action.onClick();
+    });
+
+    await waitFor(() => {
+      const failure = useNotificationStore
+        .getState()
+        .items.find((n) => n.message === "Couldn't open the folder");
+      expect(failure).toBeTruthy();
+      expect(failure!.kind).toBe("warning");
+      // Both the path it tried and the reason it failed — a bare "couldn't
+      // open" gives the user nothing to act on.
+      expect(failure!.detail).toMatch(/no application is registered/);
+      expect(failure!.detail).toMatch(/My Drive\/Vibechek/);
+    });
+  });
+
+  it("stays quiet when the folder opens", async () => {
+    (openPath as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+    const action = await installWarningAction();
+    const before = useNotificationStore.getState().items.length;
+    await act(async () => {
+      action.onClick();
+    });
+
+    expect(useNotificationStore.getState().items.length).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F029 — the first-launch tour must not run on an UNTRUSTED config load.
+//
+// When config.json exists but couldn't be read, the sidecar answers with
+// defaults and `load_failed: true`. Those defaults carry seen_onboarding:false,
+// so the full-screen, unavoidable tour appears for an already-onboarded user —
+// and both its exits (Skip / "Start using Vibechek") write seen_onboarding,
+// arming the autosave that then replaces the intact config.json with defaults.
+// The user changed no setting; they dismissed an overlay they could not avoid.
+// ---------------------------------------------------------------------------
+
+describe("<App /> — first-launch tour needs a config load we trust", () => {
+  function mountWith(extra: Record<string, unknown>) {
+    useConfigStore.setState({ loaded: false, loadUntrusted: false });
+    const base = useConfigStore.getState().config;
+    const cfg = { ...base, ui: { ...base.ui, seen_onboarding: false } };
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method?: string }) => {
+        if (args?.method === "get_config") return { ...cfg, ...extra };
+        if (args?.method === "library_state") return { recent: [], active: null };
+        return {};
+      },
+    );
+    return render(<App />);
+  }
+
+  it("shows the tour after a trusted load", async () => {
+    mountWith({});
+
+    expect(await screen.findByRole("button", { name: /^skip$/i })).toBeInTheDocument();
+  });
+
+  it("stays out of the way when the load came back flagged load_failed", async () => {
+    mountWith({ load_failed: true });
+
+    await waitFor(() => expect(useConfigStore.getState().loadUntrusted).toBe(true));
+    expect(screen.queryByRole("button", { name: /^skip$/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /start using vibechek/i }),
+    ).not.toBeInTheDocument();
   });
 });

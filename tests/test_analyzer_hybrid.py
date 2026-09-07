@@ -111,3 +111,127 @@ def test_throughput_summary_reports_per_device(_spawn_ctx):
         pool.join()
     assert "GPU" in summary and "CPU" in summary
     assert "track" in summary
+
+
+# ---------------------------------------------------------------------------
+# F030 — a clean maxtasks recycle is not a mid-track death
+# ---------------------------------------------------------------------------
+#
+# These drive `_HybridPool`'s supervisor logic directly (no real processes) so
+# the race the pool loses in production — the worker's last result still sitting
+# in _out_q while its process is already gone — is deterministic here.
+
+
+class _FakeProc:
+    def __init__(self, pid: int, exitcode: int | None, alive: bool = False):
+        self.pid = pid
+        self.exitcode = exitcode
+        self._alive = alive
+        self._vibechek_device = "-1"
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout=None) -> None:
+        pass
+
+
+class _FakeEvent:
+    def __init__(self) -> None:
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+
+class _FakeQueue:
+    def __init__(self, items=()):
+        self.items = list(items)
+
+    def put(self, item) -> None:
+        self.items.append(item)
+
+    def get(self, timeout=None):
+        import queue as _queue
+        if not self.items:
+            raise _queue.Empty
+        return self.items.pop(0)
+
+
+def _bare_pool(procs, claims, *, results_out=0, total=10):
+    """A `_HybridPool` with its supervisor state set up but no child processes."""
+    pool = object.__new__(analyzer._HybridPool)
+    pool._done_event = _FakeEvent()
+    pool._procs = list(procs)
+    pool._claims = dict(claims)
+    pool._retries = {}
+    pool._delivered = set()
+    pool._results_out = results_out
+    pool.total = total
+    pool._in_q = _FakeQueue()
+    pool._out_q = _FakeQueue()
+    pool.device_counts = {"0": 0, "-1": 0}
+    pool.device_seconds = {"0": 0.0, "-1": 0.0}
+    pool._spawn = lambda device: _FakeProc(999, None, alive=True)
+    return pool
+
+
+def test_clean_recycle_does_not_re_enqueue_a_finished_track() -> None:
+    """exitcode 0 = the worker posted its maxtasks-th result and returned. The
+    claim we still hold just means that result is behind us in _out_q."""
+    dead = _FakeProc(pid=4242, exitcode=0)
+    pool = _bare_pool([dead], {4242: (7, "/lib/t7.mp3")}, results_out=3)
+
+    pool._reap_and_respawn()
+
+    assert pool._in_q.items == [], "re-analyzed a track that had already finished"
+    assert pool._out_q.items == []  # and no synthesized error record
+    assert pool._retries == {}
+    assert pool._procs[0] is not dead  # the slot is still refilled
+
+
+def test_abnormal_exit_still_re_enqueues_the_claimed_track() -> None:
+    """The crash-recovery this guard exists for must survive the fix: an
+    OOM-kill (-9) really does take its in-flight track with it."""
+    dead = _FakeProc(pid=4243, exitcode=-9)
+    pool = _bare_pool([dead], {4243: (7, "/lib/t7.mp3")}, results_out=3)
+
+    pool._reap_and_respawn()
+
+    assert pool._in_q.items == [(7, "/lib/t7.mp3")]
+    assert pool._retries == {7: 1}
+
+
+def test_repeatedly_killed_track_still_gets_an_error_record() -> None:
+    dead = _FakeProc(pid=4244, exitcode=-9)
+    pool = _bare_pool([dead], {4244: (7, "/lib/t7.mp3")}, results_out=3)
+    pool._retries = {7: 2}
+
+    pool._reap_and_respawn()
+
+    assert pool._in_q.items == []
+    (idx, rec, _device, _secs) = pool._out_q.items[0]
+    assert idx == 7
+    assert "died repeatedly" in rec["error"]
+
+
+def test_duplicate_result_never_displaces_a_real_track() -> None:
+    """A re-enqueued item that wasn't actually lost produces a second result.
+    Counting it would fill one of the caller's `total` slots with a duplicate
+    and leave a real track out of the report."""
+    pool = _bare_pool([], {}, total=2)
+    rec0 = {"path": "/lib/t0.mp3"}
+    rec1 = {"path": "/lib/t1.mp3"}
+    pool._out_q = _FakeQueue([
+        (0, rec0, "-1", 1.0),
+        (0, rec0, "-1", 1.0),   # the duplicate
+        (1, rec1, "-1", 1.0),
+    ])
+
+    assert pool.next(timeout=5)[0] == 0
+    assert pool.next(timeout=5)[0] == 1
+    assert pool._results_out == 2
+    assert pool._done_event.is_set()

@@ -22,5 +22,17 @@
     "types": ["vitest/globals", "@testing-library/jest-dom"]
   },
   "include": ["src"],
+  // Google-Drive sync-conflict copies ("Settings (1).test.tsx", "api (1)/rpc.ts")
+  // must stay out of the program: a stale copy compiled against a renamed prop
+  // reds `tsc --noEmit` from a file nobody edited.
+  //
+  // Spelled with PLAIN parens on purpose — TypeScript's own glob expander
+  // understands only `*`, `?` and `**` and treats every other character,
+  // brackets included, literally. vitest's copy of the same rule has to be
+  // written "**/*[(]1[)]*" because picomatch would otherwise read "(1)" as a
+  // regex capture group. The two configs are therefore legitimately spelled
+  // differently; src/test/collectionGlobs.test.ts asserts each against the
+  // matcher that actually consumes it.
+  "exclude": ["src/**/* (1)*", "src/**/* (1)/**"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

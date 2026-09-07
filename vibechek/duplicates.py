@@ -281,15 +281,59 @@ def fingerprint_similarity(a: list[int], b: list[int]) -> float:
     return best
 
 
-def _file_info(filepath: Path, read_metadata: bool = True) -> FileInfo:
-    """Build a FileInfo for `filepath`.
+def _drop_aliases(paths: list[Path]) -> list[Path]:
+    """Drop symlinks and repeat hard links — an alias is not a second copy.
+
+    `Path.is_file()` follows a symlink, so a link named `*.flac` was enumerated
+    as an ordinary track, hashed to its target's MD5 and joined the same
+    duplicate group. Every keeper field is identical for a link and its target,
+    so the winner came down to path length: when the link won, the REAL audio was
+    the file offered for trash and the library kept a dangling link behind. No
+    space is recoverable from an alias in either direction, so it never belongs
+    in the scan at all. Unreadable entries are skipped here too, the same way
+    `find_audio_files` skips them — one bad entry must not abort a 12k scan.
+    """
+    out: list[Path] = []
+    seen_ids: set[tuple[int, int]] = set()
+    for p in paths:
+        try:
+            if p.is_symlink():
+                log.info("dedupe: skipping symlink (alias of another file): %s", p)
+                continue
+            stat = p.stat()
+        except OSError as e:
+            log.warning("dedupe: skipping unreadable file %s: %s", p, e)
+            continue
+        # st_ino is 0 on filesystems that don't report one; only trust it when set.
+        ident = (stat.st_dev, stat.st_ino)
+        if stat.st_ino:
+            if ident in seen_ids:
+                log.info("dedupe: skipping hard link to an already-scanned file: %s", p)
+                continue
+            seen_ids.add(ident)
+        out.append(p)
+    return out
+
+
+def _file_info(filepath: Path, read_metadata: bool = True) -> FileInfo | None:
+    """Build a FileInfo for `filepath`, or None when it can't be stat'd.
 
     When `read_metadata` is False, skip the mutagen probe entirely — only
     path/filename/size/codec/modified_time come from os.stat. This saves
     ~30s on a 12k-track library when the caller doesn't need bitrate/duration
     (e.g. MD5-only dedup that doesn't use rule-based keeper picking).
+
+    The stat is guarded because enumeration and hashing are minutes apart on a
+    real library: a file deleted, renamed or taken offline (a Drive/Dropbox sync,
+    an iTunes/Rekordbox relocate) in that window used to raise FileNotFoundError
+    straight out of `find_duplicates` and lose the whole scan — against the
+    doctrine `find_audio_files` and `file_md5` already follow.
     """
-    stat = filepath.stat()
+    try:
+        stat = filepath.stat()
+    except OSError as e:
+        log.warning("dedupe: skipping %s (%s)", filepath, e)
+        return None
     info = FileInfo(
         path=str(filepath),
         filename=filepath.name,
@@ -455,8 +499,16 @@ def _split_by_duration(
 
     Catches mislabeled pairs (e.g. an extended + a radio edit that BOTH lack a
     length tag in the filename): if their durations differ by more than `tol`
-    they're treated as different versions. Files with unknown duration don't
-    force a split (they attach to the first sub-group)."""
+    they're treated as different versions.
+
+    A file with UNKNOWN duration may only pool with other unknowns — it never
+    attaches to a group whose length IS known. It used to attach to the first
+    sub-group unconditionally, which failed open on exactly the files most likely
+    to have produced a bogus fingerprint: `duration_s` is None when the mutagen
+    probe fails, i.e. the corrupt/truncated case. A truncated `.flac` then joined
+    the full track's group and — ranking lossless-first — became the KEEPER, with
+    the healthy full-length MP3 listed for trash.
+    """
     if len(group) <= 1:
         return [group]
     clusters: list[list[FileInfo]] = []
@@ -464,10 +516,14 @@ def _split_by_duration(
         placed = False
         for c in clusters:
             head = next((x for x in c if x.duration_s), None)
-            if f.duration_s is None or head is None or head.duration_s is None:
+            if f.duration_s is None:
+                if head is not None:
+                    continue    # can't prove same version against a known length
                 c.append(f)
                 placed = True
                 break
+            if head is None or head.duration_s is None:
+                continue        # nothing comparable in this cluster
             hi = max(f.duration_s, head.duration_s)
             if hi <= 0 or abs(f.duration_s - head.duration_s) / hi <= tol:
                 c.append(f)
@@ -499,6 +555,19 @@ def _resolve_encodings(
     return [choose_keeper(vfiles)]
 
 
+def _path_is_alias(path: str) -> bool:
+    """True when `path` is a symlink rather than a real file.
+
+    Defence in depth: `find_duplicates` already drops aliases from the scan, but
+    `choose_keeper` is public and a caller that assembled its own group must
+    never be told to trash a real file in favour of a link pointing at it.
+    """
+    try:
+        return Path(path).is_symlink()
+    except OSError:
+        return False
+
+
 def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:
     """Pick which file to keep from a group; return (keeper, duplicates).
 
@@ -508,20 +577,41 @@ def choose_keeper(files: list[FileInfo]) -> tuple[FileInfo, list[FileInfo]]:
       1. Zero-byte files are deprioritized HARD. A corrupt 0-byte `.flac`
          would otherwise win on format priority over a healthy 8 MB `.mp3`
          and we'd keep the empty file while deleting the real audio.
-      2. Format priority (lossless before lossy).
-      3. Larger size (better bitrate / less truncation).
-      4. Shorter path (prefer the canonical location over a `/dupes/` copy).
-      5. Path string — a final tiebreaker so two otherwise-identical files
+      2. A real file before a symlink/alias of one — the alias carries the same
+         size, format and content, so without this the winner came down to path
+         length and the loser handed for trash could be the actual audio.
+      3. Format priority (lossless before lossy).
+      4. Larger size (better bitrate / less truncation).
+      5. Shallower FOLDER DEPTH (prefer the canonical location over a `/dupes/`
+         copy). This compared character count, which is not the same thing and
+         inverts the rule on any realistic pair: `/DJ/Sets/2024/Peak/A.mp3` (6
+         levels, 24 chars) beat `/Archive/Artist - Title (Extended Mix).mp3`
+         (3 levels, 42 chars) — and the GUI explained the win as "6 levels".
+      6. Shorter path string — the secondary tiebreak depth used to stand in for.
+      7. Path string — a final tiebreaker so two otherwise-identical files
          always order the same way regardless of scan order.
+
+    Rule 5 is DEPTH, not "already filed": for two byte-identical copies it will
+    prefer `D:/Unsorted Downloads 2024/A.mp3` (3 levels) over the organized
+    `D:/DJ/House/Tech/A.mp3` (5 levels). That is deliberate — depth is what the
+    rule's own label promises, it is the only reading a user can predict, and it
+    is not the last word: the GUI applies the user's own ordered keeper rules
+    (ui/src/lib/keeperRules.ts) on top, where `shortest_path` can be reordered
+    or turned off. An "inside the scanned library root" term was considered and
+    rejected as dead code — `find_duplicates` builds every group from
+    `find_audio_files(library_path)`, so every candidate is already under the
+    root and the term could never discriminate.
     """
-    def score(f: FileInfo) -> tuple[int, int, int, int, str]:
-        ext = Path(f.path).suffix.lower()
+    def score(f: FileInfo) -> tuple[int, int, int, int, int, int, str]:
+        path = Path(f.path)
         return (
-            0 if f.size_bytes > 0 else 1,          # real files before 0-byte
-            _KEEPER_FORMAT_PRIORITY.get(ext, 99),  # lossless first
-            -f.size_bytes,                         # larger is better
-            len(f.path),                           # shorter path is better
-            f.path,                                # deterministic tiebreak
+            0 if f.size_bytes > 0 else 1,               # real files before 0-byte
+            1 if _path_is_alias(f.path) else 0,         # real file before an alias
+            _KEEPER_FORMAT_PRIORITY.get(path.suffix.lower(), 99),  # lossless first
+            -f.size_bytes,                              # larger is better
+            len(path.parts),                            # shallower folder wins
+            len(f.path),                                # then the shorter string
+            f.path,                                     # deterministic tiebreak
         )
 
     ordered = sorted(files, key=score)
@@ -545,7 +635,14 @@ def find_duplicates(
     Set `read_metadata=False` to skip per-file mutagen probes — saves significant
     time on large libraries when the caller doesn't need bitrate/duration info
     (e.g. MD5-only dedup with default keeper rules). The format-priority and
-    size-based keeper picking still works without metadata.
+    size-based keeper picking still works without metadata. It is IGNORED when
+    `config.use_chromaprint` is on: the version split's duration guard is what
+    keeps a radio edit out of an extended mix's group, and skipping the probe
+    reduced that guard to a silent no-op.
+
+    Symlinks and repeat hard links are dropped from the scan — an alias is not a
+    second copy, and offering the real file for trash because its alias won the
+    keeper vote is data loss, not recovered space.
 
     `similarity_threshold` is the chromaprint match cutoff in [0, 1]: two tracks
     are grouped as audio duplicates when their best-aligned fingerprint
@@ -554,8 +651,14 @@ def find_duplicates(
     non-default value, so the GUI/CLI threshold control still wins; an RPC caller
     that hasn't touched the config can pass `similarity_threshold` directly.
     """
-    audio_files = find_audio_files(library_path)
+    audio_files = _drop_aliases(find_audio_files(library_path))
     report = DuplicateReport(summary=DuplicateSummary(total_files=len(audio_files)))
+
+    # The duration guard in `_split_into_versions` is what keeps a radio edit out
+    # of an extended mix's group, and it needs the mutagen probe. Skipping that
+    # probe while fingerprinting reduced the guard to a silent no-op, so the
+    # metadata read is not optional once the fuzzy phase runs.
+    read_metadata = read_metadata or config.use_chromaprint
 
     # ---------- Phase 1: hash everything (cheap; rules out the common case) ----------
     file_infos: dict[str, FileInfo] = {}
@@ -572,6 +675,8 @@ def find_duplicates(
             cancellation.check()
             report_progress(on_progress, i + 1, len(audio_files), f"hash {fp.name}")
             info = _file_info(fp, read_metadata=read_metadata)
+            if info is None:
+                continue          # vanished/unreadable since enumeration — skip it
             file_infos[str(fp)] = info
             h = file_md5(fp)
             if h:
@@ -597,8 +702,9 @@ def find_duplicates(
     # ---------- Phase 2: chromaprint on what's left ----------
     if config.use_chromaprint:
         # Zero-setup self-heal (detect -> heal -> run): the fingerprint tool is
-        # resolved from PATH, then a staged copy, then auto-provisioned (a small
-        # one-time ~2 MB download of the official Chromaprint binary) — announced
+        # resolved from the hash-verified staged copy first, then PATH, then
+        # auto-provisioned (a small one-time ~2 MB download of the official
+        # Chromaprint binary — see resolve_fpcalc for why staged wins) — announced
         # through the same progress channel. A dead-end "fpcalc not found" was a
         # manual-setup trap the doctrine forbids; now the ONLY user-visible state
         # is a banner if the DOWNLOAD itself fails (and it retries next scan).
@@ -660,6 +766,8 @@ def find_duplicates(
                 cancellation.check()
                 report_progress(on_progress, i + 1, len(remaining), f"fingerprint {fp.name}")
                 info = file_infos.get(str(fp)) or _file_info(fp, read_metadata=read_metadata)
+                if info is None:
+                    continue      # vanished/unreadable since enumeration — skip it
                 file_infos[str(fp)] = info
                 raw_fp = audio_fingerprint_raw(fp, fpcalc)
                 if raw_fp:
@@ -668,6 +776,18 @@ def find_duplicates(
                     info.audio_fingerprint = hashlib.md5(
                         ",".join(str(x) for x in raw_fp).encode()
                     ).hexdigest()
+                    if len(raw_fp) < _MIN_ALIGN_OVERLAP:
+                        # Too few frames to align on. `fingerprint_similarity`
+                        # scores offset 0 without the overlap guard, and bucket
+                        # membership is DEFINED by raw[0] equality — so a 1-frame
+                        # fingerprint scores exactly 1.0 against every bucket-mate
+                        # and single-link clustering bridges unrelated tracks into
+                        # one duplicate group. Keep the hash, never cluster on it.
+                        log.info(
+                            "dedupe: fingerprint too short to compare (%d frames): %s",
+                            len(raw_fp), fp,
+                        )
+                        continue
                     for key in _bucket_keys(raw_fp):
                         buckets[key].append((info, raw_fp))
 
@@ -731,12 +851,30 @@ def find_duplicates(
     report.summary.phases_run = phases_run
     report.summary.fpcalc_available = fpcalc_available
     report.summary.fpcalc_error = fpcalc_error
+    # A cancel that arrives after the last per-file check (or with BOTH loops
+    # skipped — `use_md5` and `use_chromaprint` both off) used to fall through
+    # to a completed-looking report: the caller couldn't tell "clean library"
+    # from "stopped before the fuzzy phase ran" and would happily act on it.
+    cancellation.check()
     return report
 
 
 # ---------------------------------------------------------------------------
 # Acting on the report
 # ---------------------------------------------------------------------------
+
+
+def _stamp_journal(summary: dict, jrnl) -> None:
+    """Publish the journal path AND whether the journal recorded everything.
+
+    `journal_incomplete` mirrors `OrganizeStats.journal_incomplete`: a move the
+    journal failed to record cannot be reverted, yet reverting the rest reports
+    a clean success — so the GUI has to be able to warn before offering
+    one-click undo. Both fields are stamped together because they are only
+    honest read together.
+    """
+    summary["journal_path"] = str(jrnl.path) if jrnl.entries > 0 else None
+    summary["journal_incomplete"] = jrnl.failed > 0
 
 
 def handle_duplicates(
@@ -750,6 +888,16 @@ def handle_duplicates(
     the count; `error_messages` is a list of human-readable strings (one per
     failed file). The list is what the GUI shows in its "errors — see report"
     toast — without it the toast pointed at a report that didn't exist.
+
+    It also carries the per-file results, mirroring organize's `moved_pairs`:
+    `moved_pairs` is `[[src, dst], …]` for the move branch and `deleted_paths`
+    is `[src, …]` for the trash branch, both listing ONLY the files the action
+    really touched. The RPC layer prunes/rewrites the saved analysis from these,
+    so counts alone would leave it guessing which rows moved.
+
+    For every action but `report` it additionally carries `journal_path` and
+    `journal_incomplete` (see `_stamp_journal`) — including on the partial
+    summary attached to a `CancelledError`.
     """
     # Local import — keeps cancellation a soft dep when duplicates is used as
     # a library outside the sidecar (mirrors the scan path).
@@ -775,11 +923,19 @@ def handle_duplicates(
             _seen_dupe_paths.add(d.path)
             all_dupes.append(d)
     error_messages: list[str] = []
+    # Per-file results, mirroring organize's `moved_pairs`. The RPC layer prunes
+    # the saved analysis from these and the GUI rewrites its rows, so they must
+    # carry only what ACTUALLY moved/trashed — a file that errored is still on
+    # disk at its old path and dropping its row would invent a ghost.
+    moved_pairs: list[list[str]] = []
+    deleted_paths: list[str] = []
     summary: dict = {
         "moved": 0,
         "deleted": 0,
         "errors": 0,
         "error_messages": error_messages,
+        "moved_pairs": moved_pairs,
+        "deleted_paths": deleted_paths,
     }
 
     if action is DuplicateAction.REPORT:
@@ -787,6 +943,7 @@ def handle_duplicates(
 
     from vibechek import journal as _journal
     summary["journal_path"] = None
+    summary["journal_incomplete"] = False
 
     if action is DuplicateAction.MOVE:
         if not config.review_folder:
@@ -813,6 +970,10 @@ def handle_duplicates(
                 try:
                     shutil.move(str(src), str(dst))
                     jrnl.record_move(src, dst)
+                    # Report the caller's spelling of the source (`dupe.path`),
+                    # not our re-rendered `str(src)` — the GUI matches its rows
+                    # against the string it sent us.
+                    moved_pairs.append([dupe.path, str(dst)])
                     summary["moved"] += 1
                 except OSError as e:
                     log.warning("Move failed for %s: %s", src, e)
@@ -824,14 +985,12 @@ def handle_duplicates(
             # path) so the RPC layer can return it tagged cancelled=True —
             # matching the organize path — instead of an error that drops the
             # journal path and hides the one-click undo.
-            if jrnl.entries > 0:
-                summary["journal_path"] = str(jrnl.path)
+            _stamp_journal(summary, jrnl)
             e.partial_summary = summary  # type: ignore[attr-defined]
             raise
         finally:
             jrnl.close()
-        if jrnl.entries > 0:
-            summary["journal_path"] = str(jrnl.path)
+        _stamp_journal(summary, jrnl)
 
     elif action is DuplicateAction.TRASH:
         # Late import — send2trash is optional, only needed for this action
@@ -859,6 +1018,8 @@ def handle_duplicates(
                 try:
                     send2trash(str(src))
                     jrnl.record_trash(src)
+                    # Caller's spelling again — see the move branch.
+                    deleted_paths.append(dupe.path)
                     summary["deleted"] += 1
                 except OSError as e:
                     log.warning("Trash failed for %s: %s", src, e)
@@ -868,14 +1029,12 @@ def handle_duplicates(
             # Same partial-summary contract as the move branch (the trash
             # journal is a manifest, not an auto-undo, but the user still
             # deserves the counts + manifest path for what already happened).
-            if jrnl.entries > 0:
-                summary["journal_path"] = str(jrnl.path)
+            _stamp_journal(summary, jrnl)
             e.partial_summary = summary  # type: ignore[attr-defined]
             raise
         finally:
             jrnl.close()
-        if jrnl.entries > 0:
-            summary["journal_path"] = str(jrnl.path)
+        _stamp_journal(summary, jrnl)
 
     return summary
 

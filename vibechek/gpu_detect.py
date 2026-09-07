@@ -33,9 +33,10 @@ import json
 import logging
 import platform
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass
+
+from vibechek.utils import find_executable
 
 log = logging.getLogger(__name__)
 
@@ -257,7 +258,11 @@ def _detect_amd_rocm_smi() -> list[DetectedGpu]:
     `rocm-smi` is only present when the ROCm stack is installed; gracefully
     no-op otherwise.
     """
-    rsmi = shutil.which("rocm-smi")
+    # `find_executable`, not `shutil.which`: the hit below is EXECUTED, and on
+    # Windows which() searches the process cwd ahead of PATH, so a `rocm-smi.exe`
+    # sitting in the folder Vibechek was launched from would win over the real
+    # ROCm tool. find_executable discards a cwd hit and absolutizes.
+    rsmi = find_executable("rocm-smi")
     if not rsmi:
         return []
     try:
@@ -314,7 +319,8 @@ def _detect_amd_lspci() -> list[DetectedGpu]:
     Matches lines like:
       03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 32 [Radeon RX 7800 XT] (rev cf)
     """
-    lspci = shutil.which("lspci")
+    # `find_executable` — the resolved path is EXECUTED (see _detect_amd_rocm_smi).
+    lspci = find_executable("lspci")
     if not lspci:
         return []
     try:
@@ -377,7 +383,8 @@ def _detect_intel() -> list[DetectedGpu]:
 
 def _detect_intel_lspci() -> list[DetectedGpu]:
     """`lspci` row for Intel graphics. Typically the iGPU on most laptops/desktops."""
-    lspci = shutil.which("lspci")
+    # `find_executable` — the resolved path is EXECUTED (see _detect_amd_rocm_smi).
+    lspci = find_executable("lspci")
     if not lspci:
         return []
     try:
@@ -432,7 +439,8 @@ def _detect_apple() -> list[DetectedGpu]:
     """
     if platform.system() != "Darwin":
         return []
-    sp = shutil.which("system_profiler")
+    # `find_executable` — the resolved path is EXECUTED (see _detect_amd_rocm_smi).
+    sp = find_executable("system_profiler")
     if not sp:
         return []
     try:
@@ -602,7 +610,9 @@ def _detect_gpus_cim(vendor_filter: str) -> list[DetectedGpu] | None:
     Returns a (possibly empty) device list on success, or None when PowerShell
     is unavailable / failed — letting the caller fall back to wmic.
     """
-    pwsh = shutil.which("powershell") or shutil.which("pwsh")
+    # `find_executable` — the resolved shell is EXECUTED, and a `powershell.exe`
+    # dropped into the folder the app was launched from must never win.
+    pwsh = find_executable("powershell") or find_executable("pwsh")
     if not pwsh:
         return None
     # -NoProfile keeps startup fast; ConvertTo-Json emits a single object for one
@@ -655,7 +665,8 @@ def _detect_gpus_wmic(vendor_filter: str) -> list[DetectedGpu]:
     if cim is not None:
         return cim
 
-    wmic = shutil.which("wmic")
+    # `find_executable` — the resolved path is EXECUTED (see _detect_gpus_cim).
+    wmic = find_executable("wmic")
     if not wmic:
         return []
     try:

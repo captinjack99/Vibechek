@@ -13,7 +13,18 @@ interface ConfigState {
   config: VibechekConfig;
   /** True after first successful load from disk. Until then we don't auto-save. */
   loaded: boolean;
+  /**
+   * True when what `config` holds is NOT the user's saved settings: `get_config`
+   * rejected, or the backend flagged its payload `load_failed` (config.json
+   * exists but couldn't be read, so it fell back to defaults).
+   *
+   * Anything that would write the config — or that nudges the user into an
+   * action which writes it — must check this. The file on disk is very likely
+   * intact, and overwriting it with the defaults on screen destroys it.
+   */
+  loadUntrusted: boolean;
   setConfig: (c: VibechekConfig, markLoaded?: boolean) => void;
+  setLoadUntrusted: (v: boolean) => void;
   updateAnalysis: (patch: Partial<VibechekConfig["analysis"]>) => void;
   updateTagging: (patch: Partial<VibechekConfig["tagging"]>) => void;
   updateDuplicates: (patch: Partial<VibechekConfig["duplicates"]>) => void;
@@ -21,7 +32,14 @@ interface ConfigState {
   updateUI: (patch: Partial<VibechekConfig["ui"]>) => void;
 }
 
-const DEFAULT_CONFIG: VibechekConfig = {
+/**
+ * Factory settings — what the store holds until a load lands.
+ *
+ * Exported so the vitest global reset can restore it between tests: the store
+ * is a module singleton, and a test that leaves e.g. `write_genre: false`
+ * behind changes what every later test asserts against.
+ */
+export const DEFAULT_CONFIG: VibechekConfig = {
   analysis: {
     workers: 0,
     models_dir: "",
@@ -84,7 +102,9 @@ const DEFAULT_CONFIG: VibechekConfig = {
 export const useConfigStore = create<ConfigState>((set) => ({
   config: DEFAULT_CONFIG,
   loaded: false,
+  loadUntrusted: false,
   setConfig: (c, markLoaded = false) => set({ config: c, ...(markLoaded ? { loaded: true } : {}) }),
+  setLoadUntrusted: (v) => set({ loadUntrusted: v }),
   updateAnalysis: (patch) =>
     set((s) => ({ config: { ...s.config, analysis: { ...s.config.analysis, ...patch } } })),
   updateTagging: (patch) =>

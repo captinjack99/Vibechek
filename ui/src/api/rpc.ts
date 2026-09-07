@@ -50,6 +50,7 @@ import type {
   GetLogTailRequest,
   GetLogTailResult,
   HandleDuplicatesRequest,
+  HandleDuplicatesResult,
   ImportTagPriorsRequest,
   IncreaseWslMemoryResult,
   InstallCudaLibsInWSLRequest,
@@ -335,12 +336,16 @@ export function findDuplicates(
 /**
  * Apply the configured action (report/delete/move) to a previously-computed
  * `DuplicateReport`. Returns a per-action stats dict.
+ *
+ * Pass `library_path` (the loaded library) so the sidecar syncs THAT library's
+ * saved analysis afterwards instead of inferring one by path-ancestry from the
+ * recents index — see `HandleDuplicatesRequest`.
  */
 export function handleDuplicates(
   params: HandleDuplicatesRequest,
   opId?: string,
-): Promise<Record<string, number>> {
-  return rpc<Record<string, number>>("handle_duplicates", withOpId(params, opId));
+): Promise<HandleDuplicatesResult> {
+  return rpc<HandleDuplicatesResult>("handle_duplicates", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------

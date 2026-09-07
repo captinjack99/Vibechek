@@ -67,6 +67,40 @@ BACKUP_VERSION = "1.0"
 # Custom (non-standard) tag names written/read on every format.
 CUSTOM_TAGS = ("energy", "mood", "timeslot", "direction", "vocal")
 
+# Snapshot key holding {frame_id: encoding} for the ID3 text frames we captured,
+# so a restore rebuilds each frame with the encoding it actually had. Leading
+# underscore = metadata about the snapshot, not a tag (like `_size`); every
+# writer ignores keys it doesn't recognize.
+ID3_ENCODINGS_KEY = "_id3_encodings"
+
+# Per-file snapshot-SHAPE marker, stamped by `read_all_tags` on every entry.
+# `BACKUP_VERSION` has been "1.0" since before the readers became format-
+# complete, so it cannot tell an old snapshot from a new one — and a restore
+# that assumes "not in the snapshot" means "the file didn't have it" DELETES the
+# user's tags when the snapshot simply never captured them. Absent = written by
+# a build whose readers only captured a fixed field set (pre-0.5.0-beta); every
+# restore path must treat that as "unknown, leave it alone" rather than
+# "absent, remove it". Leading underscore = metadata about the snapshot, not a
+# tag (like `_size`); every writer ignores keys it doesn't recognize.
+SNAPSHOT_VERSION_KEY = "_snapshot_version"
+SNAPSHOT_VERSION = 2
+
+# The Python codec behind each legal ID3 text encoding, used to check up front
+# whether a value can survive the configured encoding at all.
+_ID3_ENCODING_CODECS = {0: "latin-1", 1: "utf-16", 2: "utf-16-be", 3: "utf-8"}
+
+# `ml_genre_source` values whose genre came from the AUDIO model.
+#
+# `ml_genre_raw_confidence` used to hold the single-class AUDIO score whatever
+# source actually won, so this tuple is what kept the two-stage gate in
+# `apply_ml_tags` from judging a curated tag on an unrelated audio number.
+# `analyzer._reconcile_record_genre` now re-stamps that field with the
+# RECONCILED confidence for every non-audio source, so on a report written by
+# the current analyzer the two numbers agree and the gate's substitution is a
+# no-op. Kept as belt and braces: reports written before that landed still carry
+# the old semantics, and it is the one place the invariant is stated.
+_AUDIO_GENRE_SOURCES = ("ml", "ml_override")
+
 
 # ---------------------------------------------------------------------------
 # Result dataclasses
@@ -110,6 +144,17 @@ class ApplyStats:
     # of conflating fallback-tagged with strictly-tagged.
     genre_applied_parent_only: int = 0
     genre_skipped_low_confidence: int = 0
+    # Tracks that CLEARED a confidence gate but whose genre was never written
+    # because the `write_genre` toggle is off. They used to be counted as
+    # applied, so the CLI/GUI reported "Genre applied: N" for files nothing was
+    # written to — which also hid a regression that stops forwarding the toggle.
+    # Kept as its own bucket so `applied + parent_only + skipped_* == total`
+    # still holds.
+    genre_skipped_write_disabled: int = 0
+    # Files a format writer RAN on — deliberately not "files that gained an
+    # 'other' tag frame". A track whose analysis carries no energy/mood/timeslot
+    # counts here (and a test pins that), so don't retune it into a frame count
+    # without changing the name the CLI and GUI print.
     other_tags_applied: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -124,10 +169,14 @@ def read_all_tags(filepath: Path) -> dict[str, Any]:
 
     The backup is FORMAT-COMPLETE for every reader we have:
 
-    - **MP3 / AIFF / WAV** (all ID3-based): every text frame plus all TXXX, and
-      the Rekordbox-specific GEOB and PRIV binary frames base64-encoded. AIFF
-      and WAV carry the *same* ID3 cue/beatgrid frames as MP3, so dropping them
-      (as the old code did) was a real cue-loss risk on restore.
+    - **MP3 / AIFF / WAV** (all ID3-based): every frame Vibechek itself writes
+      (TIT2/TPE1/TALB/TCON/TBPM/TKEY/TIT1), all TXXX, and the Rekordbox-specific
+      GEOB and PRIV binary frames base64-encoded, plus each captured frame's text
+      encoding so a restore rebuilds it as it was. AIFF and WAV carry the *same*
+      ID3 cue/beatgrid frames as MP3, so dropping them (as the old code did) was
+      a real cue-loss risk on restore. Frames outside that set (TRCK, TDRC/TYER,
+      TPE2, COMM, APIC, …) are not snapshotted because nothing here writes or
+      deletes them — the ID3 block is edited in place, at its own v2 version.
     - **FLAC**: every Vorbis comment (not a fixed subset), so ReplayGain,
       label/catalog, comments and Serato fields all survive.
     - **M4A**: every atom, with binary atoms (``covr`` artwork, Serato
@@ -154,7 +203,11 @@ def read_all_tags(filepath: Path) -> dict[str, Any]:
             tags["_unsupported"] = True
     except Exception as e:  # noqa: BLE001
         tags["_error"] = str(e)
-    return {k: v for k, v in tags.items() if v is not None}
+    out = {k: v for k, v in tags.items() if v is not None}
+    # Stamp the snapshot SHAPE so a restore can tell "the file didn't have this
+    # tag" from "this build's reader never looked" — see SNAPSHOT_VERSION_KEY.
+    out[SNAPSHOT_VERSION_KEY] = SNAPSHOT_VERSION
+    return out
 
 
 def _read_id3_tags(id3: ID3 | None) -> dict[str, Any]:
@@ -168,6 +221,18 @@ def _read_id3_tags(id3: ID3 | None) -> dict[str, Any]:
     if not id3:
         return out
 
+    # Per-frame text encoding, so a restore can rebuild each frame the way it
+    # was instead of re-encoding the whole file at whatever `id3_text_encoding`
+    # happens to be set to now. Without this a restore under ISO-8859-1 raised
+    # inside save() on the first non-Latin-1 title and abandoned the WHOLE
+    # file — including the genre revert the user invoked restore for.
+    encodings: dict[str, int] = {}
+
+    def _note_encoding(frame_key: str, frame: Any) -> None:
+        enc = getattr(frame, "encoding", None)
+        if enc is not None:
+            encodings[frame_key] = int(enc)
+
     text_frame_map = {
         "TIT2": "title", "TPE1": "artist", "TALB": "album", "TCON": "genre",
         "TBPM": "bpm", "TKEY": "key", "TIT1": "subgenre",
@@ -175,6 +240,7 @@ def _read_id3_tags(id3: ID3 | None) -> dict[str, Any]:
     for frame_id, field_name in text_frame_map.items():
         if frame_id in id3:
             out[field_name] = str(id3[frame_id])
+            _note_encoding(frame_id, id3[frame_id])
 
     for key in id3:
         if key.startswith("TXXX:"):
@@ -186,6 +252,7 @@ def _read_id3_tags(id3: ID3 | None) -> dict[str, Any]:
             # to UPPER-case (which renames the frame and breaks case-sensitive
             # readers).
             out[f"txxx_{desc.lower()}"] = {"desc": desc, "text": str(id3[key])}
+            _note_encoding(key, id3[key])
         elif key.startswith("GEOB:"):
             frame = id3[key]
             out[f"geob_{key}"] = {
@@ -201,6 +268,8 @@ def _read_id3_tags(id3: ID3 | None) -> dict[str, Any]:
                 "owner": frame.owner,
                 "data": base64.b64encode(frame.data).decode("ascii"),
             }
+    if encodings:
+        out[ID3_ENCODINGS_KEY] = encodings
     return out
 
 
@@ -352,23 +421,23 @@ def write_all_tags(
     cfg = config or TaggingConfig()
     try:
         if ext == ".mp3":
-            audio = MP3(filepath)
+            audio = MP3(filepath, translate=False)
             if audio.tags is None:
                 audio.add_tags()
             _write_id3_tags(audio.tags, tags, cfg.id3_text_encoding)
-            audio.save()
+            audio.save(v2_version=_id3_save_version(audio.tags))
         elif ext in (".aiff", ".aif"):
-            audio = AIFF(filepath)
+            audio = AIFF(filepath, translate=False)
             if audio.tags is None:
                 audio.add_tags()
             _write_id3_tags(audio.tags, tags, cfg.id3_text_encoding)
-            audio.save()
+            audio.save(v2_version=_id3_save_version(audio.tags))
         elif ext == ".wav":
-            audio = WAVE(filepath)
+            audio = WAVE(filepath, translate=False)
             if audio.tags is None:
                 audio.add_tags()
             _write_id3_tags(audio.tags, tags, cfg.id3_text_encoding)
-            audio.save()
+            audio.save(v2_version=_id3_save_version(audio.tags))
         elif ext == ".flac":
             _write_flac_tags(filepath, tags)
         elif ext == ".m4a":
@@ -382,11 +451,54 @@ def write_all_tags(
 
 def _write_mp3_tags(filepath: Path, tags: dict[str, Any], config: TaggingConfig) -> None:
     """Restore an ID3 snapshot to an MP3 (kept for the public test surface)."""
-    audio = MP3(filepath)
+    audio = MP3(filepath, translate=False)
     if audio.tags is None:
         audio.add_tags()
     _write_id3_tags(audio.tags, tags, config.id3_text_encoding)
-    audio.save()
+    audio.save(v2_version=_id3_save_version(audio.tags))
+
+
+def _writable_encoding(enc: int, text: Any, frame_key: str) -> int:
+    """`enc`, or UTF-16 when `text` cannot be represented in it.
+
+    mutagen raises inside `save()` for a frame whose text doesn't fit the chosen
+    codec, and that exception escapes all the way to the file level — so a single
+    CJK/Cyrillic title under `id3_text_encoding = 0` (ISO-8859-1, offered in
+    Settings for old Rekordbox) abandoned the ENTIRE file's restore, including
+    the genre revert the user invoked restore for. Widening that one frame to
+    UTF-16 keeps the value instead of dropping the whole write, and it's logged
+    so the degradation isn't silent.
+    """
+    codec = _ID3_ENCODING_CODECS.get(enc)
+    if codec is None:
+        return enc
+    values = text if isinstance(text, list) else [text]
+    try:
+        for value in values:
+            str(value).encode(codec)
+    except UnicodeEncodeError:
+        log.warning(
+            "%s is not representable in ID3 text encoding %d; writing that frame "
+            "as UTF-16 so the rest of the file still gets written",
+            frame_key, enc,
+        )
+        return 1
+    return enc
+
+
+def _id3_save_version(id3: ID3) -> int:
+    """The ID3v2 minor version to SAVE `id3` as: keep v2.3, else write v2.4.
+
+    mutagen defaults to `v2_version=4`, which silently upgraded every v2.3 tag on
+    every apply and every restore. The upgrade is lossy — `update_to_v24` deletes
+    RVAD/EQUA/TRDA/TSIZ outright and folds TYER/TDAT/TIME into TDRC — and the
+    backup snapshot doesn't carry those frames, so a restore can't put them back.
+    Vibechek already bends over backwards for old Rekordbox/CDJ readers (see the
+    `id3_text_encoding` note at the top of this module); rewriting their tag
+    version behind their back is the same kind of harm.
+    """
+    version = getattr(id3, "version", None)
+    return 3 if isinstance(version, tuple) and len(version) > 1 and version[1] == 3 else 4
 
 
 def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
@@ -405,6 +517,24 @@ def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
     making the advertised "restore undoes a bad apply" false for added frames.
     Only Vibechek's own managed set is cleared; all other frames are untouched.
     """
+    snapshot_encodings = tags.get(ID3_ENCODINGS_KEY)
+    if not isinstance(snapshot_encodings, dict):
+        snapshot_encodings = {}
+
+    def frame_encoding(frame_key: str, text: Any) -> int:
+        """Encoding to write `frame_key` with: the one it had, else the config's."""
+        recorded = snapshot_encodings.get(frame_key)
+        # Anything outside the four legal ID3 encodings is a hand-edited or
+        # future-format snapshot; fall back rather than hand mutagen a value it
+        # will reject and lose the whole file's write over.
+        chosen = (
+            recorded if isinstance(recorded, int)
+            and not isinstance(recorded, bool)
+            and recorded in _ID3_ENCODING_CODECS
+            else enc
+        )
+        return _writable_encoding(chosen, text, frame_key)
+
     text_frame_writers = {
         "title": (TIT2, "TIT2"),
         "artist": (TPE1, "TPE1"),
@@ -416,7 +546,10 @@ def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
     }
     for field_name, (frame_cls, frame_id) in text_frame_writers.items():
         if field_name in tags:
-            id3[frame_id] = frame_cls(encoding=enc, text=str(tags[field_name]))
+            value = str(tags[field_name])
+            id3[frame_id] = frame_cls(
+                encoding=frame_encoding(frame_id, value), text=value
+            )
         elif frame_id in id3 and field_name in ("genre", "bpm", "key", "subgenre"):
             # Managed frame absent from the snapshot = the file didn't have it
             # at backup time; a later apply added it. Undo the addition.
@@ -456,10 +589,13 @@ def _write_id3_tags(id3: ID3, tags: dict[str, Any], enc: int) -> None:
             # Multi-valued sources (FLAC Vorbis comments crossing into ID3 via
             # the CDJ-export tag copy) must become a real multi-value TXXX —
             # str() on a list would write the literal "['A', 'B']".
+            values = [str(v) for v in text] if isinstance(text, list) else [str(text)]
+            # The description shares the frame's encoding, so it has to fit too.
+            txxx_enc = frame_encoding(f"TXXX:{desc}", [desc, *values])
             if isinstance(text, list):
-                id3.add(TXXX(encoding=enc, desc=desc, text=[str(v) for v in text]))
+                id3.add(TXXX(encoding=txxx_enc, desc=desc, text=values))
             else:
-                id3.add(TXXX(encoding=enc, desc=desc, text=str(text)))
+                id3.add(TXXX(encoding=txxx_enc, desc=desc, text=values[0]))
         elif key.startswith("geob_"):
             id3.add(GEOB(
                 encoding=val["encoding"],
@@ -490,11 +626,39 @@ def _write_flac_tags(filepath: Path, tags: dict[str, Any]) -> None:
     # comments; if the snapshot lacks the corresponding entry the file didn't
     # have it at backup time, so a restore must remove it.
     snapshot_comment_keys = {k[5:].lower() for k in tags if k.startswith("txxx_")}
+    # INITIALKEY / CONTENTGROUP key ONLY off the snapshot's own comments. The
+    # canonical `key`/`subgenre` fields name DIFFERENT Vorbis comments (KEY and
+    # GROUPING — see `_read_flac_tags`), so testing them here let any FLAC that
+    # merely carried a KEY or GROUPING comment (Mixed In Key and Rekordbox leave
+    # both routinely) mark the apply's OWN additions as "in the snapshot", and a
+    # restore then left INITIALKEY=<Vibechek key> and CONTENTGROUP=<Vibechek
+    # subgenre> on the file while reporting success. A genuine pre-existing
+    # INITIALKEY/CONTENTGROUP is captured by the generic comment loop as
+    # `txxx_initialkey` / `txxx_contentgroup`, so this covers it —
+    # BUT ONLY IN A FORMAT-COMPLETE SNAPSHOT. Backups written before that
+    # generic loop existed carry a fixed field set with no `txxx_initialkey` at
+    # all, so applying the rule to them turns "we never looked" into a delete
+    # instruction: a DJ whose FLACs carry both KEY (Rekordbox) and INITIALKEY
+    # (Mixed In Key) would have the MIK comment silently stripped from every
+    # file, and the restore would report success. An unstamped snapshot is
+    # therefore left alone: the worst case is a Vibechek-written INITIALKEY
+    # surviving a restore from an ancient backup; the alternative is destroying
+    # a tag the backup never promised to hold.
+    snapshot_version = tags.get(SNAPSHOT_VERSION_KEY)
+    snapshot_is_format_complete = (
+        isinstance(snapshot_version, int) and snapshot_version >= SNAPSHOT_VERSION
+    )
     managed = {
         "genre": "genre" in tags,
         "bpm": "bpm" in tags,
-        "initialkey": "key" in tags or "initialkey" in snapshot_comment_keys,
-        "contentgroup": "subgenre" in tags or "contentgroup" in snapshot_comment_keys,
+        "initialkey": (
+            "initialkey" in snapshot_comment_keys
+            or not snapshot_is_format_complete
+        ),
+        "contentgroup": (
+            "contentgroup" in snapshot_comment_keys
+            or not snapshot_is_format_complete
+        ),
     }
     managed.update({t: t in snapshot_comment_keys for t in CUSTOM_TAGS})
     for vorbis_key, in_snapshot in managed.items():
@@ -731,6 +895,23 @@ def _load_backup_files(backup_path: Path) -> dict[str, Any]:
             f"Backup file at {path} has a 'files' entry that isn't an object "
             f"(got {type(files).__name__})."
         )
+    # Per-ENTRY shape, checked up front. Both restore loops assume every value is
+    # a dict (`"_error" in tags`, `tags.get("_unsupported")`); a string entry from
+    # a hand-edited or sync-tool-merged backup silently turned the first into a
+    # substring test and made the second raise AttributeError — which no branch of
+    # the RPC dispatcher types, so the GUI got a raw traceback instead of this
+    # function's documented ValueError, and the restore aborted PART-WAY with
+    # earlier files already rewritten. Validating before the loop means nothing is
+    # written when the backup is malformed.
+    bad = sorted(k for k, v in files.items() if not isinstance(v, dict))
+    if bad:
+        shown = ", ".join(bad[:3]) + (f" (+{len(bad) - 3} more)" if len(bad) > 3 else "")
+        raise ValueError(
+            f"Backup file at {path} has {len(bad)} entr"
+            f"{'y' if len(bad) == 1 else 'ies'} that aren't tag objects: {shown}. "
+            f"It may have been hand-edited or merged by a sync tool; use an "
+            f"unmodified backup."
+        )
     return files
 
 
@@ -873,10 +1054,30 @@ def apply_ml_tags(
         family_conf = ml.get("ml_genre_confidence") or 0.0
         subgenre_conf = ml.get("ml_genre_raw_confidence")
         is_legacy_report = subgenre_conf is None
+        genre_source = str(ml.get("ml_genre_source") or "")
         if is_legacy_report:
             # Backward-compat for analysis reports written before raw_confidence
             # was plumbed. Use family confidence as the stage-1 input so we
             # don't accidentally over-tag.
+            subgenre_conf = family_conf
+        elif genre_source and genre_source not in _AUDIO_GENRE_SOURCES:
+            # The effective genre came from the FILE TAG, the online lookup, or a
+            # human review decision — not the audio model. `ml_genre_raw_
+            # confidence` USED to keep describing the AUDIO read regardless, so
+            # judging stage 1 on it meant a curated tag at 0.99 was gated on an
+            # unrelated 0.1–0.4 audio number: stage 1 could never fire, stage 2
+            # always did, and the DJ's precise subgenre was overwritten in TCON
+            # by its coarser parent family on the DEFAULT settings path.
+            #
+            # `analyzer._reconcile_record_genre` now stamps the reconciled
+            # confidence into `ml_genre_raw_confidence` for every non-audio
+            # source, so for a report from the current analyzer this branch
+            # substitutes a value equal to what's already there — a no-op. It
+            # stays as belt and braces: pre-fix reports still carry the audio
+            # number, and this is the tagger's own statement of the rule rather
+            # than a dependency on the analyzer having reconciled first.
+            # Audio-sourced records keep the raw single-class gate they were
+            # designed for.
             subgenre_conf = family_conf
 
         subgenre = ml.get("ml_subgenre", "") or ""
@@ -920,19 +1121,30 @@ def apply_ml_tags(
                 genre_to_write = subgenre
             else:
                 genre_to_write = parent_genre or subgenre
-            stats.genre_applied += 1
         elif apply_parent_only:
             genre_to_write = parent_genre
-            stats.genre_applied_parent_only += 1
         else:
             genre_to_write = ""
-            stats.genre_skipped_low_confidence += 1
 
         # The genre write is gated by BOTH the confidence thresholds above AND
         # the per-field `write_genre` toggle. Every other field has its own
         # independent toggle (checked in _apply_mp3/_apply_flac) — none are
         # gated by genre confidence.
         apply_genre = (apply_subgenre or apply_parent_only) and config.write_genre
+
+        # Count what actually LANDS, not what cleared a threshold: with
+        # `write_genre` off no genre frame is touched, so reporting those files
+        # as "genre applied" told the user about a write that never happened.
+        # Dry runs project a real apply, so they count the same way.
+        if apply_subgenre or apply_parent_only:
+            if not config.write_genre:
+                stats.genre_skipped_write_disabled += 1
+            elif apply_subgenre:
+                stats.genre_applied += 1
+            else:
+                stats.genre_applied_parent_only += 1
+        else:
+            stats.genre_skipped_low_confidence += 1
 
         if dry_run:
             continue
@@ -1041,27 +1253,45 @@ def _apply_id3_frames(
         ]
 
     if apply_genre:
+        # A genre can carry non-ASCII text (a curated tag under `prefer_tag` is
+        # written back verbatim), and under encoding 0 that would raise inside
+        # save() and abort the whole file's apply — same trap as the restore
+        # path, so it takes the same per-frame widening.
         id3.delall("TCON")
-        id3.add(TCON(encoding=enc, text=[genre_value]))
+        id3.add(TCON(
+            encoding=_writable_encoding(enc, genre_value, "TCON"),
+            text=[genre_value],
+        ))
         # Write TIT1 (subgenre frame) whenever we have a genuine subgenre to
         # record. Under stage-2 parent-only fallback subgenre_value is "" so
         # TIT1 is left untouched — we don't mislabel an unclear track.
         if subgenre_value:
             id3.delall("TIT1")
-            id3.add(TIT1(encoding=enc, text=[subgenre_value]))
+            id3.add(TIT1(
+                encoding=_writable_encoding(enc, subgenre_value, "TIT1"),
+                text=[subgenre_value],
+            ))
 
     if config.write_bpm and ml.get("ml_bpm"):
         id3.delall("TBPM")
         id3.add(TBPM(encoding=enc, text=[str(int(round(ml["ml_bpm"])))]))
     if config.write_key and ml.get("ml_key"):
+        key_value = str(ml["ml_key"])
         id3.delall("TKEY")
-        id3.add(TKEY(encoding=enc, text=[ml["ml_key"]]))
+        id3.add(TKEY(
+            encoding=_writable_encoding(enc, key_value, "TKEY"),
+            text=[key_value],
+        ))
 
     for tag_name in ("ENERGY", "MOOD", "TIMESLOT", "DIRECTION", "VOCAL"):
         val = _derived_field_value(tag_name, ml, config)
         if val is not None:
             id3.delall(f"TXXX:{tag_name}")
-            id3.add(TXXX(encoding=enc, desc=tag_name, text=[str(val)]))
+            id3.add(TXXX(
+                encoding=_writable_encoding(enc, str(val), f"TXXX:{tag_name}"),
+                desc=tag_name,
+                text=[str(val)],
+            ))
 
     for key, frame in preserved:
         if key not in id3:
@@ -1076,11 +1306,13 @@ def _apply_mp3(
     config: TaggingConfig,
     subgenre_value: str = "",
 ) -> None:
-    audio = MP3(filepath)
+    # translate=False + save-as-loaded: tagging a genre must not also rewrite the
+    # file from ID3v2.3 to v2.4 (see `_id3_save_version`).
+    audio = MP3(filepath, translate=False)
     if audio.tags is None:
         audio.add_tags()
     _apply_id3_frames(audio.tags, ml, apply_genre, genre_value, config, subgenre_value)
-    audio.save()
+    audio.save(v2_version=_id3_save_version(audio.tags))
 
 
 def _apply_aiff_wav(
@@ -1097,11 +1329,14 @@ def _apply_aiff_wav(
     analysis must be able to tag it (it used to error 'unsupported format').
     """
     ext = filepath.suffix.lower()
-    audio = AIFF(filepath) if ext in (".aiff", ".aif") else WAVE(filepath)
+    audio = (
+        AIFF(filepath, translate=False) if ext in (".aiff", ".aif")
+        else WAVE(filepath, translate=False)
+    )
     if audio.tags is None:
         audio.add_tags()
     _apply_id3_frames(audio.tags, ml, apply_genre, genre_value, config, subgenre_value)
-    audio.save()
+    audio.save(v2_version=_id3_save_version(audio.tags))
 
 
 def _apply_m4a(

@@ -112,11 +112,17 @@ def sanitize_folder_name(name: str | None) -> str:
     library root — `library_root / ".."` writes into the PARENT directory.
 
     Guarantees the result is a single, safe path segment: no separators, no
-    leading/trailing dots, never "." or "..", never a Windows reserved device
-    name (CON/PRN/AUX/NUL/COM1-9/LPT1-9).
+    leading/trailing dots, no control characters, never "." or "..", never a
+    Windows reserved device name (CON/PRN/AUX/NUL/COM1-9/LPT1-9).
     """
     if not name:
         return "Unknown"
+    # Control characters first, NUL above all. A multi-value ID3 genre frame
+    # stringifies as NUL-joined ("Techno\x00House"), and a NUL in a path makes
+    # `mkdir` raise ValueError — not OSError, so it escaped the caller's
+    # handler and aborted the whole run. Nothing downstream strips them:
+    # `.strip()` only touches whitespace, and \x00 isn't whitespace.
+    name = "".join("_" if ord(ch) < 32 or ord(ch) == 127 else ch for ch in name)
     for ch in INVALID_FOLDER_CHARS:
         name = name.replace(ch, "_")
     # Collapse any stray separators the loop above already turned into "_"
@@ -140,12 +146,48 @@ def sanitize_folder_name(name: str | None) -> str:
     return name
 
 
+def find_executable(name: str) -> str | None:
+    """Locate `name` on PATH, returning an ABSOLUTE path string, or None.
+
+    A hit in the process's CURRENT DIRECTORY is discarded: on Windows
+    `shutil.which` prepends the cwd to the search path (that's
+    `NeedCurrentDirectoryForExePath`, and passing `path=` explicitly does not
+    suppress it), so an `fpcalc.exe` / `ffmpeg.exe` dropped into an unpacked
+    sample-pack folder would win over every real PATH entry — and then be
+    executed once per track. A tool we found next to the user's music is not a
+    tool we should run.
+
+    Absolutizing matters on its own: a bare `which` result can be relative
+    (again, the cwd entry), and a relative program path re-resolves against
+    whatever directory the subprocess is launched from.
+    """
+    on_path = shutil.which(name)
+    if not on_path:
+        return None
+    found = Path(on_path).absolute()
+    try:
+        in_cwd = found.parent.resolve() == Path.cwd().resolve()
+    except OSError:
+        # An unreadable / vanished cwd is not evidence the hit is unsafe.
+        in_cwd = False
+    if in_cwd:
+        log.warning(
+            "Ignoring %s found in the current directory (%s) — refusing to "
+            "run an executable from the working folder", name, found,
+        )
+        return None
+    return str(found)
+
+
 def find_fpcalc() -> str | None:
     """Locate the `fpcalc` (Chromaprint) executable, returning its path or None.
 
-    Tries PATH first, then a few well-known install locations.
+    Tries PATH first (via `find_executable`, so a cwd hit is refused and the
+    result is absolute — the pinned, SHA256-verified copy `fpcalc_provision`
+    stages must not lose to an `fpcalc.exe` sitting next to the user's music),
+    then a few well-known install locations.
     """
-    on_path = shutil.which("fpcalc")
+    on_path = find_executable("fpcalc")
     if on_path:
         return on_path
 

@@ -631,6 +631,7 @@ Click **Copy details** to grab the full error, **View logs** to see what the sid
 | **ML models** | `<data_dir>/Vibechek/models/` |
 | **Auto-saved analysis JSONs** | `<data_dir>/Vibechek/analyses/` |
 | **Logs** | `<data_dir>/Vibechek/logs/vibechek.log` (rotating, 10 MB × 5) |
+| **Desktop shell log** | `<data_dir>/Vibechek/logs/vibechek-shell.log` (rotating, 1 MB × 1 backup, UTC timestamps — sidecar spawn/exit diagnostics and Rust panics) |
 
 To start fresh, delete the `Vibechek` folders in both your config and data dirs.
 

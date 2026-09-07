@@ -39,6 +39,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
+      - name: Install ffmpeg (CDJ-export fallback tests)
+        # tests/test_cdj_export.py's two ffmpeg-fallback regressions
+        # (canonical big-endian AIFF, and reporting a forced 44.1 kHz
+        # downsample) `pytest.skip` when ffmpeg is not on PATH — so on a runner
+        # image without it they are indistinguishable from passes and the
+        # regressions they guard would ship green. Install it on the Linux leg
+        # so they actually EXECUTE somewhere in CI; macOS/Windows keep the skip
+        # rather than paying a per-run brew/choco install for the same coverage.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+
       - name: Lint with ruff
         # Enforcing: `ruff check` now blocks the build (E9/F bug-class lints
         # must not merge green). `ruff format` is intentionally NOT run in CI,
@@ -56,17 +70,22 @@ jobs:
           path: coverage.xml
           if-no-files-found: warn
 
-      - name: Verify README stats are current
-        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
-        run: python scripts/update_readme_stats.py --check
-
       - name: Verify generated TS types match the Python dataclasses
         # The frontend types every RPC payload off the COMMITTED generated.ts /
         # keeperConstants.ts. Without this check, editing a dataclass without
         # re-running the generator ships a frontend that type-checks cleanly
         # against a stale wire contract (a bug class this repo has already hit).
+        #
+        # Ordered BEFORE the README stats check: this and the CLI smoke test run
+        # on this matrix cell only, and Actions stops a job at the first failing
+        # step — so a stale decorative counter used to skip the wire-contract
+        # gate entirely (it did, on three consecutive pushes to main).
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
         run: python scripts/generate_ts_types.py --check
+
+      - name: Verify README stats are current
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: python scripts/update_readme_stats.py --check
 
       - name: Smoke-test the CLI
         run: |
@@ -79,8 +98,27 @@ jobs:
     # tag push — a Rust compile error merged green and only surfaced at
     # release time. `cargo clippy -D warnings` closes that gap the same way
     # the frontend job's tsc step does for TypeScript.
-    name: Rust (Tauri shell)
-    runs-on: ubuntu-latest
+    #
+    # Matrixed over every OS the release builds: clippy is a rustc driver, so
+    # it only ever compiles the arms selected for ITS host. A Linux-only run
+    # left sidecar.rs's `#[cfg(windows)]` PATHEXT block (the platform
+    # Vibechek's users are actually on) and shell_log.rs's
+    # `#[cfg(target_os = "macos")] fn data_dir` first compiled inside
+    # tauri-action at TAG time — i.e. a typo there reds the release, not the PR.
+    # Every legs' triple must match release.yml's `sidecar_name`, since
+    # tauri-build looks the externalBin up by exact filename.
+    name: Rust (Tauri shell, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            sidecar: vibechek-sidecar-x86_64-unknown-linux-gnu
+          - os: macos-latest
+            sidecar: vibechek-sidecar-aarch64-apple-darwin
+          - os: windows-latest
+            sidecar: vibechek-sidecar-x86_64-pc-windows-msvc.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -98,6 +136,7 @@ jobs:
           workspaces: ui/src-tauri
 
       - name: Linux system deps for Tauri
+        if: runner.os == 'Linux'
         run: |
           sudo apt update
           sudo apt install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
@@ -108,10 +147,12 @@ jobs:
         # (binaries/vibechek-sidecar-<triple>) is absent — true on every clean
         # checkout, since the real sidecar is only built by the release
         # workflow's build-cli job. Clippy never executes the binary, so an
-        # empty file satisfies the check.
+        # empty file satisfies the check. The name is per-triple (matrix), and
+        # bash is available on the Windows runner too.
+        shell: bash
         run: |
           mkdir -p ui/src-tauri/binaries
-          touch ui/src-tauri/binaries/vibechek-sidecar-x86_64-unknown-linux-gnu
+          touch "ui/src-tauri/binaries/${{ matrix.sidecar }}"
 
       - name: cargo clippy (deny warnings)
         working-directory: ui/src-tauri

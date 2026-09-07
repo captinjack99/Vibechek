@@ -6,6 +6,8 @@ fallback is exercised with monkeypatching so no real ffmpeg binary is required.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -72,3 +74,77 @@ def test_decode_error_when_soundfile_fails_and_no_ffmpeg(monkeypatch, tmp_path) 
 
     with pytest.raises(DecodeError):
         decode_mono(str(tmp_path / "weird.m4a"), 16000)
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg discovery — a copy in the working folder is not a tool we run
+# ---------------------------------------------------------------------------
+
+
+def test_ffmpeg_available_ignores_a_copy_in_the_current_directory(
+    tmp_path, monkeypatch
+) -> None:
+    """A planted ffmpeg must not make us claim the fallback is available.
+
+    Both lookups go through utils.find_executable, which discards a hit whose
+    parent is the cwd (on Windows `shutil.which` searches the current directory
+    first, so an ffmpeg.exe unpacked next to a sample pack would win).
+    """
+    from vibechek import utils
+
+    planted = tmp_path / "ffmpeg.exe"
+    planted.write_bytes(b"planted")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: str(planted))
+
+    assert native_decode.ffmpeg_available() is False
+
+
+def test_decode_ffmpeg_refuses_a_copy_in_the_current_directory(
+    tmp_path, monkeypatch
+) -> None:
+    """The decode path must refuse too, not just the availability probe."""
+    from vibechek import utils
+
+    planted = tmp_path / "ffmpeg.exe"
+    planted.write_bytes(b"planted")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: str(planted))
+    monkeypatch.setattr(
+        native_decode.subprocess, "run",
+        lambda *_a, **_k: pytest.fail("ffmpeg from the cwd must never be executed"),
+    )
+
+    with pytest.raises(DecodeError, match="not found on PATH"):
+        native_decode._decode_ffmpeg(str(tmp_path / "x.mp3"), 16000)
+
+
+def test_decode_ffmpeg_runs_an_absolute_path(tmp_path, monkeypatch) -> None:
+    """A relative `which` hit is absolutized before it reaches subprocess."""
+    from vibechek import utils
+
+    toolsdir = tmp_path / "tools"
+    toolsdir.mkdir()
+    real = toolsdir / "ffmpeg.exe"
+    real.write_bytes(b"real")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: "tools/ffmpeg.exe")
+
+    seen: dict = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = np.arange(4, dtype="<f4").tobytes()
+        stderr = b""
+
+    def _fake_run(cmd, **_kw):
+        seen["cmd"] = cmd
+        return _Proc()
+
+    monkeypatch.setattr(native_decode.subprocess, "run", _fake_run)
+
+    out = native_decode._decode_ffmpeg(str(tmp_path / "x.mp3"), 16000)
+
+    assert Path(seen["cmd"][0]).is_absolute()
+    assert Path(seen["cmd"][0]) == real
+    np.testing.assert_array_equal(out, np.arange(4, dtype=np.float32))

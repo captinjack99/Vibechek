@@ -216,9 +216,16 @@ def _have_essentia_audio_stubs() -> bool:
         return False
 
 
-def test_effnet_guard_sets_ml_error_and_returns_early(monkeypatch, tmp_path) -> None:
-    """A bad audio file shouldn't take down the worker — it should land in
-    ml_error and the function should return a non-fatal MLResult."""
+def test_effnet_crash_degrades_the_track_instead_of_failing_it(monkeypatch, tmp_path) -> None:
+    """A bad audio file shouldn't take down the worker — and it shouldn't be
+    written off as a FAILURE either while its BPM and key are real.
+
+    `ml_error` is what `_record_failed` counts as an error and what the library
+    view reads as "never analyzed", so setting it here discarded the very BPM
+    and key this handler exists to preserve: the track was re-queued by every
+    incremental "Analyze new", forever. The missing heads are named in
+    `ml_degraded_heads` instead (R03).
+    """
     np = pytest.importorskip("numpy")
 
     # Build a fake audio loader so we don't need real essentia for this test.
@@ -237,6 +244,9 @@ def test_effnet_guard_sets_ml_error_and_returns_early(monkeypatch, tmp_path) -> 
             return (123.4, [], 0.9, [], [])
 
     class _FakeKey:
+        def __init__(self, **kwargs):
+            pass
+
         def __call__(self, _audio):
             return ("C", "major", 0.9)
 
@@ -261,11 +271,144 @@ def test_effnet_guard_sets_ml_error_and_returns_early(monkeypatch, tmp_path) -> 
     fake_file.write_bytes(b"")
 
     result = analyzer.analyze_audio_features(fake_file, {"effnet": crashing_effnet})
-    assert result.ml_error is not None
-    assert "EffNet" in result.ml_error
-    # We bailed before BPM/key extraction in this guarded-fast path because
-    # we already had nothing useful to extract; what matters is no crash.
+    assert result.ml_error is None, "a partial read must not count as an error"
+    assert result.ml_degraded_heads == [analyzer.EMBEDDING_HEAD]
+    assert analyzer._record_failed({"ml_analysis": {
+        "ml_error": result.ml_error,
+        "ml_degraded_heads": result.ml_degraded_heads,
+    }}) is False
     assert crashing_effnet.calls == 1
+    # The embedding is the ONLY thing that failed. BPM and key are pure DSP over
+    # the 44.1 kHz buffer we already paid to decode, so bailing here used to
+    # throw away tempo and key the track could have had (F080).
+    assert result.ml_bpm == 123.4
+    assert result.ml_key is not None
+    # ...but nothing that needs the embedding may be invented to fill the gap.
+    assert result.ml_genre is None
+    assert result.ml_energy is None
+    assert result.ml_mood is None
+    assert result.ml_timeslot is None
+    assert result.ml_direction is None
+
+
+def test_missing_effnet_head_still_reads_bpm_and_key(monkeypatch, tmp_path) -> None:
+    """Same contract for a models dict with no EffNet head at all — the DSP
+    extractors need no model, so this is a DEGRADED read, not a failed one."""
+    np = pytest.importorskip("numpy")
+    import sys
+    import types
+
+    class _FakeMonoLoader:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self):
+            return np.zeros(16000, dtype=np.float32)
+
+    class _FakeRhythm:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, _audio):
+            return (128.0, [], 0.9, [], [])
+
+    class _FakeKey:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, _audio):
+            return ("A", "minor", 0.9)
+
+    fake_module = types.ModuleType("essentia.standard")
+    fake_module.MonoLoader = _FakeMonoLoader
+    fake_module.RhythmExtractor2013 = _FakeRhythm
+    fake_module.KeyExtractor = _FakeKey
+    fake_essentia = types.ModuleType("essentia")
+    fake_essentia.standard = fake_module
+    monkeypatch.setitem(sys.modules, "essentia", fake_essentia)
+    monkeypatch.setitem(sys.modules, "essentia.standard", fake_module)
+
+    fake_file = tmp_path / "ok.flac"
+    fake_file.write_bytes(b"")
+
+    result = analyzer.analyze_audio_features(fake_file, {})
+    assert result.ml_error is None
+    assert result.ml_degraded_heads == [analyzer.EMBEDDING_HEAD]
+    assert result.ml_bpm == 128.0
+    assert result.ml_key is not None
+
+
+def test_decoded_buffers_are_released_as_soon_as_they_are_dead(
+    monkeypatch, tmp_path,
+) -> None:
+    """The 44.1 kHz decode feeds only the rhythm/key extractors and the 16 kHz
+    one only the embedding, so the two must never be alive at the same time.
+    Holding both for the whole function put ~1.3 GB of decoded audio inside a
+    worker `resources.per_worker_mb` sizes at a flat 800 MB (P01).
+    """
+    import sys
+    import types
+    import weakref
+
+    np = pytest.importorskip("numpy")
+
+    seen: dict[str, object] = {}
+
+    class _FakeMonoLoader:
+        def __init__(self, **kwargs):
+            self.rate = kwargs.get("sampleRate")
+
+        def __call__(self):
+            buf = np.zeros(self.rate, dtype=np.float32)
+            seen[f"ref{self.rate}"] = weakref.ref(buf)
+            return buf
+
+    class _FakeRhythm:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, _audio):
+            return (120.0, [], 0.9, [], [])
+
+    class _FakeKey:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, _audio):
+            return ("C", "major", 0.9)
+
+    fake_module = types.ModuleType("essentia.standard")
+    fake_module.MonoLoader = _FakeMonoLoader
+    fake_module.RhythmExtractor2013 = _FakeRhythm
+    fake_module.KeyExtractor = _FakeKey
+    fake_essentia = types.ModuleType("essentia")
+    fake_essentia.standard = fake_module
+    monkeypatch.setitem(sys.modules, "essentia", fake_essentia)
+    monkeypatch.setitem(sys.modules, "essentia.standard", fake_module)
+
+    def effnet(_audio):
+        # Runs after the key vote: the 44.1 kHz buffer must be gone by now.
+        seen["44k_alive_at_effnet"] = seen["ref44100"]() is not None
+        return np.zeros((4, 8), dtype=np.float32)
+
+    def danceability(_embeddings):
+        # Runs after the embedding: the 16 kHz buffer must be gone by now.
+        seen["16k_alive_at_danceability"] = seen["ref16000"]() is not None
+        return np.zeros((4, 2), dtype=np.float32)
+
+    fake_file = tmp_path / "ok.flac"
+    fake_file.write_bytes(b"")
+    result = analyzer.analyze_audio_features(
+        fake_file, {"effnet": effnet, "danceability": danceability},
+    )
+
+    assert result.ml_bpm == 120.0  # the DSP pass really ran
+    assert seen["44k_alive_at_effnet"] is False, (
+        "the 44.1 kHz decode outlived the key vote"
+    )
+    assert seen["16k_alive_at_danceability"] is False, (
+        "the 16 kHz decode outlived the embedding"
+    )
 
 
 def test_mood_fallback_requires_two_models_to_blend(monkeypatch, tmp_path) -> None:
@@ -290,6 +433,9 @@ def test_mood_fallback_requires_two_models_to_blend(monkeypatch, tmp_path) -> No
             return (128.0, [], 0.9, [], [])
 
     class _FakeKey:
+        def __init__(self, **kwargs):
+            pass
+
         def __call__(self, _audio):
             return ("A", "minor", 0.9)
 
@@ -353,6 +499,9 @@ def test_mood_fallback_blends_with_two_or_more(monkeypatch, tmp_path) -> None:
             return (128.0, [], 0.9, [], [])
 
     class _FakeKey:
+        def __init__(self, **kwargs):
+            pass
+
         def __call__(self, _audio):
             return ("A", "minor", 0.9)
 
@@ -585,3 +734,78 @@ def test_classify_vocal_backcompat_without_patch_shape() -> None:
     assert analyzer._classify_vocal(0.703) == "Instrumental"
     assert analyzer._classify_vocal(0.80) == "Light Vocal"
     assert analyzer._classify_vocal(0.95) == "Vocal"
+
+
+# ---------------------------------------------------------------------------
+# P01 — the run's own budget is sized against the library's longest track
+# ---------------------------------------------------------------------------
+
+
+def _drive_budget(tmp_path, monkeypatch, *, track_seconds: float | None):
+    """Run `analyze_directory` far enough to compute a budget; return its kwargs.
+
+    Everything after the sizing block is stubbed (models, per-track analysis), so
+    this exercises the real probe → budget wiring and nothing else.
+    """
+    from vibechek.config import AnalysisConfig
+
+    files = []
+    for i in range(3):
+        f = tmp_path / f"t{i}.flac"
+        f.write_bytes(b"\x00" * (100 + i))
+        files.append(f)
+
+    if track_seconds is None:
+        def fake_mutagen(_path):
+            raise ValueError("unreadable header")
+    else:
+        def fake_mutagen(_path):
+            return type("A", (), {"info": type("I", (), {"length": track_seconds})()})()
+
+    monkeypatch.setattr("mutagen.File", fake_mutagen)
+    monkeypatch.setattr(analyzer, "load_models", lambda *a, **kw: {"effnet": object()})
+    monkeypatch.setattr(
+        analyzer, "analyze_track",
+        lambda fp, _models: analyzer.TrackAnalysis(
+            path=str(fp), filename=fp.name, extension=fp.suffix.lower(),
+            size_mb=1.0, ml_analysis={"ml_bpm": 128.0}),
+    )
+
+    captured: dict = {}
+    real_budget = analyzer.compute_worker_budget
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_budget(*args, **kwargs)
+
+    monkeypatch.setattr(analyzer, "compute_worker_budget", spy)
+
+    with patch("vibechek.preflight.preflight",
+               return_value=MagicMock(ready=True, analyze_via="native",
+                                      reasons_not_ready=[])), \
+         patch("vibechek.utils.find_audio_files", return_value=files):
+        analyzer.analyze_directory(
+            tmp_path,
+            config=AnalysisConfig(workers=1, use_gpu="off",
+                                  inference_engine="essentia_tf"),
+        )
+    return captured
+
+
+def test_analyze_directory_sizes_workers_against_the_longest_track(
+    tmp_path, monkeypatch,
+) -> None:
+    """A worker holds the whole decoded track, so the measured duration has to
+    reach the budget model — otherwise a library of 90-minute recorded sets is
+    still planned at the singles-sized flat budget it overruns."""
+    captured = _drive_budget(tmp_path, monkeypatch, track_seconds=90 * 60)
+    assert captured["longest_track_seconds"] == 90 * 60
+
+
+def test_an_unreadable_library_falls_back_to_the_flat_budget(
+    tmp_path, monkeypatch,
+) -> None:
+    """No measurement, no number: the run sizes exactly as it did before rather
+    than against a duration nobody could read."""
+    captured = _drive_budget(tmp_path, monkeypatch, track_seconds=None)
+    assert captured["longest_track_seconds"] is None

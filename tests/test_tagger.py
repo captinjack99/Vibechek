@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from vibechek import tagger
 from vibechek.config import TaggingConfig
 from vibechek.tagger import (
     ApplyStats,
@@ -332,13 +333,24 @@ def test_apply_ml_tags_preserves_geob_across_reapply(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _has_fixtures() -> bool:
+def _fixture_audio() -> list[Path]:
+    """Every real audio fixture in the tree, at ANY depth.
+
+    The repo's real audio lives in `tests/fixtures/gold/`, one level below the
+    drop directory `tests/fixtures/README.md` documents. A non-recursive glob
+    here meant the only real-audio backup→restore roundtrip we have never ran —
+    not locally, not in CI — since the gold corpus landed.
+    """
     if not FIXTURES.exists():
-        return False
-    for ext in (".mp3", ".flac", ".m4a"):
-        if any(FIXTURES.glob(f"*{ext}")):
-            return True
-    return False
+        return []
+    return sorted(
+        p for p in FIXTURES.rglob("*")
+        if p.is_file() and p.suffix.lower() in (".mp3", ".flac", ".m4a")
+    )
+
+
+def _has_fixtures() -> bool:
+    return bool(_fixture_audio())
 
 
 @pytest.mark.skipif(not _has_fixtures(), reason="No audio fixtures in tests/fixtures/")
@@ -347,9 +359,8 @@ def test_backup_restore_roundtrip(tmp_path: Path) -> None:
     # Copy fixtures into a tmp library so the test doesn't write into the repo
     library = tmp_path / "lib"
     library.mkdir()
-    for f in FIXTURES.iterdir():
-        if f.suffix.lower() in (".mp3", ".flac", ".m4a"):
-            (library / f.name).write_bytes(f.read_bytes())
+    for f in _fixture_audio():
+        (library / f.name).write_bytes(f.read_bytes())
 
     backup_file = tmp_path / "backup.json"
     backup_stats = backup_tags(library, backup_file)
@@ -612,6 +623,9 @@ class _RecordingTags(dict):
     def __init__(self) -> None:
         super().__init__()
         self.added: list = []
+        # Real ID3 tags carry the on-disk v2 version; the writers read it to
+        # decide whether to save back as v2.3 or v2.4.
+        self.version = (2, 4, 0)
 
     def add(self, frame) -> None:  # noqa: ANN001 — mutagen has no public Frame type
         self.added.append(frame)
@@ -629,20 +643,26 @@ class _FakeMP3:
     def __init__(self) -> None:
         self.tags = _RecordingTags()
         self.saved = False
+        self.saved_v2_version: int | None = None
 
     def add_tags(self) -> None:
         pass
 
-    def save(self) -> None:
+    def save(self, v2_version: int | None = None, **_kwargs) -> None:
         self.saved = True
+        self.saved_v2_version = v2_version
 
 
 def _install_fake_mp3(monkeypatch: pytest.MonkeyPatch) -> list[_FakeMP3]:
     """Patch tagger.MP3 to return a fresh _FakeMP3 per call. Returns the
-    accumulator list so tests can introspect what got written."""
+    accumulator list so tests can introspect what got written.
+
+    The factory swallows the loader kwargs (`translate=False`) the real writers
+    pass, so this stub keeps standing in for `mutagen.mp3.MP3`.
+    """
     instances: list[_FakeMP3] = []
 
-    def factory(_path):  # noqa: ANN001
+    def factory(_path, **_kwargs):  # noqa: ANN001
         inst = _FakeMP3()
         instances.append(inst)
         return inst
@@ -1501,3 +1521,462 @@ def test_apply_ml_tags_mixed_valid_and_malformed(tmp_path: Path) -> None:
     assert stats.total == 2
     assert stats.other_tags_applied == 1
     assert FLAC(track)["genre"][0] == "Deep House"
+
+
+# ---------------------------------------------------------------------------
+# Audit round 2026-09-05 — tagging package
+# ---------------------------------------------------------------------------
+
+
+def test_flac_restore_removes_apply_added_initialkey_and_contentgroup(
+    tmp_path: Path,
+) -> None:
+    """HIGH: a FLAC that merely CARRIED a KEY or GROUPING comment used to make
+    restore keep the INITIALKEY/CONTENTGROUP the apply itself wrote.
+
+    The snapshot's `key`/`subgenre` fields name the Vorbis comments KEY and
+    GROUPING; `_apply_flac` writes INITIALKEY and CONTENTGROUP. Keying the delete
+    set off the former left the reverted-away Vibechek key and subgenre on the
+    file while restore reported success — and Rekordbox reads INITIALKEY.
+    """
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "t.flac"
+    _build_flac(track)
+    audio = FLAC(track)
+    audio["ARTIST"] = "X"
+    audio["GENRE"] = "House"
+    audio["KEY"] = "Am"
+    audio["GROUPING"] = "Deep House"
+    audio.save()
+
+    snapshot = read_all_tags(track)
+    assert snapshot["key"] == "Am" and snapshot["subgenre"] == "Deep House"
+    assert "txxx_initialkey" not in snapshot and "txxx_contentgroup" not in snapshot
+
+    analysis = {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "Techno", "ml_subgenre": "Hard Techno",
+        "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+        "ml_bpm": 128.0, "ml_key": "5A",
+    }}]}
+    apply_ml_tags(analysis, TaggingConfig(write_key=True, write_bpm=True))
+    applied = FLAC(track)
+    assert applied["initialkey"][0] == "5A"
+    assert applied["contentgroup"][0] == "Hard Techno"
+
+    ok, err = write_all_tags(track, snapshot)
+    assert ok, err
+    restored = FLAC(track)
+    assert "initialkey" not in restored, "apply-added INITIALKEY survived restore"
+    assert "contentgroup" not in restored, "apply-added CONTENTGROUP survived restore"
+    assert "bpm" not in restored
+    # The file's own pre-existing comments come back untouched.
+    assert restored["key"][0] == "Am"
+    assert restored["grouping"][0] == "Deep House"
+    assert restored["genre"][0] == "House"
+
+
+def test_flac_restore_keeps_a_genuine_pre_existing_initialkey(tmp_path: Path) -> None:
+    """The other half of the same fix: an INITIALKEY the file really had at
+    backup time is captured as `txxx_initialkey` and must be restored, not
+    deleted as if the apply had added it."""
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "t.flac"
+    _build_flac(track)
+    audio = FLAC(track)
+    audio["INITIALKEY"] = "8B"
+    audio["CONTENTGROUP"] = "Progressive House"
+    audio.save()
+
+    snapshot = read_all_tags(track)
+    assert snapshot["txxx_initialkey"] == "8B"
+
+    analysis = {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "Techno", "ml_subgenre": "Hard Techno",
+        "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+        "ml_key": "5A",
+    }}]}
+    apply_ml_tags(analysis, TaggingConfig(write_key=True))
+    ok, err = write_all_tags(track, snapshot)
+    assert ok, err
+    restored = FLAC(track)
+    assert restored["initialkey"][0] == "8B"
+    assert restored["contentgroup"][0] == "Progressive House"
+
+
+def test_flac_restore_from_a_pre_format_complete_backup_keeps_initialkey(
+    tmp_path: Path,
+) -> None:
+    """A backup written before the FLAC reader became format-complete carries a
+    FIXED field set — no `txxx_initialkey` for an INITIALKEY the file really
+    had. Applying the "not in the snapshot means the apply added it" rule to
+    those turns "we never looked" into a delete instruction: a DJ whose FLACs
+    carry KEY (Rekordbox) and INITIALKEY (Mixed In Key) would have the MIK
+    comment stripped from every file, and the restore would report success.
+
+    `BACKUP_VERSION` has been "1.0" across that reader change, so the shape is
+    detected per file: no `_snapshot_version` means "unknown, leave it alone".
+    """
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "t.flac"
+    _build_flac(track)
+    audio = FLAC(track)
+    audio["GENRE"] = "House"
+    audio["KEY"] = "Am"
+    audio["INITIALKEY"] = "8B"
+    audio["CONTENTGROUP"] = "Progressive House"
+    audio.save()
+
+    # Exactly what a 0.4.x backup holds for this file: canonical fields only.
+    # The generic Vorbis-comment loop that would have captured INITIALKEY as
+    # `txxx_initialkey` did not exist yet, so nothing in here mentions it.
+    old_snapshot = {"title": "T", "artist": "X", "genre": "House", "key": "Am"}
+    assert tagger.SNAPSHOT_VERSION_KEY not in old_snapshot
+
+    # A restore from that backup must not touch comments it never captured.
+    ok, err = write_all_tags(track, old_snapshot)
+    assert ok, err
+    restored = FLAC(track)
+    assert restored["initialkey"][0] == "8B", (
+        "restoring an OLD backup deleted the user's own INITIALKEY"
+    )
+    assert restored["contentgroup"][0] == "Progressive House"
+    assert restored["key"][0] == "Am"
+    assert restored["genre"][0] == "House"
+
+
+def test_a_format_complete_snapshot_still_removes_the_apply_addition(
+    tmp_path: Path,
+) -> None:
+    """The version gate must not blunt the fix it guards: a CURRENT snapshot
+    that genuinely lacks `txxx_initialkey` still means the file didn't have one,
+    so the apply's addition is removed."""
+    from mutagen.flac import FLAC
+
+    track = tmp_path / "t.flac"
+    _build_flac(track)
+    audio = FLAC(track)
+    audio["KEY"] = "Am"
+    audio.save()
+
+    snapshot = read_all_tags(track)
+    assert snapshot[tagger.SNAPSHOT_VERSION_KEY] == tagger.SNAPSHOT_VERSION
+    assert "txxx_initialkey" not in snapshot
+
+    analysis = {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "Techno", "ml_subgenre": "Hard Techno",
+        "ml_genre_confidence": 0.95, "ml_genre_raw_confidence": 0.95,
+        "ml_key": "5A",
+    }}]}
+    apply_ml_tags(analysis, TaggingConfig(write_key=True))
+    assert FLAC(track)["initialkey"][0] == "5A"
+
+    ok, err = write_all_tags(track, snapshot)
+    assert ok, err
+    restored = FLAC(track)
+    assert "initialkey" not in restored
+    assert "contentgroup" not in restored
+    assert restored["key"][0] == "Am"
+
+
+def test_every_backup_entry_records_the_snapshot_shape(tmp_path: Path) -> None:
+    """The marker has to be on EVERY entry, not just FLAC: it is what tells a
+    future restore whether a missing key means "absent" or "never captured"."""
+    track = tmp_path / "t.flac"
+    _build_flac(track)
+    out = tmp_path / "backup.json"
+    backup_tags(tmp_path, out)
+    entry = json.loads(out.read_text(encoding="utf-8"))["files"][str(track)]
+    assert entry[tagger.SNAPSHOT_VERSION_KEY] == tagger.SNAPSHOT_VERSION
+
+
+def _tag_sourced_analysis(track: Path, source: str) -> dict:
+    """A record whose effective genre came from `source`, with the AUDIO model's
+    raw confidence left low — the exact shape `analyzer._reconcile_record_genre`
+    produces (it rewrites ml_genre_confidence only, never the raw one)."""
+    return {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "House", "ml_subgenre": "Tech House",
+        "ml_genre_confidence": 0.99,
+        "ml_genre_raw_confidence": 0.30,
+        "ml_genre_source": source,
+        "ml_genre_audio": "Techno", "ml_subgenre_audio": "Minimal Techno",
+    }}]}
+
+
+def test_tag_sourced_genre_writes_the_subgenre_not_the_parent(tmp_path: Path) -> None:
+    """HIGH: on the DEFAULT `prefer_tag` path the curated subgenre was replaced
+    by its coarser parent family in TCON.
+
+    Stage 1 judged `ml_genre_raw_confidence`, which stays the AUDIO model's
+    number after reconciliation — so a tag-sourced genre at 0.99 was gated on an
+    unrelated 0.30, stage 1 never fired and the parent-only fallback always did.
+    """
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "t.mp3"
+    _make_silent_mp3(track)
+    stats = apply_ml_tags(_tag_sourced_analysis(track, "tag"), TaggingConfig())
+    assert stats.genre_applied == 1
+    assert stats.genre_applied_parent_only == 0
+    tags = MP3(track).tags
+    assert str(tags.get("TCON")) == "Tech House"
+    assert str(tags.get("TIT1")) == "Tech House"
+
+
+def test_web_sourced_genre_also_writes_the_subgenre(tmp_path: Path) -> None:
+    """The online lookup reaches apply the same way a tag does (0.9, source
+    'web'/'web_override'), so it needs the same stage-1 input."""
+    for source in ("web", "web_override"):
+        track = tmp_path / (source + ".mp3")
+        _make_silent_mp3(track)
+        stats = apply_ml_tags(_tag_sourced_analysis(track, source), TaggingConfig())
+        assert stats.genre_applied == 1, source
+        assert stats.genre_applied_parent_only == 0, source
+
+
+def test_audio_sourced_genre_still_gated_on_raw_confidence(tmp_path: Path) -> None:
+    """Guard on the fix: an ML-sourced read with a low single-class confidence
+    must STILL fall back to the parent family — that gate is the whole point of
+    the two-stage design and the fix must not widen it."""
+    track = tmp_path / "ml.mp3"
+    _make_silent_mp3(track)
+    stats = apply_ml_tags(_tag_sourced_analysis(track, "ml"), TaggingConfig())
+    assert stats.genre_applied == 0
+    assert stats.genre_applied_parent_only == 1
+
+
+def test_restore_with_iso8859_encoding_does_not_abandon_the_file(
+    tmp_path: Path,
+) -> None:
+    """MED: `id3_text_encoding = 0` made mutagen raise inside save() for any
+    non-Latin-1 text, and the exception aborted the WHOLE file's restore — the
+    genre revert the user invoked restore for included."""
+    from mutagen.id3 import TCON, TIT2
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "cjk.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    audio.add_tags()
+    audio.tags.add(TIT2(encoding=3, text=["\u591c\u306e\u8857"]))
+    audio.tags.add(TCON(encoding=3, text=["House"]))
+    audio.save()
+
+    snapshot = read_all_tags(track)
+    assert snapshot["title"] == "\u591c\u306e\u8857"
+
+    # A bad apply mutates the genre; restore must put it back.
+    audio = MP3(track)
+    audio.tags.delall("TCON")
+    audio.tags.add(TCON(encoding=3, text=["Deep House"]))
+    audio.save()
+
+    ok, err = write_all_tags(track, snapshot, TaggingConfig(id3_text_encoding=0))
+    assert ok, "restore abandoned the file: " + str(err)
+    restored = MP3(track).tags
+    assert str(restored.get("TCON")) == "House"
+    assert str(restored.get("TIT2")) == "\u591c\u306e\u8857"
+
+
+def test_restore_of_a_legacy_snapshot_widens_unrepresentable_text(
+    tmp_path: Path,
+) -> None:
+    """Snapshots taken before per-frame encodings were recorded have nothing to
+    restore the original encoding from, so the configured encoding is used —
+    and a value that cannot survive it widens to UTF-16 rather than taking the
+    whole file's restore down with it."""
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "legacy.mp3"
+    _make_silent_mp3(track)
+    ok, err = write_all_tags(
+        track, {"title": "\u591c\u306e\u8857", "genre": "House"},
+        TaggingConfig(id3_text_encoding=0),
+    )
+    assert ok, err
+    tags = MP3(track).tags
+    assert str(tags.get("TIT2")) == "\u591c\u306e\u8857"
+    assert tags["TIT2"].encoding == 1, "expected the UTF-16 widening"
+    # An ASCII value in the same file still honours the configured encoding.
+    assert tags["TCON"].encoding == 0
+
+
+def test_restore_rebuilds_each_frame_with_the_encoding_it_had(
+    tmp_path: Path,
+) -> None:
+    """A restore is meant to be frame-for-frame: the snapshot records each text
+    frame's encoding so restoring can't silently re-encode the file."""
+    from mutagen.id3 import TCON, TIT2
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "mixed.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    audio.add_tags()
+    audio.tags.add(TIT2(encoding=1, text=["Title"]))
+    audio.tags.add(TCON(encoding=3, text=["House"]))
+    audio.save()
+
+    snapshot = read_all_tags(track)
+    assert snapshot["_id3_encodings"] == {"TIT2": 1, "TCON": 3}
+
+    ok, err = write_all_tags(track, snapshot, TaggingConfig(id3_text_encoding=0))
+    assert ok, err
+    tags = MP3(track).tags
+    assert tags["TIT2"].encoding == 1
+    assert tags["TCON"].encoding == 3
+
+
+def _make_v23_mp3(path: Path) -> None:
+    """A silent MP3 carrying an ID3v2.3 tag with v2.3-ONLY frames."""
+    from mutagen.id3 import TCON, TDAT, TIME, TRCK, TRDA, TSIZ, TYER
+    from mutagen.mp3 import MP3
+
+    _make_silent_mp3(path)
+    audio = MP3(path)
+    audio.add_tags()
+    audio.tags.add(TCON(encoding=3, text=["Tech House"]))
+    audio.tags.add(TRCK(encoding=3, text=["3/12"]))
+    audio.tags.add(TYER(encoding=3, text=["1998"]))
+    audio.tags.add(TDAT(encoding=3, text=["0406"]))
+    audio.tags.add(TIME(encoding=3, text=["1230"]))
+    audio.tags.add(TRDA(encoding=3, text=["4th-7th June"]))
+    audio.tags.add(TSIZ(encoding=3, text=["13000"]))
+    audio.save(v2_version=3)
+
+
+def test_apply_and_restore_keep_an_id3v23_tag_at_v23(tmp_path: Path) -> None:
+    """MED: mutagen's defaults (translate on load, v2_version=4 on save) rewrote
+    every v2.3 tag as v2.4 on every apply AND every restore. `update_to_v24`
+    deletes TRDA/TSIZ/RVAD/EQUA outright and folds TYER/TDAT/TIME into TDRC, and
+    the snapshot never carried those frames — so restore could not put them back.
+    For a tool that goes out of its way to stay readable by old Rekordbox/CDJs,
+    the tag version is not ours to change."""
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "v23.mp3"
+    _make_v23_mp3(track)
+    assert MP3(track, translate=False).tags.version[:2] == (2, 3)
+
+    backup_file = tmp_path / "backup.json"
+    backup_tags(tmp_path, backup_file)
+
+    apply_ml_tags(_confident_house_analysis(track), TaggingConfig())
+    after_apply = MP3(track, translate=False).tags
+    assert after_apply.version[:2] == (2, 3), "apply upgraded the tag to v2.4"
+    for frame_id in ("TYER", "TDAT", "TIME", "TRDA", "TSIZ", "TRCK"):
+        assert frame_id in after_apply, "apply destroyed " + frame_id
+    assert str(after_apply.get("TCON")) == "Deep House"
+
+    stats = restore_tags(backup_file)
+    assert stats.restored >= 1
+    after_restore = MP3(track, translate=False).tags
+    assert after_restore.version[:2] == (2, 3), "restore upgraded the tag to v2.4"
+    for frame_id in ("TYER", "TDAT", "TIME", "TRDA", "TSIZ", "TRCK"):
+        assert frame_id in after_restore, "restore destroyed " + frame_id
+    assert str(after_restore.get("TCON")) == "Tech House"
+
+
+def test_apply_leaves_a_v24_tag_at_v24(tmp_path: Path) -> None:
+    """The version rule only PRESERVES; a v2.4 file stays v2.4."""
+    from mutagen.id3 import TIT2
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "v24.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    audio.add_tags()
+    audio.tags.add(TIT2(encoding=3, text=["T"]))
+    audio.save()
+
+    apply_ml_tags(_confident_house_analysis(track), TaggingConfig())
+    assert MP3(track, translate=False).tags.version[:2] == (2, 4)
+
+
+def test_restore_rejects_a_backup_entry_that_is_not_an_object(tmp_path: Path) -> None:
+    """LOW: a hand-edited / sync-merged backup whose entry is a bare string made
+    `tags.get(...)` raise AttributeError, which no branch of the RPC dispatcher
+    types — the GUI got a raw traceback, and the restore had already rewritten
+    every earlier entry before it blew up."""
+    from mutagen.id3 import TCON
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "good.mp3"
+    _make_silent_mp3(track)
+    audio = MP3(track)
+    audio.add_tags()
+    audio.tags.add(TCON(encoding=3, text=["Techno"]))
+    audio.save()
+
+    backup_file = tmp_path / "backup.json"
+    _write_backup(backup_file, {str(track): {"genre": "House"}, "C:/Music/a.mp3": ""})
+
+    with pytest.raises(ValueError) as excinfo:
+        restore_tags(backup_file)
+    assert "C:/Music/a.mp3" in str(excinfo.value)
+    with pytest.raises(ValueError):
+        restore_tags_with_remap(backup_file, tmp_path)
+    # Nothing was written: the shape check runs before the restore loop, so a
+    # malformed backup can't leave the library half-restored.
+    assert str(MP3(track).tags.get("TCON")) == "Techno"
+
+
+def test_write_genre_off_is_not_reported_as_genre_applied(tmp_path: Path) -> None:
+    """LOW: `genre_applied` was bumped while classifying, before the
+    `write_genre` toggle was consulted — so the CLI/GUI reported a genre write
+    for a file no genre frame was touched on, and a regression that stops
+    forwarding the toggle would look identical to a successful run."""
+    from mutagen.mp3 import MP3
+
+    track = tmp_path / "t.mp3"
+    _make_silent_mp3(track)
+
+    config = TaggingConfig(
+        write_genre=False, write_bpm=False, write_key=False, write_energy=False,
+        write_mood=False, write_timeslot=False, write_direction=False,
+        write_vocal=False,
+    )
+    stats = apply_ml_tags(_confident_house_analysis(track), config)
+    assert stats.genre_applied == 0
+    assert stats.genre_applied_parent_only == 0
+    assert stats.genre_skipped_write_disabled == 1
+    # The bucket exists so the per-track accounting still adds up.
+    assert (
+        stats.genre_applied
+        + stats.genre_applied_parent_only
+        + stats.genre_skipped_low_confidence
+        + stats.genre_skipped_write_disabled
+        == stats.total
+    )
+    # ...and no genre frame reached the file, which is what makes the count a lie.
+    written = MP3(track).tags or {}
+    assert "TCON" not in written and "TIT1" not in written
+
+
+def test_write_genre_off_reports_the_same_way_on_a_dry_run(tmp_path: Path) -> None:
+    """A dry run projects a real apply, so it must project zero genre writes too."""
+    track = tmp_path / "t.mp3"
+    _make_silent_mp3(track)
+    stats = apply_ml_tags(
+        _confident_house_analysis(track),
+        TaggingConfig(write_genre=False),
+        dry_run=True,
+    )
+    assert stats.genre_applied == 0
+    assert stats.genre_skipped_write_disabled == 1
+
+
+def test_write_genre_on_still_counts_the_parent_only_fallback(tmp_path: Path) -> None:
+    """Guard: with the toggle on (the shipped default) the two applied buckets
+    are unchanged."""
+    track = tmp_path / "t.mp3"
+    _make_silent_mp3(track)
+    analysis = {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "House", "ml_subgenre": "Deep House",
+        "ml_genre_confidence": 0.92, "ml_genre_raw_confidence": 0.30,
+    }}]}
+    stats = apply_ml_tags(analysis, TaggingConfig(), dry_run=True)
+    assert stats.genre_applied_parent_only == 1
+    assert stats.genre_skipped_write_disabled == 0

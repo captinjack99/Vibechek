@@ -110,3 +110,101 @@ describe("useLibraryStore.mergeAnalyzedTracks — batch merge", () => {
     expect([...after.selectedIds]).toEqual(["D:/Music/a.mp3"]);
   });
 });
+
+/**
+ * Regression test for the audit finding "Trashed/moved duplicates are never
+ * removed from the in-memory library" (MEDIUM, frontend).
+ *
+ * After DuplicatesView trashes files the library table kept listing them:
+ * Play loaded a nonexistent file, Apply-tags failed per file, and an organize
+ * preview filled with "File not found" — for files Vibechek itself deleted.
+ * `removeTracks` is the store half of that fix.
+ */
+describe("useLibraryStore.removeTracks", () => {
+  beforeEach(() => {
+    useLibraryStore.setState({
+      libraryPath: "D:/Music",
+      tracks: [track("D:/Music/a.mp3"), track("D:/Music/b.mp3"), track("D:/Music/c.mp3")],
+      selectedIds: new Set(["D:/Music/a.mp3", "D:/Music/c.mp3"]),
+      searchFilter: "",
+    });
+    usePlayerStore.setState({ path: null, title: null, playToken: 0 });
+    useUIStore.setState({ selectedTrackPath: null });
+  });
+
+  it("drops the removed tracks and leaves the rest untouched", () => {
+    useLibraryStore.getState().removeTracks(["D:/Music/a.mp3", "D:/Music/c.mp3"]);
+    expect(useLibraryStore.getState().tracks.map((t) => t.path)).toEqual(["D:/Music/b.mp3"]);
+  });
+
+  it("prunes the selection so bulk actions can't target deleted files", () => {
+    useLibraryStore.getState().removeTracks(["D:/Music/a.mp3"]);
+    expect([...useLibraryStore.getState().selectedIds]).toEqual(["D:/Music/c.mp3"]);
+  });
+
+  it("closes the inspector and the player when their track is the one removed", () => {
+    useUIStore.setState({ selectedTrackPath: "D:/Music/a.mp3" });
+    usePlayerStore.setState({ path: "D:/Music/a.mp3", title: "a.mp3", playToken: 1 });
+
+    useLibraryStore.getState().removeTracks(["D:/Music/a.mp3"]);
+
+    expect(useUIStore.getState().selectedTrackPath).toBeNull();
+    expect(usePlayerStore.getState().path).toBeNull();
+  });
+
+  it("leaves an untouched inspector/player alone", () => {
+    useUIStore.setState({ selectedTrackPath: "D:/Music/b.mp3" });
+    usePlayerStore.setState({ path: "D:/Music/b.mp3", title: "b.mp3", playToken: 1 });
+
+    useLibraryStore.getState().removeTracks(["D:/Music/a.mp3"]);
+
+    expect(useUIStore.getState().selectedTrackPath).toBe("D:/Music/b.mp3");
+    expect(usePlayerStore.getState().path).toBe("D:/Music/b.mp3");
+  });
+
+  it("is a no-op for an empty list or for paths that aren't in the library", () => {
+    const before = useLibraryStore.getState().tracks;
+    useLibraryStore.getState().removeTracks([]);
+    expect(useLibraryStore.getState().tracks).toBe(before);
+    useLibraryStore.getState().removeTracks(["D:/Elsewhere/z.mp3"]);
+    expect(useLibraryStore.getState().tracks).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `filename` is a STORED field, not derived at render time, and the destination
+// basename is not always the source's: both the organizer and the dedupe
+// move go through `_unique_path`, which renames on collision ("a.mp3" ->
+// "a (2).mp3"). A re-path that moves only `path` leaves the library table
+// showing a name no file has any more, and every basename-keyed lookup
+// (count_new_tracks matches on basenames) desyncs.
+// ---------------------------------------------------------------------------
+
+describe("useLibraryStore.updateTrackPaths — filename follows the path", () => {
+  beforeEach(() => {
+    useLibraryStore.setState({
+      libraryPath: "D:/Music",
+      tracks: [track("D:/Music/a.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+  });
+
+  it("re-derives the filename when the move renamed the file", () => {
+    useLibraryStore.getState().updateTrackPaths({
+      "D:/Music/a.mp3": "D:/Music/Review/a (2).mp3",
+    });
+
+    const [t] = useLibraryStore.getState().tracks;
+    expect(t.path).toBe("D:/Music/Review/a (2).mp3");
+    expect(t.filename).toBe("a (2).mp3");
+  });
+
+  it("handles a Windows-separator destination too", () => {
+    useLibraryStore.getState().updateTrackPaths({
+      "D:/Music/a.mp3": "D:\\Music\\House\\a.mp3",
+    });
+
+    expect(useLibraryStore.getState().tracks[0].filename).toBe("a.mp3");
+  });
+});

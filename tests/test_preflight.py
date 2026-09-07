@@ -335,6 +335,9 @@ def test_preflight_native_engine_served_by_dsp_only_wheel(monkeypatch: pytest.Mo
         lambda: EssentiaCheck(installed=True, version="2.1b6.dev0"),
     )
     monkeypatch.setattr(preflight_mod, "_essentia_has_tf_algos", lambda: False)  # DSP-only wheel
+    # native runs inference through onnxruntime — the bundled Windows onefile
+    # always ships both, so simulate that here (see the F054 tests below).
+    monkeypatch.setattr(preflight_mod, "_onnxruntime_importable", lambda: True)
     monkeypatch.setattr(
         preflight_mod, "check_models",
         lambda _d=None, engine="native": ModelsCheck(models_dir="/x", found=["effnet (onnx backbone)"]),
@@ -534,3 +537,179 @@ def test_summary_lines_not_ready_lists_problems() -> None:
     text = "\n".join(summary_lines(r))
     assert "NOT READY" in text
     assert "NOT INSTALLED" in text
+
+
+# ---------------------------------------------------------------------------
+# onnxruntime is what the onnx/native engines actually infer through (audit
+# F054). It's an optional extra, and the import only happens at model-load
+# time — so preflight used to say READY for an engine that can't run a track.
+# ---------------------------------------------------------------------------
+
+
+def _onnx_env(monkeypatch: pytest.MonkeyPatch, *, onnxruntime: bool) -> None:
+    """A Linux `pip install vibechek[ml]` box: essentia importable with TF
+    algos, ONNX models downloaded, no WSL, no managed venv."""
+    monkeypatch.setattr(
+        preflight_mod, "check_essentia",
+        lambda: EssentiaCheck(installed=True, version="2.1"),
+    )
+    monkeypatch.setattr(preflight_mod, "_essentia_has_tf_algos", lambda: True)
+    monkeypatch.setattr(preflight_mod, "_onnxruntime_importable", lambda: onnxruntime)
+    monkeypatch.setattr(
+        preflight_mod, "check_models",
+        lambda _d=None, engine="onnx": ModelsCheck(models_dir="/x", found=["effnet"]),
+    )
+    monkeypatch.setattr(
+        preflight_mod, "detect_wsl",
+        lambda quick=True, venv_subdir="venv-onnx": WSLStatus(False, False, False),
+    )
+    # preflight looks the probe up through the module at call time (so a stub
+    # can never get frozen into it at import), hence the patch lands on
+    # native_install, not on preflight.
+    monkeypatch.setattr(
+        preflight_mod.native_install, "probe_native_venv",
+        lambda _engine="onnx": NativeVenvStatus(supported=True, venv_dir="/home/u/.vibechek/venv-onnx"),
+    )
+
+
+def test_onnx_not_ready_without_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """essentia + models present but no onnxruntime: analyze would raise
+    'onnxruntime failed to load' inside every pool worker."""
+    _onnx_env(monkeypatch, onnxruntime=False)
+
+    r = preflight(engine="onnx")
+    assert r.ready is False
+    assert r.essentia_usable is False
+    assert r.analyze_via is None
+    assert r.onnxruntime_installed is False
+    assert any("ONNX Runtime" in reason for reason in r.reasons_not_ready)
+    assert "NOT READY" in summary_lines(r)[-1]
+
+
+def test_onnx_ready_when_onnxruntime_importable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _onnx_env(monkeypatch, onnxruntime=True)
+
+    r = preflight(engine="onnx")
+    assert r.ready is True
+    assert r.analyze_via == "native"
+    assert r.onnxruntime_installed is True
+    assert r.reasons_not_ready == []
+
+
+def test_native_engine_also_needs_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"native" is the same ONNX stack in-process — same requirement."""
+    _onnx_env(monkeypatch, onnxruntime=False)
+
+    r = preflight(engine="native")
+    assert r.ready is False
+    assert r.onnxruntime_installed is False
+
+
+def test_essentia_tf_does_not_probe_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The TF engine never touches onnxruntime; missing it must not block."""
+    _onnx_env(monkeypatch, onnxruntime=False)
+
+    r = preflight(engine="essentia_tf")
+    assert r.ready is True
+    assert r.analyze_via == "native"
+    assert r.onnxruntime_installed is None
+
+
+# ---------------------------------------------------------------------------
+# check_models — the ONNX backbone's content pin
+#
+# The backbone is the first file the whole ONNX stack loads. rpc's
+# verify_models and `vibechek verify-models` both check it against
+# model_download.BACKBONE_ONNX_SHA256; preflight used to accept ANY file over
+# 1 KB under that name, so a corrupt/tampered copy preflighted green and only
+# blew up inside the worker pool at model-load time.
+# ---------------------------------------------------------------------------
+
+
+def _stage_onnx_models(root: Path, backbone_bytes: bytes) -> Path:
+    """A models dir the `onnx` engine considers complete, backbone content given."""
+    from vibechek.analyzer import _ONNX_HEAD_STEMS, _ONNX_SUBDIR
+    from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
+
+    onnx_dir = root / _ONNX_SUBDIR
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+    (onnx_dir / BACKBONE_ONNX_FILENAME).write_bytes(backbone_bytes)
+    # The class-label JSON is a WEIGHTS row here, so it faces the same
+    # >1 KB "not truncated" threshold as the .onnx files.
+    (onnx_dir / "genre_discogs400.json").write_text(
+        '{"classes": [' + ",".join(f'"g{i}"' for i in range(400)) + "]}",
+    )
+    for stem in _ONNX_HEAD_STEMS:
+        if stem == "genre_discogs400":
+            continue
+        (onnx_dir / f"{stem}.onnx").write_bytes(b"h" * 2048)
+    return root
+
+
+def test_onnx_backbone_row_carries_the_real_pin() -> None:
+    """The pin in the model list is model_download's, and a genuine digest."""
+    from vibechek.model_download import BACKBONE_ONNX_SHA256
+    from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
+
+    rows = preflight_mod._model_files_for_engine("onnx", Path("/models"))
+    pins = {p.name: sha for _n, p, _m, _r, sha in rows}
+    assert pins[BACKBONE_ONNX_FILENAME] == BACKBONE_ONNX_SHA256
+    # A placeholder ("", "TODO", a short string) would make the check a no-op.
+    assert len(BACKBONE_ONNX_SHA256) == 64
+    assert all(c in "0123456789abcdef" for c in BACKBONE_ONNX_SHA256.lower())
+
+
+def test_check_models_rejects_a_backbone_that_fails_its_pin(tmp_path: Path) -> None:
+    """A big-enough-but-wrong backbone is reported like a missing one."""
+    _stage_onnx_models(tmp_path, b"not the real backbone" * 200)
+
+    result = check_models(tmp_path, engine="onnx")
+    assert "effnet (onnx backbone)" in result.missing
+    assert "effnet (onnx backbone)" not in result.found
+    # Only the pinned file is faulted — the heads still read as present.
+    assert "danceability" in result.found
+
+
+def test_check_models_accepts_a_backbone_matching_its_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The happy path still passes — we re-pin to the staged bytes' digest.
+
+    Staging the real 18 MB backbone in a unit test isn't practical, so pin the
+    fixture instead: what's under test is that a MATCH is accepted, not the
+    value of the constant (locked by
+    `test_onnx_backbone_row_carries_the_real_pin`).
+    """
+    import hashlib
+
+    payload = b"pretend backbone" * 200
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(preflight_mod, "BACKBONE_ONNX_SHA256", digest)
+    _stage_onnx_models(tmp_path, payload)
+
+    result = check_models(tmp_path, engine="onnx")
+    assert result.missing == []
+    assert "effnet (onnx backbone)" in result.found
+
+
+def test_check_models_unpinned_files_are_not_hashed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """essentia_tf's flat .pb set carries no pin here, so it never gets hashed.
+
+    The GUI polls preflight on first render; silently adding a full-set hash to
+    that path is a perf change, and the `.pb` digests are already enforced at
+    download time and by `verify_models`.
+    """
+    from vibechek.analyzer import MODELS
+
+    def _boom(_path: Path) -> str:
+        raise AssertionError("check_models hashed an unpinned file")
+
+    monkeypatch.setattr(preflight_mod, "_sha256_file", _boom)
+    for name in MODELS:
+        (tmp_path / f"{name}.pb").write_bytes(b"x" * 2048)
+        (tmp_path / f"{name}.json").write_text("{}")
+
+    result = check_models(tmp_path)
+    assert result.missing == []

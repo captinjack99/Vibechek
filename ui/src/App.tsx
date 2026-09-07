@@ -44,6 +44,16 @@ interface NotifyPayload {
   path?: string;
 }
 
+/** Plain text for a rejected promise — the message when there is one, the
+ *  stringified value otherwise. Never swallowed: a shell-open that fails
+ *  silently leaves the user clicking a dead button. */
+function rejectionText(e: unknown): string {
+  if (typeof e === "object" && e !== null && "message" in e) {
+    return String((e as { message: unknown }).message);
+  }
+  return String(e);
+}
+
 /**
  * Build the notification options for a sidecar `notify` warning. The
  * install-path warning is an app-breaking condition, so it is made PERSISTENT
@@ -71,8 +81,17 @@ function notifyOptsFor(p: NotifyPayload) {
       opts.action = {
         label: "Open install folder",
         onClick: () => {
-          void openPath(folder).catch(() => {
-            /* opener unavailable — the banner text still stands on its own */
+          // The opener can fail (no file manager registered, a path that no
+          // longer exists, a sandbox refusal). Swallowing that left the button
+          // looking broken — it did nothing, twice, with no explanation.
+          // Surfaced on the notification channel rather than the operation
+          // error channel: nothing long-running failed, so ErrorToast's
+          // Retry/Restart affordances would be nonsense here.
+          void openPath(folder).catch((e: unknown) => {
+            useNotificationStore.getState().notify("Couldn't open the folder", {
+              kind: "warning",
+              detail: `${folder}\n${rejectionText(e)}`,
+            });
           });
         },
       };
@@ -185,9 +204,17 @@ export default function App() {
 
   // First-launch tour. Don't render it until config is loaded — otherwise we'd
   // flash the overlay over an already-onboarded user before disk catches up.
+  // It also requires a TRUSTED load. When config.json exists but couldn't be
+  // read, the store holds DEFAULT_CONFIG — including seen_onboarding: false —
+  // so this full-screen, unavoidable overlay would appear for an onboarded
+  // user, and its only exits (Skip / "Start using Vibechek") write
+  // seen_onboarding, arming the autosave that then replaces the (intact)
+  // config.json with defaults. The user changed no setting; they dismissed an
+  // overlay they could not avoid.
   const configLoaded = useConfigStore((s) => s.loaded);
+  const configUntrusted = useConfigStore((s) => s.loadUntrusted);
   const seenOnboarding = useConfigStore((s) => s.config.ui.seen_onboarding);
-  const showOnboarding = configLoaded && !seenOnboarding;
+  const showOnboarding = configLoaded && !configUntrusted && !seenOnboarding;
 
   // Esc clears the track-inspector selection — but NOT while a modal dialog
   // is open: Esc inside ConfirmModal/etc. should only dismiss the dialog, not

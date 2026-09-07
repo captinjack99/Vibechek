@@ -22,26 +22,16 @@ import { progressMatches } from "../stores/operation";
 import { rpc, useSidecarProgress } from "../hooks/useSidecar";
 import { ConfirmModal } from "./ConfirmModal";
 import type { AnalysisReport, BackupHistory, BackupRecord } from "../types";
-import type { TagBackupStats, TagRestoreStats } from "../api/methods";
+import type {
+  TagBackupStats,
+  TagRemapRestoreStats,
+  TagRestoreStats,
+} from "../api/methods";
 
-/** Result payload from `restore_tags_with_remap`. */
-interface RemapRestoreStats {
-  total: number;
-  restored: number;
-  skipped_missing: number;
-  skipped_size_mismatch: number;
-  matched_exact: number;
-  matched_filename_size: number;
-  matched_filename: number;
-  errors: string[];
-  matches: Array<{
-    original: string;
-    matched: string | null;
-    strategy: string | null;
-    error?: string | null;
-    substrategy?: string;
-  }>;
-}
+/** Result payload from `restore_tags_with_remap`. Aliased to the shared type in
+ *  api/methods (itself derived from the generated dataclass) — this file used to
+ *  keep its own copy of the same eight fields. */
+type RemapRestoreStats = TagRemapRestoreStats;
 
 /** Days after which we suggest re-running the backup. */
 const STALE_AFTER_DAYS = 30;
@@ -84,6 +74,7 @@ function formatBytes(bytes: number): string {
 export function TagsView() {
   const libraryPath = useLibraryStore((s) => s.libraryPath);
   const setTracks = useLibraryStore((s) => s.setTracks);
+  const setLibraryPath = useLibraryStore((s) => s.setLibraryPath);
   const active = useOperationStore((s) => s.active);
   const begin = useOperationStore((s) => s.begin);
   const finish = useOperationStore((s) => s.finish);
@@ -282,6 +273,14 @@ export function TagsView() {
         // `scan_only` is the same RPC the Library tab uses for its initial
         // load; it returns the same `AnalysisReport` shape.
         const report = await rpc<AnalysisReport>("scan_only", { path: target });
+        // Adopt `target` as THE library, not just its tracks. A remap restore
+        // exists because the library moved (D:/Music -> E:/Music), and a
+        // history restore can target a different library entirely — pushing
+        // those tracks in while `libraryPath` still names the old root leaves
+        // the store internally inconsistent, and Organize reads that pair as
+        // "sources under E:, base_dir under D:" and plans a whole-library
+        // migration back onto the stale root.
+        setLibraryPath(target);
         setTracks(report.tracks);
       } catch {
         // Non-fatal — just warn the user the in-memory view is now stale.
@@ -291,7 +290,7 @@ export function TagsView() {
         );
       }
     },
-    [libraryPath, setTracks, notify],
+    [libraryPath, setTracks, setLibraryPath, notify],
   );
 
   const handleConfirmRestore = async () => {

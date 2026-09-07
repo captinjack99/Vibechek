@@ -250,6 +250,20 @@ $VIBECHEK_SIDECAR rpc
 ```
 Anything it writes to stderr appears in the Tauri dev console prefixed with `[sidecar]`.
 
+**Nothing in the dev console — a windowed release build** — release binaries use the Windows GUI
+subsystem, so there is no console and every `eprintln!` is a silent no-op. Read the files instead;
+both live in `<data_dir>/Vibechek/logs/`:
+
+| File | Written by | Holds |
+|---|---|---|
+| `vibechek.log` | the Python sidecar | analysis/RPC logging (also viewable in-app via `get_log_tail`) |
+| `vibechek-shell.log` | the Tauri shell (Rust) | sidecar spawn/exit diagnostics, relayed child stderr, Rust panics |
+
+`vibechek-shell.log` rotates at 1 MB keeping one backup (`vibechek-shell.log.1`) and timestamps
+every line in UTC (`2025-09-06T14:12:11Z`). It is the only place a failure *before* the sidecar's
+`logging_setup.configure()` runs — a lost or unspawnable child, a dropped JSON-RPC frame, a panic
+in a reader task — gets written down.
+
 **Audio preview shows "Could not load audio"** — The Tauri asset protocol is gated by CSP. Confirm `tauri.conf.json` has `assetProtocol.enable: true` and the CSP includes `media-src 'self' asset: https://asset.localhost blob:`.
 
 **npm install fails with ERESOLVE for plugin-react / vite** — `@vitejs/plugin-react@4.x` peer dep is `vite ^4 || ^5 || ^6 || ^7`. Don't bump Vite past 7 until plugin-react v5 ships.

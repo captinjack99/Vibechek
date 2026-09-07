@@ -55,6 +55,15 @@ def test_sanitize_passes_through_clean_name() -> None:
     assert sanitize_folder_name("Deep House") == "Deep House"
 
 
+def test_sanitize_replaces_control_characters() -> None:
+    """A NUL in a path makes `mkdir` raise ValueError — not OSError — which
+    escaped route_new_tracks' handler and aborted the whole batch. It arrives
+    for real: a multi-value ID3 genre frame stringifies NUL-joined."""
+    assert sanitize_folder_name("Techno\x00House") == "Techno_House"
+    assert sanitize_folder_name("Tech\tHouse\nLive") == "Tech_House_Live"
+    assert sanitize_folder_name("Techno\x7f") == "Techno_"
+
+
 def test_sanitize_rejects_dot_traversal_names() -> None:
     # A genre tag of ".." (or "." / leading-dot variants) must never survive as
     # a path segment that could escape the library root.
@@ -236,3 +245,189 @@ def test_load_state_corrupt_json_returns_empty(
     f.write_text("not json {", encoding="utf-8")
     monkeypatch.setattr(library_state, "STATE_FILE", f)
     assert library_state.load_state().recent == []
+
+
+# ---------------------------------------------------------------------------
+# find_executable — what we're willing to execute
+#
+# Shared by find_fpcalc, native_decode's ffmpeg lookups and cdj_export.
+# ---------------------------------------------------------------------------
+
+
+def test_find_executable_ignores_a_planted_copy_in_the_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tool sitting in the working folder must never win.
+
+    On Windows `shutil.which` prepends the current directory to the search path
+    (NeedCurrentDirectoryForExePath; passing `path=` doesn't suppress it), so an
+    ffmpeg.exe unpacked alongside a downloaded sample pack would beat every real
+    PATH entry — and then be run once per track.
+    """
+    from vibechek import utils
+
+    planted = tmp_path / "ffmpeg.exe"
+    planted.write_bytes(b"planted")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: str(planted))
+
+    assert utils.find_executable("ffmpeg") is None
+
+
+def test_find_executable_returns_an_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative hit is absolutized — a subprocess re-resolves relative argv[0]."""
+    from vibechek import utils
+
+    toolsdir = tmp_path / "tools"
+    toolsdir.mkdir()
+    real = toolsdir / "ffmpeg.exe"
+    real.write_bytes(b"real")
+    monkeypatch.chdir(tmp_path)          # cwd is the PARENT, not tools/
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: "tools/ffmpeg.exe")
+
+    found = utils.find_executable("ffmpeg")
+
+    assert found is not None
+    assert Path(found).is_absolute()
+    assert Path(found) == real
+
+
+def test_find_executable_returns_none_when_not_on_path(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibechek import utils
+
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: None)
+    assert utils.find_executable("definitely-not-a-real-tool") is None
+
+
+def test_find_executable_survives_an_unreadable_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError probing the cwd is not evidence the hit is unsafe."""
+    from vibechek import utils
+
+    real = tmp_path / "tools" / "ffmpeg.exe"
+    real.parent.mkdir()
+    real.write_bytes(b"real")
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: str(real))
+
+    class _NoCwd(Path):
+        @classmethod
+        def cwd(cls):  # noqa: D102
+            raise OSError("the working directory was deleted")
+
+    # Swap the module's Path, not pathlib's — patching pathlib globally would
+    # take pytest's own bookkeeping down with it.
+    monkeypatch.setattr(utils, "Path", _NoCwd)
+
+    assert utils.find_executable("ffmpeg") == str(real)
+
+
+# ---------------------------------------------------------------------------
+# find_fpcalc — what we're willing to execute
+# ---------------------------------------------------------------------------
+
+
+def test_find_fpcalc_ignores_a_hit_in_the_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An fpcalc sitting in the working folder must never win.
+
+    On Windows `shutil.which` prepends the current directory to the search path
+    (NeedCurrentDirectoryForExePath; passing `path=` doesn't suppress it), so an
+    fpcalc.exe unpacked alongside a downloaded sample pack would beat both real
+    PATH entries and the pinned, SHA256-verified staged copy — and then run once
+    per track during dedupe.
+    """
+    from vibechek import utils
+
+    planted = tmp_path / "fpcalc.exe"
+    planted.write_bytes(b"planted")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: str(planted))
+    # Keep the well-known-locations fallback hermetic and fast.
+    monkeypatch.setattr(
+        utils.subprocess, "run",
+        lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+
+    assert utils.find_fpcalc() is None
+
+
+def test_find_fpcalc_returns_an_absolute_path_for_a_real_path_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibechek import utils
+
+    toolsdir = tmp_path / "tools"
+    toolsdir.mkdir()
+    real = toolsdir / "fpcalc.exe"
+    real.write_bytes(b"real")
+    monkeypatch.chdir(tmp_path)          # cwd is the PARENT, not tools/
+    monkeypatch.setattr(utils.shutil, "which", lambda _cmd: str(real))
+
+    found = utils.find_fpcalc()
+
+    assert found == str(real)
+    assert Path(found).is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# backup_history.load — valid JSON of the wrong shape
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("body", ["null", "[]", '"hello"', "42", '{"records": null}',
+                                  '{"records": "nope"}', '{"records": [1, 2]}'])
+def test_backup_history_load_survives_wrong_shaped_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    """A hand-edited (or third-party-mangled) index must degrade to an empty
+    history like a corrupt one does — not raise AttributeError/TypeError out of
+    every caller, which also blocked `record()` from indexing NEW backups."""
+    from vibechek import backup_history
+
+    f = tmp_path / "backup_history.json"
+    f.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(backup_history, "HISTORY_FILE", f)
+
+    assert backup_history.load().records == []
+
+
+def test_backup_history_record_recovers_a_wrong_shaped_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibechek import backup_history
+
+    f = tmp_path / "backup_history.json"
+    f.write_text("null", encoding="utf-8")
+    monkeypatch.setattr(backup_history, "HISTORY_FILE", f)
+    backup = tmp_path / "backup.json"
+    backup.write_text("{}", encoding="utf-8")
+
+    rec = backup_history.record(tmp_path, backup, file_count=3)
+
+    assert rec.backup_path == str(backup)
+    assert [r.backup_path for r in backup_history.load().records] == [str(backup)]
+
+
+def test_backup_history_keeps_the_good_rows_beside_a_bad_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One junk row must not wipe the list — the same rule library_state uses."""
+    import json as _json
+
+    from vibechek import backup_history
+
+    good = {"backup_path": str(tmp_path / "b.json"), "library_path": str(tmp_path),
+            "file_count": 1, "created_at": 0.0}
+    f = tmp_path / "backup_history.json"
+    f.write_text(_json.dumps({"records": ["junk", good]}), encoding="utf-8")
+    monkeypatch.setattr(backup_history, "HISTORY_FILE", f)
+
+    records = backup_history.load().records
+
+    assert [r.backup_path for r in records] == [good["backup_path"]]

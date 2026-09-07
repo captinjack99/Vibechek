@@ -202,7 +202,11 @@ def load_profile(name: str) -> dict[str, Any]:
 
     Returns a small dict describing what happened — used by both the CLI
     and the eventual RPC method. Raises `KeyError` if the profile name is
-    unknown (the CLI catches it and prints a friendly error).
+    unknown (the CLI catches it and prints a friendly error), and
+    `config.ConfigSaveRefused` when the saved config couldn't be READ: this
+    is a load→save round trip, so on an unreadable file it would otherwise
+    write a profile-flavoured set of factory defaults over every real setting
+    the user still has on disk.
     """
     profile = get_profile(name)
     if profile is None:

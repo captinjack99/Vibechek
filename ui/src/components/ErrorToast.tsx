@@ -93,10 +93,31 @@ export function ErrorToast() {
     }
     if (!retry) return;
     clearError();
+    const { begin, finish, fail } = useOperationStore.getState();
+    if (!retry.kind) {
+      // A failure with no op behind it (a quick read). Re-issue as-is.
+      try {
+        await rpc(retry.method, retry.params);
+      } catch (e) {
+        fail(e);
+      }
+      return;
+    }
+    // The failure happened under a long op: re-issue it under a fresh op so
+    // the progress overlay (and its Cancel button) come back. The captured
+    // params carry the DEAD op's correlation id, so stamp the new one on —
+    // otherwise every progress frame from the replay is dropped as a
+    // straggler from a finished op (see `progressMatches`).
+    const opId = begin(retry.kind);
+    const params =
+      typeof retry.params === "object" && retry.params !== null && "op_id" in retry.params
+        ? { ...retry.params, op_id: opId }
+        : retry.params;
     try {
-      await rpc(retry.method, retry.params);
+      await rpc(retry.method, params);
+      finish();
     } catch (e) {
-      useOperationStore.getState().fail(e);
+      fail(e);
     }
   };
 

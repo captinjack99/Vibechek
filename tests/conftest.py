@@ -35,7 +35,13 @@ def _isolate_user_dirs(tmp_path_factory: pytest.TempPathFactory, monkeypatch: py
     monkeypatch.setattr(config, "DATA_DIR", data_dir, raising=True)
     monkeypatch.setattr(config, "CONFIG_DIR", config_dir, raising=True)
     monkeypatch.setattr(config, "MODELS_DIR", data_dir / "models", raising=True)
-    monkeypatch.setattr(config, "CONFIG_FILE", config_dir / "config.toml", raising=True)
+    # BOTH config paths must move: `VibechekConfig.load()` falls through to
+    # LEGACY_CONFIG_FILE when the JSON file is absent, so patching only
+    # CONFIG_FILE made every load() in the suite read (and "migrate") the
+    # developer's real %LOCALAPPDATA%\Vibechek\Vibechek\config.toml — tests
+    # then silently ran with that machine's engine/worker settings.
+    monkeypatch.setattr(config, "CONFIG_FILE", config_dir / "config.json", raising=True)
+    monkeypatch.setattr(config, "LEGACY_CONFIG_FILE", config_dir / "config.toml", raising=True)
 
     monkeypatch.setattr(library_state, "ANALYSES_DIR", data_dir / "analyses", raising=True)
     monkeypatch.setattr(library_state, "STATE_FILE", config_dir / "library_state.json", raising=True)
@@ -148,3 +154,65 @@ def synthetic_analysis(tmp_path: Path) -> dict:
             make_track("g.mp3", "Vaporwave", "Vaporwave", 0.65),
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Deterministic staging for the analysis-lock concurrency regressions
+# ---------------------------------------------------------------------------
+
+
+class _ContendedLock:
+    """An analysis lock that ANNOUNCES contention instead of hiding it.
+
+    Concurrency regressions here used to be staged with wall clock — a 200 ms
+    `join` that "proves" a thread blocked, and a 0.5 s `sleep` sized to keep a
+    critical section open long enough for the other writer to arrive. Both
+    claims are weaker than they read: `is_alive()` is also True for a thread the
+    OS simply hasn't scheduled, and on a loaded runner the second writer can
+    miss the window entirely — so a genuinely broken lock passes green.
+
+    This wrapper takes the real lock non-blockingly first. Failing that acquire
+    means another thread is holding it RIGHT NOW, which is the interleaving
+    under test, so it sets `blocked` before waiting. Delegating to the same
+    underlying RLock keeps re-entrancy intact.
+    """
+
+    def __init__(self, lock, blocked) -> None:  # noqa: ANN001
+        self._lock = lock
+        self.blocked = blocked
+
+    def __enter__(self):  # noqa: ANN204
+        if not self._lock.acquire(blocking=False):
+            self.blocked.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:  # noqa: ANN002
+        self._lock.release()
+
+
+@pytest.fixture
+def analysis_lock_contention(monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
+    """Patch `library_state._analysis_lock` to report contention.
+
+    Yields a `threading.Event` set the moment ANY thread finds the lock already
+    held — the deterministic replacement for sleeping and hoping. Request it
+    from any test that has to stage a two-writer interleaving.
+    """
+    import threading
+
+    from vibechek import library_state
+
+    blocked = threading.Event()
+    real = library_state._analysis_lock
+    wrappers: dict[str, _ContendedLock] = {}
+
+    def _wrapped(analysis_path: str) -> _ContendedLock:
+        wrapper = wrappers.get(analysis_path)
+        if wrapper is None:
+            wrapper = _ContendedLock(real(analysis_path), blocked)
+            wrappers[analysis_path] = wrapper
+        return wrapper
+
+    monkeypatch.setattr(library_state, "_analysis_lock", _wrapped)
+    return blocked

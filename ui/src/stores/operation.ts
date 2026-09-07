@@ -33,8 +33,11 @@ export interface OperationError {
   /** Full raw error string (the JSON envelope when structured) for Copy /
    *  Report — technical identifiers are demoted, never deleted. */
   raw: string;
-  /** For a retryable error, the exact call to re-issue on "Try again". */
-  retry?: { method: string; params: object };
+  /** For a retryable error, the exact call to re-issue on "Try again".
+   *  `kind` is the operation that was running when it failed (when there was
+   *  one) — ErrorToast re-issues under `begin(kind)` so the replay gets the
+   *  progress panel and the Cancel button instead of running invisibly. */
+  retry?: { method: string; params: object; kind?: Exclude<OperationKind, null> };
   /** A component-owned retry closure for a failure whose result must land back
    *  in a store (so the generic `retry` re-issue — which discards the result —
    *  can't work). Created by the component (stores stay transport-free) and
@@ -67,6 +70,36 @@ function cleanMessage(msg: string): string {
 }
 
 /**
+ * Methods the generic rpc-replay retry must NEVER re-issue on its own.
+ *
+ * The generic path (ErrorToast → `rpc(method, params)`) throws the resolved
+ * payload away, so replaying a call whose RESULT has to land in a store gives
+ * the user a button that appears to do nothing: `analyze_directory` — the
+ * dominant producer of `kind:"retryable"` — would re-run for hours and then
+ * drop the AnalysisReport (no tracks, no completion toast, no persist_error
+ * warning). The mutating ones would additionally re-move / re-tag / re-trash
+ * files with no confirmation.
+ *
+ * These sites own their retry: they pass `fail(e, { retryAction })`, a closure
+ * that re-enters the real code path (begin() → RPC → store write). A method
+ * listed here with no `retryAction` simply gets no Try-again button — no
+ * button is better than one that lies.
+ */
+const NON_REPLAYABLE_METHODS = new Set([
+  "analyze_directory",
+  "scan_directory",
+  "scan_only",
+  "find_duplicates",
+  "handle_duplicates",
+  "plan_organization",
+  "organize",
+  "apply_ml_tags",
+  "backup_tags",
+  "restore_tags",
+  "restore_tags_with_remap",
+]);
+
+/**
  * Turn any thrown value into a structured {@link OperationError}. Prefers the
  * envelope's `headline`/`detail`/`kind` (present on both Python errors and the
  * Rust transport envelope); degrades gracefully to the cleaned message when the
@@ -86,7 +119,9 @@ function classifyError(error: unknown): OperationError {
       detail = parts.length ? parts.join("\n\n") : undefined;
     }
     const retry =
-      error.kind === "retryable" && error.method
+      error.kind === "retryable" &&
+      error.method &&
+      !NON_REPLAYABLE_METHODS.has(error.method)
         ? { method: error.method, params: error.params ?? {} }
         : undefined;
     // Pull the backend's recovery-option flags off `error.data` (merged there at
@@ -143,18 +178,34 @@ export function progressMatches(
   return !evt.op_id || !opId || evt.op_id === opId;
 }
 
-export type OperationKind =
-  | "analyze"
-  | "dedupe"
-  | "organize"
-  | "tag"
-  | "backup"
-  | "download-models"
-  | "install-wsl"
-  | "install-essentia"
-  | "install-cuda"
-  | "revert"
-  | null;
+/**
+ * Every operation kind, as a RUNTIME value — the single source of truth the
+ * `OperationKind` type below is derived from.
+ *
+ * It exists so a test can iterate the real set instead of a hand-mirrored
+ * literal: a subset of a union is assignable to `OperationKind[]`, so the copy
+ * in AnalysisProgress.test.tsx silently stayed valid when a member was added
+ * and could never catch the missing label it claimed to guard.
+ */
+export const OPERATION_KINDS = [
+  "analyze",
+  "dedupe",
+  "organize",
+  "tag",
+  "backup",
+  "download-models",
+  "install-wsl",
+  "install-essentia",
+  "install-cuda",
+  "revert",
+  // The DESTRUCTIVE half of dedupe (move / send-to-trash), distinct from the
+  // read-only "dedupe" scan so the progress overlay can't label an irreversible
+  // delete "Finding duplicates". Matches the backend kind in vibechek/rpc.py's
+  // _CANCELLABLE_METHODS.
+  "dedupe-handle",
+] as const;
+
+export type OperationKind = (typeof OPERATION_KINDS)[number] | null;
 
 interface OperationState {
   active: OperationKind;
@@ -172,6 +223,18 @@ interface OperationState {
 
   duplicateReport: DuplicateReport | null;
   organizePlan: OrganizePlan | null;
+  /**
+   * Fingerprint of the parameters `organizePlan` was previewed with, or null
+   * when the plan carries none.
+   *
+   * It lives HERE, next to the plan, because the plan outlives the OrganizeView
+   * component (switching tabs unmounts the view but the plan stays in this
+   * store). While the key was component-local `useState` it reset to null on
+   * every remount, permanently disarming the staleness check — and organize is
+   * a destructive, no-undo bulk move, so the confirmed preview MUST match what
+   * executes.
+   */
+  organizePlanKey: string | null;
 
   /** Mark an op active and return its correlation id (thread it into the RPC
    *  call's `op_id` so progress events can be attributed back to this op). */
@@ -186,7 +249,12 @@ interface OperationState {
   clearError: () => void;
 
   setDuplicateReport: (r: DuplicateReport | null) => void;
-  setOrganizePlan: (p: OrganizePlan | null) => void;
+  /**
+   * Store the previewed plan together with the parameter fingerprint it was
+   * built from. Omitting `paramsKey` (or clearing the plan) leaves the plan
+   * unkeyed — callers gating Execute on the key must treat "no key" as stale.
+   */
+  setOrganizePlan: (p: OrganizePlan | null, paramsKey?: string | null) => void;
 }
 
 export const useOperationStore = create<OperationState>((set, get) => ({
@@ -199,6 +267,7 @@ export const useOperationStore = create<OperationState>((set, get) => ({
 
   duplicateReport: null,
   organizePlan: null,
+  organizePlanKey: null,
 
   begin: (kind) => {
     const opId = newOpId();
@@ -254,6 +323,12 @@ export const useOperationStore = create<OperationState>((set, get) => ({
     const prev = get();
     const info = classifyError(error);
 
+    // Stamp the op that was running onto the generic retry handle. Without it
+    // ErrorToast replays the call bare — no begin(), so `active` stays null and
+    // the progress panel (and its Cancel button) never appear for a run that
+    // can take many minutes.
+    if (info.retry && prev.active) info.retry = { ...info.retry, kind: prev.active };
+
     // Mid-analyze death: surface how many tracks had been analyzed. The last
     // progress frame is the most reliable count we hold, and fail() is about to
     // clear it. (These tracks were analyzed, not necessarily saved to disk —
@@ -284,5 +359,8 @@ export const useOperationStore = create<OperationState>((set, get) => ({
   clearError: () => set({ error: null, errorInfo: null }),
 
   setDuplicateReport: (r) => set({ duplicateReport: r }),
-  setOrganizePlan: (p) => set({ organizePlan: p }),
+  setOrganizePlan: (p, paramsKey) =>
+    // A cleared plan can't keep a key, and a plan stored without one is
+    // explicitly unkeyed — never inherit the previous plan's fingerprint.
+    set({ organizePlan: p, organizePlanKey: p ? (paramsKey ?? null) : null }),
 }));
