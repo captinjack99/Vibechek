@@ -45,9 +45,14 @@ param(
     # the shipped sidecar, so a force-push (or a malicious merge) on the fork's
     # branch would put arbitrary native code inside every Windows installer.
     # Every `uses:` in this repo's workflows is SHA-pinned for the same reason.
-    # SHA = tip of wo80/essentia@cmake as of 2026-09-06; bump deliberately and
-    # re-run the gold-corpus gate when you do.
-    [string]$ForkRef = "c4db58ed928406982688c554344f34876dfef9cc"
+    # SHA = the wo80/essentia@cmake commit the v0.9.1-beta installer shipped
+    # with (2026-02-02, "CMake: remove Eigen3 version check"). The branch's
+    # September 2026 commits (ML-preprocessing decoupling, RogueVector cast)
+    # produce a wheel that passes the fresh-venv import test below but crashes
+    # on `import essentia.standard` in the release build venv, where
+    # onnxruntime is also installed. Bump deliberately: rebuild, run the
+    # gold-corpus gate, and confirm the import in a venv that has onnxruntime.
+    [string]$ForkRef = "a70cb36e3db9f081e28340915435ef28285a9f54"
 )
 $ErrorActionPreference = "Stop"
 
@@ -186,7 +191,11 @@ $vdir = Join-Path $WorkDir "verify-venv"
 if (Test-Path $vdir) { Remove-Item -Recurse -Force $vdir }
 & $Python -m venv $vdir
 $vpy = Join-Path $vdir "Scripts\python.exe"
-& $vpy -m pip install -q "numpy<2" six pyyaml
+# Mirror the release build venv (packaging\build-windows.bat installs
+# onnxruntime next to the wheel): a wheel that imports fine alone but crashes
+# once onnxruntime's DLLs share the process must fail HERE, with the build's
+# own toolchain still on the runner, not three steps later as "not importable".
+& $vpy -m pip install -q "numpy<2" six pyyaml onnxruntime
 if ($LASTEXITCODE -ne 0) { throw "verify venv: dependency install failed" }
 & $vpy -m pip install -q --no-deps $out.FullName
 if ($LASTEXITCODE -ne 0) { throw "verify venv: wheel install failed" }

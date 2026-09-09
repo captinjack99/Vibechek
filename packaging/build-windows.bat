@@ -49,8 +49,18 @@ if defined VIBECHEK_NATIVE_WHEEL (
     REM newer msvcp140 than the runtime redist) must show its real error here,
     REM not just "not importable". The wheel-build script already fresh-venv
     REM import-tests the repaired wheel, so on a tag build this rarely trips.
+    REM A hard crash while loading the extension (an access violation in a DLL)
+    REM exits non-zero with NO traceback, so the exit code is the only clue —
+    REM print it. 0xC0000005 is an access violation, 0xC0000135 a missing DLL.
     python -c "import essentia, essentia.standard" && set VIBECHEK_NATIVE_BUNDLED=1
     if not defined VIBECHEK_NATIVE_BUNDLED echo WARNING: essentia not importable after install - building WITHOUT native bundle
+    if not defined VIBECHEK_NATIVE_BUNDLED (
+        python -c "import essentia, essentia.standard"
+        REM %ERRORLEVEL% inside a parenthesised block expands when the block is
+        REM parsed, i.e. before the command above ran; `call` + %%..%% defers it.
+        call echo import essentia.standard exited with code %%ERRORLEVEL%%
+        python -c "import onnxruntime, sys; print('onnxruntime', onnxruntime.__version__, 'python', sys.version)"
+    )
 ) else (
     echo VIBECHEK_NATIVE_WHEEL not set - building without the native engine bundle.
 )
