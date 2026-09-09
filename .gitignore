@@ -110,3 +110,6 @@ internal/
 # OS-level junk inside the repo (rare but possible)
 **/.DS_Store
 **/Thumbs.db
+
+# Google-Drive sync-conflict copies ("foo (1).py") must never be collected or committed
+* (1)*

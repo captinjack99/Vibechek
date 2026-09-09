@@ -42,6 +42,7 @@ from vibechek.platform import (  # noqa: F401  (IS_WINDOWS re-exported from the 
     IS_MAC,
     IS_WINDOWS,
 )
+from vibechek.utils import find_executable
 
 log = logging.getLogger(__name__)
 
@@ -223,11 +224,19 @@ def _find_host_python() -> str | None:
     We don't trust `sys.executable` because the desktop app's sidecar is a
     PyInstaller bundle — `sys.executable` would point at the frozen binary,
     not a real python. Instead, look for system python in order of preference.
+
+    Resolved via `find_executable`, never `shutil.which`: the hit is RUN (first
+    `--version`, then to build the managed venv the whole ML stack installs
+    into). On Windows which() searches the process cwd ahead of PATH, so a
+    `python.exe` dropped into whatever folder the app was launched from would
+    become the interpreter we bootstrap with. find_executable discards a cwd hit
+    and returns an absolute path, so the venv is not re-resolved against
+    whichever directory a later subprocess starts in.
     """
     # Common names — pick the highest version we can find
     candidates = ["python3.13", "python3.12", "python3.11", "python3.10", "python3", "python"]
     for name in candidates:
-        path = shutil.which(name)
+        path = find_executable(name)
         if not path:
             continue
         # Sanity check: is it 3.10+? Run --version and parse.
@@ -357,6 +366,11 @@ def install_essentia_native(
     #   AMD Linux    → onnxruntime-rocm (best-effort; ROCm not viable in WSL)
     #   else         → CPU onnxruntime
     # essentia_tf → essentia-tensorflow (CUDA via the separate Enable-GPU step).
+    # NOTE: the `shutil.which` calls below are PRESENCE probes only — nothing
+    # they resolve is ever executed, they just pick a package list — so the
+    # cwd-hijack that makes `find_executable` mandatory for `_find_host_python`
+    # doesn't apply. (Worst case a stray `nvidia-smi.exe` in the cwd picks the
+    # GPU wheel set on a machine without an NVIDIA card.)
     if engine == "onnx":
         if IS_MAC:
             ml_packages = ["essentia", "onnxruntime"]
@@ -459,7 +473,7 @@ def install_essentia_native(
             f"{essentia_result.stderr[:300]}"
         )
         if not _verify_retry:
-            # Self-heal (WP-J1): the venv we just built (possibly reusing a
+            # Self-heal: the venv we just built (possibly reusing a
             # pre-existing broken one at Step 1) can't run. A plain re-click
             # reused the SAME broken venv, so retry failed identically. Wipe the
             # venv and reinstall from scratch ONCE; the `_verify_retry` marker
@@ -723,7 +737,7 @@ def run_vibechek_in_native_venv(
 
     status = probe_native_venv(engine)
     if not status.vibechek_installed or not status.venv_vibechek:
-        # Plain, in-app guidance (voice-guide rules 4/5): no Python-API or CLI
+        # Plain, in-app guidance: no Python-API or CLI
         # instruction, no venv path in the headline. The dev detail is in the
         # log for support triage.
         log.warning(
@@ -787,20 +801,26 @@ def run_vibechek_in_native_venv(
     # leaving it unread while we block on stdout deadlocks a verbose child
     # once the stderr pipe buffer fills. The callback is optional; draining
     # is mandatory.
+    stderr_reader: _threading.Thread | None = None
     if proc.stderr is not None:
         def _reader() -> None:
             for line in proc.stderr:  # type: ignore[union-attr]
                 if on_stderr_line:
                     on_stderr_line(line.rstrip())
 
-        t = _threading.Thread(target=_reader, daemon=True)
-        t.start()
+        stderr_reader = _threading.Thread(target=_reader, daemon=True)
+        stderr_reader.start()
 
     if proc.stdout is not None:
         for line in proc.stdout:
             stdout_chunks.append(line)
 
     rc = proc.wait(timeout=timeout)
+    # Join the drain before returning (see run_vibechek_in_wsl): `wait` returns
+    # before the tail of stderr has been handed to on_stderr_line, and the
+    # caller acts on that tail immediately.
+    if stderr_reader is not None:
+        stderr_reader.join(timeout=5)
     cancel_event.set()
 
     if cancellation.is_cancelled():
@@ -815,8 +835,8 @@ def run_vibechek_in_native_venv(
 
 
 # ---------------------------------------------------------------------------
-# Self-heal — DETECT → SELF-HEAL → RUN parity with wsl.ensure_engine_runtime
-# (WP-G2). Same product doctrine (zero-setup): the user should never need a
+# Self-heal — DETECT → SELF-HEAL → RUN parity with wsl.ensure_engine_runtime.
+# Same zero-setup design: the user should never need a
 # manual "repair" step for the managed venv either. The classic break here is
 # a host OS/Python upgrade (`brew upgrade python@3.12` dropping 3.11, an apt
 # release-upgrade moving `python3`) that leaves the venv files on disk while
@@ -883,12 +903,12 @@ def ensure_native_engine_runtime(
 ) -> dict:
     """DETECT → SELF-HEAL → RUN the managed-venv engine runtime for `engine`.
 
-    The Linux/macOS analog of ``wsl.ensure_engine_runtime`` (WP-G2 parity),
+    The Linux/macOS analog of ``wsl.ensure_engine_runtime``,
     called by the analyzer right before every managed-venv dispatch:
 
       (a) verify the venv imports its ML stack (essentia / onnxruntime);
       (b) on failure, reinstall via ``install_essentia_native`` (whose verify
-          step already wipes + rebuilds a corrupt venv once — the WP-J1
+          step already wipes + rebuilds a corrupt venv once — the
           clean-reinstall path), then re-verify.
 
     Returns ``{ok, healed:[...], ...}``; failures carry the headline/detail/
@@ -1117,7 +1137,7 @@ def setup_clap_native(
     from vibechek.model_download import verify_model_sha256  # noqa: PLC0415
 
     # Reuse a cached checkpoint ONLY if it also passes its integrity check. A
-    # bare size-floor reuse (WP-I2) silently KEPT a corrupt-but-full-size file,
+    # bare size-floor reuse used to silently KEEP a corrupt-but-full-size file,
     # so the "re-run CLAP setup" remedy the load-time error suggests was a no-op.
     # Verify the cached file too; on mismatch, delete it and fall through to a
     # forced re-download.

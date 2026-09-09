@@ -73,10 +73,18 @@ def _node_names(metadata_path: Path) -> tuple[str, str]:
 
 
 def _classes(metadata_path: Path) -> list[str]:
-    try:
-        return json.loads(metadata_path.read_text(encoding="utf-8")).get("classes", [])
-    except Exception:  # noqa: BLE001
-        return []
+    """Class labels for a head, from essentia's metadata JSON.
+
+    Fails loud: an empty list here silently ships a head whose predictions can
+    never be named, and the bundle script then PINS that sidecar's digest.
+    """
+    classes = json.loads(metadata_path.read_text(encoding="utf-8")).get("classes")
+    if not classes:
+        raise RuntimeError(
+            f"{metadata_path} carries no non-empty 'classes' list — refusing to "
+            f"write a label-less sidecar for this head."
+        )
+    return classes
 
 
 def convert_one(pb_path: Path, json_path: Path, out_path: Path, *, force: bool) -> bool:

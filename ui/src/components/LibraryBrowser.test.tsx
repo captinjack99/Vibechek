@@ -1,5 +1,5 @@
 /**
- * Regression tests for three LibraryBrowser bugs found in the bug hunt:
+ * Regression tests for three LibraryBrowser bugs:
  *
  *  1. "Show errors only" toggle stays on across a library switch and traps the
  *     new (error-free) library in an empty, unrecoverable list.
@@ -20,7 +20,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { LibraryBrowser } from "./LibraryBrowser";
-import { useLibraryStore, useNotificationStore, useOperationStore } from "../stores";
+import {
+  useConfigStore, useLibraryStore, useNotificationStore, useOperationStore, useUIStore,
+} from "../stores";
 import { useLibraryFiltersStore } from "./LibraryFilters";
 import type { LibraryRecord, MLResult, TrackAnalysis } from "../types";
 
@@ -30,6 +32,7 @@ function ml(overrides: Partial<MLResult> = {}): MLResult {
     ml_subgenre: null,
     ml_genre_confidence: 0.9,
     ml_genre_raw_confidence: 0.9,
+    ml_genre_audio_confidence: 0.9,
     ml_bpm: 124,
     ml_key: "8A",
     ml_energy: 3,
@@ -741,9 +744,12 @@ describe("<LibraryBrowser /> — Import Rekordbox XML (tag priors)", () => {
     await waitFor(() => expect(resolveImport).toBeTypeOf("function"));
 
     // The user switches to library B while the import is still running.
-    useLibraryStore.setState({
-      libraryPath: "D:/LibraryB",
-      tracks: [track("D:/LibraryB/other.mp3")],
+    // Same act() rule as above — LibraryBrowser is mounted, so this re-renders.
+    act(() => {
+      useLibraryStore.setState({
+        libraryPath: "D:/LibraryB",
+        tracks: [track("D:/LibraryB/other.mp3")],
+      });
     });
 
     resolveImport({ ok: true, xml_tracks: 12, matched: 1, updated: 1, tracks: [updated] });
@@ -870,5 +876,819 @@ describe("<LibraryBrowser /> — retryable load-recent failure", () => {
     });
     expect(loadCalls).toBe(2);
     expect(useLibraryStore.getState().libraryPath).toBe("D:/LibraryB");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The bulk-tag confirm modal must model the tagger's real
+// two-stage genre gate, and the post-tag report must name the parent-only tier.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — bulk-tag confirm preview", () => {
+  beforeEach(() => {
+    useLibraryFiltersStore.getState().clearFilters();
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          default:
+            return {};
+        }
+      },
+    );
+  });
+
+  /** Family 0.72 / raw 0.40 — the tier the tagger writes as the PARENT genre. */
+  function parentOnlyTrack(path: string): TrackAnalysis {
+    return track(path, {
+      ml_analysis: ml({
+        ml_genre: "House",
+        ml_subgenre: "Deep House",
+        ml_genre_confidence: 0.72,
+        ml_genre_raw_confidence: 0.4,
+        ml_genre_source: "ml",
+      }),
+    });
+  }
+
+  async function openBulkTagModal() {
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(
+      await screen.findByRole("button", { name: /apply ml tags to all/i }),
+    );
+    return user;
+  }
+
+  it("counts the parent-genre tier as a WRITE, not as skipped", async () => {
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [parentOnlyTrack("D:/LibraryA/a.mp3"), parentOnlyTrack("D:/LibraryA/b.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    await openBulkTagModal();
+
+    // The parent genre ("House"), not the subgenre, is what lands in TCON.
+    expect(await screen.findByText("House")).toBeInTheDocument();
+    expect(screen.queryByText("Deep House")).not.toBeInTheDocument();
+    // ...and nothing is reported as skipped.
+    expect(screen.queryByText(/will be\s+skipped/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/are the parent genre only/i)).toBeInTheDocument();
+  });
+
+  it("promises no genre write at all when write_genre is off", async () => {
+    useConfigStore.getState().updateTagging({ write_genre: false });
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [parentOnlyTrack("D:/LibraryA/a.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    await openBulkTagModal();
+
+    expect(
+      await screen.findByText(/genre writing is off in settings/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("House")).not.toBeInTheDocument();
+    // No inline restore: the per-test reset in src/test/setup.ts puts the
+    // config store back to DEFAULT_CONFIG. The restore that used to live here
+    // ran only if every assertion above it passed, so the one real failure
+    // leaked `write_genre: false` into every later test in the file.
+  });
+
+  it("reports the parent-only count on its own line after the write", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "apply_ml_tags":
+            return {
+              total: 100,
+              genre_applied: 30,
+              genre_applied_parent_only: 40,
+              genre_skipped_low_confidence: 30,
+              genre_skipped_write_disabled: 0,
+              other_tags_applied: 100,
+              errors: [],
+            };
+          default:
+            return {};
+        }
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [parentOnlyTrack("D:/LibraryA/a.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = await openBulkTagModal();
+    await user.click(await screen.findByRole("button", { name: /yes, apply tags/i }));
+
+    await waitFor(() => {
+      const note = useNotificationStore
+        .getState()
+        .items.find((n) => /wrote tags/i.test(n.message));
+      expect(note).toBeTruthy();
+      // 30 + 30 = 60 of 100 was the old, self-contradicting detail block.
+      expect(note!.detail).toMatch(/Parent genre only \(>= 50%\): 40/);
+    });
+  });
+
+  // The headline counts FILES, and every genre-written file is already
+  // inside `other_tags_applied`. Summing applied + parentOnly + other turned a
+  // 100-file run into "Tagged 170 files".
+  it("headlines the number of files actually written, not the tier sum", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "apply_ml_tags":
+            return {
+              total: 100,
+              genre_applied: 30,
+              genre_applied_parent_only: 40,
+              genre_skipped_low_confidence: 30,
+              genre_skipped_write_disabled: 0,
+              other_tags_applied: 100,
+              errors: [],
+            };
+          default:
+            return {};
+        }
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [parentOnlyTrack("D:/LibraryA/a.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = await openBulkTagModal();
+    await user.click(await screen.findByRole("button", { name: /yes, apply tags/i }));
+
+    await waitFor(() => {
+      const note = useNotificationStore
+        .getState()
+        .items.find((n) => /wrote tags/i.test(n.message));
+      expect(note).toBeTruthy();
+      expect(note!.message).toBe("Wrote tags to 100 files");
+    });
+    // The inflated sums must not appear anywhere in the headline.
+    const msgs = useNotificationStore.getState().items.map((n) => n.message);
+    expect(msgs.some((m) => /\b170\b|\b130\b/.test(m))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The new-tracks banner must not survive the analyze it launched.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — new-tracks banner", () => {
+  it("clears after the incremental analyze the banner itself starts", async () => {
+    let newCount = 500;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [recordB], active: null };
+          case "load_recent_analysis":
+            return { loaded: true, report: { tracks: [track("D:/LibraryB/c1.mp3")] } };
+          case "count_new_tracks":
+            return { new_count: newCount, total_count: 1 };
+          case "analyze_directory":
+            // The analyze persisted, so a re-probe now finds nothing new.
+            newCount = 0;
+            return {
+              tracks: [track("D:/LibraryB/c1.mp3")],
+              summary: { analyzed: 1, total_files: 1, errors: 0 },
+            };
+          default:
+            return {};
+        }
+      },
+    );
+
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/old.mp3")],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    // Open LibraryB through the switcher so the banner probe runs.
+    const switcher = await screen.findByRole("button", { name: /^Library/i });
+    await user.click(switcher);
+    await user.click(await screen.findByRole("option", { name: /LibraryB/ }));
+
+    expect(
+      await screen.findByText(/new tracks added since last/i),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /analyze \+ sort/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByText(/new tracks added since last/i),
+      ).not.toBeInTheDocument();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "All caught up" is a claim about the LIBRARY, so it may only be made
+// when nothing else is narrowing the list.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — review queue empty states", () => {
+  beforeEach(() => {
+    useLibraryFiltersStore.getState().clearFilters();
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          default:
+            return {};
+        }
+      },
+    );
+  });
+
+  it("does not claim the queue is drained when a search emptied it", async () => {
+    const conflict = track("D:/LibraryA/conflict.mp3", {
+      ml_analysis: ml({
+        ml_genre_source: "ml_override",
+        ml_genre_conflict: true,
+        ml_genre: "Trance",
+        ml_subgenre: "Trance",
+        ml_genre_audio: "Trance",
+      }),
+    });
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [conflict],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(await screen.findByRole("button", { name: /1 to review/i }));
+    // The queue is non-empty, so the review list renders.
+    expect(screen.queryByText(/all caught up/i)).not.toBeInTheDocument();
+
+    // Search for something no flagged track matches.
+    await user.type(screen.getByPlaceholderText(/filter tracks/i), "zzzznomatch");
+
+    expect(
+      await screen.findByText(/no matches in the review queue/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/all caught up/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/1 track still needs review/i)).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Find compatible": the filter it generates and the toast describing it.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — find compatible", () => {
+  beforeEach(() => {
+    useLibraryFiltersStore.getState().clearFilters();
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          default:
+            return {};
+        }
+      },
+    );
+  });
+
+  it("keeps energy level 0 — the seed's own level — in the generated filter", async () => {
+    const seed = track("D:/LibraryA/ambient.mp3", {
+      ml_analysis: ml({ ml_energy: 0, ml_bpm: 90, ml_key: "8A" }),
+    });
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [seed],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+    useUIStore.setState({ selectedTrackPath: seed.path });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(await screen.findByRole("button", { name: /find compatible/i }));
+
+    const energies = useLibraryFiltersStore.getState().filters.energies;
+    expect([...energies].sort()).toEqual([0, 1]);
+    // The seed track survives its own filter.
+    expect(energies.has(0)).toBe(true);
+  });
+
+  it("does not advertise a BPM filter it never applies", async () => {
+    const seed = track("D:/LibraryA/seed.mp3", {
+      ml_analysis: ml({ ml_energy: 4, ml_bpm: 124, ml_key: "8A" }),
+    });
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [seed],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+    useUIStore.setState({ selectedTrackPath: seed.path });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(await screen.findByRole("button", { name: /find compatible/i }));
+
+    const note = useNotificationStore.getState().items.at(-1)!;
+    expect(`${note.message} ${note.detail ?? ""}`).not.toMatch(/±5 BPM/);
+    expect(note.detail).toMatch(/BPM is not filtered/i);
+  });
+
+  // Energy is a separate head and can fail on its own, so a
+  // seed can carry BPM with no energy. The toast interpolates the energy
+  // unguarded ("…at energy null"); the reason nobody has seen that string is
+  // this gate, so pin it. (The interpolation itself is now guarded too, but
+  // there is no reachable path to it while the button requires energy.)
+  it("does not offer Find compatible for a seed with BPM but no energy", async () => {
+    const seed = track("D:/LibraryA/noenergy.mp3", {
+      ml_analysis: ml({ ml_energy: null, ml_bpm: 128, ml_key: "8A" }),
+    });
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [seed],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+    useUIStore.setState({ selectedTrackPath: seed.path });
+
+    render(<LibraryBrowser />);
+    // The library rendered...
+    expect(await screen.findByText("D:/LibraryA")).toBeInTheDocument();
+    // ...but the energy-seeded filter is not on offer.
+    expect(
+      screen.queryByRole("button", { name: /find compatible/i }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A failed analyze must hand fail() a closure that re-runs the analyze
+// (the generic rpc-replay retry would discard the AnalysisReport).
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — analyze retry", () => {
+  it("attaches a component-owned retryAction when analyze fails", async () => {
+    let analyzeCalls = 0;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "analyze_directory":
+            analyzeCalls += 1;
+            if (analyzeCalls === 1) throw new Error("engine went away");
+            return {
+              tracks: [track("D:/LibraryA/a.mp3")],
+              summary: { analyzed: 1, total_files: 1, errors: 0 },
+            };
+          default:
+            return {};
+        }
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/a.mp3", { ml_analysis: null })],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(await screen.findByRole("button", { name: /analyze new \(1\)/i }));
+
+    await waitFor(() => {
+      expect(useOperationStore.getState().errorInfo?.retryAction).toBeTypeOf("function");
+    });
+    expect(analyzeCalls).toBe(1);
+
+    const retryAction = useOperationStore.getState().errorInfo!.retryAction!;
+    await act(async () => {
+      await retryAction();
+    });
+    expect(analyzeCalls).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A failed ML analysis is NOT an analysis. `ml_analysis` stays truthy on a
+// per-track failure (it holds `{ml_error: ...}`), so counting "has ml_analysis"
+// as analyzed shipped every failed track in `skip_paths` — "Analyze new" could
+// never retry them.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — failed tracks stay retryable", () => {
+  const ok = track("D:/LibraryA/ok.mp3");
+  const failed = track("D:/LibraryA/bad.mp3", {
+    ml_analysis: ml({ ml_error: "Could not decode audio: bad frame" }),
+  });
+  const never = track("D:/LibraryA/new.mp3", { ml_analysis: null });
+
+  function mountWith(tracks: TrackAnalysis[]) {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "analyze_directory":
+            return { summary: { total_files: 3, analyzed: 2, errors: 0 }, tracks: [] };
+          case "count_new_tracks":
+            return { new_count: 0, total_count: tracks.length };
+          default:
+            return {};
+        }
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks,
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+    return userEvent.setup();
+  }
+
+  it("counts a failed track as un-analyzed in the Analyze new button", async () => {
+    mountWith([ok, failed, never]);
+    render(<LibraryBrowser />);
+    // 3 tracks, 1 with a usable analysis -> 2 left to (re)try.
+    expect(
+      await screen.findByRole("button", { name: /analyze new \(2\)/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not put a failed track in skip_paths", async () => {
+    const user = mountWith([ok, failed, never]);
+    render(<LibraryBrowser />);
+
+    await user.click(await screen.findByRole("button", { name: /analyze new/i }));
+
+    await waitFor(() => {
+      const call = (invoke as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c) => (c[1] as { method: string }).method === "analyze_directory",
+      );
+      expect(call).toBeTruthy();
+      const params = (call![1] as { params: { skip_paths: string[] } }).params;
+      expect(params.skip_paths).toEqual(["D:/LibraryA/ok.mp3"]);
+      expect(params.skip_paths).not.toContain("D:/LibraryA/bad.mp3");
+    });
+  });
+
+  it("hides Analyze new only when every track has a usable analysis", async () => {
+    mountWith([ok]);
+    render(<LibraryBrowser />);
+    await screen.findByRole("button", { name: /re-analyze all/i });
+    expect(screen.queryByRole("button", { name: /analyze new/i })).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolve_genre_conflicts wire contract: ok:false + reason when nothing
+// was persisted, and requested/matched/updated on every response.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — resolve_genre_conflicts result reporting", () => {
+  const conflicted = (name: string) =>
+    track("D:/LibraryA/" + name, {
+      existing_tags: { genre: "Tech House" },
+      ml_analysis: ml({
+        ml_genre_source: "ml_override",
+        ml_genre_conflict: true,
+        ml_genre: "Trance",
+        ml_subgenre: "Trance",
+        ml_genre_audio: "Trance",
+      }),
+    });
+
+  function mount(resolveResult: unknown, tracks: TrackAnalysis[]) {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "resolve_genre_conflicts":
+            return resolveResult;
+          default:
+            return {};
+        }
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks,
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+    return userEvent.setup();
+  }
+
+  async function selectAllFlaggedAndApprove(
+    user: ReturnType<typeof userEvent.setup>,
+    flagged: number,
+  ) {
+    render(<LibraryBrowser />);
+    await user.click(
+      await screen.findByRole("button", { name: new RegExp(flagged + " to review", "i") }),
+    );
+    await user.click(await screen.findByRole("button", { name: /select all/i }));
+    await user.click(await screen.findByRole("button", { name: /approve/i }));
+  }
+
+  it("reports approved-of-matched, not a bare count", async () => {
+    const user = mount(
+      { ok: true, requested: 2, matched: 2, updated: 1, tracks: [] },
+      [conflicted("a.mp3"), conflicted("b.mp3")],
+    );
+    await selectAllFlaggedAndApprove(user, 2);
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      expect(items[0].message).toBe("Approved 1 of 2 genres — kept Vibechek's call");
+      // Not everything the user asked for landed.
+      expect(items[0].kind).toBe("warning");
+    });
+  });
+
+  it("calls out the selected tracks the saved analysis did not contain", async () => {
+    const user = mount(
+      { ok: true, requested: 2, matched: 1, updated: 1, tracks: [] },
+      [conflicted("a.mp3"), conflicted("b.mp3")],
+    );
+    await selectAllFlaggedAndApprove(user, 2);
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      expect(items[0].message).toBe("Approved 1 of 1 genre — kept Vibechek's call");
+      expect(items[0].detail).toMatch(/not in the saved analysis/i);
+    });
+  });
+
+  it("clears nothing and surfaces the reason when the sidecar persisted nothing", async () => {
+    const user = mount(
+      {
+        ok: false,
+        reason: "none of the 1 matched tracks have ML analysis to resolve",
+        requested: 1,
+        matched: 1,
+        updated: 0,
+        tracks: [],
+      },
+      [conflicted("a.mp3")],
+    );
+    await selectAllFlaggedAndApprove(user, 1);
+
+    await waitFor(() => {
+      expect(useOperationStore.getState().error).toMatch(/ML analysis to resolve/);
+    });
+    // Selection intact, conflict still flagged, no success toast.
+    expect(useLibraryStore.getState().selectedIds.size).toBe(1);
+    expect(
+      useLibraryStore.getState().tracks[0].ml_analysis?.ml_genre_conflict,
+    ).toBe(true);
+    expect(useNotificationStore.getState().items).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-guards: resolve_genre_conflicts and import_tag_priors both rewrite
+// the saved analysis and neither sets the operation store's `active`, so each
+// has to disable the other's controls for the duration.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — resolve / import mutual exclusion", () => {
+  const conflict = track("D:/LibraryA/conflict.mp3", {
+    existing_tags: { genre: "Tech House" },
+    ml_analysis: ml({
+      ml_genre_source: "ml_override",
+      ml_genre_conflict: true,
+      ml_genre: "Trance",
+      ml_subgenre: "Trance",
+      ml_genre_audio: "Trance",
+    }),
+  });
+
+  /** Route invoke so `method` never settles — the in-flight state stays on. */
+  function mountWithHangingRpc(method: string) {
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        if (args.method === "library_state") return { recent: [], active: null };
+        if (args.method === method) return new Promise(() => {});
+        return {};
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [conflict],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+    return userEvent.setup();
+  }
+
+  it("disables Import Rekordbox XML while a resolve is in flight", async () => {
+    const user = mountWithHangingRpc("resolve_genre_conflicts");
+    render(<LibraryBrowser />);
+
+    // Import is reachable before the resolve starts (nothing selected).
+    expect(
+      await screen.findByRole("button", { name: /import rekordbox xml/i }),
+    ).toBeEnabled();
+
+    await user.click(await screen.findByRole("button", { name: /1 to review/i }));
+    await user.click(await screen.findByRole("button", { name: /select all/i }));
+    await user.click(await screen.findByRole("button", { name: /approve/i }));
+
+    // Approve stays disabled for the duration, and so does the import that
+    // would rewrite the same saved analysis underneath it.
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /approve/i })).toBeDisabled();
+    });
+    // Drop the selection to bring the default toolbar (with Import) back.
+    // Wrapped: this store write synchronously re-renders the MOUNTED
+    // LibraryBrowser, and doing it outside act() both printed a React act()
+    // warning on every run (drowning out a later, real one) and left the
+    // waitFor below racing an un-flushed render.
+    act(() => {
+      useLibraryStore.setState({ selectedIds: new Set() });
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /import rekordbox xml/i })).toBeDisabled();
+    });
+  });
+
+  it("disables Approve / Revert / Clear while a priors import is in flight", async () => {
+    (openDialog as ReturnType<typeof vi.fn>).mockResolvedValue("D:/collection.xml");
+    const user = mountWithHangingRpc("import_tag_priors");
+    render(<LibraryBrowser />);
+
+    await user.click(await screen.findByRole("button", { name: /import rekordbox xml/i }));
+
+    await user.click(await screen.findByRole("button", { name: /1 to review/i }));
+    await user.click(await screen.findByRole("button", { name: /select all/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /approve/i })).toBeDisabled();
+    });
+    expect(screen.getByRole("button", { name: /revert to tag/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^clear$/i })).toBeDisabled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// scan_directory degrades a file it can't stat (size_mb 0 + an `error`) rather
+// than failing the whole scan. Swallowing that made unreadable files look like
+// empty ones.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — unreadable files in a folder scan", () => {
+  function mountWithScan(files: Array<Record<string, unknown>>) {
+    (openDialog as ReturnType<typeof vi.fn>).mockResolvedValue("D:/LibraryA");
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "scan_directory":
+            return { count: files.length, files };
+          case "count_new_tracks":
+            return { new_count: 0, total_count: files.length };
+          default:
+            return {};
+        }
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: null,
+      tracks: [],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+    return userEvent.setup();
+  }
+
+  const entry = (path: string, extra: Record<string, unknown> = {}) => ({
+    path,
+    filename: path.split("/").pop(),
+    extension: ".mp3",
+    size_mb: 0,
+    ...extra,
+  });
+
+  it("warns about the files it could not read", async () => {
+    const user = mountWithScan([
+      entry("D:/LibraryA/a.mp3", { size_mb: 4.2 }),
+      entry("D:/LibraryA/locked.mp3", { error: "[Errno 13] Permission denied" }),
+    ]);
+    render(<LibraryBrowser />);
+
+    await user.click((await screen.findAllByRole("button", { name: /open folder/i }))[0]);
+
+    await waitFor(() => {
+      const items = useNotificationStore.getState().items;
+      expect(items.length).toBe(1);
+      expect(items[0].message).toBe("1 file could not be read");
+      expect(items[0].kind).toBe("warning");
+    });
+    // And it stays on screen next to the file count, not only in a toast.
+    expect(await screen.findByText(/1 could not be read/i)).toBeInTheDocument();
+  });
+
+  it("stays quiet when every file could be read", async () => {
+    const user = mountWithScan([
+      entry("D:/LibraryA/a.mp3", { size_mb: 4.2 }),
+      entry("D:/LibraryA/b.mp3", { size_mb: 5.1 }),
+    ]);
+    render(<LibraryBrowser />);
+
+    await user.click((await screen.findAllByRole("button", { name: /open folder/i }))[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Found 2 audio files/i)).toBeInTheDocument();
+    });
+    expect(useNotificationStore.getState().items).toHaveLength(0);
+    expect(screen.queryByText(/could not be read/i)).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `analyze_directory` is on the store's NON_REPLAYABLE_METHODS list — the
+// generic replay resolves the AnalysisReport and throws it away, so a
+// "Try again" would re-run for an hour and never reach the store. The view has
+// to hand fail() its own closure or the user gets no retry at all.
+// ---------------------------------------------------------------------------
+
+describe("<LibraryBrowser /> — a failed analyze stays retryable", () => {
+  it("attaches a retryAction that re-enters runAnalyze with the same flag", async () => {
+    let calls = 0;
+    (invoke as ReturnType<typeof vi.fn>).mockImplementation(
+      async (_cmd: string, args: { method: string; params?: unknown }) => {
+        switch (args.method) {
+          case "library_state":
+            return { recent: [], active: null };
+          case "count_new_tracks":
+            return { new_count: 0, total_count: 1 };
+          case "analyze_directory":
+            calls += 1;
+            if (calls === 1) throw new Error("engine died mid-run");
+            return { summary: { total_files: 1, analyzed: 1, errors: 0 }, tracks: [] };
+          default:
+            return {};
+        }
+      },
+    );
+    useLibraryStore.setState({
+      libraryPath: "D:/LibraryA",
+      tracks: [track("D:/LibraryA/new.mp3", { ml_analysis: null })],
+      selectedIds: new Set(),
+      searchFilter: "",
+    });
+
+    const user = userEvent.setup();
+    render(<LibraryBrowser />);
+    await user.click(await screen.findByRole("button", { name: /analyze new/i }));
+
+    await waitFor(() => {
+      const info = useOperationStore.getState().errorInfo;
+      expect(info).toBeTruthy();
+      expect(info!.retryAction).toBeTypeOf("function");
+    });
+
+    await act(async () => {
+      await useOperationStore.getState().errorInfo!.retryAction!();
+    });
+    expect(calls).toBe(2);
+    // Incremental was preserved: the replay skipped nothing new and completed.
+    await waitFor(() => {
+      expect(useOperationStore.getState().active).toBeNull();
+    });
   });
 });

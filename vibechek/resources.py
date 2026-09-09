@@ -10,11 +10,15 @@ tensorflow for GPU enumeration) degrade to None / [] rather than raising.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import platform
-import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from vibechek.utils import find_executable
 
 log = logging.getLogger(__name__)
 
@@ -213,7 +217,12 @@ def _all_gpu_devices(engine: str | None = None) -> list[GpuDevice]:
 
 def _gpu_devices_from_nvidia_smi() -> list[GpuDevice]:
     """Parse `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader`."""
-    smi = shutil.which("nvidia-smi")
+    # `find_executable`, not `shutil.which`: the resolved path is EXECUTED, and
+    # on Windows which() searches the process cwd ahead of PATH, so an
+    # `nvidia-smi.exe` sitting in the folder Vibechek happens to be started
+    # from would win over the real driver tool. find_executable refuses a cwd
+    # hit and returns an absolute path.
+    smi = find_executable("nvidia-smi")
     if not smi:
         return []
     try:
@@ -258,7 +267,8 @@ def _gpu_devices_from_nvidia_smi() -> list[GpuDevice]:
 
 def _cuda_runtime() -> str | None:
     """CUDA driver version as reported by `nvidia-smi`, e.g. '12.3'. None if no NVIDIA GPU."""
-    smi = shutil.which("nvidia-smi")
+    # Same cwd-hijack reasoning as `_gpu_devices_from_nvidia_smi` above.
+    smi = find_executable("nvidia-smi")
     if not smi:
         return None
     try:
@@ -314,6 +324,30 @@ def apply_gpu_preference(use_gpu: str) -> None:
 _ESSENTIA_TF_WORKER_MB = 800
 _CLAP_WORKER_MB = 4500
 
+# The MEASURED resident floor behind each budget above (models + runtime, before
+# any track is decoded). The difference between the budget and this floor is the
+# per-track buffer headroom the flat number silently assumed — and that
+# assumption is what `per_worker_mb`'s optional track-length term replaces with a
+# measurement when the caller can supply one.
+_ESSENTIA_TF_RESIDENT_MB = 340
+_CLAP_RESIDENT_MB = 3800
+
+# Peak decoded audio inside a worker, in bytes per second of track.
+# `analyzer.analyze_audio_features` decodes to mono float32 and releases each
+# buffer at its last use, so the peak is the LARGEST single decode, not their
+# sum: 44.1 kHz for the rhythm/key extractors on every route, and 48 kHz for the
+# CLAP embedding on the advanced-genre route (the largest of the three there).
+# That is 176.4 kB per second of audio — 908 MB for a 90-minute recorded set, on
+# a route whose whole budget was 800 MB.
+_DECODE_BYTES_PER_SECOND = 44100 * 4
+_CLAP_DECODE_BYTES_PER_SECOND = 48000 * 4
+
+# How many of the biggest files `probe_longest_track_seconds` opens. The longest
+# track is what sizes the pool, and within one library the biggest FILES are the
+# best cheap proxy for it; a handful of probes covers the "one 2-hour set among
+# 12k singles" case without turning worker sizing into a full library scan.
+_LENGTH_PROBE_FILES = 8
+
 # VRAM budget per GPU worker. Tuned against an RTX 4070 Laptop (8 GB shared):
 # 2500 → cap 3 ran cleanly, 1800 → cap 4 stalled at init OOM. Includes ~800 MB
 # for the persistent CUDA context before any model/activation memory. Kept in
@@ -325,8 +359,34 @@ _GPU_WORKER_MB = 2500
 # "at most 4 workers in GPU mode" behaviour rather than regress usable machines.
 _GPU_FALLBACK_CAP = 4
 
+# Held back on top of the workers' own budget when sizing off *available* rather
+# than total RAM. `available` is a snapshot; the OS, the Tauri shell and the
+# sidecar itself all keep growing during a multi-hour run, so committing every
+# free byte to workers is how the "worker exited 1 with empty stdout" OOM kill
+# happens on a box that had plenty of TOTAL RAM.
+_AVAILABLE_HEADROOM_MB = 1024
 
-def per_worker_mb(engine: str, genre_classifier: str) -> int:
+# Sentinel for `compute_worker_budget(available_mb=...)`: the default measures
+# the machine, while an explicit None means "we couldn't measure it, skip the
+# availability cap" (and a number means "use this"). A plain None default would
+# make those two cases indistinguishable.
+_MEASURE_AVAILABLE = object()
+
+# Smallest HOST (not VM) total RAM on which raising the WSL VM's `memory=` limit
+# can actually give it anything. `wsl.bump_wslconfig_memory` targets
+# max(min(75% of host, host - 8 GB), WSL's own no-`memory=` default of
+# min(host/2, 8 GB)), floored to whole GB — at 16 GB and below the `host - 8 GB`
+# term drops to (or below) that default, so the target IS the size the VM
+# already has and the bump correctly answers "there's nothing to raise". Keep in
+# step with `wsl._choose_wslconfig_memory_target_mb`.
+_WSL_BUMP_MIN_HOST_MB = 16384
+
+
+def per_worker_mb(
+    engine: str,
+    genre_classifier: str,
+    longest_track_seconds: float | None = None,
+) -> int:
     """RAM budget (MB) per analysis worker, used to cap the worker count.
 
     `genre_classifier="clap"` dominates the footprint (a 2.2 GB checkpoint per
@@ -340,10 +400,105 @@ def per_worker_mb(engine: str, genre_classifier: str) -> int:
     than RAM allows (safe) rather than risking the multi-worker OOM that a too-
     small budget would. Replace with a measured onnx/native constant here when
     one exists (see docs/native-windows-essentia notes).
+
+    `longest_track_seconds` is the OPTIONAL track-length term. The flat budgets
+    above bury a fixed per-track buffer allowance (budget minus measured
+    resident: 460 MB on the standard route), which is fine for singles and wrong
+    for a library of recorded sets — decoded mono float32 costs 176.4 kB per
+    second, so it crosses that allowance at ~43 minutes and a 90-minute set puts
+    ~908 MB in a worker the pool sized at 800. Pass the longest track's duration
+    (see `probe_longest_track_seconds`) and the budget grows by the ACTUAL
+    overshoot, shrinking the pool for a set-heavy library. Omit it (or pass
+    0/None, which is what an unreadable probe returns) and the flat budget stands
+    exactly as before — this never sizes a pool off a number nobody measured.
     """
-    if genre_classifier == "clap":
-        return _CLAP_WORKER_MB
-    return _ESSENTIA_TF_WORKER_MB
+    clap = genre_classifier == "clap"
+    base = _CLAP_WORKER_MB if clap else _ESSENTIA_TF_WORKER_MB
+    if not longest_track_seconds or longest_track_seconds <= 0:
+        return base
+    resident = _CLAP_RESIDENT_MB if clap else _ESSENTIA_TF_RESIDENT_MB
+    rate = _CLAP_DECODE_BYTES_PER_SECOND if clap else _DECODE_BYTES_PER_SECOND
+    decode_mb = math.ceil(longest_track_seconds * rate / (1024 * 1024))
+    # Only the part the flat budget did NOT already allow for is added, so short
+    # libraries keep the measured-and-shipped numbers untouched.
+    return base + max(0, decode_mb - (base - resident))
+
+
+def decoded_audio_mb(genre_classifier: str, seconds: float) -> int:
+    """Peak decoded audio (MB) a worker holds for a track of `seconds`.
+
+    Split out so the budget math and the explanation text quote ONE number.
+    """
+    rate = (_CLAP_DECODE_BYTES_PER_SECOND if genre_classifier == "clap"
+            else _DECODE_BYTES_PER_SECOND)
+    return math.ceil(max(0.0, seconds) * rate / (1024 * 1024))
+
+
+def track_length_note(
+    engine: str, genre_classifier: str, longest_track_seconds: float | None,
+) -> str:
+    """The technical WHY behind a per-worker budget the flat model wouldn't give.
+
+    Empty string when the track-length term didn't move the number (no probe, or
+    a library short enough that the flat allowance already covered it), so
+    callers can append it unconditionally. Leading space included: it is a clause
+    appended to an existing detail sentence, never a headline of its own — the
+    calm headline stays "Using fewer workers…".
+    """
+    if not longest_track_seconds or longest_track_seconds <= 0:
+        return ""
+    raised = per_worker_mb(engine, genre_classifier, longest_track_seconds)
+    if raised <= per_worker_mb(engine, genre_classifier):
+        return ""
+    return (
+        f" This library's longest track is {longest_track_seconds / 60:.0f} minutes "
+        f"and a worker holds it decoded "
+        f"(~{decoded_audio_mb(genre_classifier, longest_track_seconds)} MB), so each "
+        "worker is budgeted higher here than for a library of singles."
+    )
+
+
+def probe_longest_track_seconds(
+    paths: Sequence[Any], *, sample: int = _LENGTH_PROBE_FILES,
+) -> float | None:
+    """Duration of the longest of the `sample` biggest files, or None.
+
+    Best-effort and cheap: `stat` for size (the analyzer stats every file anyway)
+    plus a mutagen header read on a handful of candidates — no decoding. Returns
+    None when nothing could be read (mutagen missing, unreadable headers, empty
+    list), which `per_worker_mb` treats as "no measurement" and answers with the
+    old flat budget. It never raises and never guesses: a duration this cannot
+    measure must not become a number the worker pool is sized against.
+    """
+    if not paths:
+        return None
+    try:
+        from mutagen import File as MutagenFile  # noqa: PLC0415
+    except ImportError:
+        log.debug("mutagen unavailable — worker budget keeps the flat per-track allowance")
+        return None
+
+    sized: list[tuple[int, Any]] = []
+    for p in paths:
+        try:
+            sized.append((os.stat(p).st_size, p))
+        except OSError:
+            continue
+    if not sized:
+        return None
+    sized.sort(key=lambda pair: -pair[0])
+
+    longest: float | None = None
+    for _size, p in sized[:max(1, sample)]:
+        try:
+            audio = MutagenFile(str(p))
+            length = float(getattr(getattr(audio, "info", None), "length", 0.0) or 0.0)
+        except Exception as e:  # noqa: BLE001 - a bad header must not fail the run
+            log.debug("length probe failed for %s: %s", p, e)
+            continue
+        if length > 0 and (longest is None or length > longest):
+            longest = length
+    return longest
 
 
 @dataclass
@@ -373,8 +528,8 @@ class WorkerBudget:
     # Settings slider. None when the request was honored in full.
     cap_reason: str | None = None
     # The technical explanation behind cap_reason (GB-per-model math, which RAM
-    # pool) — DEMOTED to logs / Doctor / run-history, never the progress line
-    # (voice-guide rule 9). None when there's nothing extra to demote.
+    # pool) — DEMOTED to logs / Doctor / run-history, never the progress line.
+    # None when there's nothing extra to demote.
     cap_detail: str | None = None
     # Why GPU workers = 0 despite GPU mode being on (engine can't register the
     # GPU, or insufficient VRAM). None when GPU mode is off or GPU workers ran.
@@ -404,6 +559,8 @@ def compute_worker_budget(
     use_gpu: str = "auto",
     hybrid: bool = True,
     ram_pool: str = "host",
+    available_mb: int | None | Any = _MEASURE_AVAILABLE,
+    longest_track_seconds: float | None = None,
 ) -> WorkerBudget:
     """Pure worker-sizing decision — no I/O, fully table-testable.
 
@@ -428,6 +585,19 @@ def compute_worker_budget(
       gpu_registrable: True/False when the engine's real GPU probe is
         conclusive; None when it couldn't run (we then size off VRAM as before
         rather than needlessly disabling a healthy GPU).
+      available_mb: RAM actually free right now, measured in the pool
+        `ram_pool` names. Defaults to measuring it here so a `host`-pool caller
+        (analyzer AND the `worker_budget` RPC behind the Settings slider) gets
+        the same answer without having to remember to pass it — the slider/run
+        invariant this function exists to protect. A `wsl_vm` caller MUST pass
+        its own reading (this process cannot measure the VM); both of them do.
+        Pass an explicit int to make the call pure (tests do), or an explicit
+        None to say "couldn't measure it" and skip the availability cap.
+      longest_track_seconds: the measured duration of the longest track in the
+        library (see `probe_longest_track_seconds`), or None when it wasn't
+        probed. A worker holds the whole decoded track, so a library of hour-long
+        recorded sets needs a bigger per-worker budget — and therefore a smaller
+        pool — than the flat number assumes. None keeps the old flat budget.
     """
     cpu_count = max(1, cpu_count)
     # Raw request for DISPLAY ("capped 16→2" shows the user's own 16). The run is
@@ -437,7 +607,8 @@ def compute_worker_budget(
         else max(1, cpu_count - 1)
     )
     requested_run = max(1, min(raw_request, cpu_count))
-    pw = per_worker_mb(engine, genre_classifier)
+    pw = per_worker_mb(engine, genre_classifier, longest_track_seconds)
+    length_note = track_length_note(engine, genre_classifier, longest_track_seconds)
     # Hold back more under WSL: the VM shares one pool of physical RAM with the
     # Windows host + GUI + browser, so a 2 GB Linux-only reserve starves Windows
     # and the whole machine thrashes/OOMs.
@@ -480,6 +651,32 @@ def compute_worker_budget(
     ram_seen = total_ram_mb
     usable = max(0, total_ram_mb - reserve_mb)
     memory_cap = usable // pw  # FLOOR TO 0 — "nothing fits" is now expressible.
+
+    # Total RAM says what the machine HAS; `available` says what this run can
+    # actually have. Sizing off total is how three 3.8 GB CLAP workers get
+    # OOM-killed on a 16 GB box that only had 7 GB free because Windows, the
+    # Tauri shell and a browser were already holding the rest — the flat
+    # reserve_mb was never going to stand in for "the entire rest of the
+    # machine". Take the MIN so a transient high `available` reading can never
+    # raise the cap above the total-based one.
+    if available_mb is _MEASURE_AVAILABLE:
+        # A measurement taken HERE describes the pool this process runs in.
+        # Under WSL-from-Windows, total_ram_mb is the VM's limit while psutil
+        # in the Windows sidecar sees the host — different pools, so don't mix
+        # them. Both wsl_vm callers pass their own reading instead: the analyze
+        # run measures psutil from inside the VM, and the Settings slider reads
+        # `wsl.wsl_vm_available_mb(distro)`. Falling through to None here would
+        # silently drop the availability cap for the slider ALONE, which is the
+        # slider/run divergence this function exists to prevent.
+        available_mb = _memory_available_mb() if ram_pool == "host" else None
+    available_cap: int | None = None
+    bound_by_available = False
+    if isinstance(available_mb, int):
+        available_cap = max(0, available_mb - _AVAILABLE_HEADROOM_MB) // pw
+        if available_cap < memory_cap:
+            memory_cap = available_cap
+            bound_by_available = True
+
     if memory_cap <= 0:
         # Refuse rather than force a single worker the budget itself says won't
         # fit (the old max(1, ...) launched one and got it OOM-killed silently).
@@ -487,7 +684,7 @@ def compute_worker_budget(
         # slider + the refused-run event). The GB math / classifier name /
         # .wslconfig mechanism are DEMOTED to `memory_refusal_detail()`, and the
         # machine-readable action flags come from `memory_refusal_options()` — the
-        # analyzer packs both into the UserFacingError it raises (WP-D3).
+        # analyzer packs both into the UserFacingError it raises.
         refusal = (
             "Not enough memory to run the advanced genre model right now."
             if genre_classifier == "clap"
@@ -505,16 +702,42 @@ def compute_worker_budget(
     if max_workers < requested_run or max_workers < raw_request:
         # The RUN is capped below what the user asked for. Surface it (was a
         # discarded log.warning) so "16 → 2" reaches the GUI, on WSL runs too —
-        # a CALM headline on the progress line, the GB math DEMOTED to detail
-        # (voice-guide rule 9).
-        cap_reason = (
-            f"Using fewer workers to fit available memory "
-            f"({raw_request} → {max_workers})."
-        )
-        cap_detail = (
-            f"{classifier_label} needs ~{pw / 1024:.1f} GB each; {pool_label} "
-            f"has {ram_seen / 1024:.1f} GB."
-        )
+        # a CALM headline on the progress line, the GB math DEMOTED to detail.
+        if memory_cap >= cpu_count:
+            # The CORE count is what bound this, not RAM. Blaming memory on a
+            # box with 62 GB free sends the user closing apps to fix a number
+            # that will not move.
+            cap_reason = (
+                f"Using {max_workers} worker{'' if max_workers == 1 else 's'} — "
+                f"{pool_label} has {cpu_count} CPU core"
+                f"{'' if cpu_count == 1 else 's'}."
+            )
+            cap_detail = (
+                f"You asked for {raw_request}; more workers than cores buys "
+                f"contention, not speed. Memory wasn't the limit here "
+                f"({classifier_label} needs ~{pw / 1024:.1f} GB each and "
+                f"{memory_cap} would fit)."
+            )
+        elif bound_by_available:
+            cap_reason = (
+                f"Using fewer workers to fit the memory that's free right now "
+                f"({raw_request} → {max_workers})."
+            )
+            cap_detail = (
+                f"{classifier_label} needs ~{pw / 1024:.1f} GB each; "
+                f"{pool_label} has {ram_seen / 1024:.1f} GB total but only "
+                f"{available_mb / 1024:.1f} GB free right now."
+            )
+        else:
+            cap_reason = (
+                f"Using fewer workers to fit available memory "
+                f"({raw_request} → {max_workers})."
+            )
+            cap_detail = (
+                f"{classifier_label} needs ~{pw / 1024:.1f} GB each; {pool_label} "
+                f"has {ram_seen / 1024:.1f} GB."
+            )
+        cap_detail = (cap_detail or "") + length_note
     return _finish_budget(
         max_workers=max_workers, requested_run=requested_run,
         raw_request=raw_request, pw=pw, ram_seen=ram_seen,
@@ -525,13 +748,20 @@ def compute_worker_budget(
     )
 
 
-def memory_refusal_detail(budget: WorkerBudget, genre_classifier: str) -> str:
+def memory_refusal_detail(
+    budget: WorkerBudget, genre_classifier: str, available_mb: int | None = None,
+) -> str:
     """The technical explanation behind a memory refusal — DEMOTED to the toast
-    detail toggle (the plain headline is `budget.refusal_reason`, WP-D3).
+    detail toggle (the plain headline is `budget.refusal_reason`).
 
     Rebuilt from the budget's own measured numbers so the GB math can never
     diverge from the cap that produced it. Names CLAP + `.wslconfig` here (in the
     detail), not in the headline.
+
+    `available_mb` is the free-RAM reading the same caller fed the budget. Pass
+    it whenever you have it: a refusal driven by what's free RIGHT NOW must not
+    be explained with the machine's total capacity, or the user goes looking for
+    RAM they already have.
     """
     pw_gb = budget.per_worker_mb / 1024
     ram_gb = budget.ram_seen_mb / 1024
@@ -546,11 +776,21 @@ def memory_refusal_detail(budget: WorkerBudget, genre_classifier: str) -> str:
         "the advanced genre model (CLAP)" if genre_classifier == "clap"
         else "each analysis worker"
     )
-    detail = (
-        f"{model_label} needs about {pw_gb:.1f} GB per worker, but {pool_label} "
-        f"has only {usable_gb:.1f} GB usable ({ram_gb:.1f} GB total minus "
-        f"{reserve_gb:.1f} GB held back for {reserve_for})."
-    )
+    free_gb = (available_mb - _AVAILABLE_HEADROOM_MB) / 1024 if available_mb is not None else None
+    if free_gb is not None and free_gb < usable_gb:
+        # Free RAM, not capacity, is what refused this run — say so, or the
+        # ".wslconfig"/"buy more RAM" advice below points at the wrong thing.
+        detail = (
+            f"{model_label} needs about {pw_gb:.1f} GB per worker, but only "
+            f"{max(0.0, free_gb):.1f} GB of {pool_label}'s {ram_gb:.1f} GB is "
+            f"free right now."
+        )
+    else:
+        detail = (
+            f"{model_label} needs about {pw_gb:.1f} GB per worker, but {pool_label} "
+            f"has only {usable_gb:.1f} GB usable ({ram_gb:.1f} GB total minus "
+            f"{reserve_gb:.1f} GB held back for {reserve_for})."
+        )
     if genre_classifier == "clap":
         detail += (
             " Fixes: switch to the standard genre model, or give the Linux "
@@ -563,17 +803,35 @@ def memory_refusal_detail(budget: WorkerBudget, genre_classifier: str) -> str:
     return detail
 
 
-def memory_refusal_options(genre_classifier: str, under_wsl: bool) -> dict[str, bool]:
+def memory_refusal_options(
+    genre_classifier: str,
+    under_wsl: bool,
+    host_total_mb: int | None = None,
+) -> dict[str, bool]:
     """Machine-readable flags the shell keys the refusal's action buttons off of.
 
     `can_switch_classifier` — the run used CLAP; the standard (Discogs) model
     needs far less RAM, so a one-click switch can unblock the run.
-    `can_increase_memory` — under WSL the VM's `memory=` limit can be raised
-    (the `increase_wsl_memory` RPC / `bump_wslconfig_memory`).
+    `can_increase_memory` — under WSL *and* on a PC where raising the VM's
+    `memory=` limit would actually hand it more RAM (the `increase_wsl_memory`
+    RPC / `bump_wslconfig_memory`). Below `_WSL_BUMP_MIN_HOST_MB` that bump has
+    nothing to give and says so, so offering the button sent the user through a
+    self-heal that could only answer "there's nothing to raise" — on the very
+    screen that just refused their run for lack of memory.
+
+    `host_total_mb` is the PC's total RAM. It must be the HOST's: measured from
+    inside the WSL VM, psutil reports the VM's own limit (the pool the workers
+    draw from), which says nothing about how much the host could give it. When
+    the caller can't know it the button is WITHHELD rather than promised — the
+    refusal detail still names the `.wslconfig` fix, so the honest message path
+    is unchanged; only the one-click action that cannot work goes away.
     """
+    can_increase = bool(
+        under_wsl and host_total_mb and host_total_mb > _WSL_BUMP_MIN_HOST_MB
+    )
     return {
         "can_switch_classifier": genre_classifier == "clap",
-        "can_increase_memory": bool(under_wsl),
+        "can_increase_memory": can_increase,
     }
 
 
@@ -649,4 +907,7 @@ __all__ = [
     "memory_refusal_detail",
     "memory_refusal_options",
     "per_worker_mb",
+    "decoded_audio_mb",
+    "probe_longest_track_seconds",
+    "track_length_note",
 ]

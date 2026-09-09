@@ -198,13 +198,33 @@ function compareForRule(a: FileInfo, b: FileInfo, criterion: RuleCriterion): num
       return (b.modified_time as number) - (a.modified_time as number);
     }
     case "shortest_path": {
+      // FOLDER DEPTH first — that's what the rule promises ("Files at the top
+      // of your library win over copies buried in subfolders") and what the
+      // explanation renders ("N levels"). Comparing raw character length
+      // instead inverted the rule for realistic pairs: a 6-level
+      // /DJ/Sets/2024/Peak/A.mp3 beat a 3-level file with a long descriptive
+      // name, and the UI explained the win as "folder depth: 6 levels".
+      // Character length stays as the secondary tiebreak (the canonical copy
+      // usually has the plainer name).
       // path is required; if for some reason it isn't a string, the
       // comparator should still be a total order.
-      const aLen = typeof a.path === "string" ? a.path.length : Number.MAX_SAFE_INTEGER;
-      const bLen = typeof b.path === "string" ? b.path.length : Number.MAX_SAFE_INTEGER;
+      const aStr = typeof a.path === "string" ? a.path : null;
+      const bStr = typeof b.path === "string" ? b.path : null;
+      const aDepth = aStr === null ? Number.MAX_SAFE_INTEGER : pathDepth(aStr);
+      const bDepth = bStr === null ? Number.MAX_SAFE_INTEGER : pathDepth(bStr);
+      if (aDepth !== bDepth) return aDepth - bDepth;
+      const aLen = aStr === null ? Number.MAX_SAFE_INTEGER : aStr.length;
+      const bLen = bStr === null ? Number.MAX_SAFE_INTEGER : bStr.length;
       return aLen - bLen;
     }
   }
+}
+
+/** How many path segments a path has — the "N levels" the UI explains a
+ *  shortest_path win with. Shared by the comparator and the explanation so the
+ *  number the user reads is the number that decided it. */
+function pathDepth(path: string): number {
+  return path.split(/[/\\]/).length;
 }
 
 function codecRank(codec: string | null | undefined): number {
@@ -259,6 +279,6 @@ function explainOne(f: FileInfo, criterion: RuleCriterion): string {
     case "bitrate":       return f.bitrate_kbps ? `${f.bitrate_kbps} kbps` : "unknown bitrate";
     case "size":          return `${f.size_mb.toFixed(1)} MB`;
     case "modified":      return f.modified_time ? new Date(f.modified_time * 1000).toLocaleDateString() : "?";
-    case "shortest_path": return `${f.path.split(/[/\\]/).length} levels`;
+    case "shortest_path": return `${pathDepth(f.path)} levels`;
   }
 }

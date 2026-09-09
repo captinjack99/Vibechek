@@ -733,7 +733,7 @@ function EngineGpuBlock({
   onRefresh: () => void;
   /** Opens the setup walkthrough. A probe can fail while preflight is green
    *  (so the top banner shows no "Set up now"), so this block offers its own
-   *  explicit jump-link to it (WP-B1). */
+   *  explicit jump-link to it. */
   onOpenSetup?: () => void;
 }) {
   // No engine probe yet — show host view but tell the user the truth.
@@ -783,7 +783,7 @@ function EngineGpuBlock({
   if (!engineGpu) return null; // shouldn't happen
 
   // Probe failed — plain headline; the raw probe string (exit code, stderr,
-  // "TF probe JSON" parse error) is DEMOTED to a details toggle (WP-B1).
+  // "TF probe JSON" parse error) is DEMOTED to a details toggle.
   if (!engineGpu.ok) {
     return (
       <div className="mt-3 flex items-start gap-2 text-xs text-accent-yellow">
@@ -861,7 +861,7 @@ function EngineGpuBlock({
   const hasNvidiaVisible = visibleVendors.has("nvidia");
   // The "install CUDA libs" fix is the essentia-TENSORFLOW path. For the ONNX
   // engine (engineGpu.runtime set), the GPU build is provisioned by "Set up
-  // ONNX engine", so don't show the TF fixer — fall through to the message.
+  // ONNX engine", so don't show the TF install block — fall through to the message.
   if (engineGpu.gpu_hardware_visible && !engineGpu.gpu_available && hasNvidiaVisible && !engineGpu.runtime) {
     return (
       <EngineGpuFixableBlock
@@ -921,7 +921,7 @@ function EngineGpuBlock({
               expects, so it can&apos;t use the GPU.
             </div>
             <div className="text-white/40 mt-0.5">Analysis will run on CPU.</div>
-            {/* Driver / TensorFlow / CUDA-cuDNN specifics DEMOTED to detail (WP-B2). */}
+            {/* Driver / TensorFlow / CUDA-cuDNN specifics DEMOTED to detail. */}
             <details className="mt-1 text-[11px] text-white/40">
               <summary className="cursor-pointer hover:text-white/60">
                 Technical details
@@ -992,7 +992,7 @@ export function CrossVendorGpuInventory({
 
   // Always-visible callout — one line per engine, every claim true today.
   // native must NOT imply NVIDIA would work (it's CPU-only for every vendor) —
-  // this reuses the WP-B native phrasing ("runs on CPU today — GPU support is
+  // this reuses the same native phrasing ("runs on CPU today — GPU support is
   // planned but not available yet") so the two blocks stay consistent.
   const callout =
     eng === "native"

@@ -8,7 +8,10 @@ Persistence: JSON round-trip via the stdlib `json` module. The default location
 is `<user_config_dir>/vibechek/config.json`. Older `config.toml` files (from
 before 0.3.0) are read as a one-time migration fallback and rewritten as JSON
 on the next save. Load is graceful — a missing or unparseable file falls back
-to defaults rather than raising.
+to defaults rather than raising. An unparseable file is MARKED as such on the
+returned instance (`load_failed` + `load_warnings`), and `save()` refuses to
+overwrite it without `force=True`: defaults written back over a config we
+merely failed to read would erase every setting the user still has on disk.
 
 Why JSON instead of TOML: TOML has no null type, which forces an awkward "drop
 the key" round-trip every time a field defaults to `None` — silently lossy and
@@ -21,12 +24,14 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 from platformdirs import user_config_dir, user_data_dir
 
+from vibechek.errors import UserFacingError
 from vibechek.io import atomic_write_json
 
 log = logging.getLogger(__name__)
@@ -47,6 +52,17 @@ LEGACY_CONFIG_FILE = CONFIG_DIR / "config.toml"
 # gracefully instead of breaking. Existing users keep whatever their saved
 # config already has; this only sets the default for a fresh/unset config.
 _DEFAULT_INFERENCE_ENGINE = "native" if sys.platform == "win32" else "essentia_tf"
+
+
+class ConfigSaveRefused(UserFacingError):
+    """`save()` refused to overwrite the config file it could not read.
+
+    A corrupt or momentarily-unreadable config.json loads as pristine defaults
+    (`load()` never raises, by contract). Writing those defaults back is total,
+    silent, unrecoverable loss of every setting still sitting on disk, so the
+    save is refused instead. `save(force=True)` accepts the defaults after
+    renaming the unreadable file aside as `<name>.corrupt-<timestamp>`.
+    """
 
 
 def engine_venv_subdir(engine: str) -> str:
@@ -264,6 +280,16 @@ class VibechekConfig:
     organization: OrganizationConfig = field(default_factory=OrganizationConfig)
     ui: UIConfig = field(default_factory=UIConfig)
 
+    # ----- Load diagnostics (deliberately NOT dataclass fields) -------------
+    # Unannotated on purpose: `dataclass` ignores them, so `asdict`/`save`
+    # can't round-trip them to disk or into the RPC wire shape, and `__eq__`
+    # still compares only real settings. Every instance gets a safe default
+    # here so callers can read them without `getattr(..., None)` dances.
+    load_warnings = ()          # user-facing snap-back/failure notes
+    load_failed = False         # True iff the file existed but couldn't be read
+    load_failed_path = None     # which file failed (guards `save`)
+    load_failed_reason = None   # the underlying error string, for `detail`
+
     @classmethod
     def load(cls, path: Path | None = None) -> VibechekConfig:
         """Load config from disk, falling back to defaults on any error.
@@ -292,17 +318,44 @@ class VibechekConfig:
         return cls()
 
     @classmethod
+    def _defaults_after_load_failure(
+        cls, target: Path, error: BaseException
+    ) -> VibechekConfig:
+        """Defaults, MARKED as standing in for a file we couldn't read.
+
+        `load()` never raises (a corrupt config mustn't break the app), but
+        "no config yet" and "config exists and is unreadable" are not the same
+        thing: the second one still has all the user's real settings on disk.
+        Marking the instance is what lets `save()` refuse to erase them and
+        lets `get_config` surface a warning instead of rendering factory
+        defaults as if the user had chosen them.
+        """
+        log.warning("Could not load config from %s: %s — using defaults", target, error)
+        cfg = cls()
+        cfg.load_failed = True
+        cfg.load_failed_path = target
+        cfg.load_failed_reason = f"{type(error).__name__}: {error}"
+        cfg.load_warnings = [
+            f"{target.name} couldn't be read ({error}) — showing defaults. "
+            "Your saved settings are still on disk and won't be overwritten."
+        ]
+        return cfg
+
+    @classmethod
     def _load_json(cls, target: Path) -> VibechekConfig:
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            log.warning("Could not load config from %s: %s — using defaults", target, e)
+        except FileNotFoundError:
+            # "No config yet" — a first launch, or an explicit path that isn't
+            # there. Nothing on disk to protect, so this ISN'T a load failure.
+            log.debug("No config at %s — using defaults", target)
             return cls()
+        except (OSError, json.JSONDecodeError) as e:
+            return cls._defaults_after_load_failure(target, e)
         try:
             return cls._from_dict(raw)
         except Exception as e:  # noqa: BLE001
-            log.warning("Could not parse config from %s: %s — using defaults", target, e)
-            return cls()
+            return cls._defaults_after_load_failure(target, e)
 
     @classmethod
     def _load_toml(cls, target: Path) -> VibechekConfig:
@@ -319,29 +372,67 @@ class VibechekConfig:
         except ImportError:
             try:
                 import tomli as tomllib  # Python 3.10 backport
-            except ImportError:  # pragma: no cover
+            except ImportError as e:  # pragma: no cover
                 log.warning(
                     "Neither tomllib nor tomli is available; cannot read legacy %s. "
                     "Install tomli: pip install tomli", target,
                 )
-                return cls()
+                # Same hazard as an unreadable JSON file: the settings are
+                # there, we just can't see them — don't let a save flatten them.
+                return cls._defaults_after_load_failure(target, e)
         try:
             raw = tomllib.loads(target.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as e:
-            log.warning("Could not load legacy TOML config from %s: %s — using defaults", target, e)
+        except FileNotFoundError:
+            log.debug("No legacy config at %s — using defaults", target)
             return cls()
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            return cls._defaults_after_load_failure(target, e)
         try:
             return cls._from_dict(raw)
         except Exception as e:  # noqa: BLE001
-            log.warning("Could not parse legacy TOML config from %s: %s — using defaults", target, e)
-            return cls()
+            return cls._defaults_after_load_failure(target, e)
 
-    def save(self, path: Path | None = None) -> Path:
+    def save(self, path: Path | None = None, *, force: bool = False) -> Path:
         """Write the current config to disk as JSON.
 
         Returns the final destination path. Creates parent dirs as needed.
+
+        REFUSES to overwrite the file this instance failed to load. `load()`
+        answers an unreadable config.json with pristine defaults, so any
+        load→save caller (a profile apply, the GUI's debounced autosave) would
+        otherwise write factory defaults over settings that are still perfectly
+        good on disk — silent, total, unrecoverable. `force=True` is the "yes,
+        take the defaults" path: it renames the unreadable file aside as
+        `<name>.corrupt-<timestamp>` first, so the original bytes survive for a
+        hand-repair.
         """
         target = path or CONFIG_FILE
+        failed_path = self.load_failed_path
+        if failed_path is not None and _same_file(target, failed_path):
+            if not force:
+                raise ConfigSaveRefused(
+                    "Your settings file couldn't be read, so Vibechek is showing "
+                    "factory defaults — saving now would erase the settings still "
+                    "on disk. Fix or move the file, then restart.",
+                    detail=(
+                        f"{target} could not be loaded ({self.load_failed_reason}). "
+                        "Restore Defaults overwrites it deliberately."
+                    ),
+                    kind="fatal",
+                    options={"can_restore_defaults": True},
+                )
+            quarantined = _quarantine_unreadable(target)
+            if quarantined is not None:
+                log.warning(
+                    "Overwriting unreadable config %s on request; original kept as %s",
+                    target, quarantined,
+                )
+            # The unreadable file is out of the way — this instance now
+            # describes what's on disk, so later saves mustn't keep refusing.
+            self.load_failed = False
+            self.load_failed_path = None
+            self.load_failed_reason = None
+            self.load_warnings = ()
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = _to_jsonable(self)
         # Atomic write: a kill-during-write of config.json used to leave an
@@ -374,6 +465,38 @@ class VibechekConfig:
 # ---------------------------------------------------------------------------
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """True if both paths name the same file, resolving links/case/`..`.
+
+    Falls back to a plain compare when the OS can't resolve (a path on a
+    disconnected drive) — a false negative there only costs us the refusal.
+    """
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
+def _quarantine_unreadable(target: Path) -> Path | None:
+    """Rename an unreadable config aside as `<name>.corrupt-<timestamp>`.
+
+    Returns the new path, or None if there was nothing to move. Deliberately
+    NOT best-effort: if the rename fails (the file is locked — exactly the AV /
+    backup case that makes a config unreadable in the first place) we must let
+    the OSError out rather than fall through and overwrite the original.
+    """
+    if not target.exists():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = target.with_name(f"{target.name}.corrupt-{stamp}")
+    n = 1
+    while dest.exists():  # two forced saves in the same second
+        dest = target.with_name(f"{target.name}.corrupt-{stamp}-{n}")
+        n += 1
+    target.replace(dest)
+    return dest
+
+
 def _subset(
     cls: type, data: dict[str, Any], warnings: list[str] | None = None
 ) -> Any:
@@ -387,7 +510,7 @@ def _subset(
     a short user-facing note (field + rejected value). Those notes ride out
     through `get_config` so Settings can tell the user their saved choice was
     silently reverted — a green-looking control that isn't actually what they
-    picked is exactly the status-dishonesty this audit targets.
+    picked is exactly the kind of status-dishonesty this guards against.
     """
     section = cls.__name__.removesuffix("Config").lower() or cls.__name__
 
@@ -471,6 +594,30 @@ def _subset(
             )
             note(key, coerced, "'prefer_tag'")
             continue
+        # use_gpu steers the whole resource budget, and every consumer matches
+        # the exact strings: `apply_gpu_preference` only knows "off"/"on" and
+        # `_finish_budget` gates on `in ("auto", "on")`. An out-of-set value
+        # ("ON" from a hand-edit) is therefore neither on NOR off — the GPU
+        # block is skipped entirely, so the run is CPU-only AND `gpu_reason`,
+        # the field whose whole job is explaining zero GPU workers, is None.
+        if key == "use_gpu" and coerced not in ("auto", "on", "off"):
+            log.warning(
+                "Config field %s.use_gpu has unknown value %r; "
+                "falling back to 'auto'", cls.__name__, coerced,
+            )
+            note(key, coerced, "'auto'")
+            continue
+        # duplicates.action picks between report/move/trash. An unknown value
+        # fails loudly downstream (`DuplicateAction(config.action)` raises), so
+        # nothing destructive can happen — but the user deserves the same note
+        # as every other snapped-back enum instead of a mid-run ValueError.
+        if key == "action" and coerced not in ("report", "move", "trash"):
+            log.warning(
+                "Config field %s.action has unknown value %r; "
+                "falling back to 'report'", cls.__name__, coerced,
+            )
+            note(key, coerced, "'report' (report-only)")
+            continue
         if key == "genre_llm_backend" and coerced not in ("ollama",):
             log.warning(
                 "Config field %s.genre_llm_backend has unknown value %r; "
@@ -479,6 +626,39 @@ def _subset(
             note(key, coerced, "'ollama'")
             continue
         kwargs[key] = coerced
+
+    # ----- Cross-field fix-ups (run AFTER every value is coerced) ----------
+    # The vocal thresholds are a BAND, not two independent knobs: below
+    # `vocal_instrumental_max` is Instrumental, at/above `vocal_full_min` is
+    # Vocal, and the gap between them is Light Vocal. An inverted or collapsed
+    # band (max >= min) is rejected outright by `apply_ml_tags`, so a config
+    # carrying one loads perfectly and then hard-fails EVERY tagging run with
+    # an error that names params the user never typed. Settings cross-clamps
+    # the sliders, but that can't help a hand-edited config.json or one copied
+    # from another box — so snap the pair back to its defaults here, loudly.
+    if {"vocal_instrumental_max", "vocal_full_min"} <= valid_fields.keys():
+        inst_default = valid_fields["vocal_instrumental_max"].default
+        full_default = valid_fields["vocal_full_min"].default
+        inst_max = kwargs.get("vocal_instrumental_max", inst_default)
+        full_min = kwargs.get("vocal_full_min", full_default)
+        if inst_max >= full_min:
+            log.warning(
+                "Config fields %s.vocal_instrumental_max (%r) and "
+                "%s.vocal_full_min (%r) leave no vocal band (max must be < min); "
+                "resetting both to %r / %r",
+                cls.__name__, inst_max, cls.__name__, full_min,
+                inst_default, full_default,
+            )
+            if warnings is not None:
+                warnings.append(
+                    f"{section}.vocal_instrumental_max ({inst_max!r}) was not below "
+                    f"{section}.vocal_full_min ({full_min!r}) — both reset to "
+                    f"{inst_default} / {full_default}"
+                )
+            # Dropping them from kwargs is what applies the dataclass defaults.
+            kwargs.pop("vocal_instrumental_max", None)
+            kwargs.pop("vocal_full_min", None)
+
     return cls(**kwargs)
 
 
@@ -507,7 +687,18 @@ def _coerce(ftype: Any, value: Any) -> Any:
     if "Path" in type_str:
         if isinstance(value, Path):
             return value
-        return Path(str(value))
+        text = str(value).strip()
+        # `Path("")` is `Path(".")` — the process CWD — so a Settings field the
+        # user CLEARED would round-trip to disk as "." and read back as a real,
+        # set folder: Organize then dead-ends on "must be an absolute path" for
+        # a value nobody typed. Blank (or whitespace) means unset.
+        if not text:
+            if "None" in type_str:  # Optional[Path] — unset is representable
+                return None
+            # A required Path (e.g. models_dir) has no "unset"; raise so
+            # `_subset` falls back to the default AND tells the user.
+            raise ValueError("blank string for a required path field")
+        return Path(text)
 
     # bool BEFORE int — `bool` is a subclass of `int` in Python, and `isinstance`
     # checks would treat True/False as ints. Match by type string.
@@ -587,6 +778,7 @@ __all__ = [
     "CONFIG_FILE",
     "LEGACY_CONFIG_FILE",
     "AnalysisConfig",
+    "ConfigSaveRefused",
     "TaggingConfig",
     "DuplicateConfig",
     "OrganizationConfig",

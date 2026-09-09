@@ -165,6 +165,38 @@ def test_choose_keeper_prefers_shorter_path_on_size_tie() -> None:
     assert keeper.path == "/a/track.mp3"
 
 
+def test_choose_keeper_ranks_folder_depth_not_character_count() -> None:
+    """REGRESSION: the rule is "prefer the canonical location over a /dupes/
+    copy" — folder DEPTH, which is also what the GUI renders ("N levels"). It
+    compared `len(path)` in characters, and on any realistic pair the two
+    disagree: a deeply-buried short name beat a top-level long one, and the UI
+    explained the win with a level count larger than the loser's."""
+    deep = FileInfo(path="/DJ/Sets/2024/Peak/A.mp3", filename="A.mp3",
+                    size_bytes=5_000_000, size_mb=5.0)
+    shallow = FileInfo(path="/Archive/Artist - Title (Extended Mix) [Label].mp3",
+                       filename="Artist - Title (Extended Mix) [Label].mp3",
+                       size_bytes=5_000_000, size_mb=5.0)
+    assert len(deep.path) < len(shallow.path)       # character count disagrees
+    keeper, dupes = choose_keeper([deep, shallow])
+    assert keeper.path == shallow.path
+    assert dupes[0].path == deep.path
+
+
+def test_unknown_duration_never_joins_a_known_length_group() -> None:
+    """REGRESSION: `duration_s` is None exactly when the mutagen probe fails —
+    the corrupt/truncated case. Attaching such a file to the first sub-group
+    voided the guard `test_mislabeled_extended_radio_split_by_duration` exists
+    to protect: a truncated `.flac` joined the full track's group and, ranking
+    lossless-first, became the KEEPER while the healthy MP3 was listed for
+    trash."""
+    from vibechek.duplicates import _split_into_versions
+
+    truncated = _fiv("Song.flac", None, 3.0)
+    full = _fiv("Song.mp3", 360, 12.0)
+    assert len(_split_into_versions([truncated, full], 0.12)) == 2
+    assert len(_split_into_versions([full, truncated], 0.12)) == 2
+
+
 # ---------- End-to-end scan ----------
 
 
@@ -180,6 +212,216 @@ def test_find_duplicates_detects_exact_md5_match(tiny_library: Path) -> None:
     assert group.method == "md5"
     filenames = {group.keep.filename, *(d.filename for d in group.duplicates)}
     assert filenames == {"track3.mp3", "track3_dup.mp3"}
+
+
+def test_find_duplicates_survives_a_file_that_vanishes_mid_scan(tmp_path: Path) -> None:
+    """REGRESSION: enumeration and hashing are minutes apart on a real library
+    (12k tracks on a syncing Drive folder). One entry disappearing in that window
+    raised FileNotFoundError straight out of find_duplicates and lost the WHOLE
+    scan — `find_audio_files` and `file_md5` already tolerate a vanished file
+    without aborting the whole scan; this should too."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    for name in ("a.mp3", "b.mp3", "c.mp3"):
+        (lib / name).write_bytes(b"identical-bytes")
+
+    def _sync_removes_c(current: int, total: int, message: str = "") -> None:
+        if message == "hash a.mp3":
+            (lib / "c.mp3").unlink()
+
+    report = find_duplicates(
+        lib,
+        DuplicateConfig(use_md5=True, use_chromaprint=False),
+        on_progress=_sync_removes_c,
+    )
+
+    assert len(report.exact_duplicates) == 1
+    group = report.exact_duplicates[0]
+    names = {group.keep.filename, *(d.filename for d in group.duplicates)}
+    assert names == {"a.mp3", "b.mp3"}      # the survivors are still reported
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as e:  # Windows without the privilege
+        pytest.skip(f"symlinks unavailable on this machine: {e}")
+
+
+def test_dedupe_ignores_a_symlink_pointing_at_a_scanned_file(tmp_path: Path) -> None:
+    """REGRESSION: `Path.is_file()` follows a symlink, so a link named `*.flac`
+    was enumerated as a track, hashed to its target's MD5 and joined the same
+    group. Every keeper field is identical for a link and its target, so the
+    winner came down to path length — and when the link won, the REAL audio was
+    the file offered for trash and the library kept a dangling link."""
+    lib = tmp_path / "lib"
+    (lib / "Deep House Classics").mkdir(parents=True)
+    (lib / "Sets").mkdir()
+    real = lib / "Deep House Classics" / "track.flac"
+    real.write_bytes(b"audio" * 200)
+    _symlink_or_skip(lib / "Sets" / "track.flac", real)
+
+    report = find_duplicates(lib, DuplicateConfig(use_md5=True, use_chromaprint=False))
+
+    assert report.exact_duplicates == []        # an alias is not a second copy
+    assert report.summary.total_files == 1
+
+
+def test_dedupe_drops_an_alias_the_scan_enumerated_without_needing_os_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Portable twin of the scan-level symlink drop — this one RUNS on Windows.
+
+    `_symlink_or_skip` skips without SeCreateSymbolicLinkPrivilege, i.e. on the
+    maintainer's own box and on the Windows CI leg, where a skip is
+    indistinguishable from a pass. Here the two files are ordinary byte-identical
+    copies (so the scan really would group them — asserted first) and only
+    `Path.is_symlink` is patched, for the one enumerated entry, to reach
+    `_drop_aliases`'s symlink branch on every platform without any OS privilege.
+    """
+    lib = tmp_path / "lib"
+    (lib / "Deep House Classics").mkdir(parents=True)
+    (lib / "Sets").mkdir()
+    real = lib / "Deep House Classics" / "track.flac"
+    real.write_bytes(b"audio" * 200)
+    alias = lib / "Sets" / "track.flac"
+    alias.write_bytes(real.read_bytes())
+
+    cfg = DuplicateConfig(use_md5=True, use_chromaprint=False)
+    # Control: as two plain copies they ARE a duplicate group, so the assertions
+    # below can only pass because the alias was dropped.
+    control = find_duplicates(lib, cfg)
+    assert len(control.exact_duplicates) == 1
+    assert control.summary.total_files == 2
+
+    unpatched_is_symlink = Path.is_symlink
+
+    def fake_is_symlink(self: Path) -> bool:
+        return True if self == alias else unpatched_is_symlink(self)
+
+    monkeypatch.setattr(Path, "is_symlink", fake_is_symlink)
+
+    report = find_duplicates(lib, cfg)
+
+    assert report.exact_duplicates == []        # an alias is not a second copy
+    assert report.summary.total_files == 1      # counted once, not twice
+
+
+def test_dedupe_counts_a_hard_link_once(tmp_path: Path) -> None:
+    """Same shape as the symlink case, and portable: two hard links are ONE file.
+    Grouping them advertised space that trashing either cannot recover."""
+    import os
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    real = lib / "track.flac"
+    real.write_bytes(b"audio" * 200)
+    try:
+        os.link(real, lib / "alias.flac")
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"hard links unavailable on this filesystem: {e}")
+
+    report = find_duplicates(lib, DuplicateConfig(use_md5=True, use_chromaprint=False))
+
+    assert report.exact_duplicates == []
+    assert report.summary.total_files == 1
+
+
+def test_dedupe_ignores_a_hard_link_even_when_it_would_win_the_keeper_vote(
+    tmp_path: Path,
+) -> None:
+    """Portable twin of the symlink regression above — this one RUNS on Windows.
+
+    Both symlink tests skip without SeCreateSymbolicLinkPrivilege, i.e. on the
+    maintainer's own box and on the Windows CI leg, where a skip is
+    indistinguishable from a pass. A hard link needs no privilege and reaches
+    the same data-loss shape by a different door: two names, one inode, so
+    trashing either recovers nothing and the "duplicate" offered for removal is
+    the very file the keeper points at.
+
+    The alias here is deliberately given the SHALLOWER, SHORTER path, so
+    `choose_keeper` would hand it the win — the assertion below pins that the
+    scan-level `_drop_aliases` (st_dev/st_ino) is what keeps the pair from ever
+    reaching the vote, not the keeper ordering.
+
+    CHARACTERIZATION, NOT A CONTRACT: the final `keeper.path == str(alias)` is
+    NOT a claim that a hard-link alias SHOULD win. It records that it currently
+    does, and why that is tolerable — `_path_is_alias` reads `Path.is_symlink`,
+    and a hard link is indistinguishable from an ordinary file by path alone, so
+    `choose_keeper` has nothing to discriminate on and st_dev/st_ino (the scan's
+    check) is the only layer that can. If a future change teaches `choose_keeper`
+    to stat for a link count, this assertion is the one to FLIP, not to defend.
+    """
+    import os
+
+    from vibechek.duplicates import choose_keeper
+
+    lib = tmp_path / "lib"
+    (lib / "Deep House Classics").mkdir(parents=True)
+    real = lib / "Deep House Classics" / "track.flac"
+    real.write_bytes(b"audio" * 200)
+    alias = lib / "t.flac"
+    try:
+        os.link(real, alias)
+    except (OSError, NotImplementedError) as e:
+        pytest.skip(f"hard links unavailable on this filesystem: {e}")
+
+    report = find_duplicates(lib, DuplicateConfig(use_md5=True, use_chromaprint=False))
+
+    assert report.exact_duplicates == []       # an alias is not a second copy
+    assert report.summary.total_files == 1     # counted once, not twice
+    assert real.exists() and alias.exists()    # nothing was offered for removal
+
+    # And the reason it matters: assembled by hand, the alias wins the vote today
+    # (see CHARACTERIZATION above — recorded, not endorsed).
+    keeper, dupes = choose_keeper([_fi(str(real)), _fi(str(alias))])
+    assert keeper.path == str(alias)
+    assert dupes[0].path == str(real)
+
+
+def test_choose_keeper_ranks_a_real_file_above_a_symlink(tmp_path: Path) -> None:
+    """Defence in depth for a caller that assembled its own group: the alias has
+    the shallower, shorter path here, so nothing but the link check saves the
+    real file."""
+    real = tmp_path / "Deep House Classics" / "track.flac"
+    real.parent.mkdir()
+    real.write_bytes(b"audio" * 200)
+    link = tmp_path / "t.flac"
+    _symlink_or_skip(link, real)
+
+    keeper, dupes = choose_keeper([_fi(str(link)), _fi(str(real))])
+    assert keeper.path == str(real)
+    assert dupes[0].path == str(link)
+
+
+def test_choose_keeper_ranks_a_real_file_above_an_alias_without_needing_os_symlinks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Portable twin of the keeper test above — this one RUNS on Windows.
+
+    The real-symlink version skips without SeCreateSymbolicLinkPrivilege, so on
+    the maintainer's box and the Windows CI leg a regression in the alias term
+    reads as a pass. Patching `_path_is_alias` (the seam `choose_keeper` consults)
+    exercises that term on every platform with no OS privilege at all.
+
+    The alias is given the shallower, shorter path AND the same size and format,
+    so every other term ties or favours it — asserted first, so the win below can
+    only come from the alias term.
+    """
+    from vibechek import duplicates as dd
+
+    real = _fi("/lib/Deep House Classics/track.flac")
+    link = _fi("/lib/t.flac")
+
+    # Control: with nothing patched (neither path is a real symlink) the alias
+    # wins on folder depth.
+    assert choose_keeper([link, real])[0].path == link.path
+
+    monkeypatch.setattr(dd, "_path_is_alias", lambda p: p == link.path)
+
+    keeper, dupes = choose_keeper([link, real])
+    assert keeper.path == real.path
+    assert dupes[0].path == link.path
 
 
 def test_find_duplicates_flags_failed_provision(tmp_path: Path, monkeypatch) -> None:
@@ -379,10 +621,13 @@ def test_chromaprint_threshold_clusters_similar_fingerprints(
     b.write_bytes(b"b-content")
     c.write_bytes(b"c-content-totally-different")
 
+    # At least `_MIN_ALIGN_OVERLAP` frames: shorter fingerprints are refused
+    # outright now (a 1-frame read scores 1.0 against every bucket-mate).
+    _pad = [0x0F0F0F0F, 0x33333333, 0x55555555, 0x77777777, 0x99999999]
     fps = {
-        str(a): [0x12345678, 0xABCDEF01, 0xDEADBEEF],
-        str(b): [0x12345678, 0xABCDEF01, 0xDEADBEEE],  # 1 bit different
-        str(c): [0x00000000, 0x11111111, 0x22222222],  # very different
+        str(a): [0x12345678, 0xABCDEF01, 0xDEADBEEF, *_pad],
+        str(b): [0x12345678, 0xABCDEF01, 0xDEADBEEE, *_pad],  # 1 bit different
+        str(c): [0x00000000, 0x11111111, 0x22222222, *_pad],  # very different
     }
 
     monkeypatch.setattr(duplicates, "ensure_fpcalc", lambda on_progress=None: "fpcalc")
@@ -404,7 +649,7 @@ def test_chromaprint_threshold_clusters_similar_fingerprints(
     all_paths = {group.keep.path, *(d.path for d in group.duplicates)}
     assert all_paths == {str(a), str(b)}
 
-    # Threshold 0.999: a + b differ in 1 bit / 96 bits → 0.9896, below 0.999.
+    # Threshold 0.999: a + b differ in 1 bit / 256 bits → 0.9961, below 0.999.
     cfg_strict = DuplicateConfig(
         use_md5=False,
         use_chromaprint=True,
@@ -482,6 +727,44 @@ def test_chromaprint_buckets_on_multiple_probes(
     assert all_paths == {str(a), str(b)}
 
 
+def test_a_one_frame_fingerprint_never_bridges_unrelated_tracks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """REGRESSION: `fingerprint_similarity` scores offset 0 WITHOUT the
+    min-overlap guard, and bucket membership is defined by `raw[0]` equality — so
+    a one-frame fingerprint (a short stinger, a truncated rip) compared exactly
+    the one frame the bucket already guarantees is equal and scored 1.0 against
+    every bucket-mate. Greedy single-link clustering then pulled unrelated full
+    tracks into one duplicate group through it."""
+    from vibechek import duplicates
+    from vibechek.config import DuplicateConfig
+
+    riser = tmp_path / "00-riser.flac"
+    a = tmp_path / "Artist A - Song One.mp3"
+    b = tmp_path / "Artist B - Other Tune.mp3"
+    for i, f in enumerate((riser, a, b)):
+        f.write_bytes(f"distinct-bytes-{i}".encode())
+
+    shared_first = 0xAAAAAAAA
+    tail_a = [(i * 0x01020304) & 0xFFFFFFFF for i in range(1, 20)]
+    tail_b = [~x & 0xFFFFFFFF for x in tail_a]      # bit-complement: nothing in common
+    fps = {
+        str(riser): [shared_first],                 # one frame — the bridge
+        str(a): [shared_first, *tail_a],
+        str(b): [shared_first, *tail_b],
+    }
+    monkeypatch.setattr(duplicates, "ensure_fpcalc", lambda on_progress=None: "fpcalc")
+    monkeypatch.setattr(
+        duplicates, "audio_fingerprint_raw",
+        lambda path, _cmd, duration=120: fps.get(str(path)),
+    )
+
+    report = duplicates.find_duplicates(
+        tmp_path, DuplicateConfig(use_md5=False, use_chromaprint=True))
+
+    assert report.audio_duplicates == []
+
+
 def test_find_duplicates_similarity_threshold_param_used(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -499,10 +782,13 @@ def test_find_duplicates_similarity_threshold_param_used(
     a.write_bytes(b"a-content")
     b.write_bytes(b"b-content")
 
-    # a + b differ in 1 bit / 96 bits → similarity ≈ 0.9896.
+    # a + b differ in 1 bit / 256 bits → similarity ≈ 0.9961. (Eight frames, not
+    # three: a fingerprint shorter than `_MIN_ALIGN_OVERLAP` is no longer
+    # clustered at all.)
+    _pad = [0x0F0F0F0F, 0x33333333, 0x55555555, 0x77777777, 0x99999999]
     fps = {
-        str(a): [0x12345678, 0xABCDEF01, 0xDEADBEEF],
-        str(b): [0x12345678, 0xABCDEF01, 0xDEADBEEE],
+        str(a): [0x12345678, 0xABCDEF01, 0xDEADBEEF, *_pad],
+        str(b): [0x12345678, 0xABCDEF01, 0xDEADBEEE, *_pad],
     }
     monkeypatch.setattr(duplicates, "ensure_fpcalc", lambda on_progress=None: "fpcalc")
     monkeypatch.setattr(
@@ -637,3 +923,193 @@ def test_handle_duplicates_trash_action(tmp_path: Path, monkeypatch: pytest.Monk
     assert jp, "trash must write a manifest journal"
     text = Path(jp).read_text(encoding="utf-8")
     assert "c.mp3" in text and "trash" in text
+
+
+# ---------- Per-file results + journal honesty ----------
+
+
+def _report_with_one_dupe(tmp_path: Path):
+    """A one-group report over two real files: keeper `a.mp3`, dupe `b.mp3`."""
+    from vibechek import duplicates as dd
+
+    keep = tmp_path / "a.mp3"
+    dupe = tmp_path / "b.mp3"
+    keep.write_bytes(b"same bytes")
+    dupe.write_bytes(b"same bytes")
+    group = dd.DuplicateGroup(
+        method="md5",
+        key="deadbeef",
+        keep=dd.FileInfo(path=str(keep), filename="a.mp3", size_bytes=10, size_mb=0.0),
+        duplicates=[
+            dd.FileInfo(path=str(dupe), filename="b.mp3", size_bytes=10, size_mb=0.0),
+        ],
+        recoverable_mb=0.0,
+    )
+    return dd.DuplicateReport(exact_duplicates=[group]), keep, dupe
+
+
+def test_handle_duplicates_move_reports_moved_pairs(tmp_path: Path) -> None:
+    """MOVE returns `moved_pairs` the way organize does: [[src, dst], ...].
+
+    Counts alone left the RPC layer unable to rewrite the saved analysis, so a
+    moved duplicate kept its pre-move path and dropped out of tagging, organize
+    and the conflict queue.
+    """
+    from vibechek import duplicates as dd
+
+    report, _keep, dupe = _report_with_one_dupe(tmp_path)
+    review = tmp_path / "review"
+    cfg = DuplicateConfig(action=DuplicateAction.MOVE.value, review_folder=review)
+
+    summary = dd.handle_duplicates(report, cfg)
+
+    assert summary["moved"] == 1
+    assert summary["deleted_paths"] == []
+    assert len(summary["moved_pairs"]) == 1
+    src, dst = summary["moved_pairs"][0]
+    # src is the caller's spelling; dst is where the file really landed.
+    assert src == str(dupe)
+    assert Path(dst).exists() and Path(dst).parent == review
+    assert not dupe.exists()
+
+
+def test_handle_duplicates_move_omits_files_that_errored(tmp_path: Path) -> None:
+    """A file that failed to move is NOT in `moved_pairs`.
+
+    It is still on disk at its old path — listing it would make the RPC layer
+    rewrite a good row into a path that holds nothing.
+    """
+    from vibechek import duplicates as dd
+
+    report, _keep, dupe = _report_with_one_dupe(tmp_path)
+    ghost = dd.FileInfo(
+        path=str(tmp_path / "gone.mp3"), filename="gone.mp3",
+        size_bytes=10, size_mb=0.0,
+    )
+    report.exact_duplicates[0].duplicates.append(ghost)
+    cfg = DuplicateConfig(
+        action=DuplicateAction.MOVE.value, review_folder=tmp_path / "review",
+    )
+
+    summary = dd.handle_duplicates(report, cfg)
+
+    assert summary["errors"] == 1
+    assert [p[0] for p in summary["moved_pairs"]] == [str(dupe)]
+
+
+def test_handle_duplicates_trash_reports_deleted_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TRASH returns `deleted_paths` — only the files really sent to the bin."""
+    from vibechek import duplicates as dd
+
+    report, _keep, dupe = _report_with_one_dupe(tmp_path)
+    ghost = dd.FileInfo(
+        path=str(tmp_path / "gone.mp3"), filename="gone.mp3",
+        size_bytes=10, size_mb=0.0,
+    )
+    report.exact_duplicates[0].duplicates.append(ghost)
+
+    import send2trash as send2trash_mod
+    monkeypatch.setattr(send2trash_mod, "send2trash", lambda p: None)
+
+    cfg = DuplicateConfig(action=DuplicateAction.TRASH.value)
+    summary = dd.handle_duplicates(report, cfg)
+
+    assert summary["deleted"] == 1
+    assert summary["errors"] == 1          # the ghost
+    assert summary["deleted_paths"] == [str(dupe)]
+    assert summary["moved_pairs"] == []
+
+
+def test_report_action_still_carries_the_per_file_keys(tmp_path: Path) -> None:
+    """The `report` action touches nothing, but the shape stays stable — the
+    consumers read these keys unconditionally."""
+    from vibechek import duplicates as dd
+
+    report, _keep, _dupe = _report_with_one_dupe(tmp_path)
+    summary = dd.handle_duplicates(report, DuplicateConfig(action="report"))
+
+    assert summary["moved_pairs"] == []
+    assert summary["deleted_paths"] == []
+
+
+def test_handle_duplicates_flags_an_incomplete_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A move the journal could not record makes `journal_incomplete` True.
+
+    Reverting such a journal reports a clean success while the unrecorded files
+    stay where the dedupe put them — the GUI must be able to warn first
+    (mirrors OrganizeStats.journal_incomplete).
+    """
+    from vibechek import duplicates as dd
+    from vibechek import journal as _journal
+
+    report, _keep, _dupe = _report_with_one_dupe(tmp_path)
+    real_start = _journal.start_journal
+
+    def _start_then_fill_the_disk(kind, root=None):
+        j = real_start(kind, root=root)
+        original_write = j._fh.write
+
+        def _write(s):
+            if '"move"' in s:
+                raise OSError(28, "No space left on device")
+            return original_write(s)
+
+        j._fh.write = _write
+        return j
+
+    monkeypatch.setattr(_journal, "start_journal", _start_then_fill_the_disk)
+    summary = dd.handle_duplicates(
+        report,
+        DuplicateConfig(
+            action=DuplicateAction.MOVE.value, review_folder=tmp_path / "review",
+        ),
+    )
+
+    assert summary["moved"] == 1           # the move itself succeeded
+    assert summary["journal_incomplete"] is True
+
+
+def test_a_healthy_dedupe_does_not_claim_an_incomplete_journal(
+    tmp_path: Path,
+) -> None:
+    from vibechek import duplicates as dd
+
+    report, _keep, _dupe = _report_with_one_dupe(tmp_path)
+    summary = dd.handle_duplicates(
+        report,
+        DuplicateConfig(
+            action=DuplicateAction.MOVE.value, review_folder=tmp_path / "review",
+        ),
+    )
+
+    assert summary["journal_path"] is not None
+    assert summary["journal_incomplete"] is False
+
+
+def test_cancel_after_the_loops_still_stops_the_scan(tmp_path: Path) -> None:
+    """A cancel that lands after the per-file loops must not yield a report.
+
+    With both phases off (or a cancel arriving between the last file and the
+    return) the scan used to hand back a completed-looking, near-duplicate-blind
+    report — indistinguishable from a clean library, and the caller would act
+    on it.
+    """
+    from vibechek import cancellation
+    from vibechek import duplicates as dd
+
+    (tmp_path / "a.mp3").write_bytes(b"x")
+
+    cancellation.begin("dedupe")
+    try:
+        cancellation.cancel()
+        with pytest.raises(cancellation.CancelledError):
+            dd.find_duplicates(
+                tmp_path,
+                DuplicateConfig(use_md5=False, use_chromaprint=False),
+            )
+    finally:
+        cancellation.end()

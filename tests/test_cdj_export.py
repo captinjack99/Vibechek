@@ -9,6 +9,7 @@ Two layers:
 
 from __future__ import annotations
 
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -108,6 +109,50 @@ def test_posix_location_parse() -> None:
     loc = "file://localhost/Users/dj/Music/track.flac"
     p = location_to_path(loc)
     assert str(p).replace("\\", "/") == "/Users/dj/Music/track.flac"
+
+
+def test_network_location_keeps_the_unc_host_on_the_write_side() -> None:
+    """REGRESSION: `pathname2url` folds a UNC host into the path, and collapsing
+    every leading slash threw it away — ``\\\\NAS\\dj`` was written as
+    ``file://localhost/NAS/dj``, i.e. ``C:\\NAS\\dj``. Exporting to a NAS produced
+    a Rekordbox collection where every converted track is a missing file, with
+    ``errors == 0`` and a green "Wrote …" line. The import side already fixes
+    this class of bug (see tag_priors._location_to_path)."""
+    from pathlib import PureWindowsPath
+
+    if sys.platform == "win32":
+        # The real end-to-end shape, guarded by platform: `path_to_location`
+        # starts with `path.resolve()`, and posixpath.realpath collapses the
+        # doubled root ("//NAS/..." -> "/NAS/..."), so on Linux/macOS this input
+        # can never reach the UNC branch. tests/test_tag_priors.py guards the
+        # identical assertion on the import side the same way.
+        loc = path_to_location(Path("//NAS/dj/cdj export/X.aiff"))
+        assert loc == "file://NAS/dj/cdj%20export/X.aiff"
+        back = PureWindowsPath(str(location_to_path(loc)))
+        assert str(back) == r"\\NAS\dj\cdj export\X.aiff"
+
+    # Platform-independent cover of the same branch: hand the function exactly
+    # what `Path.resolve()` returns on Windows for a UNC input, so the ubuntu
+    # and macOS CI legs exercise the write side instead of skipping it.
+    class _ResolvesToUnc:
+        def resolve(self) -> PureWindowsPath:
+            return PureWindowsPath(r"\\NAS\dj\cdj export\X.aiff")
+
+    loc = path_to_location(_ResolvesToUnc())  # type: ignore[arg-type]
+    assert loc == "file://NAS/dj/cdj%20export/X.aiff"
+    assert str(PureWindowsPath(str(location_to_path(loc)))) == (
+        r"\\NAS\dj\cdj export\X.aiff"
+    )
+
+
+def test_network_location_parses_from_either_host_form() -> None:
+    """Rekordbox writes ``file://localhost//NAS/...``; we now write
+    ``file://NAS/...``. Both must read back as the same UNC path."""
+    from pathlib import PureWindowsPath
+
+    for loc in ("file://localhost//NAS/music/x.flac", "file://NAS/music/x.flac"):
+        got = PureWindowsPath(str(location_to_path(loc)))
+        assert str(got) == r"\\NAS\music\x.flac", loc
 
 
 def test_path_to_location_is_file_localhost_uri(tmp_path: Path) -> None:
@@ -328,6 +373,72 @@ def test_transcode_errors_when_no_transcoder(tmp_path: Path, monkeypatch) -> Non
     assert "soundfile" in msg and "ffmpeg" in msg
 
 
+@needs_soundfile
+def test_export_never_overwrites_a_file_already_in_out_dir(tmp_path: Path) -> None:
+    """REGRESSION: the module header promises "strictly additive … no file is
+    silently overwritten", but the collision loop was seeded only from an
+    in-memory set that starts empty each run, and both writers clobber
+    unconditionally (``sf.write``; ``ffmpeg -y``). A DJ who keeps FLACs beside
+    their own hand-edited AIFFs lost the AIFF."""
+    import numpy as np
+    import soundfile as sf
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    flac = lib / "Track.flac"
+    sf.write(str(flac), np.zeros(4000, dtype="float32"), 44100, format="FLAC")
+
+    out_dir = tmp_path / "Set"
+    out_dir.mkdir()
+    precious = out_dir / "Track.aiff"
+    precious.write_bytes(b"MY PRECIOUS HAND-EDITED AIFF")
+
+    xml_path = tmp_path / "rb.xml"
+    xml_path.write_text(
+        _build_rekordbox_xml(path_to_location(flac), path_to_location(lib / "x.mp3")),
+        encoding="utf-8")
+
+    result = export_for_cdj(xml_path, out_dir)
+
+    assert result.flac_converted == 1 and result.errors == 0
+    assert precious.read_bytes() == b"MY PRECIOUS HAND-EDITED AIFF"
+    assert (out_dir / "Track_1.aiff").exists()
+    assert result.renamed == ["Track_1.aiff"]      # and the rename is reported
+
+
+@needs_soundfile
+def test_export_handles_a_collection_less_export(tmp_path: Path) -> None:
+    """`rewrite_for_cdj` documents and implements an iter() fallback for exports
+    that omit the <COLLECTION> wrapper; the discovery pass did not, so such a
+    file produced a green "Converted 0 FLAC" success over an XML still pointing
+    at the unplayable FLACs. Pick one contract — this is it."""
+    import numpy as np
+    import soundfile as sf
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    flac = lib / "a.flac"
+    sf.write(str(flac), np.zeros(4000, dtype="float32"), 44100, format="FLAC")
+
+    xml_path = tmp_path / "rb.xml"
+    xml_path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<DJ_PLAYLISTS Version="1.0.0">\n'
+        '  <PRODUCT Name="rekordbox" Version="6.7.7" Company="AlphaTheta"/>\n'
+        f'  <TRACK TrackID="1" Name="a" Kind="FLAC" TotalTime="100" '
+        f'SampleRate="44100" Location="{path_to_location(flac)}"/>\n'
+        "</DJ_PLAYLISTS>\n",
+        encoding="utf-8")
+
+    result = export_for_cdj(xml_path, tmp_path / "out")
+
+    assert result.flac_converted == 1 and result.errors == 0
+    written = ET.parse(result.output_xml).getroot()
+    track = _track_by_id(written, "1")
+    assert track.get("Kind") == AIFF_KIND
+    assert track.get("Location").endswith("a.aiff")
+
+
 def test_export_skips_missing_source(tmp_path: Path) -> None:
     """A FLAC TRACK whose file doesn't exist is counted as skipped, not crashed."""
     missing = tmp_path / "gone.flac"  # never created
@@ -416,11 +527,46 @@ def test_ffmpeg_fallback_keeps_44k_unchanged(tmp_path: Path, monkeypatch) -> Non
     assert info.frames == n
 
 
+@needs_soundfile
+def test_ffmpeg_fallback_writes_a_canonical_big_endian_aiff(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """REGRESSION: ffmpeg's aiff muxer switches to the AIFF-C variant
+    (``FORM….AIFC`` / ``sowt``) for any codec that isn't big-endian PCM, so the
+    ``pcm_s16le`` fallback emitted a structurally different container from the
+    soundfile path while the XML labels both ``Kind="AIFF File"``."""
+    import shutil
+
+    import numpy as np
+    import soundfile as sf
+
+    import vibechek.cdj_export as cdj
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not on PATH — required to exercise the fallback path")
+
+    sr = 44100
+    sine = (0.5 * np.sin(2 * np.pi * 440 * np.arange(4410) / sr)).astype("float32")
+    flac = tmp_path / "cd.flac"
+    sf.write(str(flac), sine, sr, format="FLAC")
+
+    reference = tmp_path / "ref.aiff"
+    transcode_to_aiff(flac, reference)              # the soundfile path
+    monkeypatch.setattr(cdj, "_soundfile_module", lambda: None)
+    fallback = tmp_path / "out" / "cd.aiff"
+    transcode_to_aiff(flac, fallback)               # the ffmpeg path
+
+    assert reference.read_bytes()[8:12] == b"AIFF"
+    assert fallback.read_bytes()[8:12] == b"AIFF"
+
+
 def test_ffmpeg_cmd_forces_44k_when_rate_unknown(tmp_path: Path, monkeypatch) -> None:
     """If the source rate can't be probed, ffmpeg is invoked with -ar 44100.
 
-    Forcing 44.1 kHz when the rate is unknown is always CDJ-safe (a no-op for
-    already-<=48 kHz tracks) and prevents shipping an unplayable hi-res AIFF.
+    Forcing 44.1 kHz when the rate is unknown is always CDJ-safe and prevents
+    shipping an unplayable hi-res AIFF. It is NOT a no-op for a 48 kHz source —
+    that really is a resample, which `export_for_cdj` records in
+    `result.resampled` from the TRACK's declared rate.
     Exercises the command construction without needing a real audio file.
     """
     import vibechek.cdj_export as cdj
@@ -437,6 +583,9 @@ def test_ffmpeg_cmd_forces_44k_when_rate_unknown(tmp_path: Path, monkeypatch) ->
 
     # Rate cannot be determined -> the fix must still add -ar 44100.
     monkeypatch.setattr(cdj, "_probe_samplerate", lambda src: None)
+    # Pin the resolved binary so this stays a pure command-construction test on
+    # a machine without ffmpeg installed.
+    monkeypatch.setattr(cdj, "_ffmpeg_path", lambda: "/usr/bin/ffmpeg")
     monkeypatch.setattr(cdj.subprocess, "run", _fake_run)
 
     cdj._transcode_ffmpeg(tmp_path / "x.flac", tmp_path / "x.aiff")
@@ -561,6 +710,52 @@ def test_export_records_resampled_hires_track(tmp_path: Path) -> None:
 
 
 @needs_soundfile
+def test_export_records_a_downsample_it_could_not_probe(tmp_path: Path, monkeypatch) -> None:
+    """REGRESSION: `_transcode_ffmpeg` forces ``-ar 44100`` when the source rate
+    can't be probed — a REAL resample for a 48 kHz source. The recording site
+    then re-called the same deterministic `_probe_samplerate` and required
+    >48 kHz, so it was structurally guaranteed to miss exactly the tracks the
+    forced ``-ar`` was applied to. The TRACK's declared rate is the probe-free
+    signal that closes the gap."""
+    import shutil
+
+    import numpy as np
+    import soundfile as sf
+
+    import vibechek.cdj_export as cdj
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not on PATH — required to exercise the fallback path")
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    flac = lib / "master.flac"
+    sf.write(str(flac), np.zeros(12000, dtype="float32"), 48000, format="FLAC")
+
+    xml_path = tmp_path / "rb.xml"
+    xml_path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<DJ_PLAYLISTS Version="1.0.0">\n'
+        '  <COLLECTION Entries="1">\n'
+        f'    <TRACK TrackID="1" Name="master" Kind="FLAC" TotalTime="1" '
+        f'SampleRate="48000" BitRate="1536" Location="{path_to_location(flac)}"/>\n'
+        "  </COLLECTION>\n</DJ_PLAYLISTS>\n",
+        encoding="utf-8")
+
+    # A soundfile-less install whose FLAC header neither ffprobe nor mutagen
+    # can read: the transcode still happens, at a forced 44.1 kHz.
+    monkeypatch.setattr(cdj, "_soundfile_module", lambda: None)
+    monkeypatch.setattr(cdj, "_probe_samplerate", lambda src: None)
+
+    result = export_for_cdj(xml_path, tmp_path / "out")
+
+    assert result.flac_converted == 1 and result.errors == 0
+    aiff = next((tmp_path / "out").glob("*.aiff"))
+    assert sf.info(str(aiff)).samplerate == 44100      # really was resampled
+    assert result.resampled == [str(flac)]             # ... and it is reported
+
+
+@needs_soundfile
 def test_export_does_not_flag_44k_track_as_resampled(tmp_path: Path) -> None:
     """A normal 44.1 kHz FLAC must NOT appear in result.resampled."""
     import numpy as np
@@ -578,3 +773,104 @@ def test_export_does_not_flag_44k_track_as_resampled(tmp_path: Path) -> None:
     result = export_for_cdj(xml_path, tmp_path / "export")
     assert result.flac_converted == 1
     assert result.resampled == []
+
+
+# ---------------------------------------------------------------------------
+# Executable resolution (cwd-hijack)
+# ---------------------------------------------------------------------------
+
+
+def test_ffmpeg_is_resolved_cwd_free_and_absolute(tmp_path: Path, monkeypatch) -> None:
+    """An `ffmpeg` sitting in the CURRENT directory must never be run.
+
+    An export runs against a folder of music the user just unpacked; a bare
+    `shutil.which("ffmpeg")` searches that folder first on Windows, so a
+    planted binary would be executed once per transcoded track. `_ffmpeg_path`
+    goes through `utils.find_executable`, which discards a cwd hit.
+    """
+    import vibechek.cdj_export as cdj
+    import vibechek.utils as utils
+
+    planted = tmp_path / "ffmpeg.exe"
+    planted.write_text("not really ffmpeg", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # Stand in for the Windows-only cwd entry `shutil.which` prepends, so the
+    # rejection is exercised on every platform the suite runs on.
+    monkeypatch.setattr(utils.shutil, "which", lambda name: str(planted))
+
+    assert cdj._ffmpeg_path() is None
+    assert cdj._have_ffmpeg() is False
+
+    # A hit anywhere else is still honoured, and comes back absolute.
+    elsewhere = tmp_path / "bin"
+    elsewhere.mkdir()
+    real = elsewhere / "ffmpeg.exe"
+    real.write_text("not really ffmpeg either", encoding="utf-8")
+    monkeypatch.setattr(utils.shutil, "which", lambda name: str(real))
+    resolved = cdj._ffmpeg_path()
+    assert resolved is not None and Path(resolved).is_absolute()
+
+
+def test_transcode_ffmpeg_uses_the_resolved_absolute_binary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The subprocess gets the ABSOLUTE resolved path, not the bare name.
+
+    A relative program name re-resolves against whatever directory the child
+    process starts in, which is the same hijack by another route.
+    """
+    import vibechek.cdj_export as cdj
+
+    captured: dict[str, list[str]] = {}
+
+    class _FakeProc:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(cdj, "_probe_samplerate", lambda src: 44100)
+    monkeypatch.setattr(cdj, "_ffmpeg_path", lambda: "/opt/bin/ffmpeg")
+    monkeypatch.setattr(
+        cdj.subprocess, "run", lambda cmd, *a, **k: (captured.__setitem__("cmd", cmd), _FakeProc())[1]
+    )
+
+    cdj._transcode_ffmpeg(tmp_path / "x.flac", tmp_path / "x.aiff")
+
+    assert captured["cmd"][0] == "/opt/bin/ffmpeg"
+
+
+def test_transcode_ffmpeg_fails_loud_when_ffmpeg_is_gone(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No resolvable ffmpeg -> a clear error, never a bare-name subprocess."""
+    import vibechek.cdj_export as cdj
+
+    monkeypatch.setattr(cdj, "_ffmpeg_path", lambda: None)
+
+    def _boom(*a, **k):  # pragma: no cover -- must not be reached
+        raise AssertionError("subprocess must not run without a resolved ffmpeg")
+
+    monkeypatch.setattr(cdj.subprocess, "run", _boom)
+
+    with pytest.raises(CdjExportError, match="ffmpeg"):
+        cdj._transcode_ffmpeg(tmp_path / "x.flac", tmp_path / "x.aiff")
+
+
+def test_probe_samplerate_skips_ffprobe_when_unresolvable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Same cwd-discarding resolution for ffprobe; absent, fall through quietly.
+
+    Falling through to the mutagen header read (rather than shelling out to a
+    bare `ffprobe`) is the whole point — the fallback still answers.
+    """
+    import vibechek.cdj_export as cdj
+
+    monkeypatch.setattr(cdj, "find_executable", lambda name: None)
+
+    def _boom(*a, **k):  # pragma: no cover -- must not be reached
+        raise AssertionError("ffprobe must not run when it cannot be resolved")
+
+    monkeypatch.setattr(cdj.subprocess, "run", _boom)
+
+    # No real FLAC either, so mutagen also declines: None, not a crash.
+    assert cdj._probe_samplerate(tmp_path / "missing.flac") is None

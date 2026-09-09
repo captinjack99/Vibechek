@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from vibechek.config import (
+    ConfigSaveRefused,
     DuplicateConfig,
     OrganizationConfig,
     VibechekConfig,
@@ -82,6 +83,9 @@ def test_load_corrupt_json_returns_defaults(tmp_path: Path) -> None:
     target.write_text("{ not valid json", encoding="utf-8")
     loaded = VibechekConfig.load(target)
     assert loaded == VibechekConfig()
+    # ...but it knows those defaults are a stand-in, so `save` won't clobber
+    # the file (see the "unreadable config" block at the bottom of this module).
+    assert loaded.load_failed is True
 
 
 def test_legacy_toml_fallback_when_no_json(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -162,3 +166,149 @@ def test_module_exports_legacy_path() -> None:
     # show that, but the conftest's autouse fixture has already swapped it.
     # Asserting the legacy default at least catches accidental renames.
     assert str(config_mod.LEGACY_CONFIG_FILE).endswith(".toml")
+
+
+# ---------------------------------------------------------------------------
+# An UNREADABLE config must never be overwritten by the defaults it loaded as.
+# `load()` still can't raise — the marking is what makes the
+# difference between "no config yet" and "config we couldn't read".
+# ---------------------------------------------------------------------------
+
+
+def _real_settings() -> dict:
+    """A config carrying settings a user would hate to lose silently."""
+    return {
+        "analysis": {"inference_engine": "onnx", "workers": 8, "use_gpu": "on"},
+        "duplicates": {"review_folder": "D:/DJ/_dupes"},
+        "organization": {"target_root": "D:/DJ/Sorted", "min_genre_size": 25},
+    }
+
+
+def test_corrupt_json_marks_load_failed_and_warns(tmp_path: Path) -> None:
+    target = tmp_path / "config.json"
+    target.write_text(json.dumps(_real_settings()) + "\n{TYPO", encoding="utf-8")
+
+    loaded = VibechekConfig.load(target)
+
+    assert loaded.load_failed is True
+    assert loaded.load_failed_path == target
+    # The note is what `get_config` ships to the GUI as `config_warnings`.
+    assert loaded.load_warnings
+    assert any("config.json" in w for w in loaded.load_warnings)
+
+
+def test_missing_file_is_not_marked_as_a_load_failure(tmp_path: Path) -> None:
+    """"No config yet" is normal — it must stay saveable."""
+    loaded = VibechekConfig.load(tmp_path / "nope.json")
+    assert loaded.load_failed is False
+    assert not loaded.load_warnings
+    assert loaded.save(tmp_path / "nope.json").exists()
+
+
+def test_save_refuses_to_overwrite_the_file_it_could_not_read(tmp_path: Path) -> None:
+    """The whole point: a load→save round trip mustn't erase live settings."""
+    target = tmp_path / "config.json"
+    original = json.dumps(_real_settings()) + "\n{TYPO"
+    target.write_text(original, encoding="utf-8")
+
+    loaded = VibechekConfig.load(target)
+    with pytest.raises(ConfigSaveRefused):
+        loaded.save(target)
+
+    assert target.read_text(encoding="utf-8") == original
+
+
+def test_save_to_a_different_path_is_allowed_after_a_load_failure(tmp_path: Path) -> None:
+    """Only the unreadable file is protected — exporting elsewhere is fine."""
+    target = tmp_path / "config.json"
+    target.write_text("{ not valid json", encoding="utf-8")
+    loaded = VibechekConfig.load(target)
+
+    other = tmp_path / "elsewhere.json"
+    assert loaded.save(other) == other
+    assert other.exists()
+
+
+def test_forced_save_quarantines_the_unreadable_file(tmp_path: Path) -> None:
+    """`force=True` is "take the defaults" — the original bytes still survive."""
+    target = tmp_path / "config.json"
+    original = json.dumps(_real_settings()) + "\n{TYPO"
+    target.write_text(original, encoding="utf-8")
+
+    loaded = VibechekConfig.load(target)
+    loaded.save(target, force=True)
+
+    quarantined = list(tmp_path.glob("config.json.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == original
+    # And the new file is valid JSON holding the defaults we were given.
+    assert json.loads(target.read_text(encoding="utf-8"))["analysis"]["workers"] == 0
+    # The mark is cleared, so a later save doesn't keep refusing.
+    assert loaded.load_failed is False
+    loaded.save(target)
+
+
+def test_unreadable_config_marks_load_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The AV/backup-lock case (OSError), not just a hand-edit typo."""
+    target = tmp_path / "config.json"
+    target.write_text(json.dumps(_real_settings()), encoding="utf-8")
+
+    def boom(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    loaded = VibechekConfig.load(target)
+    monkeypatch.undo()
+
+    assert loaded.load_failed is True
+    with pytest.raises(ConfigSaveRefused):
+        loaded.save(target)
+
+
+def test_get_config_rpc_surfaces_a_load_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The GUI's only signal that it's showing defaults, not the user's config."""
+    from vibechek import config as cfg_module
+    from vibechek.rpc import _get_config
+
+    cfg_module.CONFIG_FILE.write_text("{ not valid json", encoding="utf-8")
+    payload = _get_config({})
+    assert payload.get("config_warnings")
+
+
+def test_hand_edited_inverted_vocal_band_loads_snapped_with_a_warning(
+    tmp_path: Path,
+) -> None:
+    """End to end: the file loads (never raises), the band is usable, and the
+    user is TOLD — otherwise their next tagging run dies on params they never
+    typed, with a working-looking Settings page."""
+    from vibechek.config import TaggingConfig
+
+    target = tmp_path / "config.json"
+    target.write_text(
+        json.dumps({"tagging": {"vocal_instrumental_max": 0.95, "vocal_full_min": 0.4}}),
+        encoding="utf-8",
+    )
+
+    cfg = VibechekConfig.load(target)
+    assert cfg.load_failed is False
+    assert cfg.tagging.vocal_instrumental_max < cfg.tagging.vocal_full_min
+    assert cfg.tagging.vocal_instrumental_max == TaggingConfig().vocal_instrumental_max
+    assert any("vocal_full_min" in w for w in cfg.load_warnings)
+
+
+def test_inverted_vocal_band_reaches_the_gui_as_a_config_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`get_config` is the GUI's only channel for a silent snap-back."""
+    from vibechek import config as cfg_module
+    from vibechek.rpc import _get_config
+
+    cfg_module.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cfg_module.CONFIG_FILE.write_text(
+        json.dumps({"tagging": {"vocal_instrumental_max": 0.9, "vocal_full_min": 0.5}}),
+        encoding="utf-8",
+    )
+    payload = _get_config({})
+    assert any("vocal" in w for w in payload.get("config_warnings", []))

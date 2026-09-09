@@ -10,15 +10,18 @@ actionable next steps rather than a stack trace.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import platform
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
+from vibechek import native_install
 from vibechek.analyzer import _ONNX_HEAD_STEMS, _ONNX_SUBDIR, MODELS
 from vibechek.config import MODELS_DIR, engine_venv_subdir
-from vibechek.native_install import NativeVenvStatus, probe_native_venv
+from vibechek.model_download import BACKBONE_ONNX_SHA256
+from vibechek.native_install import NativeVenvStatus
 from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
 from vibechek.wsl import WSLStatus, detect_wsl
 
@@ -77,6 +80,10 @@ class PreflightResult:
     # "native"; this flag keeps it from hijacking essentia_tf/onnx routing into a
     # broken in-process path (those still fall through to WSL / the managed venv).
     essentia_usable: bool = False
+    # Whether `import onnxruntime` works in the sidecar's own Python. Only
+    # probed for the engines that run inference through it (onnx/native);
+    # None on essentia_tf, which doesn't use it at all.
+    onnxruntime_installed: bool | None = None
 
     @property
     def reasons_not_ready(self) -> list[str]:
@@ -91,10 +98,23 @@ class PreflightResult:
             )
         )
         if not have_engine:
-            # Plain, user-facing reason (voice-guide): the install MECHANISM
+            # Plain, user-facing reason: the install MECHANISM
             # (native / WSL / managed venv) is a diagnostic detail, not the
             # headline a user reads on the setup screen.
             out.append("The analysis engine isn't set up yet.")
+            # Name the ONE missing piece when essentia is already here and only
+            # the ONNX runtime is absent — otherwise the generic line above
+            # sends the user off to install essentia, which they already have.
+            if (
+                self.engine in ("onnx", "native")
+                and self.onnxruntime_installed is False
+                and self.essentia.installed
+            ):
+                out.append(
+                    f"The {self.engine} engine also needs ONNX Runtime — install it "
+                    "with `pip install onnxruntime`, or pick a different engine "
+                    "in Settings."
+                )
         if self.models.missing:
             out.append(f"{len(self.models.missing)} ML model file(s) missing")
         # NOTE: WSL version drift is deliberately NOT a "not ready" reason. The
@@ -138,6 +158,31 @@ def _essentia_has_tf_algos() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def _onnxruntime_importable() -> bool:
+    """True iff `import onnxruntime` works in the sidecar's own Python.
+
+    onnxruntime is an OPTIONAL extra (`vibechek[onnx]`), but the onnx and
+    native engines run every inference through it — the import happens lazily
+    at model-load time (onnx_backend.load_onnx_models), long after preflight
+    said READY. A `pip install vibechek[ml]` box (essentia-tensorflow, no
+    onnxruntime) switched to the onnx engine used to preflight green and then
+    die per-worker; with >1 worker that surfaces as the 5-minute "pool is
+    wedged" stall this module exists to prevent. The managed-venv and WSL
+    branches already gate on `import essentia, onnxruntime`
+    (native_install._native_stack_imports); this is the in-process equivalent.
+
+    Cached like `_essentia_has_tf_algos`: importability can't change within a
+    process, and the import itself is slow.
+    """
+    try:
+        import onnxruntime  # noqa: F401, PLC0415
+        return True
+    except Exception:  # noqa: BLE001
+        # A broken install can raise something other than ImportError.
+        return False
+
+
 def essentia_serves_engine(engine: str, installed: bool) -> bool:
     """Can the in-process (sidecar-Python) essentia actually run ``engine``?
 
@@ -149,8 +194,13 @@ def essentia_serves_engine(engine: str, installed: bool) -> bool:
     without that wheel hijacking the default essentia_tf/onnx routing: with the
     wheel present, essentia_tf/onnx see ``essentia_serves_engine() is False``
     and still fall through to WSL, while ``native`` runs in-process.
+
+    Both ONNX-stack engines additionally need onnxruntime importable HERE —
+    essentia does the DSP, but onnxruntime does the actual inference.
     """
     if not installed:
+        return False
+    if engine in ("onnx", "native") and not _onnxruntime_importable():
         return False
     if engine == "native":
         return True
@@ -159,13 +209,21 @@ def essentia_serves_engine(engine: str, installed: bool) -> bool:
 
 def _model_files_for_engine(
     engine: str, target: Path
-) -> list[tuple[str, Path, Path | None, bool]]:
-    """(name, weights_path, metadata_path|None, required) per model for an engine.
+) -> list[tuple[str, Path, Path | None, bool, str | None]]:
+    """(name, weights_path, metadata_path|None, required, pinned_sha256|None).
 
     essentia_tf → the `.pb` weights + `.json` metadata for every model in MODELS.
     onnx → the EffNet backbone `.onnx` + each converted head `.onnx`/`.json`. The
     genre head is OPTIONAL (the backbone emits genre directly), so a missing one
     doesn't block readiness — matching onnx_backend's loader.
+
+    The last element is a content pin `check_models` verifies (see there). Only
+    the ONNX backbone carries one today: it is the ONE file the whole ONNX stack
+    loads first and it is ~18 MB, so hashing it on this (GUI-polled) path is
+    cheap. The `.pb` set and the converted heads are pinned too, but their
+    digests are enforced at DOWNLOAD time (model_download) and on demand by
+    `verify_models` / `vibechek verify-models`; wiring them in here would be a
+    behaviour change beyond the backbone gap this closes.
     """
     if engine in ("onnx", "native"):
         # ONNX models live in their own subdir (see analyzer._ONNX_SUBDIR) so
@@ -173,12 +231,18 @@ def _model_files_for_engine(
         # "native" uses the same ONNX model set (it just runs the DSP in-process
         # via a native essentia wheel + the NumPy mel frontend).
         onnx_target = target / _ONNX_SUBDIR
-        items: list[tuple[str, Path, Path | None, bool]] = [
-            ("effnet (onnx backbone)", onnx_target / BACKBONE_ONNX_FILENAME, None, True),
+        items: list[tuple[str, Path, Path | None, bool, str | None]] = [
+            # The backbone's pin lives in model_download (it is FETCHED from
+            # upstream, not converted by scripts/convert_heads_to_onnx.py) —
+            # the same constant rpc._verify_models and cli's verify-models
+            # check it against, so all three agree on what a good copy is.
+            ("effnet (onnx backbone)", onnx_target / BACKBONE_ONNX_FILENAME, None,
+             True, BACKBONE_ONNX_SHA256),
             # Genre comes from the backbone, so the genre_discogs400.onnx HEAD is
             # optional — but its 400 class LABELS (genre_discogs400.json) are
             # REQUIRED, else the engine loads "ready" yet emits no genre.
-            ("genre_discogs400 classes", onnx_target / "genre_discogs400.json", None, True),
+            ("genre_discogs400 classes", onnx_target / "genre_discogs400.json", None,
+             True, None),
         ]
         for stem in _ONNX_HEAD_STEMS:
             if stem == "genre_discogs400":
@@ -186,22 +250,56 @@ def _model_files_for_engine(
             # Non-genre head .onnx are required; their tiny class-label .json is
             # best-effort (not coupled here, so a missing label file doesn't
             # block readiness).
-            items.append((stem, onnx_target / f"{stem}.onnx", None, True))
+            items.append((stem, onnx_target / f"{stem}.onnx", None, True, None))
         return items
     return [
-        (name, target / f"{name}.pb", target / f"{name}.json", True)
+        (name, target / f"{name}.pb", target / f"{name}.json", True, None)
         for name in MODELS
     ]
 
 
+def _sha256_file(path: Path) -> str:
+    """Stream a file's SHA256 in 1 MiB chunks (the backbone is ~18 MB)."""
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def check_models(models_dir: Path | None = None, engine: str = "essentia_tf") -> ModelsCheck:
-    """Verify every required ML model file for `engine` is present + non-trivial."""
+    """Verify every required ML model file for `engine` is present + non-trivial.
+
+    A file that carries a content pin (see `_model_files_for_engine`) must also
+    MATCH it. A corrupt-but-present backbone used to preflight green and then
+    blow up inside the worker pool at model-load time — the one failure mode
+    this module exists to catch before multiprocessing hides it. There is no
+    "corrupt" state on ModelCheck, and none is needed: a mismatched file is
+    reported exactly like a missing one, and the remedy is the same button
+    (download-models re-fetches anything that fails its pin).
+    """
     target = Path(models_dir or MODELS_DIR)
     result = ModelsCheck(models_dir=str(target))
 
-    for name, weights, metadata, required in _model_files_for_engine(engine, target):
+    for name, weights, metadata, required, pinned in _model_files_for_engine(engine, target):
         # A 0-byte / truncated weights file is broken; treat as missing.
         weights_ok = weights.exists() and weights.stat().st_size > 1024
+        if weights_ok and pinned is not None:
+            try:
+                digest = _sha256_file(weights)
+            except OSError as e:
+                # Unreadable is unusable — don't report "ready" for a file the
+                # worker pool won't be able to open either.
+                log.warning("Could not read %s to verify it: %s", weights, e)
+                weights_ok = False
+            else:
+                if digest.lower() != pinned.lower():
+                    log.warning(
+                        "%s failed its pinned SHA256 (expected %s, got %s) — "
+                        "treating it as missing; re-download the models",
+                        weights, pinned, digest,
+                    )
+                    weights_ok = False
         metadata_ok = metadata is None or (metadata.exists() and metadata.stat().st_size > 0)
         size_mb = weights.stat().st_size / (1024 * 1024) if weights.exists() else 0.0
         present = weights_ok and metadata_ok
@@ -255,8 +353,15 @@ def preflight(
     essentia = check_essentia()
     models = check_models(models_dir, engine=engine)
     wsl_status = detect_wsl(quick=quick_wsl, venv_subdir=venv_subdir)
-    native_venv = probe_native_venv(engine)
+    # Looked up through the module at call time, not bound at import: a test
+    # that monkeypatches `native_install.probe_native_venv` while this module
+    # is first imported would otherwise freeze the stub into this name for the
+    # rest of the session (and take down unrelated later tests).
+    native_venv = native_install.probe_native_venv(engine)
 
+    onnxruntime_here = (
+        _onnxruntime_importable() if engine in ("onnx", "native") else None
+    )
     have_native = essentia_serves_engine(engine, essentia.installed)
     have_wsl = wsl_status.can_run_vibechek
     have_native_venv = native_venv.essentia_installed and native_venv.vibechek_installed
@@ -289,6 +394,7 @@ def preflight(
         analyze_via=analyze_via,
         engine=engine,
         essentia_usable=have_native,
+        onnxruntime_installed=onnxruntime_here,
     )
 
 
@@ -352,6 +458,12 @@ def summary_lines(r: PreflightResult) -> list[str]:
             lines.append("  Run Vibechek inside WSL Ubuntu, or skip `analyze` (other commands still work).")
         else:
             lines.append("  Install with: pip install essentia-tensorflow")
+
+    if r.onnxruntime_installed is False:
+        lines.append("")
+        lines.append("ONNX Runtime:")
+        lines.append("  NOT INSTALLED (the onnx/native engines run inference through it)")
+        lines.append("  Install with: pip install onnxruntime")
 
     lines.append("")
     lines.append(f"Models ({r.models.models_dir}):")

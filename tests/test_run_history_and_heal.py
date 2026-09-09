@@ -1,5 +1,5 @@
-"""WP9: the durable analyze-run log (`run_history.jsonl`) and the WSL engine
-self-heal notices threaded onto the analyze report.
+"""Tests for the durable analyze-run log (`run_history.jsonl`) and the WSL
+engine self-heal notices threaded onto the analyze report.
 
 Both exist so a degradation the user would otherwise never see — a GPU that
 silently fell back to CPU after an auto-repair, or "what did my last run
@@ -53,7 +53,7 @@ def test_last_run_summary_none_when_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# rpc analyze handler writes a summary on success (WP9 #20)
+# rpc analyze handler writes a summary on success
 # ---------------------------------------------------------------------------
 
 
@@ -103,7 +103,7 @@ def test_record_run_history_falls_back_without_run_meta() -> None:
 
 
 # ---------------------------------------------------------------------------
-# incremental rebuild preserves the out-of-band fields (WP9 support)
+# incremental rebuild preserves the out-of-band fields
 # ---------------------------------------------------------------------------
 
 

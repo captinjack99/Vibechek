@@ -146,7 +146,7 @@ PATCH_HOP = 64  # frame stride between patches (tighter than 128; both pass)
 MEL_FRAME_SIZE = 512
 MEL_HOP_SIZE = 256
 
-# The heads ALWAYS run on CPU. The audit found the tiny dense heads are
+# The heads ALWAYS run on CPU. Measurement showed the tiny dense heads are
 # GPU-neutral-to-negative (kernel-launch + host↔device transfer overhead
 # dominates); only the backbone is worth a GPU EP. See docs/ONNX_MIGRATION.md §9.
 _HEAD_PROVIDERS = ["CPUExecutionProvider"]

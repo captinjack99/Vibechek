@@ -40,7 +40,14 @@ param(
     [string]$Python = "python",
     [string]$WorkDir = (Join-Path $env:TEMP "vibechek-native-build"),
     [string]$OutDir = (Join-Path $PSScriptRoot "..\packaging\wheels"),
-    [string]$ForkRef = "cmake"
+    # Pinned commit SHA, not the `cmake` branch head. This clone's C++ sources
+    # AND its packaging\build-dependencies-msvc.bat are compiled and folded into
+    # the shipped sidecar, so a force-push (or a malicious merge) on the fork's
+    # branch would put arbitrary native code inside every Windows installer.
+    # Every `uses:` in this repo's workflows is SHA-pinned for the same reason.
+    # SHA = tip of wo80/essentia@cmake as of 2026-09-06; bump deliberately and
+    # re-run the gold-corpus gate when you do.
+    [string]$ForkRef = "c4db58ed928406982688c554344f34876dfef9cc"
 )
 $ErrorActionPreference = "Stop"
 
@@ -55,12 +62,33 @@ Write-Host "==> Target Python: $Python"
 & $Python -m pip install -q --upgrade pip wheel setuptools "numpy<2" delvewheel
 
 if (-not (Test-Path $fork)) {
-    Write-Host "==> Cloning wo80/essentia ($ForkRef)"
-    git clone --depth 1 -b $ForkRef https://github.com/wo80/essentia.git $fork
-    # $ErrorActionPreference='Stop' does NOT apply to native commands — an
-    # unchecked failed clone left an empty/partial dir that every later step
-    # tripped over with misleading errors.
-    if ($LASTEXITCODE -ne 0) { throw "git clone of wo80/essentia ($ForkRef) failed (exit $LASTEXITCODE)" }
+    Write-Host "==> Fetching wo80/essentia ($ForkRef)"
+    # `git clone --depth 1 -b <sha>` is not valid — a SHA isn't a ref — so fetch
+    # the pinned commit explicitly. $ErrorActionPreference='Stop' does NOT apply
+    # to native commands: an unchecked failure left an empty/partial dir that
+    # every later step tripped over with misleading errors.
+    git init -q $fork
+    if ($LASTEXITCODE -ne 0) { throw "git init of $fork failed (exit $LASTEXITCODE)" }
+    git -C $fork remote add origin https://github.com/wo80/essentia.git
+    if ($LASTEXITCODE -ne 0) { throw "git remote add failed (exit $LASTEXITCODE)" }
+    git -C $fork fetch --depth 1 origin $ForkRef
+    if ($LASTEXITCODE -ne 0) { throw "git fetch of wo80/essentia ($ForkRef) failed (exit $LASTEXITCODE)" }
+    git -C $fork checkout -q FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git checkout of $ForkRef failed (exit $LASTEXITCODE)" }
+}
+
+# Provenance gate: refuse to compile a tree that isn't the commit we pinned.
+# Skipped only when the caller deliberately overrode $ForkRef with a branch
+# name (a local experiment) — a 40-hex $ForkRef is always enforced.
+if ($ForkRef -match '^[0-9a-f]{40}$') {
+    $head = (git -C $fork rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed in $fork (exit $LASTEXITCODE)" }
+    if ($head -ne $ForkRef) {
+        throw "wo80/essentia checkout is $head, expected the pinned $ForkRef — refusing to build. Delete $fork and re-run."
+    }
+    Write-Host "==> Verified wo80/essentia at pinned commit $head"
+} else {
+    Write-Warning "ForkRef '$ForkRef' is not a commit SHA — the built wheel is UNPINNED third-party native code. Do not ship it."
 }
 
 Write-Host "==> Building C/C++ dependencies (Release)"

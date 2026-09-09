@@ -130,9 +130,8 @@ def test_route_new_tracks_uniquifies_colliding_basenames(
     """A different staging track with a colliding basename is imported under a
     uniquified name, not silently dropped.
 
-    Regression for the audit's LOW finding: skip-on-exists discarded a
-    legitimately-different same-named track (it only showed in skipped_exists,
-    never in the library).
+    Regression: skip-on-exists discarded a legitimately-different same-named
+    track (it only showed in skipped_exists, never in the library).
     """
     from vibechek import organizer
 
@@ -499,6 +498,82 @@ def test_target_root_still_beats_library_root(tmp_path: Path) -> None:
     assert plan.base_dir == elsewhere
 
 
+def test_blank_library_root_falls_through_to_inference(tmp_path: Path) -> None:
+    """A blank `library_root` must not become `Path("")` — i.e. the CWD.
+
+    The sidecar already blanks an empty `library_path`, but the old
+    `library_root is not None` test here meant any caller passing "" rooted the
+    whole genre tree at "." — wherever the process happened to be started.
+    """
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    plan = plan_organization(_retag_analysis(lib), config, library_root="")
+
+    assert plan.base_dir == lib
+    assert [m.source.name for m in plan.moves] == ["a.mp3"]
+
+
+# ---------------------------------------------------------------------------
+# base_dir must be absolute — belt-and-braces behind the sidecar's own strip
+# ---------------------------------------------------------------------------
+
+
+def test_relative_base_dir_is_refused(tmp_path: Path) -> None:
+    """A relative base_dir would scatter the library under the CWD."""
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    with pytest.raises(ValueError, match="absolute path"):
+        plan_organization(_retag_analysis(lib), config, base_dir=Path("sorted"))
+
+
+def test_relative_target_root_is_refused(tmp_path: Path) -> None:
+    """Same guard on the config route — validate_organize_target can be bypassed.
+
+    `plan_organization` is a public entry point (CLI, library use); the sidecar's
+    pre-flight validator is not the only path to it.
+    """
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    config = OrganizationConfig(
+        use_subgenres=False, min_genre_size=1, target_root="Sorted",
+    )
+
+    with pytest.raises(ValueError, match="absolute path"):
+        plan_organization(_retag_analysis(lib), config)
+
+
+def test_whitespace_only_target_root_is_refused_not_treated_as_cwd(
+    tmp_path: Path,
+) -> None:
+    """`Path("   ")` is relative, not blank — refuse instead of using the CWD."""
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    config = OrganizationConfig(
+        use_subgenres=False, min_genre_size=1, target_root="   ",
+    )
+
+    with pytest.raises(ValueError, match="absolute path"):
+        plan_organization(_retag_analysis(lib), config)
+
+
+def test_absolute_refusal_message_names_the_offending_path(tmp_path: Path) -> None:
+    """The error is user-facing: it must say what was wrong and what to type."""
+    lib = tmp_path / "lib"
+    _sorted_library(lib)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    with pytest.raises(ValueError) as exc:
+        plan_organization(_retag_analysis(lib), config, base_dir=Path("sorted"))
+
+    message = str(exc.value)
+    assert "sorted" in message
+    assert "folder picker" in message
+
+
 def test_organize_in_place_moves_only_the_retagged_track(tmp_path: Path) -> None:
     """End-to-end: re-organizing in place relocates the corrected track only."""
     lib = tmp_path / "lib"
@@ -777,3 +852,568 @@ def test_undo_after_prune_restores_the_folder(tmp_path: Path) -> None:
 
     assert summary["reverted"] == 1
     assert (lib / "Techno" / "a.mp3").exists()
+
+
+# ---------------------------------------------------------------------------
+# Failure modes to guard against: no silent guessing, no half-written files, no
+# undo record that lies about being complete.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stray", ["relative/dir/b.mp3", "another/rel/b.mp3"])
+def test_tracks_spanning_roots_refuse_to_guess_a_base_dir(
+    tmp_path: Path, stray: str,
+) -> None:
+    """No common ancestor means no library root — say so instead of guessing.
+
+    The old fallback was `parents[0]`, i.e. the first track's parent, which for
+    a sorted library is a GENRE folder: every track in the analysis would then
+    be planned inside it (House/c.mp3 -> Techno/House/c.mp3). The CLI turns this
+    ValueError into a clean message; guessing had no such backstop.
+    """
+    analysis = {"tracks": [
+        {"path": str(tmp_path / "Techno" / "a.mp3"),
+         "ml_analysis": {"ml_genre": "Techno"}},
+        {"path": stray, "ml_analysis": {"ml_genre": "House"}},
+    ]}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    with pytest.raises(ValueError, match="different drives or roots"):
+        plan_organization(analysis, config)
+
+
+def test_explicit_root_still_works_for_tracks_spanning_roots(tmp_path: Path) -> None:
+    """Refusing to GUESS must not refuse the case where the caller knows."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "a.mp3").write_bytes(b"x")
+    analysis = {"tracks": [
+        {"path": str(lib / "a.mp3"), "ml_analysis": {"ml_genre": "Techno"}},
+        {"path": "relative/b.mp3", "ml_analysis": {"ml_genre": "House"}},
+    ]}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1, target_root=None)
+
+    plan = plan_organization(analysis, config, library_root=lib)
+
+    assert plan.base_dir == lib
+
+
+def test_failed_move_removes_the_half_written_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cross-device move that dies mid-copy must not leave a truncated file.
+
+    shutil.move falls back to copy+unlink across volumes (organizing onto an
+    external drive is the normal case), and a copy killed by a full disk leaves
+    a partial file at the destination with a valid extension. It isn't in the
+    journal (record_move never ran), so undo can't remove it and a later
+    organize just uniquifies around it.
+    """
+    from vibechek import organizer
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    victim = lib / "victim.mp3"
+    victim.write_bytes(b"full contents")
+    analysis = {"tracks": [
+        {"path": str(victim), "ml_analysis": {"ml_genre": "House"}},
+    ]}
+
+    # `copy_function=` is now passed through (see _copy_preserving_stat), so the
+    # stub has to accept the same signature shutil.move really has.
+    def _die_mid_copy(src: str, dst: str, copy_function=None) -> None:  # noqa: ANN001, ARG001
+        Path(dst).write_bytes(b"trunc")     # what copyfile leaves behind
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(organizer.shutil, "move", _die_mid_copy)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1)
+
+    stats = organize_from_analysis(analysis, config, base_dir=lib)
+
+    assert stats.moved == 0
+    assert not (lib / "House" / "victim.mp3").exists()
+    assert victim.read_bytes() == b"full contents"   # original untouched
+    assert "removed the incomplete copy" in stats.errors[0]
+
+
+def test_a_failed_move_keeps_the_source_when_cleanup_would_be_the_last_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup only fires while the source is still there — never delete the
+    only copy of a track because the tail end of a move raised."""
+    from vibechek import organizer
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    victim = lib / "victim.mp3"
+    victim.write_bytes(b"full contents")
+    analysis = {"tracks": [
+        {"path": str(victim), "ml_analysis": {"ml_genre": "House"}},
+    ]}
+
+    def _move_then_raise(src: str, dst: str, copy_function=None) -> None:  # noqa: ANN001, ARG001
+        Path(dst).write_bytes(Path(src).read_bytes())
+        Path(src).unlink()                  # the move DID complete
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(organizer.shutil, "move", _move_then_raise)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1)
+
+    stats = organize_from_analysis(analysis, config, base_dir=lib)
+
+    assert (lib / "House" / "victim.mp3").read_bytes() == b"full contents"
+    assert "removed the incomplete copy" not in stats.errors[0]
+
+
+def test_journal_write_failure_marks_the_undo_record_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moves the journal didn't record can't be undone — say so.
+
+    Without this the run reports zero errors, the GUI renders Undo, and the
+    revert reports "reverted N, skipped 0, errors 0" while the unrecorded files
+    stay stranded in the new tree.
+    """
+    from vibechek import journal as _journal
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    tracks = []
+    for i in range(3):
+        f = lib / f"t{i}.mp3"
+        f.write_bytes(b"x")
+        tracks.append({"path": str(f), "ml_analysis": {"ml_genre": "House"}})
+
+    real_start = _journal.start_journal
+
+    def _start_then_fill_the_disk(kind: str, root=None):
+        j = real_start(kind, root=root)
+        original_write = j._fh.write
+        state = {"left": 1}
+
+        def _write(s: str) -> int:
+            if state["left"] <= 0:
+                raise OSError(28, "No space left on device")
+            state["left"] -= 1
+            return original_write(s)
+
+        j._fh.write = _write
+        return j
+
+    monkeypatch.setattr(_journal, "start_journal", _start_then_fill_the_disk)
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1)
+
+    stats = organize_from_analysis({"tracks": tracks}, config, base_dir=lib)
+
+    assert stats.moved == 3
+    assert stats.errors == []          # the moves themselves all succeeded
+    assert stats.journal_path is not None
+    assert stats.journal_incomplete is True
+
+
+def test_a_healthy_organize_does_not_claim_an_incomplete_journal(
+    synthetic_analysis: dict,
+) -> None:
+    config = OrganizationConfig(use_subgenres=True, min_genre_size=3)
+    stats = organize_from_analysis(synthetic_analysis, config)
+    assert stats.moved > 0
+    assert stats.journal_incomplete is False
+
+
+def test_moved_pairs_key_on_the_path_the_caller_supplied(tmp_path: Path) -> None:
+    """The GUI looks moved_pairs up by exact string against what it SENT.
+
+    `resolve_existing_path` may hand back a different Unicode normalization of
+    the same file (the whole reason it exists), and reporting THAT spelling
+    means the lookup misses and the track keeps a dead path until a re-scan.
+    """
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    on_disk = unicodedata.normalize("NFD", "Tiësto - Adagio.mp3")
+    stored = str(lib / unicodedata.normalize("NFC", "Tiësto - Adagio.mp3"))
+    (lib / on_disk).write_bytes(b"x")
+    analysis = {"tracks": [
+        {"path": stored, "ml_analysis": {"ml_genre": "Trance"}},
+    ]}
+    config = OrganizationConfig(use_subgenres=False, min_genre_size=1)
+
+    stats = organize_from_analysis(analysis, config, base_dir=lib)
+
+    assert stats.moved == 1
+    assert stats.moved_pairs[0][0] == stored
+    assert Path(stats.moved_pairs[0][1]).exists()
+
+
+# ---------------------------------------------------------------------------
+# _read_genre_tag — every route test monkeypatches it, so the reader itself
+# had no coverage at all. These use real files.
+# ---------------------------------------------------------------------------
+
+
+def _wav_with_genre(path: Path, values: list[str]) -> Path:
+    """A real RIFF WAV carrying an ID3v2 TCON frame, exactly as the tagger writes it."""
+    import wave as _wave
+
+    from mutagen.id3 import TCON
+    from mutagen.wave import WAVE
+
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+        w.writeframes(b"\x00\x00" * 128)
+    audio = WAVE(str(path))
+    audio.add_tags()
+    audio.tags.add(TCON(encoding=3, text=values))
+    audio.save()
+    return path
+
+
+def test_read_genre_tag_reads_wav_id3(tmp_path: Path) -> None:
+    """Vibechek's own tagger writes ID3 genre frames into WAV — the router has
+    to be able to read them back, or it reports a file it tagged itself as
+    untagged and the user's "re-tag it" fix does nothing."""
+    from vibechek.organizer import _read_genre_tag
+
+    fp = _wav_with_genre(tmp_path / "t.wav", ["Tech House"])
+
+    assert _read_genre_tag(fp) == "Tech House"
+
+
+def test_read_genre_tag_takes_the_first_of_a_multi_value_frame(tmp_path: Path) -> None:
+    """`str(TCON)` NUL-joins every value ("Techno\x00House" — what Picard and
+    foobar2000 write for ID3v2.4). That NUL reached mkdir, which raises
+    ValueError, NOT OSError, so it escaped route's handler and killed the batch."""
+    from vibechek.organizer import _read_genre_tag
+
+    fp = _wav_with_genre(tmp_path / "t.wav", ["Techno", "House"])
+
+    assert _read_genre_tag(fp) == "Techno"
+
+
+def test_read_genre_tag_reads_ogg_vorbis(tmp_path: Path) -> None:
+    """`.ogg` is a supported extension too, and an externally Vorbis-tagged file
+    was reported as untagged for the same reason `.wav` was — no read arm."""
+    sf = pytest.importorskip("soundfile")
+    import numpy as np
+    from mutagen.oggvorbis import OggVorbis
+
+    from vibechek.organizer import _read_genre_tag
+
+    fp = tmp_path / "t.ogg"
+    sf.write(str(fp), np.zeros(4410, dtype="float32"), 44100,
+             format="OGG", subtype="VORBIS")
+    audio = OggVorbis(str(fp))
+    audio["genre"] = ["Tech House"]
+    audio.save()
+
+    assert _read_genre_tag(fp) == "Tech House"
+
+
+def _wma_with_genre(path: Path, genre: str, attr_type: int = 0) -> Path:
+    """Write a minimal-but-real ASF/WMA file carrying a WM/Genre descriptor.
+
+    Hand-built rather than synthesized: there is no encoder in the dev deps, and
+    mutagen's ASF reader is the thing under test, so the bytes have to be a real
+    ASF header object (GUID + size + one Extended Content Description object).
+
+    `attr_type` is the ASF attribute type: 0 = unicode (what WMP and Rekordbox
+    write), 1 = byte array, 3 = DWORD. The non-unicode types are legal and a
+    reader that just str()s the attribute mints a folder out of the repr.
+    """
+    import struct
+    import uuid
+
+    header_guid = uuid.UUID("75B22630-668E-11CF-A6D9-00AA0062CE6C").bytes_le
+    ext_content_guid = uuid.UUID("D2D0A440-E307-11D2-97F0-00A0C95EA850").bytes_le
+
+    def utf16z(s: str) -> bytes:
+        return s.encode("utf-16-le") + b"\x00\x00"
+
+    name = utf16z("WM/Genre")
+    if attr_type == 0:
+        value = utf16z(genre)
+    elif attr_type == 1:
+        value = genre.encode("utf-8")              # raw byte array
+    elif attr_type == 3:
+        value = struct.pack("<I", 130)             # a DWORD genre id
+    else:  # pragma: no cover - guard against a typo in a future case
+        raise AssertionError(f"unhandled ASF attribute type {attr_type}")
+    body = (
+        struct.pack("<H", 1)                       # one descriptor
+        + struct.pack("<H", len(name)) + name
+        + struct.pack("<HH", attr_type, len(value)) + value
+    )
+    ext = ext_content_guid + struct.pack("<Q", 16 + 8 + len(body)) + body
+    path.write_bytes(
+        header_guid
+        + struct.pack("<Q", 16 + 8 + 4 + 2 + len(ext))
+        + struct.pack("<I", 1)                     # one header sub-object
+        + b"\x01\x02"                              # reserved1 / reserved2
+        + ext
+    )
+    return path
+
+
+def test_read_genre_tag_reads_wma_asf(tmp_path: Path) -> None:
+    """`.wma` is a supported extension, and mutagen reads its genre from the
+    ASF "WM/Genre" descriptor. Without the arm, a file tagged by Windows Media
+    Player or Rekordbox was reported as having no genre and left in staging —
+    the same silent misreport the missing `.wav` arm caused."""
+    from vibechek.organizer import _read_genre_tag
+
+    fp = _wma_with_genre(tmp_path / "t.wma", "Tech House")
+
+    assert _read_genre_tag(fp) == "Tech House"
+
+
+@pytest.mark.parametrize("attr_type", [1, 3])
+def test_read_genre_tag_ignores_a_non_text_wma_attribute(
+    tmp_path: Path, attr_type: int,
+) -> None:
+    """An ASF attribute is TYPED. The descriptor can legally hold a DWORD or a
+    raw byte array, and str()ing one of those stringifies to a number or a
+    `b'...'` repr — which `route_new_tracks` would then mint a real folder out
+    of. A value that isn't text is no genre at all."""
+    from vibechek.organizer import _read_genre_tag
+
+    fp = _wma_with_genre(tmp_path / "t.wma", "Tech House", attr_type=attr_type)
+
+    assert _read_genre_tag(fp) is None
+
+
+def test_route_leaves_a_wma_with_a_non_text_genre_in_staging(tmp_path: Path) -> None:
+    """End-to-end: the untyped read minted a folder named after the attribute's
+    repr. Nothing gets filed under a number."""
+    staging = tmp_path / "staging"
+    library = tmp_path / "library"
+    staging.mkdir()
+    _wma_with_genre(staging / "a.wma", "Tech House", attr_type=3)
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["copied"] == 0
+    assert summary["skipped_no_genre"] == 1
+    assert not library.exists() or list(library.iterdir()) == []
+
+
+def test_route_files_a_wma_by_its_asf_genre(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    library = tmp_path / "library"
+    staging.mkdir()
+    _wma_with_genre(staging / "a.wma", "Tech House")
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["copied"] == 1
+    assert summary["skipped_no_genre"] == 0
+    assert (library / "Tech House" / "a.wma").exists()
+
+
+def test_route_names_aac_as_unreadable_rather_than_untagged(tmp_path: Path) -> None:
+    """mutagen exposes no tag reader for raw `.aac` (mutagen.aac.AAC has no
+    `.tags`), so the genre can never be read no matter how the file was tagged.
+    Counting that as "no genre tag" sends the user off to re-tag a file whose
+    tags we could not read either way; it gets its own counter and log line."""
+    staging = tmp_path / "staging"
+    library = tmp_path / "library"
+    staging.mkdir()
+    (staging / "a.aac").write_bytes(b"\xff\xf1nope")
+    _wav_with_genre(staging / "b.wav", ["Trance"])
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["skipped_unreadable_format"] == 1
+    assert summary["skipped_no_genre"] == 0
+    assert summary["copied"] == 1
+    assert (library / "Trance" / "b.wav").exists()
+
+
+def test_route_still_counts_a_genuinely_untagged_file_as_no_genre(
+    tmp_path: Path,
+) -> None:
+    """The new counter must not swallow the ordinary case."""
+    staging = tmp_path / "staging"
+    library = tmp_path / "library"
+    staging.mkdir()
+    _wav_with_genre(staging / "a.wav", [""])
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["skipped_no_genre"] == 1
+    assert summary["skipped_unreadable_format"] == 0
+
+
+def test_route_files_a_multi_value_tagged_track_instead_of_crashing(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a two-value genre frame must route one track, not abort the run."""
+    staging = tmp_path / "staging"
+    library = tmp_path / "library"
+    staging.mkdir()
+    _wav_with_genre(staging / "a.wav", ["Techno", "House"])
+    _wav_with_genre(staging / "b.wav", ["Trance"])
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["copied"] == 2
+    assert summary["errors"] == 0
+    assert (library / "Techno" / "a.wav").exists()
+    assert (library / "Trance" / "b.wav").exists()
+
+
+def test_route_skips_one_unwritable_file_instead_of_aborting_the_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ValueError out of mkdir/copy2 (a path-shaped tag) used to escape the
+    per-file handler, so the remaining tracks were never routed and the user
+    got a traceback instead of a summary."""
+    from vibechek import organizer
+
+    staging, library = _staged(tmp_path, "Techno", monkeypatch)
+    (staging / "second.mp3").write_bytes(b"x")
+
+    calls = {"n": 0}
+    real_copyfile = organizer.shutil.copyfile
+
+    def _first_one_explodes(src: str, dst: str):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            Path(dst).write_bytes(b"trunc")   # partial copy left behind
+            raise ValueError("embedded null character in path")
+        return real_copyfile(src, dst)
+
+    # The route loop copies through `copyfile` now, so that a copystat failure
+    # on exFAT/SMB can no longer be mistaken for a truncated copy.
+    monkeypatch.setattr(organizer.shutil, "copyfile", _first_one_explodes)
+
+    summary = route_new_tracks(staging, library)
+
+    # find_audio_files sorts by path, so "second.mp3" is the one that explodes
+    # and "track.mp3" proves the batch carried on past it.
+    assert summary["errors"] == 1
+    assert summary["copied"] == 1
+    # ...and the half-written file the failed copy left behind is gone.
+    assert [p.name for p in (library / "Techno").iterdir()] == ["track.mp3"]
+
+
+# ---------------------------------------------------------------------------
+# A copystat failure must not discard a complete copy
+# ---------------------------------------------------------------------------
+
+
+def _reject_copystat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """exFAT sticks and SMB shares routinely reject os.utime/os.chmod on a file
+    that copied perfectly — the failure `shutil.copy2` raises AFTER every byte
+    has landed."""
+    from vibechek import organizer
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise PermissionError(13, "Operation not permitted")
+
+    monkeypatch.setattr(organizer.shutil, "copystat", _boom)
+
+
+def test_route_keeps_a_copy_whose_only_failure_was_copystat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`shutil.copy2` is copyfile + copystat, and the old handler could not tell
+    the two apart: a copystat failure sent a COMPLETE file to
+    `_discard_partial_copy`, which unlinked it. Routing onto an exFAT/SMB
+    library reported `copied: 0, errors: N` over a transfer that worked, every
+    retry included.
+    """
+    staging, library = _staged(tmp_path, "Techno", monkeypatch)
+    _reject_copystat(monkeypatch)
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["copied"] == 1
+    assert summary["errors"] == 0
+    dest = library / "Techno" / "track.mp3"
+    assert dest.exists()
+    assert dest.read_bytes() == (staging / "track.mp3").read_bytes()
+
+
+def test_route_still_discards_a_copy_whose_bytes_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: when the BYTE copy fails it really can leave a truncated
+    file behind, and that one must still be removed."""
+    from vibechek import organizer
+
+    staging, library = _staged(tmp_path, "Techno", monkeypatch)
+
+    def _half_written(src: str, dst: str) -> None:
+        Path(dst).write_bytes(b"trunc")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(organizer.shutil, "copyfile", _half_written)
+
+    summary = route_new_tracks(staging, library)
+
+    assert summary["copied"] == 0
+    assert summary["errors"] == 1
+    assert not (library / "Techno" / "track.mp3").exists()
+    assert (staging / "track.mp3").exists()   # the source is never touched
+
+
+def test_copy_preserving_stat_applies_metadata_when_it_can(tmp_path: Path) -> None:
+    """The warning path must not become the only path: on a filesystem that
+    accepts it, the timestamps are still preserved."""
+    import os
+
+    from vibechek.organizer import _copy_preserving_stat
+
+    src = tmp_path / "a.mp3"
+    src.write_bytes(b"audio")
+    os.utime(src, (1_600_000_000, 1_600_000_000))
+    dest = tmp_path / "b.mp3"
+
+    _copy_preserving_stat(src, dest)
+
+    assert dest.read_bytes() == b"audio"
+    assert int(dest.stat().st_mtime) == 1_600_000_000
+
+
+def test_organize_move_survives_a_copystat_failure_on_a_cross_device_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`shutil.move`'s cross-device fallback is copy2 + unlink, so the same
+    copystat failure turned a working organize onto an external drive into
+    `0 moved / N errors` with an empty destination. The move loop hands
+    shutil.move its own copy_function for exactly this reason.
+    """
+    from vibechek import organizer
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    track = lib / "t.mp3"
+    track.write_bytes(b"audio")
+
+    # Force shutil.move down its cross-device branch for THIS file only (a
+    # blanket os.rename patch would also break the journal's atomic writes),
+    # then fail the copystat that branch runs after the bytes have landed.
+    real_rename = organizer.os.rename
+
+    def _no_rename(src, dst, *a, **kw):  # noqa: ANN001, ANN202
+        if str(src) == str(track):
+            raise OSError(18, "Invalid cross-device link")
+        return real_rename(src, dst, *a, **kw)
+
+    monkeypatch.setattr(organizer.os, "rename", _no_rename)
+    _reject_copystat(monkeypatch)
+
+    analysis = {"tracks": [{"path": str(track), "ml_analysis": {
+        "ml_genre": "Techno", "ml_subgenre": "Hard Techno",
+        "ml_genre_confidence": 0.95,
+    }}]}
+    stats = organize_from_analysis(
+        analysis, OrganizationConfig(use_subgenres=True, min_genre_size=1),
+        dry_run=False, library_root=str(lib),
+    )
+
+    assert stats.errors == []
+    assert stats.moved == 1
+    assert not track.exists()
+    assert (lib / "Techno" / "Hard Techno" / "t.mp3").read_bytes() == b"audio"

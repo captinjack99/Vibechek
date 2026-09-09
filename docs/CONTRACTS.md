@@ -28,7 +28,7 @@ See also: [CONTRIBUTING.md](../CONTRIBUTING.md) (the type bridge), [`vibechek/rp
 > scripts, Linux/macOS → `native_install.setup_clap_native`/`setup_resolver_native`
 > (same venv + artifact paths, so analyze-time consumers don't care which ran).
 > Engine/genre selection also **added params to existing methods** (they cross the
-> wire) — see "Engine-aware params" below. The UX-audit memory self-heal added
+> wire) — see "Engine-aware params" below. The memory self-heal added
 > `increase_wsl_memory` (raises the WSL VM's `memory=` limit in `.wslconfig` for a
 > CLAP out-of-memory refusal; returns `{ok, changed, old, new, restart_required}`
 > and never restarts WSL itself).
@@ -107,8 +107,8 @@ Concretely, the genre/vocal/key **reconciliation-provenance** fields on `MLResul
 they're absent on the raw per-track `track_analyzed` notifications that stream during
 analyze. The library UI's conflict surfacing keys off them with truthy checks accordingly.
 The key pair is read-only surfacing: `ml_key` itself stays the audio read (embedded tag
-keys measured 49% exact vs audio's 63% on the gold corpus, wrong 10:1 on disagreement —
-`internal/bughunt/score_tag_priors.py`), so tags flag for review, never override.
+keys measured 49% exact vs audio's 63% on the gold corpus, wrong 10:1 on disagreement),
+so tags flag for review, never override.
 
 `MLResult` also carries two **silent-degradation provenance** fields, `ml_genre_classifier`
 (`"clap"` | `"discogs"` — which audio model actually produced this track's genre) and

@@ -1,5 +1,5 @@
 /**
- * WP7: the "Ready to analyze?" banner must not paint a green Essentia row for a
+ * The "Ready to analyze?" banner must not paint a green Essentia row for a
  * build that can't actually serve the engine it's evaluating. The bundled
  * DSP-only Windows wheel imports fine (`installed=true`) but can't run
  * essentia_tf/onnx in-process, so the row is gated on `essentia_usable`.
@@ -45,7 +45,7 @@ describe("<PreflightSection /> — Essentia row honesty", () => {
   });
 
   it("does NOT show a green row when essentia is installed but can't serve the engine", () => {
-    // The exact audited scenario: DSP-only wheel present (installed), but not
+    // The exact scenario: DSP-only wheel present (installed), but not
     // TF-capable so essentia_usable=false, and no WSL fallback set up.
     render(
       <PreflightSection

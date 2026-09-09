@@ -56,7 +56,7 @@ describe("<ConfirmModal />", () => {
     expect(onCancel).toHaveBeenCalled();
   });
 
-  // --- Accessibility / focus behaviour (audit: MED frontend ConfirmModal) ----
+  // --- Accessibility / focus behaviour ---------------------------------
 
   it("exposes dialog semantics (role=dialog + aria-modal)", () => {
     setup();

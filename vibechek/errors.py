@@ -27,7 +27,7 @@ safe), so a site can start by only setting a headline and add `detail`/`kind`
 later. `str(exc)` is the headline, so legacy code that does `str(e)` still gets
 the plain string rather than a repr.
 
-Voice rules (see the UX-audit voice guide + zero-setup doctrine):
+Voice rules:
   * headline  — plain DJ-app terms + the next step; never an exit code, byte
                 count, `.so` name, distro, or stack fragment.
   * detail    — the technical identifiers, DEMOTED not deleted (bug reports and

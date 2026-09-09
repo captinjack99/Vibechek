@@ -267,3 +267,103 @@ def test_backbone_onnx_sha256_is_pinned() -> None:
     pin = model_download.BACKBONE_ONNX_SHA256
     assert isinstance(pin, str) and len(pin) == 64
     int(pin, 16)  # valid hex
+
+
+# ---------------------------------------------------------------------------
+# The label JSON is output semantics, not decoration; and a
+# cached file we can't READ must not unwind the whole loop out of a pool worker.
+# ---------------------------------------------------------------------------
+
+
+def test_metadata_pin_mismatch_is_fatal_and_drops_the_file(tmp_path, monkeypatch) -> None:
+    """`classes` from the metadata JSON is the genre string written into the
+    user's tags and the folder name organize moves the track into — a rotated
+    label list silently relabels the whole library. It used to be a log.warning
+    while the .pb next to it verified strictly."""
+    monkeypatch.setattr(
+        model_download, "MODELS",
+        {"genre_discogs400": ("sub", "w.pb", "m.json")},
+    )
+    monkeypatch.setattr(model_download, "_needs_download", lambda *a, **k: False)
+
+    weights = tmp_path / "genre_discogs400.pb"
+    weights.write_bytes(b"w" * 200_000)
+    meta = tmp_path / "genre_discogs400.json"
+    meta.write_text('{"classes": ["Trance", "Techno"]}', encoding="utf-8")
+
+    def verify(path, expected):
+        if str(path).endswith(".json"):
+            raise RuntimeError(
+                f"Model file {Path(path).name} failed SHA256 check: expected a, got b"
+            )
+
+    monkeypatch.setattr(model_download, "verify_model_sha256", verify)
+
+    with pytest.raises(RuntimeError) as ei:
+        model_download.download_models(tmp_path, engine="essentia_tf")
+
+    assert "genre_discogs400.json" in str(ei.value)
+    assert not meta.exists(), (
+        "a label file that fails its pin must not stay cached — _needs_download "
+        "would keep re-fetching it while the descriptor served the bad labels"
+    )
+
+
+def test_metadata_matching_its_pin_still_supplies_the_classes(tmp_path, monkeypatch) -> None:
+    """The strict path must not break the normal case."""
+    monkeypatch.setattr(
+        model_download, "MODELS",
+        {"genre_discogs400": ("sub", "w.pb", "m.json")},
+    )
+    monkeypatch.setattr(model_download, "_needs_download", lambda *a, **k: False)
+    monkeypatch.setattr(model_download, "verify_model_sha256", lambda p, e: None)
+
+    (tmp_path / "genre_discogs400.pb").write_bytes(b"w" * 200_000)
+    (tmp_path / "genre_discogs400.json").write_text(
+        '{"classes": ["Techno", "Trance"]}', encoding="utf-8",
+    )
+
+    descriptors = model_download.download_models(tmp_path, engine="essentia_tf")
+    assert descriptors["genre_discogs400"]["classes"] == ["Techno", "Trance"]
+
+
+class _LockedPath:
+    """A cached model file that exists but can't be stat'd (AV / cloud-sync
+    client / flaky share holding an exclusive handle)."""
+
+    suffix = ".pb"
+    name = "effnet.pb"
+
+    def exists(self) -> bool:
+        return True
+
+    def stat(self):
+        raise PermissionError(13, "Permission denied", "effnet.pb")
+
+
+def test_needs_download_does_not_escape_when_the_cached_file_cannot_be_stated() -> None:
+    """`_needs_download` runs inside `_worker_init` -> `load_models`, OUTSIDE the
+    caller's per-model try. An escaping OSError killed every pool worker at init;
+    the pool respawned into the same error until the 300 s stall watchdog fired
+    with a generic 'likely ran out of memory' message."""
+    assert model_download._needs_download(
+        _LockedPath(), "http://nope.invalid/effnet.pb", "ab" * 32,
+    ) is True
+
+
+def test_needs_download_does_not_escape_when_the_cached_file_cannot_be_read(
+    tmp_path, monkeypatch,
+) -> None:
+    f = tmp_path / "effnet.pb"
+    f.write_bytes(b"x" * 200_000)
+    pin = _sha(f)
+
+    def locked(path, expected):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(model_download, "verify_model_sha256", locked)
+    # Unreadable is NOT "verified good": refetch, and let the caller's own
+    # `except OSError` arm name the file if it is still unreadable.
+    assert model_download._needs_download(
+        f, "http://nope.invalid/effnet.pb", pin,
+    ) is True

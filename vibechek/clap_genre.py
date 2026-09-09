@@ -29,8 +29,7 @@ from vibechek.errors import UserFacingError
 
 log = logging.getLogger(__name__)
 
-# CLAP geometry — must match how the bundled reference was embedded
-# (internal/bughunt/build_reference.py / clap_embed_cache.py).
+# CLAP geometry — must match how the bundled reference was embedded.
 _SR = 48000
 _SEG_SECONDS = 20
 _SEG_FRACS = (0.25, 0.5, 0.75)
@@ -177,7 +176,7 @@ def clap_checkpoint_path() -> Path:
 
 def _reheal_checkpoint(ckpt: Path) -> bool:
     """Delete a corrupt CLAP checkpoint and re-download it via the shared mirror
-    downloader, then re-verify (WP-I1 self-heal — no hand-deletion, no CLI).
+    downloader, then re-verify (self-heal — no hand-deletion, no CLI).
 
     Race-safe for multiple analyze workers hitting the same corrupt file: first
     re-checks whether a sibling already healed it (avoids a redundant 2.2 GB
@@ -244,7 +243,7 @@ def load_clap_model(checkpoint: Path | None = None, use_gpu: str = "auto") -> An
         try:
             verify_model_sha256(ckpt, _CHECKPOINT_SHA256)
         except RuntimeError as e:
-            # Self-heal (WP-I1) + plain error (WP-I3). The checkpoint is a torch
+            # Self-heal + a plain error. The checkpoint is a torch
             # pickle (executable on load), corrupt/truncated. Instead of telling a
             # GUI user to hand-delete ~/.vibechek/clap/music_clap.pt and run a CLI
             # command (`vibechek verify-models` doesn't even cover this file — it

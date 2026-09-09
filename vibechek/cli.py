@@ -107,11 +107,7 @@ def _load_analysis_with_tracks(path: Path) -> dict:
     if isinstance(data, list):
         return {"tracks": data}
     if isinstance(data, dict):
-        if not isinstance(data.get("tracks", []), list):
-            raise click.ClickException(
-                f"{path.name}: the 'tracks' field must be a list — this doesn't "
-                f"look like output from `vibechek analyze`."
-            )
+        _tracks_from_analysis(data, path.name)  # shape check — raises on a non-list
         return data
     raise click.ClickException(
         f"{path.name} is not a valid analysis file — expected an object with a "
@@ -119,10 +115,88 @@ def _load_analysis_with_tracks(path: Path) -> dict:
     )
 
 
+def _tracks_from_analysis(data: object, name: str) -> list:
+    """Pull the `tracks` list out of already-parsed analysis JSON, or fail loud.
+
+    Same shape contract as `_load_analysis_with_tracks`, but over a parsed
+    object so `export` can keep the raw data for its json passthrough while
+    still rejecting e.g. `"tracks": "pending"` — which the loose loader let
+    through and then iterated character by character, reporting each character
+    as an exported track.
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        tracks = data.get("tracks", [])
+        if not isinstance(tracks, list):
+            raise click.ClickException(
+                f"{name}: the 'tracks' field must be a list — this doesn't "
+                f"look like output from `vibechek analyze`."
+            )
+        return tracks
+    raise click.ClickException(
+        f"{name} is not a valid analysis file — expected an object with a "
+        f"'tracks' list (or a list of tracks) from `vibechek analyze`."
+    )
+
+
+def _print_errors(errors: list, limit: int = 5) -> None:
+    """Print the first `limit` errors and say how many were withheld.
+
+    Truncating to 5 with no remainder count hid the scale of a failed batch —
+    "errors: 500" followed by exactly five lines reads like five problems.
+    """
+    for err in errors[:limit]:
+        console.print(f"  [red]✗[/] {err}")
+    if len(errors) > limit:
+        console.print(f"  [dim]… and {len(errors) - limit} more[/]")
+
+
+def _exit_if_total_failure(succeeded: int, error_count: int, what: str) -> None:
+    """Exit non-zero when a mutating batch achieved nothing and errored.
+
+    These commands used to print a green "Done." and exit 0 no matter how many
+    per-file operations failed, so `vibechek organize a.json && rm a.json`
+    proceeded happily after a read-only share failed all 500 moves. The exit
+    code is the only machine-readable signal a script has.
+    """
+    if error_count > 0 and succeeded == 0:
+        console.print(
+            f"[red]Nothing was {what} — all {error_count} operations failed.[/]"
+        )
+        raise click.exceptions.Exit(code=1)
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="vibechek")
 def main() -> None:
     """Vibechek — ML-powered DJ library organizer."""
+    # The RPC sidecar configures logging on entry; the CLI never did, so every
+    # log.info/debug from a CLI run went nowhere and `doctor`'s log tail could
+    # only ever show GUI activity. Idempotent (guarded by `_configured`).
+    from vibechek import logging_setup  # noqa: PLC0415
+
+    try:
+        logging_setup.configure()
+    except OSError as e:
+        # A read-only or permission-denied data dir must not take EVERY CLI
+        # command down with a traceback — least of all `vibechek doctor`, which
+        # is the command a user runs BECAUSE their install is broken. Logging is
+        # a diagnostic, never a precondition: say so on stderr and carry on.
+        # configure() drops the root handlers before it can fail, so re-attach a
+        # console one or warnings from the run would vanish silently too.
+        import logging  # noqa: PLC0415
+
+        root = logging.getLogger()
+        if not root.handlers:
+            console_only = logging.StreamHandler(sys.stderr)
+            console_only.setLevel(logging.WARNING)
+            root.addHandler(console_only)
+        click.echo(
+            f"Warning: could not open the log file ({e}). This run will not be "
+            "logged; everything else works normally.",
+            err=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +325,15 @@ def analyze(path: Path, workers: int, gpu: str, skip: int, limit: int,
             f"— nothing analyzed, [cyan]{output}[/] not refreshed."
         )
     else:
+        done = "[yellow]Done (with errors).[/]" if summary["errors"] else "[green]Done.[/]"
         console.print(
-            f"\n[green]Done.[/] Analyzed {summary['analyzed']}/{summary['total_files']} "
+            f"\n{done} Analyzed {summary['analyzed']}/{summary['total_files']} "
             f"({summary['errors']} errors) → [cyan]{output}[/]"
         )
+        # The report IS still written (500 error records are worth keeping),
+        # but `analyze L -o a.json && tag a.json` must not proceed on a run
+        # where every single file failed.
+        _exit_if_total_failure(summary["analyzed"], summary["errors"], "analyzed")
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +376,34 @@ def tag(analysis_json: Path, confidence: float, skip_bpm_key: bool,
         stats = apply_ml_tags(data, config, on_progress=on_progress, dry_run=dry_run)
 
     mode = "[yellow](dry-run)[/] " if dry_run else ""
+    done = "[yellow]Done (with errors).[/]" if stats.errors else "[green]Done.[/]"
+    # `genre_applied + genre_applied_parent_only + genre_skipped_*` is exactly
+    # the track count, so every term has to be printed or the numbers don't add
+    # up and tracks vanish from the summary. Parent-only is a SEPARATE bucket
+    # from applied (it's the parent-genre fallback, not a subgenre write), so it
+    # gets its own term rather than being folded into "Genre applied".
+    write_off = (
+        f" • [yellow]Genre writes off in config: "
+        f"{stats.genre_skipped_write_disabled}[/]"
+        if stats.genre_skipped_write_disabled
+        else ""
+    )
     console.print(
-        f"\n{mode}[green]Done.[/] "
-        f"Genre applied: {stats.genre_applied} (skipped low-conf: {stats.genre_skipped_low_confidence}) • "
+        f"\n{mode}{done} "
+        f"Genre applied: {stats.genre_applied} • "
+        f"parent-only: {stats.genre_applied_parent_only} • "
+        f"skipped low-conf: {stats.genre_skipped_low_confidence}{write_off} • "
         f"Other tags: {stats.other_tags_applied} • Errors: {len(stats.errors)}"
     )
-    for err in stats.errors[:5]:
-        console.print(f"  [red]✗[/] {err}")
+    _print_errors(stats.errors)
+    # A parent-only genre IS a tag that landed on disk — leaving it out of the
+    # success count made a run whose every genre came from the parent fallback
+    # look like a total failure.
+    _exit_if_total_failure(
+        stats.genre_applied + stats.genre_applied_parent_only + stats.other_tags_applied,
+        len(stats.errors),
+        "tagged",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -327,11 +427,12 @@ def backup_tags_cmd(path: Path, output: Path) -> None:
 
         stats = backup_tags(path, output, on_progress=on_progress)
 
+    done = "[yellow]Done (with errors).[/]" if stats.errors else "[green]Done.[/]"
     console.print(
-        f"\n[green]Done.[/] Backed up {stats.backed_up}/{stats.total} files → [cyan]{output}[/]"
+        f"\n{done} Backed up {stats.backed_up}/{stats.total} files → [cyan]{output}[/]"
     )
-    for err in stats.errors[:5]:
-        console.print(f"  [red]✗[/] {err}")
+    _print_errors(stats.errors)
+    _exit_if_total_failure(stats.backed_up, len(stats.errors), "backed up")
 
 
 @main.command("restore-tags")
@@ -354,12 +455,13 @@ def restore_tags_cmd(backup_file: Path) -> None:
             # Click error rather than leaking the raw traceback.
             raise click.ClickException(str(e)) from e
 
+    done = "[yellow]Done (with errors).[/]" if stats.errors else "[green]Done.[/]"
     console.print(
-        f"\n[green]Done.[/] Restored {stats.restored}/{stats.total} • "
+        f"\n{done} Restored {stats.restored}/{stats.total} • "
         f"missing: {stats.skipped_missing} • errors: {len(stats.errors)}"
     )
-    for err in stats.errors[:5]:
-        console.print(f"  [red]✗[/] {err}")
+    _print_errors(stats.errors)
+    _exit_if_total_failure(stats.restored, len(stats.errors), "restored")
 
 
 # ---------------------------------------------------------------------------
@@ -417,8 +519,9 @@ def revert(journal_file: Path) -> None:
             # and never silently "succeed" (Reverted 0) on the wrong file.
             raise click.ClickException(str(e)) from e
 
+    done = "[yellow]Done (with errors).[/]" if summary["errors"] else "[green]Done.[/]"
     console.print(
-        f"\n[green]Done.[/] Reverted {summary['reverted']} • "
+        f"\n{done} Reverted {summary['reverted']} • "
         f"skipped: {summary['skipped']} • errors: {summary['errors']}"
     )
     if summary["trashed_not_reverted"]:
@@ -426,8 +529,8 @@ def revert(journal_file: Path) -> None:
             f"  [yellow]⚠[/] {summary['trashed_not_reverted']} trashed files "
             f"can't be auto-restored — recover them from your OS recycle bin."
         )
-    for err in summary["error_messages"][:5]:
-        console.print(f"  [red]✗[/] {err}")
+    _print_errors(summary["error_messages"])
+    _exit_if_total_failure(summary["reverted"], summary["errors"], "reverted")
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +614,17 @@ def dedupe(path: Path, output: Path, no_chromaprint: bool, no_md5: bool,
                 progress.update(task, completed=current, total=total, description=message[:40])
 
             summary = handle_duplicates(report, config, on_progress=on_progress)
-        console.print(f"[green]Done.[/] {summary}")
+        acted = summary["moved"] + summary["deleted"]
+        done = "[yellow]Done (with errors).[/]" if summary["errors"] else "[green]Done.[/]"
+        console.print(
+            f"{done} moved: {summary['moved']} • deleted: {summary['deleted']} • "
+            f"errors: {summary['errors']}"
+        )
+        _print_errors(summary["error_messages"])
+        _exit_if_total_failure(
+            acted, summary["errors"],
+            "moved" if action is DuplicateAction.MOVE else "trashed",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +638,9 @@ def dedupe(path: Path, output: Path, no_chromaprint: bool, no_md5: bool,
 @click.option("--min-genre-size", default=10, show_default=True,
               help="Genres with fewer tracks go into Other/.")
 @click.option("--target-root", type=click.Path(path_type=Path), default=None,
-              help="Override the destination root (defaults to first track's parent).")
+              help="Destination root for the genre tree (default: the common parent "
+                   "folder of the analysed tracks — pass your library root if you "
+                   "analysed a single genre folder).")
 @click.option("--dry-run", is_flag=True, help="Preview the moves without executing.")
 def organize(analysis_json: Path, no_subgenres: bool, min_genre_size: int,
              target_root: Path | None, dry_run: bool) -> None:
@@ -564,11 +679,23 @@ def organize(analysis_json: Path, no_subgenres: bool, min_genre_size: int,
         except ValueError as e:
             raise click.ClickException(str(e)) from e
 
+    done = "[yellow]Done (with errors).[/]" if stats.errors else "[green]Done.[/]"
     console.print(
-        f"\n[green]Done.[/] Moved {stats.moved}/{stats.planned} • errors: {len(stats.errors)}"
+        f"\n{done} Moved {stats.moved}/{stats.planned} • errors: {len(stats.errors)}"
     )
-    for err in stats.errors[:5]:
-        console.print(f"  [red]✗[/] {err}")
+    # Sibling of the cdj-export case: organize_from_analysis records that the
+    # undo journal is missing completed moves, and the CLI dropped the flag. A
+    # later `vibechek revert` on that journal restores only part of the run and
+    # still reports a clean success, so the one moment the user can be told is
+    # here.
+    if stats.journal_incomplete:
+        console.print(
+            "[yellow]Warning:[/] the undo journal is INCOMPLETE — some moves that "
+            "happened were not recorded, so a revert will only restore part of "
+            "this run. Note the moves above before undoing."
+        )
+    _print_errors(stats.errors)
+    _exit_if_total_failure(stats.moved, len(stats.errors), "moved")
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +720,9 @@ def route(staging: Path, library_root: Path, dry_run: bool) -> None:
         summary = route_new_tracks(staging, library_root, on_progress=on_progress, dry_run=dry_run)
 
     mode = "[yellow](dry-run)[/] " if dry_run else ""
-    console.print(f"\n{mode}[green]Done.[/] {summary}")
+    done = "[yellow]Done (with errors).[/]" if summary["errors"] else "[green]Done.[/]"
+    console.print(f"\n{mode}{done} {summary}")
+    _exit_if_total_failure(summary["copied"], summary["errors"], "copied")
 
 
 # ---------------------------------------------------------------------------
@@ -856,64 +985,140 @@ def doctor(output: Path | None, models_dir: Path | None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _sha256_file(path: Path) -> str:
+    """Stream a file's SHA256 in 1 MiB chunks (the .pb weights are 100+ MB)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _optional_onnx_filenames() -> set[str]:
+    """ONNX files `download-models` treats as BEST-EFFORT, so their absence is
+    not a broken install.
+
+    Authoritative source is model_download.py's own `required` expression in
+    `_download_onnx_set` — a head is required unless it is the
+    `genre_discogs400.onnx` weights (the backbone already emits genre), and a
+    head's class-label `.json` is required only for `genre_discogs400` (without
+    those 400 labels the engine loads "ready" and silently emits no genre).
+    Verifying every file as required made a healthy install that never fetched
+    e.g. `mood_happy.json` report MISSING and exit 1.
+
+    `vibechek.rpc._optional_onnx_filenames` mirrors this; the two are pinned
+    together by a test.
+    """
+    from vibechek.analyzer import _ONNX_HEAD_STEMS  # noqa: PLC0415
+
+    optional = {"genre_discogs400.onnx"}
+    optional.update(
+        f"{stem}.json" for stem in _ONNX_HEAD_STEMS if stem != "genre_discogs400"
+    )
+    return optional
+
+
+def _model_verification_targets(engine: str, models_dir: Path) -> list[tuple[str, Path, str | None]]:
+    """(display name, path, pinned digest) for every file `engine` needs on disk.
+
+    Mirrors the `verify_model_hashes` RPC. The ONNX family (`onnx`/`native`)
+    stages its backbone + converted heads under `<models>/onnx` and never
+    downloads the flat essentia `.pb` set, so checking the `.pb` files for
+    those engines reported all 16 "MISSING" on the Windows default.
+    """
+    if engine in ("onnx", "native"):
+        from vibechek.analyzer import (  # noqa: PLC0415
+            _ONNX_HEAD_STEMS,
+            _ONNX_SUBDIR,
+            MODEL_SHA256_ONNX,
+        )
+        from vibechek.model_download import BACKBONE_ONNX_SHA256  # noqa: PLC0415
+        from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME  # noqa: PLC0415
+
+        onnx_dir = models_dir / _ONNX_SUBDIR
+        targets = [
+            (
+                BACKBONE_ONNX_FILENAME,
+                onnx_dir / BACKBONE_ONNX_FILENAME,
+                BACKBONE_ONNX_SHA256,
+            )
+        ]
+        for stem in _ONNX_HEAD_STEMS:
+            for fname in (f"{stem}.onnx", f"{stem}.json"):
+                targets.append((fname, onnx_dir / fname, MODEL_SHA256_ONNX.get(fname)))
+        return targets
+
+    from vibechek.analyzer import MODEL_SHA256, MODELS  # noqa: PLC0415
+
+    # MODEL_SHA256 is keyed by model NAME with an inner {"pb": ..., "json": ...}.
+    # Looking it up by FILENAME (`effnet.pb`) always returned None, so every
+    # comparison was a silent no-op and the command could only fail on a
+    # missing file — the tamper check it exists for never ran.
+    return [
+        (f"{name}.{suffix}", models_dir / f"{name}.{suffix}",
+         MODEL_SHA256.get(name, {}).get(suffix))
+        for name in MODELS
+        for suffix in ("pb", "json")
+    ]
+
+
 @main.command("verify-models")
 @click.option("--models-dir", type=click.Path(path_type=Path), default=None,
               help="Override the ML model directory (defaults to user data dir).")
-def verify_models_cmd(models_dir: Path | None) -> None:
-    """Hash each model file on disk and check against the expected SHA256.
+@click.option("--engine", type=click.Choice(["essentia_tf", "onnx", "native"]),
+              default=None,
+              help="Which model set to verify (default: the configured engine).")
+def verify_models_cmd(models_dir: Path | None, engine: str | None) -> None:
+    """Hash each model file on disk and check it against the pinned SHA256.
 
-    If `analyzer.MODEL_SHA256` is present in this build (added by the
-    analyzer agent), each file is verified. Otherwise the computed hashes
-    are printed so you can mail them to the maintainer.
+    Engine-aware, like the GUI's "Verify model integrity" button: `onnx` and
+    `native` verify the `.onnx` backbone + heads under `<models>/onnx`,
+    `essentia_tf` verifies the flat `.pb`/`.json` set.
 
-    Exits non-zero if any file is missing or mismatched.
+    Exits non-zero if any file is missing, unreadable, or mismatched.
     """
-    import hashlib
+    from vibechek.config import MODELS_DIR  # noqa: PLC0415
 
-    from vibechek.analyzer import MODELS
-    from vibechek.config import MODELS_DIR
-
-    # Optional table — gracefully handle the case where the analyzer agent
-    # hasn't landed MODEL_SHA256 yet.
-    expected: dict[str, str] = {}
-    try:
-        from vibechek.analyzer import MODEL_SHA256 as _MODEL_SHA256  # type: ignore[attr-defined]
-        expected = dict(_MODEL_SHA256)
-    except ImportError:
-        pass
-
+    engine = engine or _resolve_default_engine()
     target = models_dir or MODELS_DIR
-    console.print(f"Verifying models in [cyan]{target}[/]")
-    if not expected:
-        console.print("[yellow]No MODEL_SHA256 table yet — printing computed hashes only.[/]")
+    entries = _model_verification_targets(engine, target)
+
+    console.print(f"Verifying [bold]{engine}[/] models in [cyan]{target}[/]")
+    if not any(exp for _, _, exp in entries):
+        console.print("[yellow]No pinned hashes for this set — printing computed hashes only.[/]")
+
+    optional = _optional_onnx_filenames() if engine in ("onnx", "native") else set()
 
     failures = 0
-    for name in MODELS:
-        for suffix in (".pb", ".json"):
-            fname = f"{name}{suffix}"
-            fp = target / fname
-            if not fp.exists():
-                console.print(f"  [red]{fname}: MISSING[/]")
-                failures += 1
+    for fname, fp, exp in entries:
+        if not fp.exists():
+            if fname in optional:
+                # download-models never treats these as an error, so neither can
+                # the verifier — otherwise a healthy install reports a broken one.
+                console.print(f"  [yellow]{fname}: optional-missing[/]")
                 continue
-            try:
-                h = hashlib.sha256(fp.read_bytes()).hexdigest()
-            except OSError as e:
-                console.print(f"  [red]{fname}: READ ERROR — {e}[/]")
-                failures += 1
-                continue
-            exp = expected.get(fname)
-            if exp is None:
-                console.print(f"  {fname}: sha256={h}")
-            elif exp == h:
-                console.print(f"  [green]{fname}: OK[/] (sha256={h})")
-            else:
-                console.print(
-                    f"  [red]{fname}: MISMATCH[/] "
-                    f"(expected={exp}, got={h}) — redownload via "
-                    f"`vibechek download-models`."
-                )
-                failures += 1
+            console.print(f"  [red]{fname}: MISSING[/]")
+            failures += 1
+            continue
+        try:
+            h = _sha256_file(fp)
+        except OSError as e:
+            console.print(f"  [red]{fname}: READ ERROR — {e}[/]")
+            failures += 1
+            continue
+        if exp is None:
+            console.print(f"  {fname}: sha256={h}")
+        elif exp.lower() == h.lower():
+            console.print(f"  [green]{fname}: OK[/] (sha256={h})")
+        else:
+            console.print(
+                f"  [red]{fname}: MISMATCH[/] "
+                f"(expected={exp}, got={h}) — redownload via "
+                f"`vibechek download-models --engine {engine}`."
+            )
+            failures += 1
 
     if failures > 0:
         raise click.exceptions.Exit(code=1)
@@ -981,15 +1186,27 @@ def export_cmd(analysis_json: Path, fmt: str, output: Path | None) -> None:
     """
     import csv
 
+    from vibechek.io import atomic_write_json
+
     data = _load_analysis_json(analysis_json)
-    tracks = data.get("tracks") if isinstance(data, dict) else None
-    if tracks is None:
-        # Allow callers to pass a bare list of tracks too.
-        tracks = data if isinstance(data, list) else []
+    # Same strict shape check `tag`/`organize` get. The loose path let a
+    # `"tracks": "pending"` string through, iterated it character by character
+    # and reported "Exported 7 tracks" for an empty CSV.
+    tracks = _tracks_from_analysis(data, analysis_json.name)
 
     if output is None:
         output = analysis_json.with_suffix(f".{fmt}")
 
+    # `Path("analysis.json").with_suffix(".json")` IS the input, so the json
+    # branch used to truncate-and-rewrite the report it was handed — 30+ min of
+    # analysis destroyed if that write is interrupted. Refuse instead.
+    if output.resolve() == analysis_json.resolve():
+        raise click.ClickException(
+            f"Refusing to write over the source analysis file "
+            f"({analysis_json.name}) — pass -o/--output to name a destination."
+        )
+
+    written = 0
     if fmt == "csv":
         with output.open("w", encoding="utf-8", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=_EXPORT_CSV_COLUMNS)
@@ -1002,8 +1219,12 @@ def export_cmd(analysis_json: Path, fmt: str, output: Path | None) -> None:
                 if not isinstance(track, dict):
                     continue
                 writer.writerow(_track_to_csv_row(track))
+                written += 1
     elif fmt == "json":
-        output.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Atomic, like analyzer.py's own report write: an interrupted export
+        # must never leave a half-written JSON behind.
+        atomic_write_json(output, data, indent=2)
+        written = len(tracks)
     elif fmt == "m3u8":
         # Minimal — just paths. We deliberately *don't* prefix with `#EXTM3U`
         # yet because some DJ apps (rekordbox) get confused by m3u8 without
@@ -1013,8 +1234,15 @@ def export_cmd(analysis_json: Path, fmt: str, output: Path | None) -> None:
         # .get so a bare string/int doesn't raise AttributeError.
         lines = [t.get("path", "") for t in tracks if isinstance(t, dict) and t.get("path")]
         output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        written = len(lines)
 
-    console.print(f"[green]Exported {len(tracks)} tracks[/] → [cyan]{output}[/] ({fmt})")
+    # Report what was WRITTEN, not the length of the input collection — both
+    # writer branches drop entries the old count still included.
+    skipped = len(tracks) - written
+    note = f" [yellow]({skipped} unusable entries skipped)[/]" if skipped else ""
+    console.print(
+        f"[green]Exported {written} tracks[/] → [cyan]{output}[/] ({fmt}){note}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1053,11 +1281,18 @@ def profile_list_cmd() -> None:
 @click.argument("name")
 def profile_load_cmd(name: str) -> None:
     """Apply a profile's overrides to the saved config (and write to disk)."""
+    from vibechek.config import ConfigSaveRefused
     from vibechek.profiles import load_profile
 
     try:
         result = load_profile(name)
     except KeyError as e:
+        raise click.UsageError(str(e)) from e
+    except ConfigSaveRefused as e:
+        # load_profile is a load→save round trip, so an unreadable config.json
+        # would have it write profile-flavoured factory defaults over the
+        # user's real settings. config.save() refuses; without this handler the
+        # refusal reached the user as a raw traceback.
         raise click.UsageError(str(e)) from e
     console.print(
         f"[green]Loaded profile[/] [cyan]{result['loaded']}[/] → "
@@ -1108,8 +1343,9 @@ def cdj_export_cmd(rekordbox_xml: Path, out_dir: Path, dry_run: bool) -> None:
         raise click.ClickException(str(e)) from e
 
     verb = "Planned" if dry_run else "Converted"
+    colour = "yellow" if result.errors else "green"
     console.print(
-        f"[green]{verb}[/] [bold]{result.flac_planned}[/] FLAC → AIFF • "
+        f"[{colour}]{verb}[/] [bold]{result.flac_planned}[/] FLAC → AIFF • "
         f"[dim]{result.passthrough} passthrough • "
         f"{result.skipped} skipped • {result.errors} errors[/]"
     )
@@ -1119,6 +1355,32 @@ def cdj_export_cmd(rekordbox_xml: Path, out_dir: Path, dry_run: bool) -> None:
             console.print(f"  [red]{te.location}[/] — {te.message}")
         if len(result.track_errors) > 20:
             console.print(f"  [dim]… and {len(result.track_errors) - 20} more[/]")
+    # Down-sampling is an IRREVERSIBLE quality reduction (hi-res source, or an
+    # unprobeable one that got the CDJ-safe 44.1 kHz forced on it). The export
+    # reported it and the CLI threw it away, so a DJ exporting a 96 kHz library
+    # had no way to learn their AIFFs are not the masters.
+    if result.resampled:
+        console.print(
+            f"[yellow]Down-sampled {len(result.resampled)} track(s)[/] "
+            f"[dim]— the AIFF has a lower sample rate than the source[/]"
+        )
+        for src in result.resampled[:20]:
+            console.print(f"  [yellow]{src}[/]")
+        if len(result.resampled) > 20:
+            console.print(f"  [dim]… and {len(result.resampled) - 20} more[/]")
+    # Renames are benign but must be visible: the XML points at the new name,
+    # so a user diffing --out against their collection needs to know why
+    # "Track.aiff" came out as "Track_1.aiff" — and that the file already there
+    # is untouched.
+    if result.renamed:
+        console.print(
+            f"[dim]Renamed {len(result.renamed)} destination file(s) to avoid a "
+            f"name already in {out_dir} — nothing was overwritten.[/]"
+        )
+        for name in result.renamed[:20]:
+            console.print(f"  [dim]{name}[/]")
+        if len(result.renamed) > 20:
+            console.print(f"  [dim]… and {len(result.renamed) - 20} more[/]")
     if dry_run:
         console.print(
             f"[dim]Dry run — no audio or XML written. Output would go to[/] [cyan]{out_dir}[/]"
@@ -1128,6 +1390,9 @@ def cdj_export_cmd(rekordbox_xml: Path, out_dir: Path, dry_run: bool) -> None:
         console.print(
             "[dim]Next: import this XML into Rekordbox, then export to USB for the CDJ.[/]"
         )
+
+    converted = result.flac_planned if dry_run else result.flac_converted
+    _exit_if_total_failure(converted + result.passthrough, result.errors, "exported")
 
 
 # ---------------------------------------------------------------------------

@@ -56,29 +56,64 @@ def test_platform_pins_are_well_formed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Resolution order: PATH > staged > provision
+# Resolution order: staged > PATH > provision
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_prefers_path_over_staged(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(fp, "find_fpcalc", lambda: "SYS/fpcalc")
-    # Stage a decoy — PATH must still win.
+def _stage(payload: bytes = b"f" * 200_000) -> Path:
     staged = fp.staged_fpcalc_path()
     staged.parent.mkdir(parents=True, exist_ok=True)
-    staged.write_bytes(b"decoy")
+    staged.write_bytes(payload)
     os.chmod(staged, 0o755)
+    return staged
+
+
+def test_resolve_prefers_staged_over_path(monkeypatch, tmp_path: Path) -> None:
+    """The staged copy is the ONE binary whose provenance we know: this module
+    fetched the official release asset, checked it against a pinned SHA256, and
+    extracted it into an app-owned directory. A PATH hit is an arbitrary
+    executable named `fpcalc` — and on Windows `shutil.which` searches the
+    process's CURRENT DIRECTORY first, so a file dropped into a freshly unpacked
+    sample-pack folder used to win and be run once per track."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    # RAW string: `"\f"` is a form feed, so the unescaped literal was really
+    # '.\x0cpcalc.EXE' and this fixture no longer stood for the cwd hit its
+    # docstring describes.
+    cwd_hit = r".\fpcalc.EXE"
+    monkeypatch.setattr(fp, "find_fpcalc", lambda: cwd_hit)
+    staged = _stage()
+    assert fp.resolve_fpcalc() == str(staged)
+    # Make the fixture's value load-bearing: the cwd hit must LOSE, not merely
+    # be absent from the answer by coincidence.
+    assert fp.resolve_fpcalc() != cwd_hit
+
+
+def test_resolve_falls_back_to_path_when_nothing_staged(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """A system- or user-managed install still works when we have staged nothing."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(fp, "find_fpcalc", lambda: "SYS/fpcalc")
     assert fp.resolve_fpcalc() == "SYS/fpcalc"
 
 
 def test_resolve_uses_staged_when_no_path(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(fp, "find_fpcalc", lambda: None)
-    staged = fp.staged_fpcalc_path()
-    staged.parent.mkdir(parents=True, exist_ok=True)
-    staged.write_bytes(b"staged")
-    os.chmod(staged, 0o755)
+    staged = _stage()
     assert fp.resolve_fpcalc() == str(staged)
+
+
+def test_resolve_ignores_an_implausible_staged_stub(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Since the staged copy now WINS, a truncated extraction or a leftover stub
+    must not shadow a working fpcalc on PATH — a real Chromaprint build is ~2 MB."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(fp, "find_fpcalc", lambda: "SYS/fpcalc")
+    _stage(b"not-a-real-binary")
+    assert fp.find_staged_fpcalc() is None
+    assert fp.resolve_fpcalc() == "SYS/fpcalc"
 
 
 def test_resolve_none_when_absent(monkeypatch, tmp_path: Path) -> None:
@@ -248,8 +283,29 @@ def test_ensure_unsupported_platform_skips(monkeypatch, tmp_path: Path) -> None:
 def test_find_staged_fpcalc_present_and_absent(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     assert fp.find_staged_fpcalc() is None  # nothing staged yet
-    staged = fp.staged_fpcalc_path()
-    staged.parent.mkdir(parents=True, exist_ok=True)
-    staged.write_bytes(b"bin")
-    os.chmod(staged, 0o755)
+    staged = _stage()
     assert fp.find_staged_fpcalc() == str(staged)
+
+
+# ---------------------------------------------------------------------------
+# Cancel is not a network failure
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_lets_a_user_cancel_unwind(monkeypatch, tmp_path: Path) -> None:
+    """Cancel during the one-time fpcalc download must NOT be classified as a
+    failed download. It was: the banner told the user to "check your connection",
+    and — worse — duplicates.py's `except FpcalcProvisionError` then CONTINUED
+    the scan, so a cancelled dedupe returned a finished, near-duplicate-blind
+    report. Let it unwind to the dispatcher's cancelled branch instead."""
+    from vibechek import cancellation
+
+    _arm_missing(monkeypatch, tmp_path)
+
+    def cancelled(urls, dest, label, on_progress=None):
+        raise cancellation.CancelledError("Operation 'dedupe' cancelled by user")
+
+    monkeypatch.setattr(fp, "_download_from_mirrors", cancelled)
+
+    with pytest.raises(cancellation.CancelledError):
+        fp.ensure_fpcalc()

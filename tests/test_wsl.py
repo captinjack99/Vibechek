@@ -7,6 +7,7 @@ mocked so these tests run anywhere — Linux, macOS, or Windows.
 
 from __future__ import annotations
 
+import concurrent.futures
 import subprocess
 from unittest.mock import patch
 
@@ -428,7 +429,7 @@ def test_detect_wsl_non_windows_returns_empty_status(monkeypatch: pytest.MonkeyP
 
 def test_detect_wsl_missing_wsl_exe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", True)
-    monkeypatch.setattr("vibechek.wsl.shutil.which", lambda _name: None)
+    monkeypatch.setattr("vibechek.wsl.find_executable", lambda _name: None)
     from vibechek.wsl import detect_wsl
 
     status = detect_wsl()
@@ -439,7 +440,7 @@ def test_detect_wsl_missing_wsl_exe(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_detect_wsl_status_feature_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """If wsl --status returns non-zero, feature is disabled."""
     monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", True)
-    monkeypatch.setattr("vibechek.wsl.shutil.which", lambda _name: "C:\\Windows\\wsl.exe")
+    monkeypatch.setattr("vibechek.wsl.find_executable", lambda _name: "C:\\Windows\\wsl.exe")
     fake = subprocess.CompletedProcess([], 1, "", "")
     monkeypatch.setattr("vibechek.wsl._wsl_run", lambda *_a, **_k: fake)
     from vibechek.wsl import detect_wsl
@@ -452,7 +453,7 @@ def test_detect_wsl_status_feature_disabled(monkeypatch: pytest.MonkeyPatch) -> 
 def test_detect_wsl_quick_mode_skips_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     """quick=True should never call _probe_distro."""
     monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", True)
-    monkeypatch.setattr("vibechek.wsl.shutil.which", lambda _name: "C:\\Windows\\wsl.exe")
+    monkeypatch.setattr("vibechek.wsl.find_executable", lambda _name: "C:\\Windows\\wsl.exe")
 
     status_output = subprocess.CompletedProcess([], 0, "ok", "")
     list_output = subprocess.CompletedProcess(
@@ -835,7 +836,7 @@ def test_repair_wsl_shim_handles_missing_wsl_exe(monkeypatch: pytest.MonkeyPatch
     """If wsl.exe isn't on PATH, repair returns a clean error not an exception."""
     from vibechek.wsl import repair_wsl_shim
     monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", True)
-    monkeypatch.setattr("vibechek.wsl.shutil.which", lambda _: None)
+    monkeypatch.setattr("vibechek.wsl.find_executable", lambda _: None)
     result = repair_wsl_shim("Ubuntu")
     assert result["ok"] is False
     assert "wsl.exe" in result["error"].lower()
@@ -997,7 +998,7 @@ def test_install_cuda_libs_in_wsl_no_packages_for_unknown_libs(
 
     # Pretend we're on Windows so the early non-Windows return doesn't fire
     monkeypatch.setattr("vibechek.wsl.IS_WINDOWS", True)
-    monkeypatch.setattr("vibechek.wsl.shutil.which", lambda _: "C:\\fake\\wsl.exe")
+    monkeypatch.setattr("vibechek.wsl.find_executable", lambda _: "C:\\fake\\wsl.exe")
 
     result = install_cuda_libs_in_wsl("Ubuntu", ["libimaginary.so.99"])
     assert result["ok"] is False
@@ -1477,7 +1478,7 @@ def test_install_cuda_libs_failure_routes_through_explain(
     from vibechek import wsl as wsl_mod
 
     monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
-    monkeypatch.setattr(wsl_mod.shutil, "which", lambda _n: "C:\\fake\\wsl.exe")
+    monkeypatch.setattr(wsl_mod, "find_executable", lambda _n: "C:\\fake\\wsl.exe")
     monkeypatch.setattr(wsl_mod, "_stage_script_for_wsl", lambda s: tmp_path / f"s-{id(s)}")
     monkeypatch.setattr(wsl_mod, "win_to_wsl_path", lambda s: s)
     monkeypatch.setattr(
@@ -1514,7 +1515,7 @@ def test_install_cuda_libs_failure_routes_through_explain(
 def _win_wsl(monkeypatch: pytest.MonkeyPatch) -> None:
     from vibechek import wsl as wsl_mod
     monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
-    monkeypatch.setattr(wsl_mod.shutil, "which", lambda _n: "C:\\fake\\wsl.exe")
+    monkeypatch.setattr(wsl_mod, "find_executable", lambda _n: "C:\\fake\\wsl.exe")
 
 
 def test_engine_stack_imports_maps_engine_to_stack() -> None:
@@ -1533,7 +1534,7 @@ def test_probe_engine_stack_import_inconclusive_without_wsl(
     """No wsl.exe -> the probe returns ok=True (inconclusive), NEVER False — we
     must never trigger a reinstall off a probe that couldn't even run."""
     from vibechek import wsl as wsl_mod
-    monkeypatch.setattr(wsl_mod.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(wsl_mod, "find_executable", lambda _n: None)
     ok, detail = wsl_mod._probe_engine_stack_import("Ubuntu", "onnx")
     assert ok is True
     assert "skipped" in detail
@@ -1731,3 +1732,492 @@ def test_pyproject_onnx_gpu_extra_matches_the_bootstrap_pin() -> None:
         f"ceiling as wsl.ONNXRUNTIME_GPU_SPEC ({ONNXRUNTIME_GPU_SPEC}) — both "
         "feed the cu12 wheel set"
     )
+
+
+# ---------------------------------------------------------------------------
+# Shim repair, probe robustness, .wslconfig round-trip
+# ---------------------------------------------------------------------------
+
+
+def _fake_distro(name: str = "Ubuntu-24.04") -> DistroInfo:
+    return DistroInfo(name=name, version="2", state="Running", is_default=True)
+
+
+def _assert_chmod_before_every_shim_mv(script: str, label: str) -> None:
+    """Every atomic `mv <temp> "$SHIM"` must carry the entry point's mode across.
+
+    `mktemp` creates the temp 0600 and `mv` is a rename, so without a chmod the
+    "repaired" shim comes back non-executable — and every `[ -x ]` readiness gate
+    (the probe's own, and the launcher's) then reports "vibechek not installed"
+    while repair_wsl_shim still claims "Analyze should work now."
+    """
+    lines = script.splitlines()
+    movs = [i for i, ln in enumerate(lines) if ln.strip().startswith('mv "$TMP')]
+    assert movs, f"{label}: expected at least one shim atomic-replace `mv`"
+    for i in movs:
+        var = lines[i].strip().split('"')[1]
+        window = "\n".join(lines[max(0, i - 8):i])
+        assert f'chmod --reference="$SHIM" "{var}"' in window, (
+            f"{label}: {lines[i].strip()!r} (line {i + 1}) is not preceded by a "
+            "chmod that preserves the shim's mode — the repair would leave a "
+            "0600 entry point"
+        )
+
+
+def test_cuda_pip_bootstrap_shim_repair_preserves_the_executable_bit() -> None:
+    from vibechek.wsl import _CUDA_LIBS_PIP_BOOTSTRAP
+
+    _assert_chmod_before_every_shim_mv(
+        _CUDA_LIBS_PIP_BOOTSTRAP, "_CUDA_LIBS_PIP_BOOTSTRAP",
+    )
+
+
+def test_probe_distro_shim_repair_preserves_the_executable_bit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe's self-repair runs on EVERY status refresh, so a mode-losing
+    rewrite flips a fixable install to 'not installed' in the same script run."""
+    from vibechek import wsl as wsl_mod
+
+    captured: list[str] = []
+
+    class _Proc:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):  # noqa: A002
+            captured.append(input.decode("utf-8"))
+            return (b"", b"")
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", lambda *a, **k: _Proc())
+    wsl_mod._probe_distro(_fake_distro(), "C:\\fake\\wsl.exe")
+
+    assert captured, "the probe must pipe its script over stdin"
+    _assert_chmod_before_every_shim_mv(captured[0], "_probe_distro")
+
+
+def test_repair_wsl_shim_script_preserves_the_executable_bit(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from vibechek import cancellation as cancel_mod
+    from vibechek import wsl as wsl_mod
+
+    monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(wsl_mod, "find_executable", lambda _n: "C:\\fake\\wsl.exe")
+    monkeypatch.setattr(wsl_mod, "win_to_wsl_path", lambda s: s)
+    monkeypatch.setattr(cancel_mod, "is_cancelled", lambda: False)
+    monkeypatch.setattr(
+        wsl_mod, "_start_cancellation_watchdog",
+        lambda proc, on_cancel=None: (threading.Event(), {"v": False}),
+    )
+
+    staged: list[str] = []
+
+    def _stage(script: str):
+        staged.append(script)
+        path = tmp_path / "repair.sh"
+        path.write_text(script, encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(wsl_mod, "_stage_script_for_wsl", _stage)
+
+    class _Proc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return (b"ALREADY_OK\n", b"")
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", lambda *a, **k: _Proc())
+
+    wsl_mod.repair_wsl_shim("Ubuntu")
+    assert staged, "repair_wsl_shim must stage a script"
+    _assert_chmod_before_every_shim_mv(staged[0], "repair_wsl_shim")
+
+
+def test_probe_distro_kills_the_child_when_the_probe_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`communicate` does NOT kill on timeout. Abandoning the child leaks a live
+    wsl.exe (plus the `bash -s` inside the VM) on every status refresh."""
+    from vibechek import wsl as wsl_mod
+
+    class _Proc:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.killed = False
+            self.drained = False
+
+        def communicate(self, input=None, timeout=None):  # noqa: A002
+            if not self.killed:
+                raise subprocess.TimeoutExpired("wsl", timeout or 30)
+            self.drained = True
+            return (b"", b"")
+
+        def kill(self) -> None:
+            self.killed = True
+
+    proc = _Proc()
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", lambda *a, **k: proc)
+
+    distro = _fake_distro()
+    wsl_mod._probe_distro(distro, "C:\\fake\\wsl.exe")
+
+    assert proc.killed is True, "a timed-out probe must kill its wsl.exe child"
+    assert proc.drained is True, "and reap it, so the pipes are released"
+    assert distro.vibechek_installed is False
+
+
+def _arm_detect(monkeypatch: pytest.MonkeyPatch, status_rc: int, list_stdout: str):
+    """Point detect_wsl at a fake wsl.exe with the given --status rc / -l -v text."""
+    from vibechek import wsl as wsl_mod
+
+    monkeypatch.setattr(wsl_mod, "IS_WINDOWS", True)
+    monkeypatch.setattr(wsl_mod, "find_executable", lambda _n: "C:\\fake\\wsl.exe")
+
+    def fake_run(cmd, **kwargs):
+        if "--status" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, status_rc, "", "Invalid command line argument: --status",
+            )
+        if "--list" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, list_stdout, "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(wsl_mod, "_wsl_run", fake_run)
+    return wsl_mod
+
+
+_LIST_OK = "  NAME            STATE     VERSION\n* Ubuntu-24.04    Running   2\n"
+
+
+def test_detect_wsl_trusts_the_distro_list_over_a_failing_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A distro inventory is proof the feature is on. `wsl --status` is a single
+    unretried 5 s probe that an older in-box wsl.exe rejects outright — treating
+    it as the sole authority told users with a provisioned Ubuntu that WSL wasn't
+    installed and offered them a UAC-elevated `wsl --install`."""
+    wsl_mod = _arm_detect(monkeypatch, status_rc=1, list_stdout=_LIST_OK)
+
+    status = wsl_mod.detect_wsl(quick=True)
+    assert status.wsl_feature_enabled is True
+    assert [d.name for d in status.distros] == ["Ubuntu-24.04"]
+    assert status.error is None
+
+
+def test_detect_wsl_explains_a_feature_off_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No distros either -> the feature really is off, but say WHY: the non-zero
+    branch used to return with error=None, so nothing explained the verdict."""
+    wsl_mod = _arm_detect(monkeypatch, status_rc=1, list_stdout="")
+
+    status = wsl_mod.detect_wsl(quick=True)
+    assert status.wsl_feature_enabled is False
+    assert status.error and "--status" in status.error
+
+
+def test_detect_wsl_survives_a_probe_fanout_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`as_completed`'s timeout raises from the `for` statement, OUTSIDE the
+    per-future handler. Unguarded it escaped detect_wsl -> preflight ->
+    analyze_directory and killed a multi-hour job the user had just queued."""
+    wsl_mod = _arm_detect(monkeypatch, status_rc=0, list_stdout=_LIST_OK)
+    monkeypatch.setattr(wsl_mod, "_probe_distro", lambda *_a, **_k: None)
+
+    budgets: list[int] = []
+
+    def boom(fs, timeout=None):
+        budgets.append(timeout)
+        # The class as_completed really raises. On 3.11+ it is an alias of the
+        # builtin, but on 3.10 (our floor, and a CI leg) it is
+        # concurrent.futures._base.TimeoutError — a plain Exception subclass, so
+        # raising the builtin here would pass a handler the real code fails.
+        raise concurrent.futures.TimeoutError("1 (of 1) futures unfinished")
+
+    monkeypatch.setattr(wsl_mod.concurrent.futures, "as_completed", boom)
+
+    status = wsl_mod.detect_wsl(quick=False)  # must not raise
+    assert [d.name for d in status.distros] == ["Ubuntu-24.04"]
+    assert budgets and budgets[0] > 30, (
+        "the fan-out budget must exceed the per-probe 30 s, or as_completed "
+        "deterministically fires before the probes' own deadline"
+    )
+
+
+@pytest.mark.parametrize("engine", ["essentia_tf", "onnx", "native"])
+def test_user_bootstrap_rebuilds_a_venv_whose_interpreter_is_dead(engine: str) -> None:
+    """Existence-only (`[ ! -d ]`) meant a venv DIRECTORY with a dead bin/python
+    — the exact state _probe_distro reports as py_broken=1 — skipped creation and
+    went straight to the venv's own pip, whose shebang names the dead
+    interpreter. 'Set up now' and ensure_engine_runtime then failed forever."""
+    script = _user_bootstrap(engine)
+    subdir = "venv-onnx" if engine in ("onnx", "native") else "venv"
+
+    assert f'if [ ! -d "$HOME/.vibechek/{subdir}" ]' not in script, (
+        "the existence-only venv guard must be gone"
+    )
+    assert '-m venv --clear "$VENV_DIR"' in script
+    assert '[ ! -x "$VENV_DIR/bin/python" ]' in script
+    assert '"$VENV_DIR/bin/python" -c "import sys"' in script
+
+
+def test_user_bootstrap_venv_guard_takes_the_rebuild_branch_when_python_is_gone(
+    tmp_path,
+) -> None:
+    """bash-level proof against a real half-built venv directory (what an install
+    killed during step [3/4], or a distro release-upgrade, leaves behind)."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    bash = _shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this host")
+
+    guard = next(
+        ln for ln in _user_bootstrap("essentia_tf").splitlines()
+        if ln.startswith('if [ ! -x "$VENV_DIR/bin/python" ]')
+    )
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "pip").write_text("#!/nonexistent/python\n", encoding="utf-8")
+    posix = str(tmp_path / "venv").replace("\\", "/")
+
+    program = "\n".join([
+        f'VENV_DIR="{posix}"', guard, "    echo REBUILD", "else", "    echo SKIP", "fi",
+    ])
+    result = _subprocess.run(
+        [bash, "-s"], input=program.encode("utf-8"),
+        capture_output=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert b"REBUILD" in result.stdout, (
+        "a venv directory with no working bin/python must be rebuilt, not pip'd into"
+    )
+
+
+@pytest.mark.parametrize("engine", ["essentia_tf", "onnx", "native"])
+def test_generated_user_bootstrap_parses_as_bash(engine: str) -> None:
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    bash = _shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available on this host")
+
+    result = _subprocess.run(
+        [bash, "-n"], input=_user_bootstrap(engine).encode("utf-8"),
+        capture_output=True, timeout=20,
+    )
+    assert result.returncode == 0, (
+        f"{engine} bootstrap has a bash syntax error:\n"
+        f"{result.stderr.decode('utf-8', errors='replace')}"
+    )
+
+
+def test_run_vibechek_in_wsl_joins_the_stderr_reader(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`proc.wait()` returns the instant the child exits; the tail of stderr is
+    still in flight on an unjoined daemon thread. analyzer.py reads that shared
+    list IMMEDIATELY — both for the version-drift retry and for the user-facing
+    crash detail — so the last lines before a crash must be in hand."""
+    import time as _time
+
+    from vibechek import cancellation as cancel_mod
+    from vibechek import wsl as wsl_mod
+
+    monkeypatch.setattr(wsl_mod, "find_executable", lambda _n: "C:\\fake\\wsl.exe")
+    monkeypatch.setattr(wsl_mod, "win_to_wsl_path", lambda s: s)
+    monkeypatch.setattr(
+        wsl_mod, "_stage_script_for_wsl", lambda s: tmp_path / "launcher.sh",
+    )
+    monkeypatch.setattr(cancel_mod, "is_cancelled", lambda: False)
+    (tmp_path / "launcher.sh").write_text("true\n", encoding="utf-8")
+
+    class _SlowStderr:
+        def __iter__(self):
+            for line in ("VIBECHEK_EVENT\tstage\tx\n",
+                         "Error: No such option: --genre-web-lookup\n"):
+                _time.sleep(0.08)
+                yield line
+
+    class _Proc:
+        pid = 4242
+        stdout = iter(())
+        stderr = _SlowStderr()
+
+        def wait(self, timeout=None):
+            return 2
+
+        def poll(self):
+            return 2
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", lambda *a, **k: _Proc())
+
+    tail: list[str] = []
+    result = wsl_mod.run_vibechek_in_wsl(
+        "Ubuntu", ["analyze", "/music"], on_stderr_line=tail.append,
+    )
+    assert result.returncode == 2
+    assert tail and tail[-1] == "Error: No such option: --genre-web-lookup", (
+        "the crash line must have reached the caller's tail before we returned"
+    )
+
+
+# ---------------------------------------------------------------------------
+# .wslconfig — never write below WSL's own default; round-trip the user's codec
+# ---------------------------------------------------------------------------
+
+
+def test_wslconfig_target_never_lands_below_the_wsl2_default() -> None:
+    """WSL2 gives the VM 50% of host RAM (max 8 GB) with no `memory=` key at all.
+    Below ~16 GB of host the old `host - 8192` term dropped under that, so the
+    'Increase memory available to Vibechek' button SHRANK the VM — to 1 GB on a
+    9 GB laptop, on the very screen that just refused the run for lack of RAM."""
+    from vibechek import wsl as wsl_mod
+
+    for host in (9216, 10240, 12288, 16384, 20480, 32768):
+        target = wsl_mod._choose_wslconfig_memory_target_mb(host)
+        assert target is not None, host
+        floor = (min(host // 2, 8192) // 1024) * 1024
+        assert target >= floor, f"host {host}MB: {target}MB is below WSL's {floor}MB"
+
+    # The two headline regressions, spelled out.
+    assert wsl_mod._choose_wslconfig_memory_target_mb(9216) >= 4096
+    assert wsl_mod._choose_wslconfig_memory_target_mb(12288) >= 6144
+
+
+def test_bump_wslconfig_refuses_to_write_a_non_increase(tmp_path) -> None:
+    """No `memory=` line is NOT 'no limit' — it is WSL's default. Treating it as
+    unknown skipped the never-shrink guard entirely (the common case: 'Nothing in
+    the app wrote that file before')."""
+    from vibechek import wsl as wsl_mod
+
+    p = tmp_path / ".wslconfig"
+    out = wsl_mod.bump_wslconfig_memory(path=p, host_total_mb=12288)
+
+    assert out["ok"] is True
+    assert out["changed"] is False
+    assert out["restart_required"] is False
+    assert not p.exists(), "nothing to raise means nothing written"
+    assert "nothing to raise" in out["message"]
+
+
+def test_bump_wslconfig_still_raises_on_a_host_with_room(tmp_path) -> None:
+    from vibechek import wsl as wsl_mod
+
+    p = tmp_path / ".wslconfig"
+    out = wsl_mod.bump_wslconfig_memory(path=p, host_total_mb=32768)
+    assert out["ok"] is True and out["changed"] is True
+    assert out["new"] == "24GB"
+
+
+def test_bump_wslconfig_round_trips_a_utf16_file(tmp_path) -> None:
+    """PowerShell 5.1 redirection — what every WSL tutorial tells Windows users
+    to run — writes UTF-16 LE with a BOM. Reading it as UTF-8 with
+    errors='replace' turned the BOM into two U+FFFD and appended an ASCII tail,
+    leaving a file WSL can no longer parse (processors/swap/kernel silently
+    stop applying) while reporting success."""
+    import codecs
+
+    from vibechek import wsl as wsl_mod
+
+    p = tmp_path / ".wslconfig"
+    original = "[wsl2]\r\nmemory=10GB\r\nprocessors=8\r\nswap=0\r\n"
+    p.write_bytes(codecs.BOM_UTF16_LE + original.encode("utf-16-le"))
+
+    out = wsl_mod.bump_wslconfig_memory(path=p, target_mb=24 * 1024)
+    assert out["ok"] is True and out["changed"] is True
+    # The never-shrink guard can SEE the existing value now.
+    assert out["old"] == "10GB" and out["old_mb"] == 10 * 1024
+
+    raw = p.read_bytes()
+    assert raw.startswith(codecs.BOM_UTF16_LE), "the BOM must survive the edit"
+    text = raw.decode("utf-16")
+    assert text.count("[wsl2]") == 1
+    assert "processors=8" in text and "swap=0" in text
+    assert "memory=24GB" in text and "memory=10GB" not in text
+
+
+def test_bump_wslconfig_does_not_duplicate_a_bomd_wsl2_section(tmp_path) -> None:
+    """`str.strip()` does not remove U+FEFF, so a BOM'd first line never matched
+    the `[...]` header test and a SECOND [wsl2] section was appended."""
+    import codecs
+
+    from vibechek import wsl as wsl_mod
+
+    p = tmp_path / ".wslconfig"
+    p.write_bytes(codecs.BOM_UTF8 + b"[wsl2]\nmemory=10GB\nprocessors=8\n")
+
+    out = wsl_mod.bump_wslconfig_memory(path=p, target_mb=24 * 1024)
+    assert out["ok"] is True and out["old"] == "10GB"
+
+    raw = p.read_bytes()
+    assert raw.startswith(codecs.BOM_UTF8)
+    text = raw.decode("utf-8-sig")
+    assert text.count("[wsl2]") == 1
+    assert text.count("memory=") == 1
+    assert "memory=24GB" in text and "processors=8" in text
+
+
+def test_bump_wslconfig_refuses_an_undecodable_file(tmp_path) -> None:
+    """Fail loud: the lossy read reported success over a mangled config."""
+    from vibechek import wsl as wsl_mod
+
+    p = tmp_path / ".wslconfig"
+    corrupt = b"[wsl2]\nmemory=\xff\xfe8GB\n"
+    p.write_bytes(corrupt)
+
+    out = wsl_mod.bump_wslconfig_memory(path=p, target_mb=24 * 1024)
+    assert out["ok"] is False and out["changed"] is False
+    assert out["kind"] == "fatal"
+    assert out["restart_required"] is False
+    assert p.read_bytes() == corrupt, "an unreadable config must be left alone"
+
+    read = wsl_mod.read_wslconfig_memory(path=p)
+    assert read["ok"] is False and read["memory"] is None
+
+
+# ---------------------------------------------------------------------------
+# _wsl_exe — the one lookup every wsl.exe launcher goes through
+#
+# Its result is EXECUTED (install, upgrade, analyze, GPU probes), so it resolves
+# through `utils.find_executable`, which discards a hit in the process cwd. On
+# Windows `shutil.which` prepends the current directory to the search path
+# (NeedCurrentDirectoryForExePath; passing `path=` doesn't suppress it), so a
+# `wsl.exe` unpacked next to a sample pack would have beaten the System32 copy
+# and then been handed our command lines.
+# ---------------------------------------------------------------------------
+
+
+def test_wsl_exe_ignores_a_wsl_planted_in_the_current_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibechek import utils
+    from vibechek import wsl as wsl_mod
+
+    planted = tmp_path / "wsl.exe"
+    planted.write_bytes(b"planted")
+    monkeypatch.chdir(tmp_path)
+    # Drive the REAL find_executable: only the raw which() underneath is stubbed,
+    # exactly as Windows would answer with the cwd on the search path.
+    monkeypatch.setattr(utils.shutil, "which", lambda _name: str(planted))
+
+    assert wsl_mod._wsl_exe() is None
+
+    # ...and a caller degrades honestly rather than running the planted binary.
+    def _explode(*_a, **_kw):
+        raise AssertionError("the cwd copy must never be executed")
+
+    monkeypatch.setattr(wsl_mod.subprocess, "Popen", _explode)
+    monkeypatch.setattr(wsl_mod.subprocess, "run", _explode)
+
+    info = wsl_mod._probe_wsl_onnx_gpu("Ubuntu-24.04")
+    assert info.error == "wsl.exe not on PATH"

@@ -84,6 +84,15 @@ interface LibraryState {
    * selection survives the move. ML analysis fields are preserved.
    */
   updateTrackPaths: (pathMap: Map<string, string> | Record<string, string>) => void;
+  /**
+   * Drop tracks that no longer exist on disk (e.g. duplicates the user just
+   * sent to the trash). Without this the library table keeps listing ghosts:
+   * Play loads a nonexistent file, Apply-tags reports per-file failures, and an
+   * organize preview fills with "File not found" — all against files Vibechek
+   * itself deleted. Also prunes the selection and the right-rail inspector so
+   * neither points at a removed path. A no-op for an empty list.
+   */
+  removeTracks: (paths: string[]) => void;
   toggleSelect: (path: string) => void;
   selectAll: () => void;
   /**
@@ -215,6 +224,32 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const player = usePlayerStore.getState();
     const movedPlay = player.path ? lookup.get(player.path) : undefined;
     if (movedPlay && movedPlay !== player.path) usePlayerStore.setState({ path: movedPlay });
+  },
+
+  removeTracks: (paths) => {
+    if (paths.length === 0) return;
+    const gone = new Set(paths);
+    const { tracks, selectedIds } = get();
+    const nextTracks = tracks.filter((t) => !gone.has(t.path));
+    if (nextTracks.length === tracks.length) return; // nothing matched
+
+    let nextSelected = selectedIds;
+    if (selectedIds.size > 0) {
+      const kept = new Set<string>();
+      for (const id of selectedIds) if (!gone.has(id)) kept.add(id);
+      if (kept.size !== selectedIds.size) nextSelected = kept;
+    }
+    set({ tracks: nextTracks, selectedIds: nextSelected });
+
+    // The right-rail inspector keeps its own single-track selection; leaving it
+    // on a deleted path would render a detail pane for a file that's gone.
+    const ui = useUIStore.getState();
+    if (ui.selectedTrackPath && gone.has(ui.selectedTrackPath)) ui.setSelectedTrack(null);
+
+    // Same for the global player: the file is gone, so Play/Restart would load
+    // a 404. Close the bar rather than leave a dead track loaded.
+    const player = usePlayerStore.getState();
+    if (player.path && gone.has(player.path)) player.stop();
   },
 
   toggleSelect: (path) => {

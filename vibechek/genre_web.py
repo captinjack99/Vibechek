@@ -6,8 +6,7 @@ track. No model is involved in the answer: a search, a few polite page fetches, 
 bounded regex over the labelled field, an identity gate, and a chart-bucket
 refusal. Output feeds `genres.reconcile_genre`'s web tier.
 
-Why deterministic (measured 2026-07-24, 86-track adjudicated corpus — see
-internal/MODEL_PORTFOLIO_2026-07-21.md addenda and internal/bughunt/v2_score_*.log):
+Why deterministic (measured 2026-07-24, 86-track adjudicated corpus):
 
   * shipping prefer_tag baseline                      52.3% exact / 70.9% family
   * v1 (this module's old LLM snippet synthesis)      59.3 / 72.7
@@ -27,7 +26,10 @@ Design notes for the shipping path:
     throttle, 403, malformed page) returns an empty genre so analysis falls back
     to tags + the audio read. It must never take down an analyze run.
   * Fetch policy: only URLs the search returned (no crawling), robots.txt
-    honoured, one request per host per 1.5 s, 10 s timeout, capped body size.
+    honoured, one request per host per 1.5 s, 10 s timeout, capped body size,
+    and never a loopback/LAN/link-local address. The policy is re-run on EVERY
+    redirect hop, not just the URL the search handed us — otherwise a 30x is a
+    hole through every promise on this list.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ import re
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -85,35 +89,107 @@ _SYSTEM = (
 )
 
 
+def _canon_norm(s: str) -> str:
+    """Separator- AND ampersand-insensitive form, used on both sides of `_canon`.
+
+    `_norm` folds "&" to " and "; this normalizer used not to, so the only two
+    vocab entries carrying an ampersand ("Drum & Bass", "Melodic House & Techno")
+    never matched a page that spells the word out. "Drum and Bass" was dropped
+    outright and "Melodic House and Techno" fell through to containment and came
+    back as the wrong family, "Techno".
+    """
+    s = re.sub(r"[-_/]+", " ", s.lower()).replace("&", " and ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# Leftover words the containment rung may ignore. A vocab entry found inside a
+# LONGER phrase is only evidence for that entry when everything else in the
+# phrase merely NARROWS it: "Progressive Trance" is still a Trance record, but
+# "Hardcore Punk" is not a gabber record, "Pop Rock" is not a pop record and
+# "Post-Disco"/"Disco Polo" are their own musics. Anything not listed here makes
+# the phrase a genre we do not know, and an unknown genre must be refused rather
+# than rounded to whichever vocab word happens to sit inside it.
+_CANON_QUALIFIERS = frozenset({
+    # Modifiers this taxonomy already uses to narrow a family.
+    "progressive", "melodic", "deep", "dark", "hard", "soulful", "funky",
+    "jackin", "uplifting", "vocal", "acid", "liquid", "classic", "club",
+    # Filler a catalog page wraps around the value itself.
+    "music", "genre", "genres", "style", "styles", "and", "the", "of",
+})
+
+# Parenthesised asides ("Trance (Main Floor)", "Rock (feat. hardcore punk
+# influences)") qualify a genre field; they never name it. Dropping them before
+# the canon runs keeps the legitimate field readable AND stops an aside from
+# donating the vocab word it happens to mention.
+_BRACKETED = re.compile(r"[\(\[][^)\]]*[\)\]]")
+
+
+def _whole_phrase_in(needle: str, hay: str) -> bool:
+    """True when `needle` stands as its own word(s) inside `hay`.
+
+    Plain substring containment let a FUSED word donate a subgenre it does not
+    name: "electronic style" → "Electro", "britpop" → "Pop". The vocab entry has
+    to be a whole word to count.
+    """
+    return re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", hay) is not None
+
+
+def _only_qualifiers_left(hay: str, needle: str) -> bool:
+    """True when `needle` accounts for `hay` apart from narrowing qualifiers.
+
+    Both arguments are `_canon_norm`ed. This is what keeps the containment rung
+    from answering a question it was not asked: "Hardcore Punk" contains the
+    vocab entry "Hardcore", but the leftover word "punk" says the phrase names a
+    DIFFERENT music, so there is no read — a punk record must not be filed as
+    gabber (and a prose span that merely mentions a genre must not become one).
+    """
+    rest = re.sub(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", " ", hay)
+    return all(w in _CANON_QUALIFIERS for w in rest.split())
+
+
 def _canon(g: str | None) -> str:
     """Map a web genre string onto the known taxonomy (best-effort).
 
-    Exact (case/separator-insensitive) vocab match first, then the LONGEST
-    vocab entry contained in the answer. Never the reverse containment — that
-    direction mapped generic answers onto the first *specific* subgenre that
-    happened to contain them ("house" → "Tech House", "disco" → "Nu-Disco"),
-    and the wrong subgenre then flowed into reconciliation as the web read.
+    Exact (case/separator/ampersand-insensitive) vocab match first, then the
+    LONGEST vocab entry contained in the answer as a whole word. Never the
+    reverse containment — that direction mapped generic answers onto the first
+    *specific* subgenre that happened to contain them ("house" → "Tech House",
+    "disco" → "Nu-Disco"), and the wrong subgenre then flowed into
+    reconciliation as the web read.
 
     Both sides of the exact rung are separator-normalized, so a catalog field
     that reads "Nu Disco" matches the vocab entry "Nu-Disco" instead of falling
     through to the containment rung and losing specificity to plain "Disco".
+
+    The containment rung additionally refuses a hit that leaves un-consumed,
+    non-qualifier words behind (`_only_qualifiers_left`). Without that guard it
+    had no "outside our taxonomy → refuse" branch at all: every phrase merely
+    CONTAINING a vocab word was rounded to it, so "Hardcore Punk", "Pop Rock",
+    "Disco Polo" and "Post-Disco" all came back as EDM genres — and so did any
+    prose span a field capture happened to swallow.
     """
     from vibechek.genres import DJ_GENRE_MAP  # noqa: PLC0415
 
     t = (g or "").strip()
     if not t:
         return ""
-    norm = re.sub(r"[-_/]+", " ", t.lower())
-    norm = re.sub(r"\s+", " ", norm).strip()
+    # A bracketed aside qualifies the field, it never names it.
+    norm = _canon_norm(_BRACKETED.sub(" ", t))
+    if not norm:
+        # ...unless the aside is ALL there is. "(Deep House)" has nothing else
+        # to name it, so the brackets are decoration and the value inside is the
+        # field; dropping them wholesale here refused a genre we do know.
+        norm = _canon_norm(_BRACKETED.sub(lambda m: f" {m.group(0)[1:-1]} ", t))
+    if not norm:
+        return DJ_GENRE_MAP.get(t, t)
     for v in VOCAB:
-        vn = re.sub(r"\s+", " ", re.sub(r"[-_/]+", " ", v.lower())).strip()
-        if norm in (v.lower(), vn):
+        if norm == _canon_norm(v):
             return DJ_GENRE_MAP.get(v, v)
     best = ""
     for v in VOCAB:
-        if v.lower() in norm and len(v) > len(best):
+        if _whole_phrase_in(_canon_norm(v), norm) and len(v) > len(best):
             best = v
-    if best:
+    if best and _only_qualifiers_left(norm, _canon_norm(best)):
         return DJ_GENRE_MAP.get(best, best)
     return DJ_GENRE_MAP.get(t, t)
 
@@ -238,7 +314,25 @@ BUCKET_EXACT = frozenset({"electronic", "dance", "edm", "pop", "electronica danc
                           "dance electronic", "electronic dance music", "music", "other"})
 
 # Beatport/Traxsource-style detail block: "Label : X Genre : Tech House BPM: 126"
-FIELD_A = re.compile(r"Genre\s*:\s*(.{2,60}?)\s+(?:BPM\b|Length\s*:|Released\s*:|Key\s*:)", re.I)
+# The capture is GENRE-SHAPED, not dot-any. `_extract_text` collapses the whole
+# page to one line, so a dot-any capture spanned what were separate table cells:
+# on "Genre: Rock Style: Hardcore Punk Released: 1981" it swallowed the
+# neighbouring label and handed the canon "Rock Style: Hardcore Punk", which
+# contains the EDM vocab entry "Hardcore". Barring ':' (and anything else a genre
+# field never holds) stops the capture at its own cell — the same discipline
+# FIELD_GEN already applies.
+#
+# '.' and '+' are barred for the same reason ':' is: they are sentence and list
+# punctuation, not genre punctuation, and admitting them let a colon-free PROSE
+# span between the label and a stop word be captured whole —
+# "Genre: Rock. Buy the reissue of this hardcore classic. Released: 1981" was
+# captured and donated "Hardcore". Round brackets stay, because a real field does
+# use them ("Trance (Main Floor)"); a bracketed aside can no longer donate a
+# genre because `_canon` strips brackets before matching.
+FIELD_A = re.compile(
+    r"Genre\s*:\s*([A-Za-z0-9 ,&/'’()|\-]{2,60}?)"
+    r"\s+(?:BPM\b|Length\s*:|Released\s*:|Key\s*:)",
+    re.I)
 # Generic labelled field for everything else. Non-greedy WITH a stop-word
 # lookahead: a Discogs page reads "Genre: Electronic Style: House, Tech House",
 # and a greedy capture swallowed "Electronic Style" — which is not in
@@ -286,10 +380,30 @@ def _title_core(title: str) -> str:
 
 
 def _artist_names(artist: str) -> list[str]:
-    """Each collaborating artist, feat-credits removed, normalized."""
+    """Each collaborating artist, feat-credits removed, normalized.
+
+    Components under 3 normalized characters are too weak to match on their own,
+    but when that floor removes EVERYTHING the artist is simply a short one (MK,
+    MØ, Ki/Ki) — fall back to the whole normalized artist so there is still a
+    name to verify. An empty list here means "no usable name at all", and the
+    identity gate must read it that way, never as "matched".
+    """
     parts = re.split(r"\s*(?:,|&|\bx\b|\bvs\.?\b|\bwith\b|/|\+)\s*",
                      _FEAT.sub(" ", str(artist)))
-    return [_norm(p) for p in parts if len(_norm(p)) >= 3]
+    names = [_norm(p) for p in parts if len(_norm(p)) >= 3]
+    if names:
+        return names
+    whole = _norm(artist)
+    return [whole] if whole else []
+
+
+def _name_on_page(name: str, ntext: str) -> bool:
+    """Whole-word membership of a normalized name in normalized page text.
+
+    Substring matching is unsafe for the short names the gate now checks ("mk"
+    sits inside "remark"), and it was never right for the long ones either.
+    """
+    return re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", ntext) is not None
 
 
 def _host_of(url: str) -> str:
@@ -396,12 +510,12 @@ def _robots_rules(host: str) -> list[tuple[str, str]]:
     with _robots_lock:
         if host in _robots_cache:
             return _robots_cache[host]
-    import urllib.request  # noqa: PLC0415
-
     try:
         req = urllib.request.Request(f"https://{host}/robots.txt",
                                      headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:  # noqa: S310
+        # Same hop policy as a page fetch: a robots.txt that 30x's must not be
+        # able to steer the probe at a loopback/LAN address either.
+        with _robots_opener().open(req, timeout=FETCH_TIMEOUT) as r:
             txt = r.read(200_000).decode("utf-8", "replace")
     except Exception as e:  # noqa: BLE001
         txt = f"# unreachable: {type(e).__name__}"
@@ -463,23 +577,144 @@ def _extract_text(html: str) -> str:
     return re.sub(r"\s+", " ", " ".join(p for p in parts if p)).strip()[:200_000]
 
 
+class _RedirectRefused(Exception):
+    """A redirect hop failed the fetch policy. Loud: the chain aborts."""
+
+
+def _is_public_host(host: str) -> bool:
+    """False when `host` resolves to a loopback/link-local/private/reserved address.
+
+    The URLs this module fetches are chosen by third parties — a search result,
+    or whatever a fetched page redirects to. Without this the desktop app is a
+    blind GET probe aimable at 127.0.0.1, the user's LAN router, or a cloud
+    metadata endpoint. Unresolvable means refuse, not "probably fine".
+    """
+    import ipaddress  # noqa: PLC0415
+    import socket  # noqa: PLC0415
+
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+def _target_refusal(url: str) -> str:
+    """Empty when `url` is an acceptable TARGET, else the reason it is not.
+
+    Scheme, the hard block and the address check — everything that does not
+    itself need a robots.txt lookup, so the robots probe can police its own
+    redirects with this without recursing into another robots lookup.
+    """
+    if not url.lower().startswith(("http://", "https://")):
+        return "non-http url"
+    if _domain_tier(url) == "X":
+        return "robots.txt prohibits automated access"
+    if not _is_public_host(_host_of(url)):
+        return "refusing a non-public address"
+    return ""
+
+
+def _fetch_refusal(url: str) -> str:
+    """Empty when `url` may be fetched, else the reason it may not.
+
+    The WHOLE fetch policy in one place so it can be re-run on every redirect
+    hop, not just the URL the search returned.
+    """
+    return _target_refusal(url) or ("" if _robots_allows(url) else "robots.txt disallow")
+
+
+def _throttle(host: str) -> None:
+    """Wait out DOMAIN_MIN_INTERVAL for `host`, then record the hit."""
+    gap = DOMAIN_MIN_INTERVAL - (time.time() - _last_hit.get(host, 0.0))
+    if gap > 0:
+        time.sleep(gap)
+    _last_hit[host] = time.time()
+
+
+def _refuse_hop(refusal: str, newurl: str) -> None:
+    if refusal:
+        raise _RedirectRefused(
+            f"redirect to {_host_of(newurl) or newurl!r} refused: {refusal}")
+
+
+class _TargetRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Scheme/hard-block/address policy on every hop, without the robots lookup.
+
+    Used for the robots.txt probe itself: checking robots there would recurse
+    into another robots probe.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201, PLR0913
+        _refuse_hop(_target_refusal(newurl), newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the FULL fetch policy on every redirect hop.
+
+    The default opener follows 30x anywhere, so the scheme check, the
+    rateyourmusic hard block, robots.txt and the per-host rate limit applied only
+    to the URL the search returned. A page could bounce the fetch onto a
+    Disallow'd path, onto a host the module promises never to touch, or straight
+    at http://127.0.0.1/ — and the only consequence was `tier` being recomputed
+    AFTER the request had already been made.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201, PLR0913
+        _refuse_hop(_fetch_refusal(newurl), newurl)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            # Politeness follows the bytes: the new host gets its own interval.
+            # No host lock here on purpose — the caller already holds one and
+            # threading.Lock is not reentrant.
+            _throttle(_host_of(newurl))
+        return new
+
+
+_opener_lock = threading.Lock()
+_openers: dict[str, Any] = {}
+
+
+def _policy_opener() -> Any:
+    """The process-wide opener whose redirect handling enforces the full policy."""
+    return _build_opener("policy", _PolicyRedirectHandler)
+
+
+def _robots_opener() -> Any:
+    """Opener for the robots.txt probe — target policy only, no robots recursion."""
+    return _build_opener("robots", _TargetRedirectHandler)
+
+
+def _build_opener(name: str, handler: type) -> Any:
+    with _opener_lock:
+        if name not in _openers:
+            _openers[name] = urllib.request.build_opener(handler)
+        return _openers[name]
+
+
 def _fetch_page(url: str) -> dict[str, Any]:
     """Fetch ONE search-result URL. No crawling: links out of the page are never
-    followed. NEVER raises — failures come back as an empty `text`."""
-    import urllib.error  # noqa: PLC0415
-    import urllib.request  # noqa: PLC0415
-
+    followed, and every redirect hop is re-checked against the same policy.
+    NEVER raises — failures come back as an empty `text`."""
     out: dict[str, Any] = {"url": url, "host": _host_of(url), "tier": _domain_tier(url),
                            "final_url": url, "status": 0, "err": "", "text": ""}
-    if out["tier"] == "X":
-        out["err"] = "robots.txt prohibits automated access"
-        return out
-    if not url.lower().startswith(("http://", "https://")):
-        out["err"] = "non-http url"
-        return out
     try:
-        if not _robots_allows(url):
-            out["err"] = "robots.txt disallow"
+        refusal = _fetch_refusal(url)
+        if refusal:
+            out["err"] = refusal
             return out
         h = out["host"]
         with _host_lock(h):
@@ -493,7 +728,7 @@ def _fetch_page(url: str) -> dict[str, Any]:
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept-Encoding": "identity",
                 })
-                with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:  # noqa: S310
+                with _policy_opener().open(req, timeout=FETCH_TIMEOUT) as r:
                     raw = r.read(MAX_HTML_BYTES)
                     enc = r.headers.get_content_charset() or "utf-8"
                     ctype = (r.headers.get("Content-Type") or "").lower()
@@ -503,6 +738,8 @@ def _fetch_page(url: str) -> dict[str, Any]:
                     out["err"] = f"non-html content-type: {ctype[:40]}"
                 else:
                     out["text"] = _extract_text(raw.decode(enc, "replace"))
+            except _RedirectRefused as e:
+                out["err"] = str(e)[:160]
             except urllib.error.HTTPError as e:
                 out["status"], out["err"] = e.code, f"HTTP {e.code}"
             except Exception as e:  # noqa: BLE001
@@ -524,14 +761,23 @@ def _identity_grade(ntext: str, artist: str, title: str) -> str:
 
     'title-only' (title present but no artist name fits) is a WEAKER grade and is
     never silently promoted — only `_identity_ok` (full) licenses evidence.
+
+    An unverifiable side is never read as a match. Both checks used to VANISH
+    when their input reduced to nothing: an artist whose every component fell
+    under the 3-char floor yielded an empty name list, and `not names` graded the
+    page 'full'. For "MK - 17" the gate degenerated to "does '17' appear on this
+    page", which is true of nearly any catalog page (chart position, year, price)
+    — a Beatport page about a different act then licensed a web_override of the
+    user's tag. Same shape on the title side when `_title_core` strips a title
+    that is nothing but a mix qualifier.
     """
-    tc = _title_core(title)
-    if tc and tc not in ntext:
+    tc = _title_core(title) or _norm(title)
+    if not tc or tc not in ntext:
         return ""
     names = _artist_names(artist)
-    if not names or any(a in ntext for a in names):
-        return "full"
-    return "title-only"
+    if not names:
+        return "title-only"
+    return "full" if any(_name_on_page(a, ntext) for a in names) else "title-only"
 
 
 def _identity_ok(ntext: str, artist: str, title: str) -> bool:
@@ -542,6 +788,39 @@ def _bucket_refused(raw: str) -> bool:
     """True when the string is a retailer sales bucket, not a musical genre."""
     n = _norm(raw)
     return bool(CHART_BUCKET.search(n)) or n in BUCKET_EXACT
+
+
+def _split_segments(raw: str) -> list[str]:
+    """Split a genre field on its list separators, ignoring bracketed asides.
+
+    A catalog field lists several genres ("House, Tech House", "Trance (Main
+    Floor) | Progressive Trance"), so the field has to be divided before it is
+    canonned. But Beatport's real Techno taxonomy reads "Techno (Peak Time /
+    Driving)" and "Techno (Raw / Deep / Hypnotic)": splitting on every '/' tore
+    the bracket pair in half, `_canon` could no longer see the aside AS an aside,
+    and the orphaned "(peak time" left non-qualifier words behind — so the
+    highest-trust tier refused its own commonest field. Only a separator at
+    bracket depth 0 divides the field.
+    """
+    segs: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for i, ch in enumerate(raw):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if depth == 0 and (
+            ch in ",/|"
+            or (ch == "-" and i and raw[i - 1].isspace()
+                and i + 1 < len(raw) and raw[i + 1].isspace())
+        ):
+            segs.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    segs.append("".join(buf))
+    return [s.strip() for s in segs if s.strip()] or [raw]
 
 
 def _parse_field(text: str, tier: str) -> tuple[str, str, str] | None:
@@ -561,7 +840,7 @@ def _parse_field(text: str, tier: str) -> tuple[str, str, str] | None:
         # Canon the SEGMENTS, not the whole field. The canon is substring-based,
         # so canon("Electronic") → "Electro": a top-level retailer bucket becomes
         # a real subgenre. Refusing bucket words per segment is what stops that.
-        segs = [s.strip() for s in re.split(r"[,/|]|\s-\s", raw) if s.strip()] or [raw]
+        segs = _split_segments(raw)
         for seg in segs:
             if _bucket_refused(seg):
                 continue
@@ -631,8 +910,15 @@ def resolve(
 ) -> dict[str, Any]:
     """Resolve a verified genre for one track from catalog pages. NEVER raises.
 
-    Returns {genre, confidence, source_matched, used_web, url, quote, tier}.
-    `genre=""` means "no read — fall back to tags + audio".
+    Returns {genre, confidence, source_matched, used_web, web_unavailable, url,
+    quote, tier}. `genre=""` means "no read — fall back to tags + audio".
+
+    `used_web` is True once at least one search actually returned results, and
+    `web_unavailable` carries a short reason string whenever the tier could not
+    reach the web at all for this track (offline, throttled, ddgs raising). The
+    two together are what lets the caller tell "searched and found nothing" from
+    "never reached the network", so a library-wide degradation can be reported
+    instead of looking like a clean pass that simply found no evidence.
 
     `source_matched` is the grounding flag `reconcile_genre` reads as
     `web_grounded`, and it is now strictly stronger than it was: it means the
@@ -647,12 +933,14 @@ def resolve(
     (there is no offline read to fall back on).
     """
     empty: dict[str, Any] = {"genre": "", "confidence": 0.0, "source_matched": False,
-                             "used_web": False, "url": "", "quote": "", "tier": ""}
+                             "used_web": False, "web_unavailable": "",
+                             "url": "", "quote": "", "tier": ""}
     if not (artist and title) or not use_web:
         return empty
 
     hits: list[dict[str, Any]] = []
     used_web = False
+    search_error = ""
     try:
         seen_urls: set[str] = set()
         for qi, qf in enumerate(QUERIES):
@@ -662,6 +950,7 @@ def resolve(
                 results = _ddgs_results(qf(artist, title))
             except Exception as e:  # noqa: BLE001 — search is best-effort
                 log.debug("web search failed (%s - %s): %s", artist, title, e)
+                search_error = f"{type(e).__name__}: {e}"[:160]
                 results = []
             if not results:
                 continue
@@ -697,7 +986,7 @@ def resolve(
                 break
     except Exception as e:  # noqa: BLE001 — the web tier must never break analysis
         log.debug("online genre lookup failed (%s - %s): %s", artist, title, e)
-        return empty
+        return {**empty, "web_unavailable": f"{type(e).__name__}: {e}"[:160]}
 
     def _pick(hs: list[dict[str, Any]], genre: str) -> dict[str, Any]:
         h = next(h for h in hs if h["genre"] == genre)
@@ -706,20 +995,28 @@ def resolve(
     tier_a = [h for h in hits if h["tier"] == "A"]
     ga = _consensus(tier_a)
     if ga:
-        return {"genre": ga, "confidence": 0.95, "source_matched": True,
+        return {**empty, "genre": ga, "confidence": 0.95, "source_matched": True,
                 "used_web": True, **_pick(tier_a, ga)}
+    # Cite from the SAME list the decision used. `_two_domain` counts only tier
+    # A/B, but `hits` accumulates across both query phrasings, so a tier-C blog
+    # from query 1 sat ahead of the catalog pages from query 2 and `_pick` handed
+    # it back as the evidence for a source_matched answer — a provenance lie.
+    evidence = [h for h in hits if h["tier"] in ("A", "B")]
     g2 = _two_domain(hits)
     if g2:
-        return {"genre": g2, "confidence": 0.9, "source_matched": True,
-                "used_web": True, **_pick(hits, g2)}
+        return {**empty, "genre": g2, "confidence": 0.9, "source_matched": True,
+                "used_web": True, **_pick(evidence, g2)}
     tier_b = [h for h in hits if h["tier"] == "B"]
     gb = _consensus(tier_b)
     if gb:
         # One tier-B catalog alone fills a generic/missing tag but is not allowed
         # to override a specific one — hence source_matched=False.
-        return {"genre": gb, "confidence": 0.6, "source_matched": False,
+        return {**empty, "genre": gb, "confidence": 0.6, "source_matched": False,
                 "used_web": True, **_pick(tier_b, gb)}
-    return {**empty, "used_web": used_web}
+    # A search that came back empty is a clean miss, not a degradation — only an
+    # error from every phrasing means the tier could not reach the web at all.
+    return {**empty, "used_web": used_web,
+            "web_unavailable": "" if used_web else search_error}
 
 
 __all__ = ["resolve", "resolver_ready", "ensure_backend", "VOCAB", "DEFAULT_MODEL"]

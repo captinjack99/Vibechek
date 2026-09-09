@@ -108,7 +108,7 @@ def test_no_env_var_uses_default_mirror_tuple() -> None:
 
 
 # ---------------------------------------------------------------------------
-# WP8: the failure summary must not blame the network for disk-full / checksum
+# The failure summary must not blame the network for disk-full / checksum
 # ---------------------------------------------------------------------------
 
 
@@ -197,7 +197,8 @@ def test_verify_model_sha256_rejects_mismatch(tmp_path: Path) -> None:
 
 def test_verify_model_sha256_error_mentions_remediation(tmp_path: Path) -> None:
     """The error message should tell the user how to recover — without naming a
-    CLI command (voice-guide rule 4: this rides in a GUI detail toggle)."""
+    CLI command (this rides in a GUI detail toggle, which has no terminal to
+    run a command in)."""
     from vibechek import model_download as analyzer
 
     target = tmp_path / "model.pb"

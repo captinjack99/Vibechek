@@ -1,6 +1,6 @@
 /**
- * Regression test for the audit finding "ONNX setup dialog has no Cancel and
- * cannot be dismissed while running — can wedge the UI" (MED, fe-settings).
+ * Regression test: the ONNX setup dialog had no Cancel and could not be
+ * dismissed while running, which could wedge the UI.
  *
  * While phase === "running" the dialog deliberately hides the close (X) button
  * (so a partial setup can't be half-dismissed). Before the fix the running view

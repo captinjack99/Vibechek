@@ -207,6 +207,7 @@ export interface PreflightResult {
   analyze_via: string | null;
   engine: string;
   essentia_usable: boolean;
+  onnxruntime_installed: boolean | null;
   readonly reasons_not_ready: string[];
 }
 
@@ -230,6 +231,7 @@ export interface MLResult {
   ml_error: string | null;
   ml_genre_audio: string | null;
   ml_subgenre_audio: string | null;
+  ml_genre_audio_confidence: number | null;
   ml_genre_web: string | null;
   ml_genre_web_grounded: boolean | null;
   ml_genre_source: string | null;
@@ -311,6 +313,7 @@ export interface OrganizeStats {
   moved: number;
   errors: string[];
   journal_path: string | null;
+  journal_incomplete: boolean;
   moved_pairs: string[][];
   emptied_dirs: string[];
 }
@@ -322,6 +325,7 @@ export interface PlannedMove {
   subgenre: string;
   reason: string;
   relative_destination: string;
+  original_source: string;
 }
 
 export interface LibraryRecord {
@@ -350,4 +354,147 @@ export interface BackupRecord {
   created_at: number;
   size_bytes: number;
   missing: boolean;
+}
+
+export interface CdjExportResult {
+  flac_converted: number;
+  flac_planned: number;
+  passthrough: number;
+  skipped: number;
+  errors: number;
+  output_xml: string | null;
+  out_dir: string | null;
+  track_errors: TrackError[];
+  resampled: string[];
+  renamed: string[];
+}
+
+export interface TrackError {
+  location: string;
+  message: string;
+}
+
+export interface ClapReference {
+  emb: unknown;
+  labels: unknown;
+  meta: Record<string, unknown>;
+}
+
+export interface DiagnosticReport {
+  vibechek_version: string;
+  python_version: string;
+  os_platform: string;
+  arch: string;
+  config_file_path: string;
+  config_file_size: number;
+  config_file_parse_ok: boolean;
+  config_file_error: string | null;
+  cpu_count: number;
+  memory_total_mb: number | null;
+  memory_available_mb: number | null;
+  gpus: Record<string, unknown>[];
+  models_dir: string;
+  models: Record<string, unknown>[];
+  model_integrity_verified: boolean;
+  log_tail: string[];
+  shell_log_tail: string[];
+  wsl: Record<string, unknown> | null;
+  native_venv: Record<string, unknown> | null;
+  tempfile_leaks: number;
+  engine_readiness: Record<string, unknown> | null;
+  last_run: Record<string, unknown> | null;
+}
+
+export interface _PlatformAsset {
+  asset: string;
+  sha256: string;
+  archive: string;
+  member: string;
+}
+
+export interface GenrePrediction {
+  raw: string;
+  parent_category: string | null;
+  subgenre: string | null;
+  dj_name: string | null;
+  confidence: number;
+}
+
+export interface GenreResult {
+  genre: string;
+  subgenre: string;
+  confidence: number;
+  raw_confidence: number;
+  all_predictions: GenrePrediction[];
+}
+
+export interface ReconciledGenre {
+  genre: string;
+  subgenre: string;
+  confidence: number;
+  source: string;
+  conflict: boolean;
+}
+
+export interface DetectedGpu {
+  vendor: string;
+  name: string;
+  device_kind: string;
+  vram_mb: number | null;
+  accelerated_by_vibechek: boolean;
+  unsupported_reason: string | null;
+}
+
+export interface JournalWriter {
+  path: string;
+  kind: string;
+  _fh: unknown;
+  entries: number;
+  failed: number;
+}
+
+export interface DJProfile {
+  name: string;
+  description: string;
+  genre_confidence_threshold: number | null;
+  min_genre_size: number | null;
+  use_gpu: string | null;
+  timeslot_bpm_bands: Record<string, number[]>;
+}
+
+export interface ApplyStats {
+  total: number;
+  genre_applied: number;
+  genre_applied_parent_only: number;
+  genre_skipped_low_confidence: number;
+  genre_skipped_write_disabled: number;
+  other_tags_applied: number;
+  errors: string[];
+}
+
+export interface BackupStats {
+  total: number;
+  backed_up: number;
+  not_fully_backed_up: number;
+  errors: string[];
+}
+
+export interface RemapRestoreStats {
+  total: number;
+  restored: number;
+  skipped_missing: number;
+  skipped_size_mismatch: number;
+  matched_exact: number;
+  matched_filename_size: number;
+  matched_filename: number;
+  errors: string[];
+  matches: Record<string, unknown>[];
+}
+
+export interface RestoreStats {
+  total: number;
+  restored: number;
+  skipped_missing: number;
+  skipped_unsupported: number;
+  errors: string[];
 }

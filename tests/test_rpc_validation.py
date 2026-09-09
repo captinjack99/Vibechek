@@ -1,7 +1,7 @@
 """Regression tests for write-path parameter validation at the RPC boundary.
 
 The CLI clamps numeric inputs via click ranges; these tests pin the equivalent
-guarantees on the RPC seam (audit 2026-06-01, rpc-cli-config MEDIUM findings):
+guarantees on the RPC seam:
 
   - id3_text_encoding out of {0,1,2,3} → falls back to 3 (UTF-8)
   - confidence thresholds clamped to [0, 1]
@@ -437,3 +437,152 @@ def test_rebuild_report_rejects_non_dict(bad) -> None:
     # without the dedupe deps installed.
     with pytest.raises(ValueError, match="must be an object"):
         rpc._rebuild_report(bad)
+
+
+# ---------------------------------------------------------------------------
+# handle_duplicates: the destructive move path gets the same fail-fast guard
+# the organize handlers have
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["dupes/review", r"dupes\review", "./review", "review"])
+def test_relative_review_folder_is_rejected(bad) -> None:
+    """A relative review folder resolves against the SIDECAR's working
+    directory, so the duplicates leave the library and land somewhere the user
+    can't find — and the journal records a relative dst, so even the one-click
+    undo becomes CWD-dependent. The client-side check accepts anything with a
+    slash in it, so the sidecar has to be the enforcement point.
+    """
+    with pytest.raises(rpc.InvalidParams, match="absolute path"):
+        rpc._validated_review_folder(bad)
+
+
+def test_absolute_review_folder_is_resolved(tmp_path) -> None:
+    out = rpc._validated_review_folder(f"  {tmp_path}  ")
+    assert out.is_absolute()
+    assert out == tmp_path.resolve()
+
+
+def test_blank_review_folder_is_rejected() -> None:
+    with pytest.raises(rpc.InvalidParams, match="review folder"):
+        rpc._validated_review_folder("   ")
+
+
+@pytest.mark.parametrize("action", ["report", "move", "trash"])
+def test_known_dedupe_actions_pass(action) -> None:
+    assert rpc._validated_dedupe_action(action) == action
+
+
+def test_unknown_dedupe_action_is_invalid_params() -> None:
+    # Previously reached DuplicateAction('nuke') deep inside duplicates.py and
+    # surfaced as INTERNAL_ERROR + a full traceback — a caller mistake reported
+    # as a server fault.
+    with pytest.raises(rpc.InvalidParams, match="Unknown dedupe action"):
+        rpc._validated_dedupe_action("nuke")
+
+
+def test_handle_duplicates_move_without_folder_is_invalid_params() -> None:
+    with pytest.raises(rpc.InvalidParams, match="review folder"):
+        rpc._handle_duplicates({"action": "move", "report": {}})
+
+
+@pytest.mark.parametrize("action", ["report", "trash"])
+def test_a_stale_relative_review_folder_does_not_block_report_or_trash(action) -> None:
+    """Only `move` reads the review folder. Validating it for every action meant
+    a relative value left sitting in the Settings field — which the GUI forwards
+    on every call — hard-blocked a plain Trash with "must be an absolute path",
+    an operation that never touches that folder.
+    """
+    assert rpc._dedupe_review_folder({"review_folder": "dupes/review"}, action) is None
+
+
+def test_move_still_rejects_a_relative_review_folder() -> None:
+    with pytest.raises(rpc.InvalidParams, match="absolute path"):
+        rpc._dedupe_review_folder({"review_folder": "dupes/review"}, "move")
+
+
+def test_trash_with_a_relative_review_folder_reaches_the_handler(monkeypatch) -> None:
+    """End-to-end at the RPC seam: the trash actually runs instead of raising."""
+    from vibechek import duplicates
+
+    seen: dict = {}
+
+    def fake_handle(_report, config, **_kw):
+        seen["action"] = config.action
+        seen["review_folder"] = config.review_folder
+        return {"trashed": 1, "errors": 0}
+
+    monkeypatch.setattr(duplicates, "handle_duplicates", fake_handle)
+    out = rpc._handle_duplicates({
+        "action": "trash", "review_folder": "dupes/review", "report": {},
+    })
+    assert out == {"trashed": 1, "errors": 0}
+    assert seen["review_folder"] is None
+
+
+# ---------------------------------------------------------------------------
+# organize: the value that MOVES files is the value that was VALIDATED
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t", None])
+def test_whitespace_target_root_means_default_not_a_relative_dir(blank) -> None:
+    """validate_organize_target treats a whitespace-only target as "blank, use
+    the default", but the config that drove the move took the raw string —
+    and Path("   ") is RELATIVE, so the whole genre tree got rooted in the
+    sidecar's working directory while validation said ok.
+    """
+    assert rpc._normalized_target_root({"target_root": blank}) is None
+
+
+def test_target_root_is_stripped_like_the_validator_strips_it(tmp_path) -> None:
+    # A leading space makes an otherwise-absolute path RELATIVE, while the
+    # validator probed (and even mkdir'd) the STRIPPED, absolute one. Both
+    # sides must now see the same value.
+    out = rpc._normalized_target_root({"target_root": f"  {tmp_path}  "})
+    assert out == tmp_path
+    assert out.is_absolute()
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_blank_library_path_falls_through_to_inference(blank) -> None:
+    """`"" is not None`, and plan_organization tests `library_root is not None`
+    — so an empty library_path meant base_dir = Path("") = the sidecar's CWD.
+    """
+    assert rpc._organize_library_root({"library_path": blank}) is None
+
+
+def test_library_path_is_stripped() -> None:
+    assert rpc._organize_library_root({"library_path": " /Music/lib "}) == "/Music/lib"
+
+
+def test_find_duplicates_rejects_a_relative_review_folder(tmp_path) -> None:
+    """The scan itself is harmless, but it builds the same config the move path
+    uses — reject the bad value before a 12k-track scan, not after.
+
+    Scoped to `action="move"`: a scan that will only report or trash never
+    reads the review folder, and rejecting it there blocked those actions for
+    anyone with a stale relative value in the Settings field.
+    """
+    with pytest.raises(rpc.InvalidParams, match="absolute path"):
+        rpc._find_duplicates({
+            "path": str(tmp_path), "action": "move",
+            "review_folder": "dupes/review",
+        })
+
+
+def test_find_duplicates_ignores_a_relative_review_folder_when_only_reporting(
+    tmp_path, monkeypatch
+) -> None:
+    from vibechek import duplicates
+
+    seen: dict = {}
+
+    def fake_find(_path, config, **_kw):
+        seen["review_folder"] = config.review_folder
+        return duplicates.DuplicateReport()
+
+    monkeypatch.setattr(duplicates, "find_duplicates", fake_find)
+    rpc._find_duplicates({"path": str(tmp_path), "review_folder": "dupes/review"})
+    assert seen["review_folder"] is None
+

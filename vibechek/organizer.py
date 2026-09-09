@@ -19,9 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from mutagen.aiff import AIFF
+from mutagen.asf import ASF
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
+from mutagen.oggvorbis import OggVorbis
+from mutagen.wave import WAVE
 
 from vibechek.config import OrganizationConfig
 from vibechek.utils import (
@@ -50,6 +53,12 @@ class PlannedMove:
     # absolute destination if `os.path.relpath` raises (e.g. destination on a
     # different Windows drive than base_dir).
     relative_destination: str = ""
+    # The path string EXACTLY as the caller supplied it. `source` may be a
+    # different Unicode normalization (resolve_existing_path returns whichever
+    # NFC/NFD form is really on disk), and the GUI keys its store update off an
+    # exact string match against what it sent — so moved_pairs must report this
+    # spelling, not the resolved one, or accented tracks keep dead paths.
+    original_source: str = ""
 
 
 @dataclass
@@ -75,6 +84,13 @@ class OrganizeStats:
     # Path to the undo journal written for this run (None if nothing moved or
     # the journal couldn't be opened). The GUI uses it to offer "Undo".
     journal_path: str | None = None
+    # True when at least one completed move is MISSING from the undo journal
+    # (the journal couldn't be opened at all, or a write failed mid-run — a
+    # full data volume, an AV/cloud-sync lock). The files moved regardless, so
+    # an Undo of this journal restores only part of the run and still reports
+    # "reverted N, skipped 0, errors 0". The GUI must say the undo record is
+    # incomplete rather than showing a clean success.
+    journal_incomplete: bool = False
     # (source, ACTUAL destination) for every COMPLETED move. The GUI must
     # update its in-memory track paths from THIS list, never from the plan:
     # the real destination can differ from the planned one (re-uniquified at
@@ -305,9 +321,17 @@ def _infer_library_root(tracks: list[dict[str, Any]]) -> Path:
     parents = [Path(t["path"]).parent for t in tracks]
     try:
         return Path(os.path.commonpath([str(p) for p in parents]))
-    except ValueError:
-        # Mixed drives / mixed absolute-relative (Windows raises here).
-        return parents[0]
+    except ValueError as e:
+        # Mixed drives / mixed absolute-relative (Windows raises here). There
+        # is no common ancestor to infer, and falling back to `parents[0]` is
+        # the exact "first track's parent" guess this function exists to kill —
+        # on a sorted library that is a GENRE folder, so every track in the
+        # analysis gets planned inside it. Refuse instead of guessing wrong.
+        raise ValueError(
+            "These tracks are spread across different drives or roots, so "
+            "there's no single library folder to organize into. Choose a "
+            "destination folder and try again."
+        ) from e
 
 
 def plan_organization(
@@ -326,6 +350,9 @@ def plan_organization(
          when the caller knows it (the sidecar does); beats any path guess.
       4. Common ancestor of the analyzed tracks' folders (`_infer_library_root`).
 
+    However it is resolved, the result must be ABSOLUTE — a relative base_dir
+    raises ValueError rather than quietly rooting the library at the CWD.
+
     Re-organizing IN PLACE is a supported case: point `base_dir` at the library
     root of an already-sorted tree and only the tracks whose genre CHANGED move
     (everything else hits the `source == dest` skip below).
@@ -342,7 +369,10 @@ def plan_organization(
     if base_dir is None:
         if config.target_root is not None:
             base_dir = Path(config.target_root)
-        elif library_root is not None:
+        elif library_root:
+            # Truthiness, not `is not None`: `Path("")` is `.` — the sidecar's
+            # working directory — so a blank library_path must fall through to
+            # inference rather than rooting the whole genre tree in the CWD.
             base_dir = Path(library_root)
         elif tracks:
             base_dir = _infer_library_root(tracks)
@@ -350,6 +380,18 @@ def plan_organization(
             raise ValueError("No tracks in analysis and no base_dir / target_root set")
 
     base_dir = Path(base_dir)
+
+    # Belt-and-braces over the sidecar's own strip/blank normalization: a
+    # relative base_dir re-roots the entire library under whatever directory
+    # the process happens to be running in (Path("") -> ".", Path(" /Music")
+    # -> relative too), which silently scatters the user's tracks somewhere
+    # they will never look. Refuse rather than move.
+    if not base_dir.is_absolute():
+        raise ValueError(
+            f"Organize target must be an absolute path. Got: {str(base_dir)!r}. "
+            r"Type the full path (e.g. C:\Music\sorted on Windows, "
+            "/Users/you/Music/sorted on macOS) or click the folder picker."
+        )
 
     # First pass: count genres so we know which ones are "small"
     genre_counts: dict[str, int] = defaultdict(int)
@@ -444,6 +486,7 @@ def plan_organization(
             subgenre=subgenre,
             reason=reason,
             relative_destination=rel_dest,
+            original_source=str(track["path"]),
         ))
 
     return plan
@@ -482,13 +525,18 @@ def organize_from_analysis(
     # can be reverted. A failure to open the journal degrades to a no-op
     # writer — the organize still runs, just without undo.
     jrnl = _journal.start_journal(_journal.KIND_ORGANIZE, root=plan.base_dir)
+    # Sources of the moves that actually completed, in their ON-DISK spelling.
+    # `moved_pairs` reports the caller's spelling (see PlannedMove.original_source),
+    # which may not resolve — emptied-folder detection needs the real one.
+    moved_sources: list[Path] = []
     try:
         for i, move in enumerate(plan.moves):
             # Check before each move — user clicking Cancel mid-organize must
-            # actually stop, not just stop SHOWING progress. Audit found that
-            # without this, ~12k file moves would continue after cancel.
+            # actually stop, not just stop SHOWING progress. Without this,
+            # ~12k file moves would continue after cancel.
             cancellation.check()
             report_progress(on_progress, i + 1, len(plan.moves), move.source.name)
+            dest = None
             try:
                 if not move.source.exists():
                     # Vanished between plan and execute (user deleted it, an
@@ -503,13 +551,25 @@ def organize_from_analysis(
                 if dest.exists():
                     dest = _unique_destination(dest)
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(move.source), str(dest))
+                # `copy_function` matters on the CROSS-DEVICE path (organizing
+                # an internal library onto an external drive — the normal case):
+                # shutil.move falls back to copy-then-unlink there, and the
+                # default copy2 raises when copystat can't apply timestamps to
+                # an exFAT/SMB destination, AFTER every byte has landed. The
+                # handler below would then discard a complete file.
+                shutil.move(str(move.source), str(dest),
+                            copy_function=_copy_preserving_stat)
                 # Record AFTER the move succeeds, BEFORE the next iteration.
                 jrnl.record_move(move.source, dest)
                 stats.moved += 1
-                stats.moved_pairs.append((str(move.source), str(dest)))
+                moved_sources.append(move.source)
+                stats.moved_pairs.append(
+                    (move.original_source or str(move.source), str(dest))
+                )
             except OSError as e:
-                stats.errors.append(f"{move.source.name}: {e}")
+                stats.errors.append(
+                    f"{move.source.name}: {e}{_discard_partial_copy(move.source, dest)}"
+                )
     except cancellation.CancelledError as exc:
         # A mid-batch Cancel unwinds through here. The `finally` below flushes
         # the journal containing the moves already done; we must surface the
@@ -520,6 +580,7 @@ def organize_from_analysis(
         # affordance for a partial organize. Attach the partial stats to the
         # exception so the RPC layer can return it as a partial result.
         stats.journal_path = str(jrnl.path) if jrnl.entries > 0 else None
+        stats.journal_incomplete = jrnl.failed > 0
         exc.partial_stats = stats  # type: ignore[attr-defined]
         raise
     finally:
@@ -527,12 +588,16 @@ def organize_from_analysis(
 
     # Expose the journal path so the GUI can offer "Undo this organize".
     stats.journal_path = str(jrnl.path) if jrnl.entries > 0 else None
-    stats.emptied_dirs = _find_emptied_dirs(plan, stats.moved_pairs)
+    # A move the journal didn't record can't be undone, and a revert of the
+    # rest reports a clean success — say so instead of letting the user read
+    # "Undo complete" as "everything is back".
+    stats.journal_incomplete = jrnl.failed > 0
+    stats.emptied_dirs = _find_emptied_dirs(plan, moved_sources)
 
     return stats
 
 
-def _find_emptied_dirs(plan: OrganizePlan, moved_pairs: list[tuple[str, str]]) -> list[str]:
+def _find_emptied_dirs(plan: OrganizePlan, moved_sources: list[Path]) -> list[str]:
     """Source folders left empty by the moves that actually completed.
 
     Only folders we moved OUT of, only inside `base_dir`, never `base_dir`
@@ -543,8 +608,8 @@ def _find_emptied_dirs(plan: OrganizePlan, moved_pairs: list[tuple[str, str]]) -
     """
     base = plan.base_dir.resolve()
     candidates: set[Path] = set()
-    for src, _dst in moved_pairs:
-        parent = Path(src).parent
+    for src in moved_sources:
+        parent = src.parent
         try:
             resolved = parent.resolve()
         except OSError:
@@ -645,7 +710,10 @@ def route_new_tracks(
     """Copy each tagged track from `staging_dir` into a `library_root/<Genre>/` folder.
 
     Genre is read from the file's existing tag. Tracks without a genre tag are
-    skipped (with a log entry). When the destination filename already exists, the
+    skipped (with a log entry); a track whose container has no tag reader at all
+    (`.aac`) is skipped under its own `skipped_unreadable_format` count, because
+    "we can't read tags from this file" and "you didn't tag it" call for
+    different fixes. When the destination filename already exists, the
     incoming file is copied under a uniquified name (`track_1.mp3`, ...) — the
     same never-clobber rule `organize_from_analysis` uses — so a genuinely
     different staging track that happens to share a basename is never silently
@@ -677,6 +745,9 @@ def route_new_tracks(
     summary = {
         "copied": 0,
         "skipped_no_genre": 0,
+        # Files whose container has no tag reader at all (.aac) — distinct from
+        # "tagged nothing", because the user's remedy is different.
+        "skipped_unreadable_format": 0,
         "skipped_exists": 0,
         "routed_to_other": 0,
         "errors": 0,
@@ -700,8 +771,17 @@ def route_new_tracks(
 
         genre = _read_genre_tag(fp)
         if not genre:
-            summary["skipped_no_genre"] += 1
-            log.info("No genre tag, skipping: %s", fp.name)
+            if fp.suffix.lower() in _NO_TAG_READER_EXTENSIONS:
+                # Not "you forgot to tag it" — we CANNOT read tags from this
+                # container at all (see _NO_TAG_READER_EXTENSIONS). Say so.
+                summary["skipped_unreadable_format"] += 1
+                log.info(
+                    "No readable genre tag for %s files, skipping: %s",
+                    fp.suffix.lower(), fp.name,
+                )
+            else:
+                summary["skipped_no_genre"] += 1
+                log.info("No genre tag, skipping: %s", fp.name)
             continue
 
         # Canonical spelling, keeping the SPECIFIC name: split_tag_genre returns
@@ -732,10 +812,18 @@ def route_new_tracks(
 
         try:
             dest_folder.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(fp), str(dest_file))
+            _copy_preserving_stat(fp, dest_file)
             summary["copied"] += 1
-        except OSError as e:
-            log.warning("Copy failed for %s: %s", fp, e)
+        except (OSError, ValueError) as e:
+            # ValueError too: a path-shaped tag (an embedded NUL from a
+            # multi-value ID3 frame is the one we hit) makes mkdir/copy2 raise
+            # ValueError, NOT OSError — which aborted the whole batch and left
+            # the remaining files unrouted behind a raw traceback. One bad tag
+            # skips one file. A failed BYTE copy also leaves a truncated file at
+            # the destination, so remove it (the source is untouched — route
+            # copies). Reaching here means the bytes failed, not just the
+            # timestamps: see `_copy_preserving_stat`.
+            log.warning("Copy failed for %s: %s%s", fp, e, _discard_partial_copy(fp, dest_file))
             summary["errors"] += 1
 
     return summary
@@ -746,6 +834,90 @@ def route_new_tracks(
 # ---------------------------------------------------------------------------
 
 
+def _copy_preserving_stat(src: str | Path, dest: str | Path) -> None:
+    """Copy `src` to `dest`, then apply its metadata BEST-EFFORT.
+
+    `shutil.copy2` is `copyfile` followed by `copystat`, and `copystat`
+    propagates the OSError that exFAT sticks and SMB shares routinely raise from
+    `os.utime` / `os.chmod`. By that point every byte is already at the
+    destination and the copy has materially SUCCEEDED — but the caller's handler
+    sees an OSError and calls `_discard_partial_copy`, which cannot tell a
+    truncated file from a complete one and deletes the good copy. Every retry
+    then does the same thing, so a whole route/organize onto such a volume
+    reports `copied: 0, errors: N` over a transfer that worked.
+
+    Splitting the two makes the BYTE copy the only thing that decides success:
+    a copystat failure loses timestamps and permission bits, and says so in the
+    log, but the file stays. Used as `shutil.move`'s `copy_function` too, so the
+    cross-device move fallback gets the same treatment.
+    """
+    shutil.copyfile(str(src), str(dest))
+    try:
+        shutil.copystat(str(src), str(dest))
+    except OSError as e:
+        log.warning(
+            "Copied %s but could not preserve its timestamps/permissions "
+            "(the destination filesystem rejected it): %s", dest, e,
+        )
+
+
+def _discard_partial_copy(source: Path, dest: Path | None) -> str:
+    """Remove the half-written file a failed cross-device move/copy left behind.
+
+    `shutil.move` renames when it can, but source and destination on different
+    volumes (organizing an internal library onto an external drive — the normal
+    case, not the exotic one) fall back to copy-then-unlink. A copy that dies
+    mid-stream — disk full, the drive dropping off — leaves a TRUNCATED file
+    sitting at the destination with a valid audio extension and a plausible
+    name. Nothing else cleans it up: the journal entry is written only after a
+    successful move, so undo can't remove it, and a later organize just
+    uniquifies around it while dedupe may well keep it over the intact original.
+
+    Only removes it when the source is still there, so we can never delete the
+    last copy of a track. Returns a suffix for the error message (empty when
+    there was nothing to clean up) so the user is told what happened.
+
+    It cannot tell a truncated file from a complete one, so it must only ever be
+    reached when the BYTE copy itself failed — which is exactly why both callers
+    copy through `_copy_preserving_stat` rather than `shutil.copy2`.
+    """
+    if dest is None or not source.exists():
+        return ""
+    try:
+        if not dest.exists():
+            return ""
+        dest.unlink()
+    except OSError as cleanup_err:
+        return f" (an incomplete copy may remain at {dest}: {cleanup_err})"
+    return " (removed the incomplete copy left at the destination)"
+
+
+def _first_frame_value(frame: Any) -> str | None:
+    """First non-empty value of a possibly multi-value ID3 text frame.
+
+    `str(TCON)` is `'\\x00'.join(frame.text)`, so an ID3v2.4 frame with two
+    genres — what MusicBrainz Picard and foobar2000 write — comes back as
+    "Techno\\x00House". That NUL travelled all the way into a folder name and
+    made `Path.mkdir` raise ValueError, which isn't an OSError, so it escaped
+    route's handler and killed the rest of the batch. One folder can only
+    express one genre: take the first value the tagger wrote.
+    """
+    for value in getattr(frame, "text", None) or ():
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+# Extensions Vibechek accepts as audio but for which mutagen exposes NO tag
+# reader at all: `mutagen.aac.AAC` parses the ADTS stream and has no `.tags`.
+# A raw .aac therefore can never yield a genre, no matter how it was tagged.
+# Reporting that as "no genre tag" is a lie — the distinction matters because
+# the user's fix is different (remux to .m4a), so `route_new_tracks` counts and
+# names it separately instead of folding it into skipped_no_genre.
+_NO_TAG_READER_EXTENSIONS: frozenset[str] = frozenset({".aac"})
+
+
 def _read_genre_tag(filepath: Path) -> str | None:
     """Return the main genre tag from a file, or None if missing/unreadable."""
     ext = filepath.suffix.lower()
@@ -753,7 +925,7 @@ def _read_genre_tag(filepath: Path) -> str | None:
         if ext == ".mp3":
             audio = MP3(filepath)
             if audio.tags and "TCON" in audio.tags:
-                return str(audio.tags["TCON"])
+                return _first_frame_value(audio.tags["TCON"])
         elif ext == ".flac":
             audio = FLAC(filepath)
             if audio.tags and "genre" in audio.tags:
@@ -762,10 +934,39 @@ def _read_genre_tag(filepath: Path) -> str | None:
             audio = MP4(filepath)
             if audio.tags and "\xa9gen" in audio.tags:
                 return audio.tags["\xa9gen"][0]
-        elif ext in (".aiff", ".aif"):
-            audio = AIFF(filepath)
+        elif ext in (".aiff", ".aif", ".wav"):
+            # WAV carries the same ID3v2 frames AIFF does, and Vibechek's own
+            # tagger writes them there (tagger._apply_aiff_wav). Without the
+            # .wav arm, a file Vibechek tagged itself was reported back as
+            # having no genre tag and left in staging.
+            audio = AIFF(filepath) if ext != ".wav" else WAVE(filepath)
             if audio.tags and "TCON" in audio.tags:
-                return str(audio.tags["TCON"])
+                return _first_frame_value(audio.tags["TCON"])
+        elif ext == ".ogg":
+            audio = OggVorbis(filepath)
+            if audio.tags and "genre" in audio.tags:
+                return audio.tags["genre"][0]
+        elif ext == ".wma":
+            # ASF/WMA stores the genre under the "WM/Genre" descriptor. Without
+            # this arm a file tagged by Windows Media Player or Rekordbox was
+            # reported as untagged and left in staging — the same silent lie
+            # the missing .wav arm caused.
+            audio = ASF(filepath)
+            if audio.tags and "WM/Genre" in audio.tags:
+                # An ASF attribute is typed. WMP and Rekordbox write the unicode
+                # type, but the descriptor can legally hold a DWORD, a BOOL or a
+                # raw byte array — and str()ing one of those mints a folder named
+                # after a number or a `b'...'` repr. Read the attribute's own
+                # value and only accept it when it really is text.
+                attr = audio.tags["WM/Genre"][0]
+                value = getattr(attr, "value", attr)
+                if isinstance(value, str):
+                    return value.strip() or None
+                log.debug(
+                    "Ignoring non-text WM/Genre attribute in %s (%s)",
+                    filepath, type(value).__name__,
+                )
+                return None
     except Exception as e:  # noqa: BLE001
         log.debug("Could not read genre from %s: %s", filepath, e)
     return None

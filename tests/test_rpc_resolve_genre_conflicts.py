@@ -145,7 +145,11 @@ def test_only_listed_tracks_are_touched() -> None:
     assert by_path["/lib/t2.mp3"]["ml_analysis"]["ml_genre_conflict"] is True
 
 
-def test_track_without_ml_is_skipped() -> None:
+def test_track_without_ml_is_reported_not_silently_skipped() -> None:
+    """The path matched but there is nothing to resolve, so NOTHING is written.
+    That used to come back ok:true — the GUI cleared the selection and toasted
+    a success for a resolve that never persisted.
+    """
     _seed(
         "/lib",
         [{"path": "/lib/raw.mp3", "existing_tags": {"genre": "House"}, "ml_analysis": None}],
@@ -153,8 +157,10 @@ def test_track_without_ml_is_skipped() -> None:
     out = _resolve_genre_conflicts(
         {"library_path": "/lib", "items": [{"path": "/lib/raw.mp3", "action": "approve"}]},
     )
-    assert out["ok"] is True
+    assert out["ok"] is False
     assert out["updated"] == 0
+    assert out["matched"] == 1
+    assert "ML analysis" in out["reason"]
 
 
 def test_unknown_action_defaults_to_approve() -> None:
@@ -172,17 +178,30 @@ def test_unknown_action_defaults_to_approve() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Every ok:false branch answers with the SAME keys, so the GUI can word its
+# "0 of N resolved" message off one shape. The two earliest returns used to omit
+# `requested`/`matched`, so an early refusal read as undefined where a late one
+# read as a number.
+_REFUSAL_KEYS = {"ok", "reason", "requested", "matched", "updated", "tracks"}
+
+
 def test_missing_library_path_is_rejected() -> None:
     out = _resolve_genre_conflicts({"items": [{"path": "/x", "action": "approve"}]})
     assert out["ok"] is False
     assert out["updated"] == 0
     assert out["tracks"] == []
+    assert _REFUSAL_KEYS <= set(out)
+    assert out["requested"] == 1
+    assert out["matched"] == 0
 
 
 def test_empty_items_is_rejected() -> None:
     _seed("/lib", [_conflict_track("/lib/t1.mp3")])
     out = _resolve_genre_conflicts({"library_path": "/lib", "items": []})
     assert out["ok"] is False
+    assert _REFUSAL_KEYS <= set(out)
+    assert out["requested"] == 0
+    assert out["matched"] == 0
 
 
 def test_library_not_in_recents_is_rejected() -> None:
@@ -191,6 +210,9 @@ def test_library_not_in_recents_is_rejected() -> None:
     )
     assert out["ok"] is False
     assert out["reason"] == "library not in recents"
+    assert _REFUSAL_KEYS <= set(out)
+    assert out["requested"] == 1
+    assert out["matched"] == 0
 
 
 def test_no_saved_analysis_is_rejected(tmp_path: Path) -> None:
@@ -210,3 +232,132 @@ def test_no_saved_analysis_is_rejected(tmp_path: Path) -> None:
     )
     assert out["ok"] is False
     assert out["reason"] == "no saved analysis for library"
+
+
+# ---------------------------------------------------------------------------
+# a resolve that matched nothing must not look like a success
+# ---------------------------------------------------------------------------
+
+
+def test_total_miss_is_reported_not_a_silent_success() -> None:
+    """After an in-place organize the store holds POST-move paths while the
+    saved analysis still holds the pre-move ones (nothing re-paths a saved
+    report), so every selected path misses. That returned ok:true / updated:0
+    with nothing written — the DJ's approvals silently evaporated.
+    """
+    _seed("/lib", [_conflict_track("/lib/t1.mp3")])
+    out = _resolve_genre_conflicts(
+        {
+            "library_path": "/lib",
+            "items": [{"path": "/lib/Techno/t1.mp3", "action": "approve"}],
+        },
+    )
+    assert out["ok"] is False
+    assert out["matched"] == 0
+    assert out["requested"] == 1
+    assert "re-analyze" in out["reason"]
+    # Nothing was persisted, and the track stays in the review queue.
+    assert _reload_tracks("/lib")["/lib/t1.mp3"]["ml_analysis"]["ml_genre_conflict"] is True
+
+
+def test_partial_miss_still_succeeds_but_reports_the_counts() -> None:
+    _seed("/lib", [_conflict_track("/lib/t1.mp3")])
+    out = _resolve_genre_conflicts(
+        {
+            "library_path": "/lib",
+            "items": [
+                {"path": "/lib/t1.mp3", "action": "approve"},
+                {"path": "/lib/gone.mp3", "action": "approve"},
+            ],
+        },
+    )
+    assert out["ok"] is True
+    assert out["requested"] == 2
+    assert out["matched"] == 1
+    assert out["updated"] == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve and import_tag_priors must not race on the saved analysis
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_import_does_not_discard_a_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+    analysis_lock_contention,  # noqa: ANN001
+) -> None:
+    """Both handlers load the WHOLE report, mutate it and write it back, and
+    neither is a cancellable long op — so the 8-worker dispatch pool genuinely
+    runs them at once and the later save used to discard the earlier one's
+    decisions behind two ok:true replies.
+
+    The interleaving is FORCED, not timed: the import holds its critical section
+    open until the analysis lock reports that the resolve has actually blocked
+    on it. A fixed `time.sleep(0.5)` only made the race likely — under CPU
+    contention the resolve could start after the import had already saved, and
+    then a lost-update regression passed green while costing every run half a
+    second.
+    """
+    import threading
+
+    from vibechek import rpc, tag_priors
+
+    _seed("/lib", [_conflict_track("/lib/t1.mp3"), _conflict_track("/lib/t2.mp3")])
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _slow_apply(report, priors, policy, override):  # noqa: ANN001, ANN202
+        # Stands in for a 12k-track re-reconcile: held open until the resolve
+        # below is provably inside the import's read-modify-write window.
+        entered.set()
+        assert release.wait(10), "the resolve never blocked on the analysis lock"
+        target = next(t for t in report["tracks"] if t["path"] == "/lib/t2.mp3")
+        target.setdefault("existing_tags", {})["genre_origin"] = "rekordbox"
+        return [target], 1
+
+    monkeypatch.setattr(tag_priors, "parse_rekordbox_collection", lambda _p: {"k": {}})
+    monkeypatch.setattr(tag_priors, "apply_priors_to_report", _slow_apply)
+    monkeypatch.setattr(tag_priors, "load_priors", lambda _p: {})
+    monkeypatch.setattr(tag_priors, "save_priors", lambda _p, _d: None)
+
+    import_out: dict = {}
+
+    def _run_import() -> None:
+        import_out.update(
+            rpc._import_tag_priors({"library_path": "/lib", "xml_path": "/x.xml"}),
+        )
+
+    resolve_out: dict = {}
+
+    def _run_resolve() -> None:
+        resolve_out.update(_resolve_genre_conflicts(
+            {"library_path": "/lib",
+             "items": [{"path": "/lib/t1.mp3", "action": "approve"}]},
+        ))
+
+    # The resolve runs on its OWN thread: it has to BLOCK on the lock while the
+    # import holds it, and the thread that releases the import can't be the one
+    # that's blocked.
+    th = threading.Thread(target=_run_import)
+    rt = threading.Thread(target=_run_resolve)
+    th.start()
+    try:
+        assert entered.wait(5), "the import never reached its critical section"
+        rt.start()
+        assert analysis_lock_contention.wait(10), (
+            "the resolve never contended for the analysis lock"
+        )
+    finally:
+        release.set()
+        if rt.ident is not None:
+            rt.join(10)
+        th.join(10)
+
+    assert import_out["ok"] is True
+    assert resolve_out["ok"] is True
+    by_path = _reload_tracks("/lib")
+    # BOTH decisions survive on disk — neither writer clobbered the other.
+    assert by_path["/lib/t1.mp3"]["ml_analysis"]["ml_genre_source"] == "approved"
+    assert by_path["/lib/t1.mp3"]["ml_analysis"]["ml_genre_conflict"] is False
+    assert by_path["/lib/t2.mp3"]["existing_tags"]["genre_origin"] == "rekordbox"

@@ -97,7 +97,7 @@ def test_is_specific_genre_filters_generic_buckets() -> None:
 def test_electro_is_not_a_trustworthy_file_tag() -> None:
     """"Electro" names a real genre but is sprayed over whole pools, so it is not
     trusted AS A TAG. Measured on the 86-track adjudicated corpus: +1 exact,
-    +1 family, zero broken (internal/bughunt/score_generic_set.py)."""
+    +1 family, zero broken."""
     for spelling in ("Electro", "electro", "  ELECTRO  "):
         assert not is_specific_genre(spelling), spelling
     # ...but a genre we RESOLVED ourselves is still a usable answer.
@@ -117,8 +117,7 @@ def test_playlist_phrase_in_the_genre_field_is_not_a_genre() -> None:
     """A long phrase naming no genre we know is a playlist / record-pool label that
     landed in the genre field. Left trusted it becomes the track's genre AND an
     organize destination folder. Measured non-harmful on the adjudicated corpus and
-    zero-false-positive over a 12,145-file library
-    (internal/bughunt/score_unplaceable_rule.py)."""
+    zero-false-positive over a 12,145-file library."""
     for junk in ("Hypeddit Top Weekly Picks",
                  "Electronic Pop Pop Rock Soft Rock Synth-Pop",
                  "Dance Deep House House Edm",
@@ -192,7 +191,7 @@ def test_spelling_variants_resolve_to_the_hierarchy_name() -> None:
 def test_beatport_slash_names_resolve_to_their_family() -> None:
     """Beatport ships these as SINGLE genre names, not lists. Each target was
     checked against the family its files independently resolve to
-    (internal/bughunt/score_genre_aliases.py route 2)."""
+    (route 2)."""
     assert split_tag_genre("Nu Disco / Disco") == ("Disco", "Nu-Disco")
     assert split_tag_genre("Organic House / Downtempo") == ("House", "Organic House")
     assert split_tag_genre("Indie Dance / Nu Disco") == ("Indie Dance", "Indie Dance")
@@ -415,3 +414,36 @@ def test_mlresult_declares_provenance_fields() -> None:
         "ml_vocal_audio", "ml_vocal_source",
     ):
         assert getattr(m, fname) is None
+
+
+def test_genre_matching_ignores_case() -> None:
+    """A lowercase or upper-case tag names the SAME genre, and used to become its
+    own top-level genre instead: the wrong stored label, no parent family (so
+    organizer files it flat rather than under `House/`), and a spurious conflict
+    against a matching ML read. Same failure class as the "Hip-Hop"/"Hip Hop"
+    split of 4d10dfa, one level below the alias table.
+    """
+    for spelling in ("Tech House", "tech house", "TECH HOUSE", "Tech  House"):
+        assert split_tag_genre(spelling) == ("House", "Tech House"), spelling
+    assert split_tag_genre("deep house") == ("House", "Deep House")
+    assert split_tag_genre("psytrance") == ("Trance", "Psytrance")
+    assert split_tag_genre("house") == ("House", "House")
+    # the bracketed-qualifier rule is case-insensitive too
+    assert split_tag_genre("techno (peak time / driving)") == ("Techno", "Techno")
+
+
+def test_case_variant_tag_is_not_a_conflict_with_a_matching_ml_read() -> None:
+    """The downstream harm: a correct lowercase tag disagreed with an identical
+    ML read, which flags the track for review and — above the override floor —
+    replaces the user's tag with `ml_override`."""
+    same = reconcile_genre("House", "Tech House", 0.95, "tech house")
+    assert same.source == "tag"
+    assert same.conflict is False
+    assert (same.genre, same.subgenre) == ("House", "Tech House")
+
+
+def test_case_folding_does_not_rescue_a_genre_the_hierarchy_lacks() -> None:
+    """Scope guard: matching ignores case, it does not invent entries. A name the
+    taxonomy has no entry for stays its own label, verbatim casing included."""
+    for gap in ("reggaeton", "SOUNDTRACK", "Bossa Nova", "chemicals (extended mix)"):
+        assert split_tag_genre(gap) == (gap, gap), gap

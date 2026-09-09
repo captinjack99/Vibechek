@@ -98,6 +98,7 @@ _per_worker_mb = _resources.per_worker_mb
 from vibechek.utils import (
     ProgressCallback,
     find_audio_files,
+    find_executable,
     report_progress,
 )
 
@@ -111,8 +112,8 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 _MOOD_INDEX = {"aggressive": 0, "happy": 0, "relaxed": 1, "sad": 1}
 
 # Essentia KeyExtractor pitch profile. A shoot-out of every Essentia profile on
-# the 72-track gold corpus (internal/bughunt/profile_shootout.py) ranked Shaath's
-# profile highest for our electronic-music libraries — ahead of the EDM-tuned
+# the 72-track gold corpus ranked Shaath's profile highest for our
+# electronic-music libraries — ahead of the EDM-tuned
 # "edma" it replaced (66.7% vs 65.3% exact-Camelot single-read; the gap widens
 # once segment-voting is layered on, see KEY_VOTE_SEGMENTS). Exposed as a module
 # constant so it can be tuned without touching call sites.
@@ -182,6 +183,12 @@ class MLResult:
     # tracks for one-click review (tag ≠ audio ≠ web).
     ml_genre_audio: str | None = None      # pure-audio genre, pre-reconcile
     ml_subgenre_audio: str | None = None   # pure-audio subgenre, pre-reconcile
+    # The audio model's own single-class score, stashed pre-reconcile because
+    # `ml_genre_raw_confidence` is rewritten to describe the genre that ends up
+    # STORED (a tag or a web read may not be the audio one). Reconciliation is
+    # idempotent only because it re-derives from this stash instead of from the
+    # rewritten field — see `_reconcile_record_genre`.
+    ml_genre_audio_confidence: float | None = None
     ml_genre_web: str | None = None        # online catalog-lookup genre, if run
     # True when the online read was DETERMINISTICALLY VERIFIED: the genre came
     # out of a catalog page's structured genre field, the quote naming it is a
@@ -202,7 +209,7 @@ class MLResult:
     ml_key_tag: str | None = None          # file's key tag, normalized to Camelot
     ml_key_conflict: bool | None = None    # parseable tag key != audio key
 
-    # --- Silent-degradation provenance (WP3) -----------------------------
+    # --- Silent-degradation provenance ------------------------------------
     # Which audio genre classifier ACTUALLY produced this track's genre:
     # "clap" (the opt-in ~54%-accurate CLAP+kNN student the user paid a 2.2 GB
     # checkpoint for) or "discogs" (the ~28% engine head). A per-track CLAP
@@ -531,9 +538,9 @@ def _classify_mood(brightness: float) -> str:
 # Minimum start→end delta in the per-frame aggressive (energy proxy) score
 # before we call a track "Up"/"Down" rather than "Steady".
 #
-# Empirically validated against 40 real DJ tracks (internal/bughunt/
-# direction_timeslot_probe.py, 2026-06-17): the signed first-third→last-third
-# delta has mean +0.027 / std 0.096 / |Δ| median 0.06, and ±0.08 yields a
+# Empirically validated against 40 real DJ tracks: the signed
+# first-third→last-third delta has mean +0.027 / std 0.096 / |Δ| median
+# 0.06, and ±0.08 yields a
 # 70/25/5 Steady/Up/Down split — non-degenerate (the pre-fix column bug was
 # 100% Steady) and intentionally PRECISION-LEANING (it sits just above the |Δ|
 # median, so only a clear trend earns a direction; a wrong Up/Down on a
@@ -555,7 +562,7 @@ def _classify_direction(
     not-aggressive]). We compare the mean of the AGGRESSIVE column over the
     first third of the track against the last third.
 
-    Historical bug (audit HIGH): the old code did ``np.mean(aggressive_raw[:third])``
+    Historical bug: the old code did ``np.mean(aggressive_raw[:third])``
     with no column selection, averaging BOTH softmax columns of the slice. Since
     each row sums to ~1.0, that mean was ~0.5 for every slice, so start≈end and
     EVERY track collapsed to "Steady" — a silently-dead feature still written to
@@ -734,28 +741,65 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
 
     result = MLResult()
 
+    # The two decodes are independent, so we take them one at a time and free
+    # each at its last use instead of holding both for the whole function. On a
+    # 90-minute recorded set — first-class content for a DJ library — that is
+    # the difference between ~1.3 GB and ~950 MB of decoded audio alive inside
+    # a worker `resources.per_worker_mb` sizes at 800 MB plus whatever the
+    # measured track-length term adds (it models the peak as the LARGEST
+    # single decode precisely because of the `del`s below — keep them in step).
+    #
+    # 44.1 kHz first: it feeds only the pure-DSP rhythm/key extractors, so it
+    # can be gone before any model runs.
     try:
-        audio_16k = MonoLoader(filename=str(filepath), sampleRate=16000, resampleQuality=4)()
         audio_44k = MonoLoader(filename=str(filepath), sampleRate=44100, resampleQuality=4)()
     except Exception as e:  # noqa: BLE001
         result.ml_error = f"Could not decode audio: {e}"
         return result
 
-    if "effnet" not in models:
-        result.ml_error = "EffNet embedding model not loaded"
-        return result
+    # ---------- BPM ----------
+    try:
+        bpm, *_ = RhythmExtractor2013(method="multifeature")(audio_44k)
+        result.ml_bpm = round(float(bpm), 1)
+    except Exception as e:  # noqa: BLE001
+        log.debug("BPM detection failed for %s: %s", filepath.name, e)
+
+    # ---------- Key ----------
+    try:
+        result.ml_key = _vote_key(KeyExtractor(profileType=KEY_PROFILE), audio_44k)
+    except Exception as e:  # noqa: BLE001
+        log.debug("Key detection failed for %s: %s", filepath.name, e)
+
+    del audio_44k
+
+    try:
+        audio_16k = MonoLoader(filename=str(filepath), sampleRate=16000, resampleQuality=4)()
+    except Exception as e:  # noqa: BLE001
+        # BPM and key are already read — keep them and report only what failed.
+        return _finish_ml_result(result, models, f"Could not decode audio: {e}")
 
     # EffNet embedding can blow up on malformed audio (0-byte files, truncated
     # FLAC headers, corrupted MP3 sync bytes) — Essentia surfaces these as a
-    # bare RuntimeError from native code that takes the whole worker down. We
-    # bail early on failure so the parent analysis still records BPM/key from
-    # the rhythm/key extractors run by the non-ML pass, instead of losing the
-    # entire track to an unhandled exception in the worker pool.
-    try:
-        embeddings = models["effnet"](audio_16k)
-    except Exception as e:  # noqa: BLE001
-        result.ml_error = f"EffNet embedding failed: {e}"
-        return result
+    # bare RuntimeError from native code that would take the whole worker down.
+    # We catch it and carry on WITHOUT embeddings rather than returning: BPM and
+    # key above need no model at all, so bailing here threw away a perfectly
+    # good read on a track we had already paid to decode. (The old comment
+    # claimed a "non-ML pass" would recover them — there has never been one;
+    # analyze_track calls this function once.) Every embedding-dependent head
+    # below is gated on `embeddings is not None`.
+    embeddings = None
+    embed_error: str | None = None
+    if "effnet" not in models:
+        embed_error = "EffNet embedding model not loaded"
+    else:
+        try:
+            embeddings = models["effnet"](audio_16k)
+        except Exception as e:  # noqa: BLE001
+            embed_error = f"EffNet embedding failed: {e}"
+
+    # The 16 kHz decode fed the embedding and nothing else — release it before
+    # the remaining heads run inference over `embeddings`.
+    del audio_16k
 
     # ---------- Genre ----------
     # Pure-audio CLAP student (opt-in): a CLAP embedding matched by kNN against
@@ -798,7 +842,10 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         except Exception as e:  # noqa: BLE001
             log.warning("CLAP genre failed for %s (falling back to Discogs): %s", filepath.name, e)
 
-    if not clap_done and "genre" in models and "genre_classes" in models:
+    if (
+        not clap_done and embeddings is not None
+        and "genre" in models and "genre_classes" in models
+    ):
         try:
             preds = models["genre"](embeddings)
             avg = np.mean(preds, axis=0)
@@ -814,21 +861,8 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         except Exception as e:  # noqa: BLE001
             log.warning("Genre classification failed for %s: %s", filepath.name, e)
 
-    # ---------- BPM ----------
-    try:
-        bpm, *_ = RhythmExtractor2013(method="multifeature")(audio_44k)
-        result.ml_bpm = round(float(bpm), 1)
-    except Exception as e:  # noqa: BLE001
-        log.debug("BPM detection failed for %s: %s", filepath.name, e)
-
-    # ---------- Key ----------
-    try:
-        result.ml_key = _vote_key(KeyExtractor(profileType=KEY_PROFILE), audio_44k)
-    except Exception as e:  # noqa: BLE001
-        log.debug("Key detection failed for %s: %s", filepath.name, e)
-
     # ---------- Danceability ----------
-    if "danceability" in models:
+    if embeddings is not None and "danceability" in models:
         try:
             pred = np.mean(models["danceability"](embeddings), axis=0)
             danceability = float(pred[0]) if len(pred) > 1 else float(np.mean(pred))
@@ -837,7 +871,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
             log.debug("Danceability failed for %s: %s", filepath.name, e)
 
     # ---------- Voice / instrumental ----------
-    if "voice_instrumental" in models:
+    if embeddings is not None and "voice_instrumental" in models:
         try:
             preds = np.asarray(models["voice_instrumental"](embeddings))
             # Resolve the "voice" column by label NAME from the model's class
@@ -879,7 +913,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
     # library for no benefit.
     aggressive_raw = None
     for mood in ("aggressive", "happy", "relaxed", "sad"):
-        if mood not in models:
+        if embeddings is None or mood not in models:
             continue
         try:
             raw = models[mood](embeddings)
@@ -919,7 +953,7 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
         result.ml_mood = _classify_mood(brightness)
 
         result.ml_mood_scores = {k: round(v, 3) for k, v in mood_scores.items()}
-    else:
+    elif embeddings is not None or clap_done:
         # Genre-based fallback when mood models failed.
         # `ml_genre` is the DJ-friendly PARENT genre; the finer Discogs styles
         # (Hard Techno, Deep House, …) live in `ml_subgenre`. Match parent
@@ -945,16 +979,21 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
             result.ml_energy, result.ml_mood = 4, "Bright"
         else:
             result.ml_energy, result.ml_mood = 3, "Neutral"
+    # No `else`: when the embedding pass never ran (embed_error is set) there is
+    # no genre to fall back on either, and stamping "energy 3 / Neutral / Steady"
+    # on a track we never heard is fabrication, not a fallback. The BPM and key
+    # read earlier are real, and are kept.
 
-    # Use an explicit None check, not `or 3`: energy 0 is a legitimate computed
-    # value (calmest tracks). `0 or 3` would silently treat those as medium
-    # energy and assign the wrong timeslot.
-    result.ml_timeslot = _pick_timeslot(
-        result.ml_genre,
-        result.ml_subgenre,
-        result.ml_energy if result.ml_energy is not None else 3,
-        result.ml_bpm,
-    )
+    if result.ml_energy is not None or result.ml_genre:
+        # Use an explicit None check, not `or 3`: energy 0 is a legitimate
+        # computed value (calmest tracks). `0 or 3` would silently treat those
+        # as medium energy and assign the wrong timeslot.
+        result.ml_timeslot = _pick_timeslot(
+            result.ml_genre,
+            result.ml_subgenre,
+            result.ml_energy if result.ml_energy is not None else 3,
+            result.ml_bpm,
+        )
 
     # ---------- Direction (energy curve over the track) ----------
     # Reuse the aggressive prediction computed in the mood loop above instead
@@ -962,17 +1001,59 @@ def analyze_audio_features(filepath: Path, models: dict[str, Any]) -> MLResult:
     # into thirds and compares the AGGRESSIVE column start-vs-end).
     if aggressive_raw is not None:
         result.ml_direction = _classify_direction(aggressive_raw)
-    else:
+    elif embeddings is not None or clap_done:
         result.ml_direction = "Steady"
 
-    # Stamp any mood/vocal heads that failed to LOAD this run so the report can
-    # tell the user which fields (energy/mood/vocal) ran on the fallback rather
-    # than pretending full fidelity. Copied per track (the list is worker-wide
-    # and identical everywhere) so it survives the worker→parent boundary.
-    degraded = models.get("_degraded_heads")
-    if degraded:
-        result.ml_degraded_heads = list(degraded)
+    return _finish_ml_result(result, models, embed_error)
 
+
+# `ml_degraded_heads` entry for "the EffNet embedding was unavailable for THIS
+# track". Not a member of the load-time `_degraded_heads` list (those are heads
+# that failed to load for the whole worker); `_build_report` keeps the two
+# apart so a single malformed file can't produce a "re-download your models"
+# banner about every track in the library.
+EMBEDDING_HEAD = "effnet"
+
+
+def _finish_ml_result(
+    result: MLResult, models: dict[str, Any], embed_error: str | None,
+) -> MLResult:
+    """Stamp degradation provenance and decide DEGRADED vs FAILED.
+
+    An EffNet embedding failure used to set `ml_error`, and `_record_failed`
+    counts any record with `ml_error` as an error — which the library view
+    mirrors as "never analyzed". So the very records the embedding-failure
+    handler goes out of its way to keep (real BPM, real key, no model needed
+    for either) were counted as failures and re-queued by every incremental
+    "Analyze new" forever: one permanently malformed FLAC pinned the counter at
+    1 and got re-decoded on every run. Worse, a worker-wide embedding failure
+    made `analyzed` 0 and `errors` == the file count, so the CLI's
+    `_exit_if_total_failure` aborted `analyze && tag` over a report that held a
+    usable BPM and key for every track.
+
+    So: a partial read is DEGRADED, not failed — the missing heads are named in
+    `ml_degraded_heads` and `ml_error` stays None. Only a read with nothing
+    usable in it (no BPM and no key) keeps `ml_error` and counts as a failure.
+
+    Also stamps the mood/vocal heads that failed to LOAD this run (the
+    worker-wide list) so the report can tell the user which fields ran on a
+    fallback. Copied per track — the list lives in the worker's `models` dict
+    and this is its only channel across the worker→parent boundary.
+    """
+    degraded: list[str] = list(models.get("_degraded_heads") or [])
+    if embed_error is not None:
+        if result.ml_bpm is None and result.ml_key is None:
+            # Nothing usable came out of this file at all — a real failure.
+            result.ml_error = embed_error
+        else:
+            log.debug(
+                "Embedding-dependent heads unavailable (%s) — keeping the BPM/key "
+                "read and marking the track degraded", embed_error,
+            )
+            if EMBEDDING_HEAD not in degraded:
+                degraded.append(EMBEDDING_HEAD)
+    if degraded:
+        result.ml_degraded_heads = degraded
     return result
 
 
@@ -1255,7 +1336,7 @@ def _normalize_version(v: str) -> str:
 def _wsl_install_is_outdated(wsl_version: str, sidecar_version: str) -> bool:
     """True only when the WSL `vibechek` install is STRICTLY OLDER than the sidecar.
 
-    Audit fix (LOW): the old guard blocked on *any* version mismatch
+    Historical bug: the old guard blocked on *any* version mismatch
     (`_normalize_version(a) != _normalize_version(b)`), which wrongly rejected a
     WSL install that was actually NEWER than the sidecar (e.g. a user who
     upgraded the WSL venv ahead of the desktop app) and relied on a non-PEP-440
@@ -1323,7 +1404,7 @@ def _visible_gpu_index() -> int:
 def _probe_free_vram_mb() -> int | None:
     """Return free VRAM in MB on the SINGLE GPU our workers pin, via `nvidia-smi`.
 
-    Audit fix (MED): the old probe SUMMED `memory.free` across every visible
+    Historical bug: the old probe SUMMED `memory.free` across every visible
     GPU, but every worker pins one device (`CUDA_VISIBLE_DEVICES=0`, or the
     first entry the environment already set). On a 2×8 GB rig the sum (~16 GB)
     sized ~6 workers that ALL piled onto GPU 0 → CUDA OOM, with only the 5-min
@@ -1334,10 +1415,13 @@ def _probe_free_vram_mb() -> int | None:
     target index not present). Callers must treat None as "unknown" and fall
     back to the conservative cap.
     """
-    import shutil as _shutil  # noqa: PLC0415  (lazy to keep import cost flat)
     import subprocess as _subprocess  # noqa: PLC0415
 
-    smi = _shutil.which("nvidia-smi")
+    # `find_executable`, not `shutil.which`: the result is EXECUTED, and on
+    # Windows which() searches the process cwd ahead of PATH — an
+    # `nvidia-smi.exe` dropped in a sample-pack folder would be run once per
+    # worker-sizing probe. find_executable discards a cwd hit and absolutizes.
+    smi = find_executable("nvidia-smi")
     if not smi:
         return None
     try:
@@ -1378,7 +1462,7 @@ def _probe_free_vram_mb() -> int | None:
 def _stable_free_vram_mb() -> int | None:
     """Free VRAM for GPU sizing, taken as the MIN of two quick samples.
 
-    The audit measured free VRAM swinging wildly between probes (3129 vs 7948
+    Measurement showed free VRAM swinging wildly between probes (3129 vs 7948
     MiB) as other apps (browser GPU-accel, a DAW) allocate and release. We size
     off free VRAM rather than total-minus-headroom on purpose: free respects
     what another process is genuinely holding, so we never oversize the GPU pool
@@ -1600,6 +1684,9 @@ class _HybridPool:
         # record instead of an infinite respawn loop).
         self._claims: dict[int, tuple[int, str]] = {}
         self._retries: dict[int, int] = {}
+        # Indices already handed to the caller — a re-enqueued item can still
+        # produce a second result (see next()).
+        self._delivered: set[int] = set()
 
         self._in_q = ctx.Queue()
         self._out_q = ctx.Queue()
@@ -1637,6 +1724,13 @@ class _HybridPool:
         forever. (Tiny residual race: a claim marker the parent hasn't consumed
         yet when the death is noticed is invisible here — the marker is posted
         before the seconds-long analyze, so in practice it has long been read.)
+
+        A worker that exits CLEANLY (exitcode 0) is a `maxtasks` recycle, not a
+        death: it posted its last result and then returned, so a claim we still
+        hold only means that result is still sitting in `_out_q` behind us. We
+        used to re-enqueue it — re-analyzing a finished track and logging a
+        false, OOM-flavoured "Worker died mid-track" at every recycle boundary,
+        which is the exact log line real worker deaths are diagnosed from.
         """
         if self._done_event.is_set():
             return
@@ -1644,6 +1738,8 @@ class _HybridPool:
             if not p.is_alive():
                 p.join(timeout=0.1)
                 claim = self._claims.pop(p.pid, None) if p.pid is not None else None
+                if claim is not None and p.exitcode == 0:
+                    claim = None  # clean recycle; the result is already in flight
                 if claim is not None and self._results_out < self.total:
                     idx, path = claim
                     self._retries[idx] = self._retries.get(idx, 0) + 1
@@ -1699,6 +1795,14 @@ class _HybridPool:
             idx, rec, device, seconds = item
             # The item completed — drop whichever worker's claim carried it.
             self._claims = {p: c for p, c in self._claims.items() if c[0] != idx}
+            if idx in self._delivered:
+                # A re-enqueued item that turned out not to be lost after all.
+                # Counting it would fill one of the caller's `total` slots with
+                # a duplicate, leaving a real track's record out of the report —
+                # and `_done_event` set before it was ever processed.
+                log.debug("Discarding duplicate result for index %s", idx)
+                continue
+            self._delivered.add(idx)
             self._results_out += 1
             self.device_counts[device] = self.device_counts.get(device, 0) + 1
             self.device_seconds[device] = self.device_seconds.get(device, 0.0) + seconds
@@ -1874,6 +1978,15 @@ EVENT_PREFIX = "VIBECHEK_EVENT\t"
 _EVENT_LOCK = _threading_for_events.Lock()
 _EVENT_STREAM_ON = _os_for_events.environ.get("VIBECHEK_STREAM_PROGRESS") == "1"
 
+# `stage` event name for a run refused because nothing fits in memory. The name
+# is part of the child→parent contract: `_analyze_via_wsl` matches on it to
+# re-raise the refusal as a STRUCTURED error on the Windows side. It has to be
+# re-decided there because the one self-heal a WSL memory refusal can offer —
+# raising the VM's `memory=` limit — depends on the HOST's total RAM, and the
+# in-WSL child measuring psutil sees the VM's limit instead. Rename it in both
+# places or the "Increase memory" button silently disappears again.
+WORKER_BUDGET_REFUSED = "worker_budget_refused"
+
 
 def _emit_event(event_type: str, **payload: Any) -> None:
     """Emit a structured event line if VIBECHEK_STREAM_PROGRESS=1.
@@ -1990,7 +2103,7 @@ def analyze_directory(
 
     pf = preflight(config.models_dir, quick_wsl=False, engine=config.inference_engine)
     if not pf.ready:
-        # Plain, CLI-free (voice-guide rule 4): the reasons are already
+        # Plain, CLI-free: the reasons are already
         # user-facing; point at the in-app setup instead of a terminal command.
         raise RuntimeError(
             "Can't analyze yet: " + "; ".join(pf.reasons_not_ready) +
@@ -2048,11 +2161,19 @@ def analyze_directory(
     # that pure function; here we only gather the measured inputs and surface the
     # reasons it returns.
     total_ram_mb: int | None
+    available_ram_mb: int | None
     try:
         import psutil  # noqa: PLC0415
-        total_ram_mb = psutil.virtual_memory().total // (1024 * 1024)
+        vm = psutil.virtual_memory()
+        total_ram_mb = vm.total // (1024 * 1024)
+        # Both readings come from THIS process, so they describe the same pool
+        # whether we're the Windows sidecar or the in-WSL analyzer — which is
+        # why we pass the availability figure explicitly instead of letting the
+        # budget measure it (it refuses to mix a host reading with a VM total).
+        available_ram_mb = vm.available // (1024 * 1024)
     except ImportError:
         total_ram_mb = None  # capping unavailable — the budget names it loudly
+        available_ram_mb = None
 
     under_wsl = _running_under_wsl()
     free_vram_mb: int | None = None
@@ -2069,6 +2190,15 @@ def analyze_directory(
         if gpu_registrable is not False:
             free_vram_mb = _stable_free_vram_mb()
 
+    # A worker holds the whole decoded track (176.4 kB per second at 44.1 kHz
+    # mono float32), so the per-worker budget is only flat for a library of
+    # singles: at ~43 minutes the decode alone exceeds the allowance the flat
+    # number buries, and six workers on 90-minute recorded sets oversubscribe the
+    # pool by ~1.6x. Measure the longest track (header read on the biggest few
+    # files — no decoding) and let the budget size against it. An unreadable
+    # probe returns None and the flat budget stands, unchanged.
+    longest_track_seconds = _resources.probe_longest_track_seconds(files)
+
     budget = compute_worker_budget(
         config.inference_engine,
         config.genre_classifier,
@@ -2081,22 +2211,49 @@ def analyze_directory(
         use_gpu=config.use_gpu,
         hybrid=config.hybrid_cpu_gpu,
         ram_pool="wsl_vm" if under_wsl else "host",
+        available_mb=available_ram_mb,
+        longest_track_seconds=longest_track_seconds,
     )
 
     # Nothing fits — refuse instead of launching one worker the budget says is
     # doomed. Plain headline (budget.refusal_reason); the GB math / classifier /
     # .wslconfig are demoted to the detail, and the machine-readable options let
     # the shell offer "Switch to the standard genre model" / "Increase memory"
-    # buttons on the refusal (WP-D3 + WP-D options).
+    # buttons on the refusal.
     if budget.refusal_reason is not None:
-        _emit_event("stage", name="worker_budget_refused",
-                    message=budget.refusal_reason)
+        refusal_detail = _resources.memory_refusal_detail(
+            budget, config.genre_classifier, available_ram_mb,
+        ) + _resources.track_length_note(
+            # A refusal driven by hour-long sets must SAY so, or the user
+            # goes hunting for RAM to fix a number that only moved because
+            # of what is in this library.
+            config.inference_engine, config.genre_classifier,
+            longest_track_seconds,
+        )
+        # The event carries the WHOLE refusal, not just its headline: when this
+        # analyzer is the in-WSL child, its exception dies with the subprocess
+        # and the Windows parent only ever sees stderr. `_analyze_via_wsl` reads
+        # this event back and re-raises a structured refusal — with the
+        # "Increase memory" button, which only the parent can decide on because
+        # only the parent can measure the HOST's RAM (see WORKER_BUDGET_REFUSED).
+        _emit_event("stage", name=WORKER_BUDGET_REFUSED,
+                    message=budget.refusal_reason,
+                    detail=refusal_detail,
+                    genre_classifier=config.genre_classifier)
         raise UserFacingError(
             budget.refusal_reason,
-            detail=_resources.memory_refusal_detail(budget, config.genre_classifier),
+            detail=refusal_detail,
             kind="fatal",
             options=_resources.memory_refusal_options(
                 config.genre_classifier, under_wsl,
+                # The "increase WSL memory" button is gated on the HOST's RAM,
+                # and only the non-WSL path can measure it here: under WSL this
+                # process IS the VM, so `total_ram_mb` is the VM's limit, not
+                # the PC's. Pass None there rather than a number that means
+                # something else — memory_refusal_options withholds the button
+                # instead of promising a bump it can't verify. The Windows
+                # parent re-decides it with the host figure it CAN measure.
+                host_total_mb=None if under_wsl else total_ram_mb,
             ),
         )
 
@@ -2123,7 +2280,7 @@ def analyze_directory(
     # Surface the RAM/worker cap on the GUI channel (was a discarded log.warning).
     # The progress line stays CALM ("Using fewer workers to fit available memory
     # (16 → 2).", budget.cap_reason); the GB math / RAM pool are DEMOTED to the
-    # log + the run-history event's detail (voice-guide rule 9). This routes
+    # log + the run-history event's detail. This routes
     # through _emit_event, which the WSL-subprocess line handler forwards to
     # on_progress — so the cap reaches the GUI on WSL runs too, not just native.
     if budget.cap_reason and budget.ram_measured:
@@ -2162,132 +2319,36 @@ def analyze_directory(
     report_progress(on_progress, 0, total,
                     f"Analyzing {total} files with {workers} worker(s)")
 
-    if hybrid:
-        _run_hybrid_pool(
-            file_strs, config, gpu_workers, cpu_workers, total,
-            results, on_progress, on_track, output_path,
-        )
-    elif workers == 1:
-        _emit_event("stage", name="loading_models",
-                    message="Loading ML models...")
-        report_progress(on_progress, 0, total, "Loading ML models...")
-        models = load_models(
-            config.models_dir, use_gpu=config.use_gpu, engine=config.inference_engine,
-            genre_classifier=config.genre_classifier,
-        )
-        for i, filepath in enumerate(files):
-            cancellation.check()  # Raises CancelledError if user clicked Cancel
-            report_progress(on_progress, i + 1, total, filepath.name)
-            try:
-                record = asdict(analyze_track(filepath, models))
-            except Exception as e:  # noqa: BLE001
-                record = {
-                    "path": str(filepath),
-                    "filename": filepath.name,
-                    "extension": filepath.suffix.lower(),
-                    "size_mb": 0.0,
-                    "error": str(e),
-                }
-            results.append(record)
-            # Per-track stream — sidecar relays this to the GUI so analyzed
-            # tracks appear live instead of after the whole batch.
-            _emit_event("track", index=i + 1, total=total, record=record)
-            if on_track is not None:
+    try:
+        if hybrid:
+            _run_hybrid_pool(
+                file_strs, config, gpu_workers, cpu_workers, total,
+                results, on_progress, on_track, output_path,
+            )
+        elif workers == 1:
+            _emit_event("stage", name="loading_models",
+                        message="Loading ML models...")
+            report_progress(on_progress, 0, total, "Loading ML models...")
+            models = load_models(
+                config.models_dir, use_gpu=config.use_gpu, engine=config.inference_engine,
+                genre_classifier=config.genre_classifier,
+            )
+            for i, filepath in enumerate(files):
+                cancellation.check()  # Raises CancelledError if user clicked Cancel
+                report_progress(on_progress, i + 1, total, filepath.name)
                 try:
-                    on_track(record, i + 1, total)
-                except Exception:  # noqa: BLE001
-                    log.exception("on_track callback raised; ignoring")
-            if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
-                # A transient checkpoint-write failure (disk full, permission
-                # blip) must NOT abort the run — that would discard the
-                # in-memory results AND defeat the point of checkpointing. The
-                # final write at the end is the backstop.
-                try:
-                    _write_partial(output_path, results, total, in_progress=(i + 1) < total)
-                except OSError as e:
-                    log.warning("Partial checkpoint write failed (continuing): %s", e)
-    else:
-        # *Always use spawn for multi-worker analyze* — even on Linux where
-        # Python defaults to fork on <3.14. Reasons:
-        #
-        #   1. essentia bundles TensorFlow as a native C++ lib. If the parent
-        #      process has touched TF for any reason (preflight, system_info,
-        #      anything), fork()-ing it leaves the child with a half-initialized
-        #      CUDA context that segfaults or hangs on first use.
-        #   2. Some Python libraries (e.g., libxml, libcairo) install atfork
-        #      handlers that lock up after fork() if any worker thread was
-        #      mid-call. spawn sidesteps the entire class of problem.
-        #   3. The slight startup cost (~1 sec per worker for re-imports) is
-        #      dwarfed by the per-track analysis time.
-        _emit_event("stage", name="spawning_workers",
-                    message=f"Spawning {workers} worker process(es) "
-                            f"(loading models, may take 10-30 s)...")
-        report_progress(on_progress, 0, total,
-                        f"Spawning {workers} workers (loading models)...")
-        spawn_ctx = multiprocessing.get_context("spawn")
-        # maxtasksperchild=200: every 200 tracks the worker recycles, freeing
-        # any TF memory leaks that essentia / TF native code might accumulate.
-        # Cheap; one re-init per ~200 tracks is invisible alongside analysis.
-        with spawn_ctx.Pool(
-            processes=workers,
-            initializer=_worker_init,
-            initargs=(str(config.models_dir), config.use_gpu, config.inference_engine,
-                      config.genre_classifier),
-            maxtasksperchild=200,
-        ) as pool:
-            # Stall watchdog: if no result arrives in STALL_TIMEOUT seconds, the
-            # pool is wedged (workers all crashed during init, or all OOM-killed).
-            # Tear down with a useful error instead of hanging until the RPC
-            # timeout (1 hour) cuts us off.
-            import time as _time
-            STALL_TIMEOUT = 300  # 5 minutes between any two results = dead
-            iterator = pool.imap_unordered(_worker_analyze, file_strs)
-
-            def _next_with_stall_check():
-                """Like next(iterator) but raises RuntimeError on stall."""
-                deadline = _time.monotonic() + STALL_TIMEOUT
-                # multiprocessing's imap iterator doesn't expose a timeout
-                # directly, but it's actually a `_PoolReadyResult` wrapper
-                # whose `.next(timeout)` we can use.
-                while True:
-                    try:
-                        return iterator.next(timeout=10)  # type: ignore[attr-defined]
-                    except multiprocessing.TimeoutError:
-                        if _time.monotonic() > deadline:
-                            raise UserFacingError(
-                                "Analysis stalled and had to stop — the analysis "
-                                "engine likely ran out of memory. Try again with "
-                                "fewer workers (Settings → Performance), or run "
-                                "Doctor.",
-                                detail=(
-                                    f"No track completed in {STALL_TIMEOUT}s; the "
-                                    "worker pool is dead (likely OOM or an essentia "
-                                    "init crash). Check the analysis-service log "
-                                    "for VIBECHEK_WORKER_INIT_FAIL lines."
-                                ),
-                                kind="fatal",
-                            ) from None
-                        if cancellation.is_cancelled():
-                            raise cancellation.CancelledError(
-                                "Analysis cancelled by user"
-                            ) from None
-
-            for i in range(total):
-                try:
-                    record = _next_with_stall_check()
-                except cancellation.CancelledError:
-                    pool.terminate()
-                    pool.join()
-                    raise
-                except StopIteration:
-                    break
-                # On cancel: terminate the pool (kills outstanding workers) and bail.
-                if cancellation.is_cancelled():
-                    pool.terminate()
-                    pool.join()
-                    raise cancellation.CancelledError("Analysis cancelled by user")
+                    record = asdict(analyze_track(filepath, models))
+                except Exception as e:  # noqa: BLE001
+                    record = {
+                        "path": str(filepath),
+                        "filename": filepath.name,
+                        "extension": filepath.suffix.lower(),
+                        "size_mb": 0.0,
+                        "error": str(e),
+                    }
                 results.append(record)
-                report_progress(on_progress, i + 1, total, Path(record.get("path", "")).name)
+                # Per-track stream — sidecar relays this to the GUI so analyzed
+                # tracks appear live instead of after the whole batch.
                 _emit_event("track", index=i + 1, total=total, record=record)
                 if on_track is not None:
                     try:
@@ -2295,45 +2356,151 @@ def analyze_directory(
                     except Exception:  # noqa: BLE001
                         log.exception("on_track callback raised; ignoring")
                 if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
-                    # See single-worker path: a transient checkpoint-write
-                    # failure must not abort the whole analyze.
+                    # A transient checkpoint-write failure (disk full, permission
+                    # blip) must NOT abort the run — that would discard the
+                    # in-memory results AND defeat the point of checkpointing. The
+                    # final write at the end is the backstop.
                     try:
                         _write_partial(output_path, results, total, in_progress=(i + 1) < total)
                     except OSError as e:
                         log.warning("Partial checkpoint write failed (continuing): %s", e)
+        else:
+            # *Always use spawn for multi-worker analyze* — even on Linux where
+            # Python defaults to fork on <3.14. Reasons:
+            #
+            #   1. essentia bundles TensorFlow as a native C++ lib. If the parent
+            #      process has touched TF for any reason (preflight, system_info,
+            #      anything), fork()-ing it leaves the child with a half-initialized
+            #      CUDA context that segfaults or hangs on first use.
+            #   2. Some Python libraries (e.g., libxml, libcairo) install atfork
+            #      handlers that lock up after fork() if any worker thread was
+            #      mid-call. spawn sidesteps the entire class of problem.
+            #   3. The slight startup cost (~1 sec per worker for re-imports) is
+            #      dwarfed by the per-track analysis time.
+            _emit_event("stage", name="spawning_workers",
+                        message=f"Spawning {workers} worker process(es) "
+                                f"(loading models, may take 10-30 s)...")
+            report_progress(on_progress, 0, total,
+                            f"Spawning {workers} workers (loading models)...")
+            spawn_ctx = multiprocessing.get_context("spawn")
+            # maxtasksperchild=200: every 200 tracks the worker recycles, freeing
+            # any TF memory leaks that essentia / TF native code might accumulate.
+            # Cheap; one re-init per ~200 tracks is invisible alongside analysis.
+            with spawn_ctx.Pool(
+                processes=workers,
+                initializer=_worker_init,
+                initargs=(str(config.models_dir), config.use_gpu, config.inference_engine,
+                          config.genre_classifier),
+                maxtasksperchild=200,
+            ) as pool:
+                # Stall watchdog: if no result arrives in STALL_TIMEOUT seconds, the
+                # pool is wedged (workers all crashed during init, or all OOM-killed).
+                # Tear down with a useful error instead of hanging until the RPC
+                # timeout (1 hour) cuts us off.
+                import time as _time
+                STALL_TIMEOUT = 300  # 5 minutes between any two results = dead
+                iterator = pool.imap_unordered(_worker_analyze, file_strs)
 
-    if tag_priors:
-        from vibechek.tag_priors import merge_priors_into_results  # noqa: PLC0415
+                def _next_with_stall_check():
+                    """Like next(iterator) but raises RuntimeError on stall."""
+                    deadline = _time.monotonic() + STALL_TIMEOUT
+                    # multiprocessing's imap iterator doesn't expose a timeout
+                    # directly, but it's actually a `_PoolReadyResult` wrapper
+                    # whose `.next(timeout)` we can use.
+                    while True:
+                        try:
+                            return iterator.next(timeout=10)  # type: ignore[attr-defined]
+                        except multiprocessing.TimeoutError:
+                            if _time.monotonic() > deadline:
+                                raise UserFacingError(
+                                    "Analysis stalled and had to stop — the analysis "
+                                    "engine likely ran out of memory. Try again with "
+                                    "fewer workers (Settings → Performance), or run "
+                                    "Doctor.",
+                                    detail=(
+                                        f"No track completed in {STALL_TIMEOUT}s; the "
+                                        "worker pool is dead (likely OOM or an essentia "
+                                        "init crash). Check the analysis-service log "
+                                        "for VIBECHEK_WORKER_INIT_FAIL lines."
+                                    ),
+                                    kind="fatal",
+                                ) from None
+                            if cancellation.is_cancelled():
+                                raise cancellation.CancelledError(
+                                    "Analysis cancelled by user"
+                                ) from None
 
-        merged = merge_priors_into_results(results, tag_priors)
-        if merged:
-            log.info("Applied imported tag priors to %d of %d records", merged, total)
+                for i in range(total):
+                    try:
+                        record = _next_with_stall_check()
+                    except cancellation.CancelledError:
+                        pool.terminate()
+                        pool.join()
+                        raise
+                    except StopIteration:
+                        break
+                    # On cancel: terminate the pool (kills outstanding workers) and bail.
+                    if cancellation.is_cancelled():
+                        pool.terminate()
+                        pool.join()
+                        raise cancellation.CancelledError("Analysis cancelled by user")
+                    results.append(record)
+                    report_progress(on_progress, i + 1, total, Path(record.get("path", "")).name)
+                    _emit_event("track", index=i + 1, total=total, record=record)
+                    if on_track is not None:
+                        try:
+                            on_track(record, i + 1, total)
+                        except Exception:  # noqa: BLE001
+                            log.exception("on_track callback raised; ignoring")
+                    if output_path and ((i + 1) % 50 == 0 or (i + 1) == total):
+                        # See single-worker path: a transient checkpoint-write
+                        # failure must not abort the whole analyze.
+                        try:
+                            _write_partial(output_path, results, total, in_progress=(i + 1) < total)
+                        except OSError as e:
+                            log.warning("Partial checkpoint write failed (continuing): %s", e)
 
-    report = _build_report(
-        results, total, in_progress=False,
-        genre_policy=(config.genre_source_policy, config.genre_ml_override_confidence),
-        web_cfg={"enabled": config.genre_web_lookup, "backend": config.genre_llm_backend},
-        genre_classifier=config.genre_classifier,
-    )
-    # Stamp the resolved worker/GPU plan onto the report so the durable run log
-    # (written by the RPC analyze handler) can record what THIS run actually
-    # decided — requested vs effective workers, the GPU split, and why the GPU
-    # was or wasn't used. It rides through the WSL route too: the in-WSL analyze
-    # writes it into analysis.json and the parent reads it straight back.
-    report["run_meta"] = {
-        "engine": config.inference_engine,
-        "genre_classifier": config.genre_classifier,
-        "requested_workers": budget.requested_workers,
-        "effective_workers": budget.effective_workers,
-        "gpu_workers": budget.gpu_workers,
-        "cpu_workers": budget.cpu_workers,
-        "gpu_reason": budget.gpu_reason,
-    }
-    if output_path:
-        # Atomic write — a kill/power-loss/disk-full mid-write must not
-        # truncate the report (which can represent 30+ min of GPU time).
-        atomic_write_json(Path(output_path), report, indent=2)
-    return report
+        if tag_priors:
+            from vibechek.tag_priors import merge_priors_into_results  # noqa: PLC0415
+
+            merged = merge_priors_into_results(results, tag_priors)
+            if merged:
+                log.info("Applied imported tag priors to %d of %d records", merged, total)
+
+        report = _build_report(
+            results, total, in_progress=False,
+            genre_policy=(config.genre_source_policy, config.genre_ml_override_confidence),
+            web_cfg={"enabled": config.genre_web_lookup, "backend": config.genre_llm_backend},
+            genre_classifier=config.genre_classifier,
+        )
+        # Stamp the resolved worker/GPU plan onto the report so the durable run log
+        # (written by the RPC analyze handler) can record what THIS run actually
+        # decided — requested vs effective workers, the GPU split, and why the GPU
+        # was or wasn't used. It rides through the WSL route too: the in-WSL analyze
+        # writes it into analysis.json and the parent reads it straight back.
+        report["run_meta"] = {
+            "engine": config.inference_engine,
+            "genre_classifier": config.genre_classifier,
+            "requested_workers": budget.requested_workers,
+            "effective_workers": budget.effective_workers,
+            "gpu_workers": budget.gpu_workers,
+            "cpu_workers": budget.cpu_workers,
+            "gpu_reason": budget.gpu_reason,
+        }
+        if output_path:
+            # Atomic write — a kill/power-loss/disk-full mid-write must not
+            # truncate the report (which can represent 30+ min of GPU time).
+            atomic_write_json(Path(output_path), report, indent=2)
+        return report
+    except (cancellation.CancelledError, UserFacingError) as e:
+        # Cancel and the stall watchdog used to unwind with `results` purely
+        # local: hours of finished GPU work on screen, nothing on disk, and
+        # the RPC layer's record_analysis never reached. Persist what we
+        # have (and hand it to the caller on the exception) BEFORE the stack
+        # unwinds — a checkpoint that only exists on the happy path is not a
+        # checkpoint.
+        _persist_partial_on_abort(e, output_path, results, total)
+        raise
 
 
 def _make_event_aware_line_handler(
@@ -2343,6 +2510,7 @@ def _make_event_aware_line_handler(
     *,
     progress_re: re.Pattern[str] | None = None,
     noise_re: re.Pattern[str] | None = None,
+    on_stage: Callable[[dict[str, Any]], None] | None = None,
 ) -> Callable[[str], None]:
     """Build an `on_stderr_line` handler that parses VIBECHEK_EVENT lines.
 
@@ -2361,6 +2529,11 @@ def _make_event_aware_line_handler(
     bounded error-context buffer the WSL launcher uses on failure exit.
     `noise_re` filters out essentia / TF chatter before the tail accumulates.
 
+    `on_stage` (if provided) receives the raw payload of every `stage` event —
+    the only channel a child's structured diagnosis has back to the parent,
+    since the child's exception dies with its process. `_analyze_via_wsl` uses
+    it to recover a memory refusal it must re-decide with host-side facts.
+
     Returns a closure ready to pass to `run_vibechek_in_wsl(..., on_stderr_line=...)`
     or `run_vibechek_in_native_venv(..., on_stderr_line=...)`.
     """
@@ -2377,6 +2550,11 @@ def _make_event_aware_line_handler(
                 log.debug("Failed to parse VIBECHEK_EVENT line: %s", e)
                 return
             if event_type == "stage":
+                if on_stage is not None:
+                    try:
+                        on_stage(payload)
+                    except Exception:  # noqa: BLE001
+                        log.exception("on_stage raised; ignoring")
                 if on_progress is not None:
                     msg = str(payload.get("message", payload.get("name", "")))
                     try:
@@ -2447,7 +2625,7 @@ def _analyze_via_native_venv(
         run_vibechek_in_native_venv,
     )
 
-    # DETECT → SELF-HEAL → RUN (zero-setup doctrine; WP-G2 parity with the WSL
+    # DETECT → SELF-HEAL → RUN (parity with the WSL
     # sibling's ensure_engine_runtime): probe the managed venv's ML-stack
     # import and repair it in place BEFORE dispatching, so a host OS/Python
     # upgrade that broke the venv self-heals on the next analyze instead of
@@ -2533,6 +2711,11 @@ def _analyze_via_native_venv(
 
     try:
         result = run_vibechek_in_native_venv(args, on_stderr_line=on_line, engine=config.inference_engine)
+    except (cancellation.CancelledError, UserFacingError) as e:
+        # The child has been checkpointing into local_output all along; a cancel
+        # used to leave that file unread and the finished tracks discarded.
+        _attach_child_partial(e, local_output)
+        raise
     finally:
         if skip_paths_file is not None:
             skip_paths_file.unlink(missing_ok=True)
@@ -2586,6 +2769,57 @@ def _analyze_via_native_venv(
             pass
 
     return report
+
+
+def _host_total_ram_mb() -> int | None:
+    """Total RAM (MB) of the machine THIS process runs on, or None if unmeasurable.
+
+    Called from the Windows sidecar, so it really is the host's total — which is
+    the figure `memory_refusal_options` needs to decide whether raising the WSL
+    VM's `memory=` limit can hand it anything.
+    """
+    try:
+        import psutil  # noqa: PLC0415
+    except ImportError:
+        return None
+    try:
+        return psutil.virtual_memory().total // (1024 * 1024)
+    except Exception:  # noqa: BLE001 — a refusal must not become a crash
+        log.debug("Could not read host total RAM for the WSL memory refusal")
+        return None
+
+
+def _wsl_memory_refusal(
+    payload: dict[str, Any], genre_classifier: str,
+) -> UserFacingError:
+    """Rebuild the in-WSL child's memory refusal as a host-side UserFacingError.
+
+    The child raised a fully-shaped refusal and then died with its process; the
+    Windows parent only inherits the event line. Re-raising it here is not just
+    cosmetic — it is the ONLY place the "Increase memory available to Vibechek"
+    action can honestly be offered. That button drives `increase_wsl_memory` ->
+    `bump_wslconfig_memory`, which raises the VM's `memory=` limit out of the
+    HOST's RAM; the child's own psutil reading is the VM's limit, so the child
+    correctly withholds the button (it cannot tell whether a bump has anything
+    to give). Here we can measure the host, so the flag is decided on the real
+    number instead of being permanently False.
+    """
+    headline = str(payload.get("message") or
+                   "Not enough memory to run analysis right now.")
+    detail = payload.get("detail")
+    return UserFacingError(
+        headline,
+        detail=str(detail) if detail else None,
+        kind="fatal",
+        options=_resources.memory_refusal_options(
+            # The child names the classifier it actually ran with; fall back to
+            # the config we dispatched so the "switch model" flag is never lost
+            # to an older WSL install that predates the field.
+            str(payload.get("genre_classifier") or genre_classifier),
+            under_wsl=True,
+            host_total_mb=_host_total_ram_mb(),
+        ),
+    )
 
 
 def _analyze_via_wsl(
@@ -2719,11 +2953,24 @@ def _analyze_via_wsl(
     else:
         translated_on_track = None
 
+    # The in-WSL child refuses a run that can't fit in the VM's memory by
+    # raising a UserFacingError — inside its own process, where it dies. All the
+    # parent ever saw was exit 1 and a stderr tail, so the refusal reached the
+    # GUI as "Analysis stopped unexpectedly" with no headline, no detail and no
+    # action buttons. Capture the child's structured refusal event and re-raise
+    # it properly below.
+    child_refusal: dict[str, Any] = {}
+
+    def _capture_stage(payload: dict[str, Any]) -> None:
+        if payload.get("name") == WORKER_BUDGET_REFUSED:
+            child_refusal.update(payload)
+
     on_line = _make_event_aware_line_handler(
         on_progress=on_progress,
         on_track=translated_on_track,
         stderr_tail=stderr_tail,
         noise_re=_STDERR_NOISE,
+        on_stage=_capture_stage,
     )
 
     # Self-heal notices (set by the drift-update path below) to thread onto the
@@ -2777,9 +3024,9 @@ def _analyze_via_wsl(
             # below instead of dead-ending. Any OTHER upgrade failure (the code
             # re-pull itself failed) is genuinely fatal.
             if not up.get("ok") and not up.get("stack_broken"):
-                # Phantom-pointer fix (WP-H1): the old text pointed at a Settings
+                # Phantom-pointer fix: the old text pointed at a Settings
                 # control that doesn't exist in the UI. Describe the real
-                # remediation (reinstall from the setup screen) and demote the
+                # fix (reinstall from the setup screen) and demote the
                 # version/exit detail.
                 raise UserFacingError(
                     "Couldn't update the analysis engine, so this analysis can't "
@@ -2793,7 +3040,7 @@ def _analyze_via_wsl(
                     ),
                     kind="fatal",
                 )
-            # DETECT → SELF-HEAL → RUN (zero-setup doctrine): after the code
+            # DETECT → SELF-HEAL → RUN: after the code
             # update, verify the venv can import its ML stack and that the GPU
             # libs are present; repair in place if not. This turns a WSL
             # reinstall / app upgrade into a self-healing next-analyze instead of
@@ -2807,7 +3054,7 @@ def _analyze_via_wsl(
                 raise cancellation.CancelledError("Analysis cancelled by user")
             if not heal.get("ok"):
                 # ensure_engine_runtime now carries a plain headline + demoted
-                # detail (WP-H self-heal messages); reuse them, with a generic
+                # detail for its self-heal messages; reuse them, with a generic
                 # fallback for the repair-subprocess-failed branches that don't.
                 raise UserFacingError(
                     heal.get("headline")
@@ -2822,7 +3069,7 @@ def _analyze_via_wsl(
             # notice to surface on the finished report; the analyze itself is
             # about to proceed on a now-working engine.
             if heal.get("gpu_heal_failed"):
-                # Phantom-pointer fix (WP-H1): the removed control didn't exist.
+                # Phantom-pointer fix: the removed control didn't exist.
                 runtime_heal_warning = (
                     "GPU acceleration couldn't be restored automatically, so this "
                     "run used the CPU. Reinstall the analysis environment from "
@@ -2834,7 +3081,19 @@ def _analyze_via_wsl(
                     f"({', '.join(heal['healed'])})."
                 )
 
-    result = run_vibechek_in_wsl(distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir)
+    def _run_child():  # type: ignore[no-untyped-def]
+        """Run the WSL analyze, salvaging its checkpoint if the run is aborted."""
+        try:
+            return run_vibechek_in_wsl(
+                distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir,
+            )
+        except (cancellation.CancelledError, UserFacingError) as e:
+            # The in-WSL child checkpoints into local_output every 50 tracks;
+            # without this the cancel discarded every finished track.
+            _attach_child_partial(e, local_output, wsl_to_win_path)
+            raise
+
+    result = _run_child()
 
     if result.returncode != 0 and any("no such option" in ln.lower() for ln in stderr_tail):
         # Same-version-but-code-stale WSL install: the version strings MATCH
@@ -2854,12 +3113,13 @@ def _analyze_via_wsl(
             distro, on_progress=on_progress, engine=config.inference_engine,
         )
         if up.get("cancelled"):
-            raise cancellation.CancelledError("Analysis cancelled by user")
+            cancelled = cancellation.CancelledError("Analysis cancelled by user")
+            _attach_child_partial(cancelled, local_output, wsl_to_win_path)
+            raise cancelled
         if up.get("ok"):
             stderr_tail.clear()
-            result = run_vibechek_in_wsl(
-                distro, args, on_stderr_line=on_line, venv_subdir=venv_subdir,
-            )
+            child_refusal.clear()
+            result = _run_child()
         # If the upgrade failed we fall through: the generic error below shows
         # the "No such option" stderr tail, which is an honest description.
 
@@ -2868,6 +3128,8 @@ def _analyze_via_wsl(
         skip_paths_file.unlink(missing_ok=True)
 
     if result.returncode != 0:
+        if child_refusal:
+            raise _wsl_memory_refusal(child_refusal, config.genre_classifier)
         stderr_blob = "\n".join(stderr_tail[-40:]) if stderr_tail else "(no stderr output)"
         raise UserFacingError(
             "Analysis stopped unexpectedly while processing your library.",
@@ -2968,6 +3230,82 @@ def _write_partial(output_path: Path, results: list[dict[str, Any]], total: int,
     )
 
 
+def _persist_partial_on_abort(
+    exc: BaseException, output_path: Path | None,
+    results: list[dict[str, Any]], total: int,
+) -> None:
+    """Save the finished records of an aborted run, and attach them to `exc`.
+
+    Cancel is a first-class GUI button and the stall watchdog fires unattended
+    on OOM — both used to propagate out of `analyze_directory` with `results`
+    still local, so an 11,400-of-12,000 run lost every finished track: the RPC
+    layer's `record_analysis` sits AFTER the call and never ran, and the
+    streamed `track_analyzed` records live only in the GUI's in-memory store.
+    The report rides out on `exc.partial_report` so the caller can persist it
+    even when no `output_path` was configured, and is written here when one was.
+
+    Deliberately `in_progress=True`: this is a checkpoint, not a finished run,
+    and building it that way also skips the reconcile loop's own
+    `cancellation.check()` — which is what would otherwise raise while we are
+    already handling a cancel.
+    """
+    if not results:
+        # Nothing finished (an abort during model load, say). Writing a
+        # zero-track report here would overwrite the user's previous
+        # analysis.json with an empty one — worse than the loss we're fixing.
+        return
+    try:
+        report = _build_report(results, total, in_progress=True)
+    except Exception:  # noqa: BLE001 — we are already unwinding; say so and move on
+        log.exception("Could not build a partial report for the aborted run")
+        return
+    exc.partial_report = report  # type: ignore[attr-defined]
+    log.warning("Analysis aborted after %d of %d tracks — partial report kept",
+                len(results), total)
+    if output_path:
+        try:
+            atomic_write_json(Path(output_path), report, indent=2)
+        except OSError as e:
+            log.warning("Could not write the partial report to %s: %s", output_path, e)
+
+
+def _attach_child_partial(
+    exc: BaseException, local_output: Path,
+    path_fix: Callable[[str], str] | None = None,
+) -> None:
+    """Salvage the checkpoint a subprocess route's child already wrote.
+
+    The WSL / managed-venv children DO checkpoint every 50 tracks into their
+    `-o` file (a temp path when the caller passed no `output_path`), but a
+    cancel makes `run_vibechek_in_*` raise in the parent, which then never read
+    that file back — the finished tracks were left orphaned in %TEMP% and
+    discarded. Same contract as the in-process route: the partial rides out on
+    `exc.partial_report`. `path_fix` translates WSL paths back to Windows ones.
+    """
+    try:
+        raw = local_output.read_bytes()
+    except OSError:
+        return
+    if not raw:
+        return
+    try:
+        report = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        log.warning("The aborted run's checkpoint at %s doesn't parse — discarding",
+                    local_output)
+        return
+    tracks = report.get("tracks") or []
+    if not tracks:
+        return  # nothing finished — don't hand the caller an empty "partial"
+    if path_fix is not None:
+        for track in tracks:
+            if "path" in track:
+                track["path"] = path_fix(track["path"])
+    exc.partial_report = report  # type: ignore[attr-defined]
+    log.warning("Analysis aborted — kept the engine's checkpoint of %d track(s)",
+                len(report.get("tracks", [])))
+
+
 def _record_artist_title(r: dict[str, Any]) -> tuple[str, str]:
     """Best artist/title for a record (tag first, then filename-parsed)."""
     et = r.get("existing_tags") or {}
@@ -2980,10 +3318,12 @@ def _reconcile_record_genre(
     r: dict[str, Any], policy: str, override_conf: float,
     web_cfg: dict[str, Any] | None = None,
     web_cache: dict[tuple[str, str], dict[str, Any]] | None = None,
+    web_stats: dict[str, Any] | None = None,
 ) -> None:
     """Reconcile one record's ML genre with its existing tag, in place.
 
-    Keeps the pure-audio read in `ml_genre_audio`/`ml_subgenre_audio` and sets
+    Keeps the pure-audio read in `ml_genre_audio`/`ml_subgenre_audio`/
+    `ml_genre_audio_confidence` and sets
     `ml_genre`/`ml_subgenre` to the effective (reconciled) value plus
     `ml_genre_source` ("tag"|"ml"|"ml_override"|"web"|"web_override") and
     `ml_genre_conflict`. When `web_cfg` is enabled, the online catalog lookup
@@ -2992,7 +3332,10 @@ def _reconcile_record_genre(
     AnalysisConfig.genre_source_policy / genre_web_lookup.
     """
     ml = r.get("ml_analysis")
-    if not ml:
+    # A saved report can carry a corrupt row whose ml_analysis is truthy but
+    # not a dict; `_record_failed` counts that as failed, and reconciling it
+    # would just raise AttributeError halfway through an offline re-reconcile.
+    if not ml or not isinstance(ml, dict):
         return
     # A conflict the user explicitly resolved from the review queue
     # (resolve_genre_conflicts "approve") is a final human decision — an
@@ -3032,18 +3375,45 @@ def _reconcile_record_genre(
             )
             if web_cache is not None:
                 web_cache[key] = wr
+        if wr is not None and web_stats is not None:
+            # `used_web` distinguishes "searched and found nothing" from "never
+            # reached the network at all", and `web_unavailable` carries the
+            # short REASON for the latter (offline, throttled, ddgs raising).
+            # The caller aggregates both so a run where every search was
+            # rate-limited or offline can say so — and say why — instead of
+            # silently degrading to tags + audio. A search that simply
+            # came back empty is a clean miss: it leaves the reason empty and
+            # must NOT be counted as a degradation.
+            web_stats["attempted"] = web_stats.get("attempted", 0) + 1
+            if wr.get("used_web"):
+                web_stats["used"] = web_stats.get("used", 0) + 1
+            reason = str(wr.get("web_unavailable") or "")
+            if reason:
+                web_stats["unavailable"] = web_stats.get("unavailable", 0) + 1
+                web_stats["reasons"][reason] += 1
         if wr:
             web_genre = wr.get("genre", "") or ""
             web_grounded = bool(wr.get("source_matched"))
 
+    # The pure-audio single-class score, stashed like `ml_genre_audio` because
+    # `ml_genre_raw_confidence` is rewritten below to describe the genre we
+    # actually STORE. Without the stash a second reconcile (priors import,
+    # incremental-analyze record merge, conflict resolution) would feed a tag's
+    # 0.99 back in as the audio model's confidence and clear the 0.90
+    # ml_override gate on it — the same record reconciling to a different answer
+    # every pass, which this function's idempotency contract forbids.
+    audio_conf = ml.get("ml_genre_audio_confidence", ml.get("ml_genre_raw_confidence"))
     rec = reconcile_genre(
         audio_genre, audio_sub or "",
-        ml.get("ml_genre_raw_confidence") or ml.get("ml_genre_confidence") or 0.0,
+        # A legacy report (no raw confidence at all) keeps its old input.
+        audio_conf if audio_conf is not None else (ml.get("ml_genre_confidence") or 0.0),
         tag, policy, override_conf,
         web_genre=web_genre, web_grounded=web_grounded,
     )
     ml["ml_genre_audio"] = audio_genre
     ml["ml_subgenre_audio"] = audio_sub
+    if audio_conf is not None:
+        ml["ml_genre_audio_confidence"] = audio_conf
     if web_genre:
         ml["ml_genre_web"] = web_genre
         ml["ml_genre_web_grounded"] = web_grounded
@@ -3053,6 +3423,16 @@ def _reconcile_record_genre(
     ml["ml_genre_conflict"] = rec.conflict
     if rec.source != "ml":
         ml["ml_genre_confidence"] = round(rec.confidence, 3)
+    # Both confidence fields describe the STORED genre. `ml_genre_raw_confidence`
+    # used to keep reporting the audio model's number for a genre the audio model
+    # didn't supply, so any consumer reading it as "how sure are we about this
+    # genre?" was answered about a different genre entirely (a curated tag at
+    # 0.99 carrying an unrelated 0.2). Legacy records with no raw confidence stay
+    # without one — its ABSENCE is how consumers detect a pre-two-stage report.
+    if audio_conf is not None:
+        ml["ml_genre_raw_confidence"] = round(
+            float(audio_conf) if rec.source == "ml" else rec.confidence, 3,
+        )
 
 
 def _reconcile_record_key(r: dict[str, Any]) -> None:
@@ -3150,6 +3530,60 @@ def _degraded_head_fields(heads: set[str]) -> str:
     return ", ".join(fields[:-1]) + " and " + fields[-1]
 
 
+# When the online-lookup degradation is worth a WARNING banner rather than just
+# a recorded count. The GUI folds the banner into the `degraded` flag that turns
+# the whole completion toast to "warning", so a single throttled track in a
+# 2000-track run must not report the entire analysis as degraded — but a run
+# where the tier is genuinely not working must not be silent either.
+_WEB_DEGRADED_FLOOR = 3
+_WEB_DEGRADED_SHARE = 20  # 1-in-20 == 5% of the tracks that reached the tier
+
+
+def _web_degradation_is_material(unavailable: int, attempted: int) -> bool:
+    """Is this online-lookup degradation worth warning the user about?
+
+    Every attempted track failing always is — that is the tier not working. Below
+    that it takes a real share of the run: 5% of the tracks that reached the tier,
+    never fewer than three, so one transient throttle is recorded but not
+    announced.
+    """
+    if not unavailable:
+        return False
+    if unavailable >= attempted:
+        return True
+    return unavailable >= max(_WEB_DEGRADED_FLOOR, attempted // _WEB_DEGRADED_SHARE)
+
+
+def _record_failed(r: dict[str, Any]) -> bool:
+    """Did this track actually fail?
+
+    A per-track ML failure never sets the record-level `error`: a total decode
+    failure leaves `error` None and `ml_analysis` a truthy `{"ml_error": …}`
+    dict, so counting "has ml_analysis" as analyzed reported a run where every
+    single track failed as "Analyzed 5000/5000, 0 errors" — a green success
+    toast over a library with no BPM, key or genre. This is the same rule the
+    library view's error chip already uses.
+
+    `ml_error` means NOTHING usable came out of the file. A PARTIAL read — the
+    EffNet embedding failed but the model-free BPM and key succeeded — leaves
+    `ml_error` None and names the missing heads in `ml_degraded_heads` instead
+    (see `_finish_ml_result`), so it counts as analyzed here and the incremental
+    "Analyze new" stops re-queuing it forever.
+
+    A truthy `ml_analysis` that is NOT a dict is a corrupt row (a hand-edited or
+    half-written analysis JSON). `(x or {}).get(...)` raised AttributeError on it
+    and that escaped as far as the dedupe sync, which reports a failure AFTER the
+    files were already trashed. A row we cannot read is a row we cannot call
+    analyzed, so it counts as failed.
+    """
+    if r.get("error"):
+        return True
+    ml = r.get("ml_analysis")
+    if ml and not isinstance(ml, dict):
+        return True
+    return bool((ml or {}).get("ml_error"))
+
+
 def _build_report(
     results: list[dict[str, Any]], total: int, in_progress: bool,
     genre_policy: tuple[str, float] = ("prefer_tag", 0.90),
@@ -3160,6 +3594,16 @@ def _build_report(
     # checkpoints stay raw-ML — they're transient). _reconcile_record_genre is
     # idempotent, so the final pass produces the configured result regardless.
     web_unavailable = False
+    # How many tracks reached the online tier, how many actually got a web read
+    # out of it, and how many came back reporting that no search reached the web
+    # at all — with the reasons they gave. All-of-many unavailable means the
+    # packages are installed but the network isn't answering (offline, or
+    # DuckDuckGo rate-limiting a per-track walk — which genre_web's own
+    # docstring says WILL happen on a large library), and that has to be
+    # surfaced like the other degradations.
+    web_stats: dict[str, Any] = {
+        "attempted": 0, "used": 0, "unavailable": 0, "reasons": Counter(),
+    }
     if not in_progress:
         pol, override = genre_policy
         # Online genre lookup is per-track network I/O (a search plus a few page
@@ -3199,7 +3643,7 @@ def _build_report(
             if web_cache is not None and (i % 5 == 0 or i == n - 1):
                 _emit_event("stage", name="resolving_genres_online",
                             message=f"Resolving genres online ({i + 1}/{n})…")
-            _reconcile_record_genre(r, pol, override, web_cfg, web_cache)
+            _reconcile_record_genre(r, pol, override, web_cfg, web_cache, web_stats)
             _reconcile_record_vocal(r)
             _reconcile_record_key(r)
 
@@ -3208,11 +3652,17 @@ def _build_report(
     timeslots: dict[str, int] = defaultdict(int)
     moods: dict[str, int] = defaultdict(int)
 
-    # Aggregate the per-track silent-degradation provenance (WP3) so the GUI can
+    # Aggregate the per-track silent-degradation provenance so the GUI can
     # banner it once at the end instead of the user having to notice a field is
     # quietly missing. Only meaningful on the FINAL report.
     degraded_heads: set[str] = set()
     clap_fallbacks = 0
+    # Tracks whose EffNet embedding was unavailable: BPM and key were read, the
+    # embedding-dependent heads weren't. Counted SEPARATELY from `degraded_heads`
+    # — that set drives a "re-download your models" banner about every track in
+    # the run, which is the right message for a head that failed to load and the
+    # wrong one for one malformed file in five thousand.
+    embedding_failures = 0
     for r in results:
         ml = r.get("ml_analysis") or {}
         if ml.get("ml_genre"):
@@ -3224,7 +3674,11 @@ def _build_report(
         if ml.get("ml_mood"):
             moods[ml["ml_mood"]] += 1
         if ml.get("ml_degraded_heads"):
-            degraded_heads.update(ml["ml_degraded_heads"])
+            heads = set(ml["ml_degraded_heads"])
+            if EMBEDDING_HEAD in heads:
+                embedding_failures += 1
+                heads.discard(EMBEDDING_HEAD)
+            degraded_heads.update(heads)
         # CLAP was the selected classifier, yet this track was scored by the
         # weaker Discogs head — a per-track embed failure or a whole-worker CLAP
         # load failure. Either way the user paid for CLAP and silently didn't get
@@ -3236,8 +3690,10 @@ def _build_report(
         "status": "in_progress" if in_progress else "complete",
         "summary": {
             "total_files": total,
-            "analyzed": sum(1 for r in results if r.get("ml_analysis")),
-            "errors": sum(1 for r in results if r.get("error")),
+            "analyzed": sum(
+                1 for r in results if r.get("ml_analysis") and not _record_failed(r)
+            ),
+            "errors": sum(1 for r in results if _record_failed(r)),
         },
         "statistics": {
             "genres": dict(sorted(genres.items(), key=lambda x: -x[1])),
@@ -3249,19 +3705,41 @@ def _build_report(
     }
 
     if not in_progress:
+        degradation_lines: list[str] = []
         if degraded_heads:
             fields = _degraded_head_fields(degraded_heads)
             # Plain wording naming the affected FIELDS; the raw head names ride
             # only on the diagnostic event (heads=…) and the log, not the banner.
-            warning = (
+            degradation_lines.append(
                 f"{fields} used a fallback for every track this run. Use "
                 "Download models in Settings to re-fetch them."
             )
-            report["model_degradation_warning"] = warning
             log.warning("ML heads failed to load this run: %s",
                         ", ".join(sorted(degraded_heads)))
-            _emit_event("stage", name="model_load_degraded", message=warning,
+            _emit_event("stage", name="model_load_degraded",
+                        message=degradation_lines[-1],
                         heads=sorted(degraded_heads))
+        if embedding_failures:
+            # These tracks ARE analyzed (real BPM and key) and deliberately do
+            # NOT count as errors — but the fields they are missing have to be
+            # named, or the user reads a blank genre as "Vibechek thinks it has
+            # no genre" instead of "Vibechek couldn't hear this file".
+            degradation_lines.append(
+                f"{embedding_failures} of {total} track"
+                f"{'' if total == 1 else 's'} couldn't be fully analyzed — BPM "
+                "and key were read, but genre, energy and mood weren't. "
+                "Damaged or unreadable audio is the usual cause."
+            )
+            log.warning(
+                "EffNet embedding unavailable for %d of %d track(s) — BPM/key "
+                "kept, embedding-dependent heads missing",
+                embedding_failures, total,
+            )
+            _emit_event("stage", name="embedding_degraded",
+                        message=degradation_lines[-1],
+                        tracks=embedding_failures, total=total)
+        if degradation_lines:
+            report["model_degradation_warning"] = " ".join(degradation_lines)
         if clap_fallbacks:
             # Mirror the Settings genre-model picker labels (advanced/standard);
             # "CLAP"/"Discogs" stay on the diagnostic event only.
@@ -3274,13 +3752,70 @@ def _build_report(
             _emit_event("stage", name="genre_classifier_degraded", message=warning,
                         fallbacks=clap_fallbacks, total=total)
         if web_unavailable:
-            # WP-G5: persistent post-run degradation flag (like the two above),
+            # A persistent post-run degradation flag (like the two above),
             # so the online-lookup fallback is more than a transient progress
             # line the user may have missed.
             report["genre_web_unavailable_warning"] = (
                 "Online genre lookup wasn't available this run — genres used tags "
                 "and audio only. Set it up in Settings, then re-analyze."
             )
+        elif web_stats["unavailable"]:
+            # Some — possibly all — of the tracks we asked about reported that no
+            # search reached the web: offline, or rate-limited. The progress line
+            # said "Resolving genres online (1743/2000)…" the whole time, so
+            # without this the user believes the verified-web tier ran on the
+            # library. It is deliberately NOT all-or-nothing: DuckDuckGo throttles
+            # after the first few dozen of a 2000-track run, and gating the banner
+            # on "every track failed" meant one lucky early read silenced it for
+            # the 1999 that didn't happen. Gated on the REASON, not on "no web
+            # read": a search that came back EMPTY searched fine and simply found
+            # nothing, and calling that a connection problem sends the user to fix
+            # a network that is working.
+            attempted = web_stats["attempted"]
+            unavailable = web_stats["unavailable"]
+            # The count is ALWAYS recorded — it is the honest number and a
+            # diagnostic worth keeping. The WARNING is not: the GUI folds the
+            # banner into the `degraded` flag that turns the whole completion
+            # toast to "warning", so firing it on any non-zero count meant one
+            # transient blip in a 2000-track run reported the whole analysis as
+            # degraded. Raise it when the degradation is MATERIAL — everything
+            # failed, or enough of the run failed (5%, floor 3) that re-analyzing
+            # is the right advice.
+            report["genre_web_unavailable_count"] = unavailable
+            report["genre_web_attempted"] = attempted
+            if _web_degradation_is_material(unavailable, attempted):
+                # The reason the most tracks hit. Rate-limiting and DNS failure
+                # need opposite responses, so the banner has to name which one it
+                # was rather than leave "check your connection" to cover both.
+                reason = web_stats["reasons"].most_common(1)[0][0]
+                if unavailable == attempted:
+                    scope = f"any of {attempted} track{'' if attempted == 1 else 's'}"
+                    whose = "genres"
+                else:
+                    # Name the PROPORTION. "Couldn't reach the web" over a run
+                    # that partly worked would overclaim; the count is what tells
+                    # the user whether to re-analyze or shrug off a blip.
+                    scope = f"{unavailable} of {attempted} tracks"
+                    whose = "those genres"
+                warning = (
+                    f"Online genre lookup couldn't reach the web for {scope} this "
+                    f"run — {whose} used tags and audio only. Most common reason: "
+                    f"{reason}. Check your connection, then re-analyze."
+                )
+                report["genre_web_unavailable_warning"] = warning
+                log.warning(
+                    "Online genre lookup reached no web read for %d of %d track(s): %s",
+                    unavailable, attempted, reason,
+                )
+                _emit_event("stage", name="genre_web_degraded", message=warning,
+                            attempted=attempted, used=web_stats["used"],
+                            unavailable=unavailable, reason=reason)
+            else:
+                log.info(
+                    "Online genre lookup missed the web on %d of %d track(s) — "
+                    "below the degradation threshold, no banner raised",
+                    unavailable, attempted,
+                )
 
     return report
 

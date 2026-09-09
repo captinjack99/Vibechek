@@ -157,13 +157,29 @@ export function OperationsHistory() {
       const parts = [`Restored ${summary.reverted}`];
       if (summary.skipped) parts.push(`skipped ${summary.skipped}`);
       if (summary.errors) parts.push(`${summary.errors} error${summary.errors === 1 ? "" : "s"}`);
-      notify(`Undo complete — ${parts.join(", ")}`, {
-        kind: summary.errors > 0 || summary.skipped > 0 ? "warning" : "success",
-        detail:
-          summary.trashed_not_reverted > 0
-            ? `${summary.trashed_not_reverted} trashed file(s) can't be auto-restored — recover them from your OS recycle bin.`
-            : undefined,
-      });
+      const trashedDetail =
+        summary.trashed_not_reverted > 0
+          ? `${summary.trashed_not_reverted} trashed file(s) can't be auto-restored — recover them from your OS recycle bin.`
+          : undefined;
+      // A cancelled revert resolves with partial counts and `cancelled: true`,
+      // not a rejection — reporting it as "Undo complete" would claim a
+      // finished job while most files are still at their organized paths.
+      notify(
+        summary.cancelled
+          ? `Undo cancelled — restored ${summary.reverted} of ${j.move_count} before stopping.`
+          : `Undo complete — ${parts.join(", ")}`,
+        {
+          kind: summary.cancelled
+            ? "info"
+            : summary.errors > 0 || summary.skipped > 0
+              ? "warning"
+              : "success",
+          detail: summary.cancelled
+            ? (trashedDetail ??
+              "The rest of the files were left where they are — run the undo again to finish.")
+            : trashedDetail,
+        },
+      );
       await refresh();
     } catch (e) {
       // Always clear op state. We use a soft info notification (not the sticky

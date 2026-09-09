@@ -31,11 +31,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _METHODS_TS = _REPO_ROOT / "ui" / "src" / "api" / "methods.ts"
 
 # Python RPC methods whose TypeScript wiring (methods.ts RPC_METHODS + the rpc.ts
-# wrapper + the rpc.test.ts mirror) is deliberately deferred to a later frontend
-# wave. Empty now: Wave 2 wired `increase_wsl_memory` (the WP-D2 ".wslconfig
-# memory" self-heal RPC) — typed wrapper, registry entry, and mirror all landed —
-# so the sync guard covers it directly again. Add a name here only to defer a
-# *future* backend-only method's TS wiring to a later wave.
+# wrapper + the rpc.test.ts mirror) is deliberately deferred to later frontend
+# work. Empty now: `increase_wsl_memory` (the ".wslconfig memory" self-heal
+# RPC) got its typed wrapper, registry entry, and mirror — so the sync guard
+# covers it directly again. Add a name here only to defer a *future*
+# backend-only method's TS wiring.
 _PENDING_TS_WIRING: set[str] = set()
 
 
@@ -83,3 +83,145 @@ def test_ts_rpc_methods_has_no_duplicates() -> None:
     names = _parse_ts_rpc_methods(_METHODS_TS.read_text(encoding="utf-8"))
     dupes = sorted({n for n in names if names.count(n) > 1})
     assert not dupes, f"Duplicate entries in RPC_METHODS: {dupes}"
+
+
+# ---------------------------------------------------------------------------
+# The other half of the same guarantee: the TS codegen must actually WALK every
+# dataclass module, and must refuse to emit a contract it couldn't type. These
+# live here (rather than in a script-specific module) because they guard the
+# same Python↔TypeScript contract as the method-name check above.
+# ---------------------------------------------------------------------------
+
+
+def _load_generator():
+    """Import scripts/generate_ts_types.py as a module (it isn't a package)."""
+    import importlib.util
+
+    path = _REPO_ROOT / "scripts" / "generate_ts_types.py"
+    spec = importlib.util.spec_from_file_location("_gen_ts_types", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_ts_codegen_walks_every_dataclass_module() -> None:
+    """The walk is derived from the source tree, not a hand-kept list.
+
+    A hard-coded MODULES list reached 10 of the 19 `vibechek/*.py` modules that
+    define dataclasses, so `tagger`'s ApplyStats / BackupStats / RestoreStats —
+    returned verbatim over JSON-RPC — sat outside the drift gate entirely.
+    """
+    gen = _load_generator()
+    walked = set(gen.all_dataclass_modules())
+
+    on_disk = {
+        f"vibechek.{p.stem}"
+        for p in sorted((_REPO_ROOT / "vibechek").glob("*.py"))
+        if p.name != "__init__.py"
+        and re.search(r"^\s*@(?:dataclasses\.)?dataclass\b", p.read_text(encoding="utf-8"),
+                      re.MULTILINE)
+    }
+    assert on_disk - walked == set(), f"dataclass modules outside the codegen walk: {on_disk - walked}"
+    # The four wire payloads that motivated this: `asdict(stats)` straight onto
+    # the JSON-RPC wire from _apply_tags / _backup_tags / _restore_tags.
+    assert "vibechek.tagger" in walked
+
+
+def test_generated_ts_covers_the_tagger_wire_payloads() -> None:
+    """`ApplyStats` & friends must exist in the committed generated.ts."""
+    generated = (_REPO_ROOT / "ui" / "src" / "types" / "generated.ts").read_text(encoding="utf-8")
+    for name in ("ApplyStats", "BackupStats", "RestoreStats", "RemapRestoreStats"):
+        assert f"export interface {name} " in generated, f"{name} missing from generated.ts"
+
+
+def test_ts_codegen_records_untranslatable_fields_instead_of_emitting_unknown() -> None:
+    """`unknown` is assignable from anything — emitting it silently would make
+    the drift gate permanently green over a contract it stopped enforcing."""
+    gen = _load_generator()
+    gen._DEGRADED.clear()
+
+    class Weird:
+        pass
+
+    assert gen.translate(Weird, set(), "Thing.field") == "unknown"
+    assert len(gen._DEGRADED) == 1
+    assert "Thing.field" in gen._DEGRADED[0]
+
+
+def test_ts_codegen_records_a_class_whose_hints_do_not_resolve() -> None:
+    """A failed `get_type_hints` degrades EVERY field of the class to unknown."""
+    import dataclasses
+
+    gen = _load_generator()
+    gen._DEGRADED.clear()
+
+    @dataclasses.dataclass
+    class Broken:
+        ml_bpm: NoSuchTypeAnywhere  # noqa: F821 — deliberately unresolvable
+
+    out = gen.emit_interface(Broken, set())
+    assert "ml_bpm: unknown;" in out
+    assert any("could not resolve type hints" in m for m in gen._DEGRADED)
+
+
+def test_ts_codegen_main_refuses_to_write_a_degraded_contract(monkeypatch) -> None:
+    gen = _load_generator()
+    gen._DEGRADED.clear()
+    gen._DEGRADED.append("Fake.field: unhandled annotation")
+    monkeypatch.setattr("sys.argv", ["generate_ts_types.py", "--check"])
+    assert gen.main() == 1
+
+
+# ---------------------------------------------------------------------------
+# scripts/update_readme_stats.py — the README counter is committed, so a count
+# the script could not establish must abort, never fall back to 0.
+# ---------------------------------------------------------------------------
+
+
+def _load_readme_stats():
+    import importlib.util
+
+    path = _REPO_ROOT / "scripts" / "update_readme_stats.py"
+    spec = importlib.util.spec_from_file_location("_readme_stats", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_readme_stats_raises_when_pytest_collection_fails(monkeypatch) -> None:
+    """`return 0` here wrote "**0 Python tests**" into README.md and exited 0."""
+    import subprocess
+
+    stats = _load_readme_stats()
+
+    def fake_run(*_a, **_kw):
+        # A conftest import error: exit 4, nothing on stdout, all detail on stderr.
+        return subprocess.CompletedProcess(
+            args=[], returncode=4, stdout="",
+            stderr="ImportError while loading conftest 'tests/conftest.py'",
+        )
+
+    monkeypatch.setattr(stats.subprocess, "run", fake_run)
+    with pytest.raises(stats.StatsError) as exc:
+        stats.count_tests()
+    assert "conftest" in str(exc.value)  # the discarded stderr is surfaced
+
+
+def test_readme_stats_rejects_a_partial_collection(monkeypatch) -> None:
+    """"2 tests collected, 1 error" is a partial count — just as fabricated."""
+    import subprocess
+
+    stats = _load_readme_stats()
+
+    def fake_run(*_a, **_kw):
+        return subprocess.CompletedProcess(
+            args=[], returncode=2,
+            stdout="ERROR tests/test_ml.py\n2 tests collected, 1 error in 0.21s\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(stats.subprocess, "run", fake_run)
+    with pytest.raises(stats.StatsError):
+        stats.count_tests()

@@ -71,8 +71,21 @@ def load() -> BackupHistory:
         log.warning("Could not load backup history: %s", e)
         return BackupHistory()
 
+    # Valid JSON of the WRONG SHAPE is a separate failure from unparseable
+    # JSON, and it used to escape as an AttributeError/TypeError out of every
+    # caller — including `record()`, so a hand-mangled index also blocked new
+    # backups from being indexed. Degrade to an empty history the same way the
+    # decode error above does (mirrors library_state.load_state).
+    raw_records = raw.get("records", []) if isinstance(raw, dict) else []
+    if not isinstance(raw_records, list):
+        log.warning("Backup history 'records' is not a list; ignoring it")
+        raw_records = []
+
     records = []
-    for r in raw.get("records", []):
+    for r in raw_records:
+        if not isinstance(r, dict):
+            log.debug("Skipping non-object backup record: %r", r)
+            continue
         try:
             rec = BackupRecord(**r)
         except TypeError as e:

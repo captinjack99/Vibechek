@@ -101,3 +101,19 @@ def test_cli_profile_load_unknown_returns_usage_error() -> None:
     result = runner.invoke(main, ["profile", "load", "no-such-profile"])
     # Click UsageError exit code is 2
     assert result.exit_code != 0
+
+
+def test_load_profile_refuses_to_clobber_an_unreadable_config() -> None:
+    """`load_profile` is a load→save round trip: on a config we
+    couldn't READ it would otherwise write profile-flavoured factory defaults
+    over every real setting still on disk."""
+    from vibechek import config as cfg_module
+    from vibechek.config import ConfigSaveRefused
+
+    original = '{"analysis": {"workers": 8}, "organization": {"min_genre_size": 25}\n{TYPO'
+    cfg_module.CONFIG_FILE.write_text(original, encoding="utf-8")
+
+    with pytest.raises(ConfigSaveRefused):
+        profiles.load_profile("house-dj")
+
+    assert cfg_module.CONFIG_FILE.read_text(encoding="utf-8") == original

@@ -372,7 +372,7 @@ def test_setup_clap_native_reuses_existing_checkpoint(
     ckpt.parent.mkdir(parents=True)
     ckpt.write_bytes(b"y" * 64)
 
-    # WP-I2: reuse now also requires the cached file to PASS its integrity check
+    # Reuse now also requires the cached file to PASS its integrity check
     # (a size floor alone silently kept corrupt files). Stub verify to pass so
     # this "valid cached file → reuse, no re-download" case still holds.
     monkeypatch.setattr(
@@ -533,3 +533,118 @@ def test_ollama_tarball_picks_platform_asset(
     # verification.
     assert sha256 == _OLLAMA_TARBALL_SHA256[expected_fragment]
     assert sha256 and len(sha256) == 64
+
+
+# ---------------------------------------------------------------------------
+# The stderr drain runs on a daemon thread nobody waited for, while the
+# return value claims stderr is complete.
+# ---------------------------------------------------------------------------
+
+
+def test_run_vibechek_in_native_venv_joins_the_stderr_reader(monkeypatch) -> None:
+    """`proc.wait()` returns the instant the child exits; whatever is still in
+    the stderr pipe reaches `on_stderr_line` afterwards. analyzer.py reads that
+    shared list IMMEDIATELY — for the version-drift retry decision and for the
+    user-facing crash detail — so the last lines before a crash (the traceback,
+    the OOM kill, click's "No such option") must be in hand before we return."""
+    import subprocess
+    import time
+    import types
+
+    from vibechek import cancellation as cancel_mod
+
+    monkeypatch.setattr(
+        native_install, "probe_native_venv",
+        lambda engine="essentia_tf": types.SimpleNamespace(
+            vibechek_installed=True, venv_vibechek="/fake/venv/bin/vibechek",
+        ),
+    )
+    monkeypatch.setattr(cancel_mod, "is_cancelled", lambda: False)
+
+    class _SlowStderr:
+        def __iter__(self):
+            for line in ("VIBECHEK_EVENT\tstage\tscanning\n",
+                         "Error: No such option: --genre-web-lookup\n"):
+                time.sleep(0.08)
+                yield line
+
+    class _Proc:
+        pid = 777
+        stdout = iter(())
+        stderr = _SlowStderr()
+
+        def wait(self, timeout=None):
+            return 2
+
+        def poll(self):
+            return 2
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: _Proc())
+
+    tail: list[str] = []
+    result = native_install.run_vibechek_in_native_venv(
+        ["analyze", "/music"], on_stderr_line=tail.append,
+    )
+    assert result.returncode == 2
+    assert tail and tail[-1] == "Error: No such option: --genre-web-lookup", (
+        "the crash line must have reached the caller's tail before we returned"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _find_host_python — the interpreter the managed venv is built with
+#
+# Its result is RUN: first `--version`, then to create the venv the whole ML
+# stack installs into. `shutil.which` searches the process cwd ahead of PATH on
+# Windows, so a `python.exe` sitting in whatever folder the app was launched
+# from would have become that interpreter. `utils.find_executable` is the
+# cwd-discarding, absolutizing lookup.
+# ---------------------------------------------------------------------------
+
+
+def test_find_host_python_resolves_via_find_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    looked_up: list[str] = []
+    which_calls: list[str] = []
+
+    def _fake_find(name: str) -> str | None:
+        looked_up.append(name)
+        return "/opt/pythons/python3.12" if name == "python3.12" else None
+
+    def _fake_which(name: str) -> str | None:
+        which_calls.append(name)
+        return "./python.exe"  # the cwd hit find_executable exists to refuse
+
+    ran: list[list[str]] = []
+
+    class _Result:
+        stdout = "Python 3.12.4\n"
+        stderr = ""
+
+    def _fake_run(args, **_kw):
+        ran.append(list(args))
+        return _Result()
+
+    monkeypatch.setattr(native_install, "find_executable", _fake_find)
+    monkeypatch.setattr(native_install.shutil, "which", _fake_which)
+    monkeypatch.setattr(native_install.subprocess, "run", _fake_run)
+
+    assert native_install._find_host_python() == "/opt/pythons/python3.12"
+    # The candidate list is walked newest-first through find_executable...
+    assert looked_up[:2] == ["python3.13", "python3.12"]
+    # ...and `shutil.which` — which would have handed back the cwd copy — is
+    # never consulted for the interpreter.
+    assert which_calls == []
+    # The absolute path find_executable returned is what actually gets executed.
+    assert ran and ran[0][0] == "/opt/pythons/python3.12"
+
+
+def test_find_host_python_returns_none_when_nothing_is_on_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cwd-only hit is no hit: find_executable returns None, so do we."""
+    monkeypatch.setattr(native_install, "find_executable", lambda _name: None)
+    monkeypatch.setattr(native_install.shutil, "which", lambda _name: "./python.exe")
+
+    assert native_install._find_host_python() is None

@@ -210,8 +210,8 @@ def test_drift_auto_update_failure_surfaces_clean_error(
          patch("vibechek.wsl.upgrade_vibechek_in_wsl",
                return_value={"ok": False, "error": "pip failed"}):
         from vibechek.config import AnalysisConfig
-        # WP-H1: now a UserFacingError with a plain headline; the version/exit
-        # detail (and the "Set up WSL" phantom pointer) are gone from the headline.
+        # A UserFacingError with a plain headline; the version/exit detail
+        # (and the "Set up WSL" phantom pointer) are gone from the headline.
         with pytest.raises(UserFacingError) as ei:
             analyzer.analyze_directory(
                 tmp_path, config=AnalysisConfig(workers=1, use_gpu="off"),
@@ -273,7 +273,7 @@ def test_drift_self_heal_failure_surfaces_clean_error(
          patch("vibechek.wsl.ensure_engine_runtime",
                return_value={"ok": False, "error": "still broken after reinstall"}):
         from vibechek.config import AnalysisConfig
-        # WP-H1: a UserFacingError with a plain headline; the raw repair error is
+        # A UserFacingError with a plain headline; the raw repair error is
         # demoted to detail. (This mock returns no headline, so the analyzer's
         # generic fallback headline is used.)
         with pytest.raises(UserFacingError) as ei:
@@ -342,3 +342,133 @@ def test_drift_guard_skipped_when_probe_returned_none(
             config=AnalysisConfig(workers=1, use_gpu="off"),
             output_path=output,
         )
+
+
+# ---------------------------------------------------------------------------
+# A memory refusal raised INSIDE the VM must reach the GUI with the one action
+# only the Windows side can decide on
+# ---------------------------------------------------------------------------
+
+
+def _refusal_event(message: str, detail: str, classifier: str = "clap") -> str:
+    """The stderr line the in-WSL analyzer emits before it refuses the run."""
+    import json
+
+    return analyzer.EVENT_PREFIX + "stage\t" + json.dumps({
+        "name": analyzer.WORKER_BUDGET_REFUSED,
+        "message": message,
+        "detail": detail,
+        "genre_classifier": classifier,
+    })
+
+
+def _run_refusing_child(host_total_mb: int | None, tmp_path: Path):  # noqa: ANN202
+    """Drive `_analyze_via_wsl` against a child that refuses for lack of memory.
+
+    `host_total_mb` is what psutil reports on the WINDOWS side — the figure the
+    in-WSL child cannot see, and the only one that decides whether raising the
+    VM's `memory=` limit can hand it anything.
+    """
+    (tmp_path / "x.flac").write_bytes(b"\x00")
+    output = tmp_path / "out.json"
+
+    def _fake_run(distro, args, on_stderr_line=None, venv_subdir=None):  # noqa: ANN001, ANN202, ARG001
+        on_stderr_line(_refusal_event(
+            "Not enough memory to run the advanced genre model right now.",
+            "the advanced genre model (CLAP) needs about 4.5 GB per worker, but "
+            "the Linux analysis environment (WSL) has only 4.0 GB usable. "
+            "Fixes: switch to the standard genre model, or give the Linux "
+            "analysis environment more memory (its limit lives in .wslconfig).",
+        ))
+        on_stderr_line("vibechek.errors.UserFacingError: Not enough memory")
+        return MagicMock(returncode=1, stdout="", stderr="")
+
+    with patch("vibechek.preflight.preflight", return_value=_stub_preflight(None)), \
+         patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]), \
+         patch("vibechek.wsl.run_vibechek_in_wsl", side_effect=_fake_run), \
+         patch("vibechek.wsl.win_to_wsl_path", side_effect=lambda s: s), \
+         patch("vibechek.wsl.wsl_to_win_path", side_effect=lambda s: s), \
+         patch.object(analyzer, "_host_total_ram_mb", return_value=host_total_mb):
+        from vibechek.config import AnalysisConfig
+        with pytest.raises(UserFacingError) as ei:
+            analyzer.analyze_directory(
+                tmp_path,
+                config=AnalysisConfig(workers=1, use_gpu="off",
+                                      genre_classifier="clap"),
+                output_path=output,
+            )
+    return ei.value
+
+
+def test_wsl_memory_refusal_offers_the_bump_on_a_pc_that_can_give_more(
+    tmp_path: Path,
+) -> None:
+    """The self-heal button was structurally unreachable.
+
+    The refusal is raised inside the WSL VM, where psutil reports the VM's own
+    limit — so the child correctly withholds "Increase memory" (it cannot tell
+    whether a bump has anything to give), and the child's exception then dies
+    with its process. All the Windows parent kept was exit 1 and a stderr tail,
+    which it reported as a generic "Analysis stopped unexpectedly". Result: no
+    headline, no detail, and `can_increase_memory` false on every code path in
+    the repo. The parent now rebuilds the refusal with the HOST figure it can
+    actually measure.
+    """
+    err = _run_refusing_child(32768, tmp_path)
+    assert err.headline == "Not enough memory to run the advanced genre model right now."
+    assert ".wslconfig" in (err.detail or "")
+    assert err.kind == "fatal"
+    assert err.options["can_increase_memory"] is True
+    assert err.options["can_switch_classifier"] is True
+    # And it survives serialization to the shell, which is where the buttons
+    # are keyed off it.
+    assert err.to_error_data()["can_increase_memory"] is True
+
+
+def test_wsl_memory_refusal_still_withholds_the_bump_on_a_small_pc(
+    tmp_path: Path,
+) -> None:
+    """16 GB host: `bump_wslconfig_memory` has nothing to raise, so offering the
+    button would send the user through a self-heal that can only answer "there's
+    nothing to give" — on the screen that just refused their run."""
+    err = _run_refusing_child(16384, tmp_path)
+    assert err.options["can_increase_memory"] is False
+    assert err.options["can_switch_classifier"] is True
+
+
+def test_wsl_memory_refusal_withholds_the_bump_when_the_host_cannot_be_measured(
+    tmp_path: Path,
+) -> None:
+    """No psutil in a stripped build: withhold rather than promise a bump we
+    can't verify. The detail still names the .wslconfig fix."""
+    err = _run_refusing_child(None, tmp_path)
+    assert err.options["can_increase_memory"] is False
+    assert ".wslconfig" in (err.detail or "")
+
+
+def test_a_child_failure_that_is_not_a_memory_refusal_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Only the refusal event re-shapes the error; every other exit 1 keeps the
+    generic retryable message with its stderr tail."""
+    (tmp_path / "x.flac").write_bytes(b"\x00")
+
+    def _fake_run(distro, args, on_stderr_line=None, venv_subdir=None):  # noqa: ANN001, ANN202, ARG001
+        on_stderr_line("RuntimeError: something else entirely")
+        return MagicMock(returncode=1, stdout="", stderr="")
+
+    with patch("vibechek.preflight.preflight", return_value=_stub_preflight(None)), \
+         patch("vibechek.utils.find_audio_files", return_value=[tmp_path / "x.flac"]), \
+         patch("vibechek.wsl.run_vibechek_in_wsl", side_effect=_fake_run), \
+         patch("vibechek.wsl.win_to_wsl_path", side_effect=lambda s: s), \
+         patch("vibechek.wsl.wsl_to_win_path", side_effect=lambda s: s):
+        from vibechek.config import AnalysisConfig
+        with pytest.raises(UserFacingError) as ei:
+            analyzer.analyze_directory(
+                tmp_path, config=AnalysisConfig(workers=1, use_gpu="off"),
+                output_path=tmp_path / "out.json",
+            )
+    assert "Analysis stopped unexpectedly" in ei.value.headline
+    assert ei.value.kind == "retryable"
+    assert "something else entirely" in (ei.value.detail or "")
+    assert ei.value.options == {}

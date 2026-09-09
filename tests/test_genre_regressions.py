@@ -1,10 +1,10 @@
-"""Regression tests for the post-genre-feature audit round.
+"""Regression tests for the genre feature and its surrounding plumbing.
 
-Each test pins a confirmed finding from the end-to-end review: CLAP worker
-sizing, same-version WSL drift self-heal, the web-lookup phase's cancellation/
-backend probing/checkpoint honesty, genre_web canonicalization + grounding,
-the Psytrance family mapping, kNN vote shares, config snap-backs, RPC
-parameter threading, and the organizer's actual-moved-pairs contract.
+Each test pins a specific bug: CLAP worker sizing, same-version WSL drift
+self-heal, the web-lookup phase's cancellation/backend probing/checkpoint
+honesty, genre_web canonicalization + grounding, the Psytrance family
+mapping, kNN vote shares, config snap-backs, RPC parameter threading, and
+the organizer's actual-moved-pairs contract.
 """
 
 from __future__ import annotations
@@ -243,7 +243,7 @@ def test_grounding_requires_evidence_we_fetched_ourselves(
 
 
 # ---------------------------------------------------------------------------
-# WP3: silent-degradation surfacing (CLAP fallback + failed model heads)
+# Silent-degradation surfacing (CLAP fallback + failed model heads)
 # ---------------------------------------------------------------------------
 
 
@@ -266,7 +266,7 @@ def test_report_flags_clap_fallback_to_discogs() -> None:
     ]
     rep = analyzer._build_report(tracks, 3, in_progress=False, genre_classifier="clap")
     warn = rep["genre_fallback_warning"]
-    # WP-G/voice: mirror the Settings picker labels (advanced/standard); the raw
+    # Mirrors the Settings picker labels (advanced/standard); the raw
     # "CLAP"/"Discogs" names stay on the diagnostic event only.
     assert "2 of 3" in warn and "standard model" in warn
     assert "Discogs" not in warn and "CLAP" not in warn
@@ -290,7 +290,7 @@ def test_report_flags_failed_model_heads_and_affected_fields() -> None:
     rep = analyzer._build_report(tracks, 2, in_progress=False)
     warn = rep["model_degradation_warning"]
     # The banner names the user-facing FIELDS; the raw head names are demoted to
-    # the diagnostic event + log (WP-G voice: technical identifiers demoted).
+    # the diagnostic event + log, where technical identifiers belong.
     assert "vocal" in warn and "energy/mood" in warn
     assert "voice_instrumental" not in warn
 

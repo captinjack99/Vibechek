@@ -1,4 +1,4 @@
-"""Tests for the whole-machine UX-audit backend fixes (WP-D/G/H/I/J).
+"""Tests for the whole-machine UX backend behaviour.
 
 Covers the shared user-facing error shape, the `.wslconfig` memory self-heal,
 the analyzer's plain headlines + kinds, the one WSL-missing handler, the CLAP
@@ -73,7 +73,7 @@ def test_dispatch_serializes_user_facing_error(monkeypatch: pytest.MonkeyPatch) 
 
 
 # ---------------------------------------------------------------------------
-# WP-D2 — .wslconfig memory read/bump self-heal
+# .wslconfig memory read/bump self-heal
 # ---------------------------------------------------------------------------
 
 
@@ -186,7 +186,7 @@ def test_increase_wsl_memory_rpc_registered_and_delegates(
 
 
 # ---------------------------------------------------------------------------
-# WP-H1 — one shared "WSL missing" handler + phantom-pointer removal
+# One shared "WSL missing" handler + phantom-pointer removal
 # ---------------------------------------------------------------------------
 
 
@@ -212,13 +212,13 @@ def test_all_six_wsl_missing_sites_use_the_shared_handler() -> None:
 
 def test_phantom_set_up_wsl_pointer_removed_from_analyzer() -> None:
     """The 'Set up WSL' Settings control never existed in the UI — the analyzer
-    must not point users at it (WP-H1)."""
+    must not point users at it."""
     src = Path(analyzer.__file__).read_text(encoding="utf-8")
     assert "Set up WSL" not in src
 
 
 # ---------------------------------------------------------------------------
-# WP-G — analyzer plain headlines + kinds (managed-venv path)
+# Analyzer plain headlines + kinds (managed-venv path)
 # ---------------------------------------------------------------------------
 
 
@@ -227,7 +227,7 @@ def _cfg(tmp_path: Path) -> AnalysisConfig:
 
 
 def _stub_heal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Neutralize the WP-G2 pre-dispatch self-heal so these post-dispatch
+    """Neutralize the pre-dispatch self-heal so these post-dispatch
     error-shape tests never touch the real installer (multi-minute pip in CI)."""
     monkeypatch.setattr(
         native_install, "ensure_native_engine_runtime",
@@ -292,7 +292,7 @@ def test_g2_managed_venv_no_output_is_retryable(
 
 
 # ---------------------------------------------------------------------------
-# WP-I1/I3 — CLAP checkpoint self-heal (delete + re-download) at load
+# CLAP checkpoint self-heal (delete + re-download) at load
 # ---------------------------------------------------------------------------
 
 
@@ -351,7 +351,7 @@ def test_load_clap_model_triggers_reheal_on_integrity_failure(
     assert reheal_calls["n"] == 1  # self-heal was attempted
     assert ei.value.headline == "The advanced genre model file is damaged."
     assert ei.value.kind == "retryable"
-    # No CLI reference in the headline (WP-I3).
+    # No CLI reference in the headline.
     assert "verify-models" not in ei.value.headline
     assert "verify-models" not in (ei.value.detail or "")
 
@@ -381,12 +381,12 @@ def test_load_clap_model_no_autoheal_skips_reheal(
 
 
 # ---------------------------------------------------------------------------
-# WP-I2 — both setup paths force-redownload on SHA failure
+# Both setup paths force-redownload on SHA failure
 # ---------------------------------------------------------------------------
 
 
 def test_wsl_clap_setup_script_reverifies_cached_file() -> None:
-    """Bash-side (WP-I2): the script must SHA-check the CACHED checkpoint, not
+    """Bash-side: the script must SHA-check the CACHED checkpoint, not
     only re-fetch when it's empty (`[ ! -s ]`) — else a corrupt-but-full-size
     file was silently kept and 're-run setup' was a no-op."""
     script = wsl._clap_setup_script("venv", "http://x/ckpt", "d" * 64)
@@ -404,7 +404,7 @@ def test_wsl_clap_setup_script_reverifies_cached_file() -> None:
 def test_native_clap_setup_rejects_corrupt_cached_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Native-side (WP-I2): a corrupt-but-full-size cached checkpoint is deleted
+    """Native-side: a corrupt-but-full-size cached checkpoint is deleted
     and re-downloaded, not reused."""
     monkeypatch.setattr(native_install, "IS_SUPPORTED", True)
     monkeypatch.setattr(native_install, "_CLAP_MIN_CKPT_BYTES", 4)
@@ -447,7 +447,7 @@ def test_native_clap_setup_rejects_corrupt_cached_checkpoint(
 
 
 # ---------------------------------------------------------------------------
-# WP-J1 — native install verify failure → clean reinstall once (no loop)
+# Native install verify failure → clean reinstall once (no loop)
 # ---------------------------------------------------------------------------
 
 

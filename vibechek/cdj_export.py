@@ -62,7 +62,6 @@ touch ``Location``/``Kind``/``Size`` on FLAC tracks and pass everything else
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import urllib.parse
 import urllib.request
@@ -70,6 +69,8 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from vibechek.utils import find_executable
 
 log = logging.getLogger(__name__)
 
@@ -117,9 +118,13 @@ class CdjExportResult:
         output_xml: path to the written ``rekordbox_cdj.xml`` (None on dry run).
         out_dir: the output directory.
         track_errors: per-track error detail.
-        resampled: source locations whose audio was down-sampled to a CDJ-safe
-            rate (>48 kHz hi-res). This is an irreversible quality reduction the
-            user should be told about; the CLI surfaces it as a warning.
+        resampled: source locations whose audio came out at a LOWER sample rate
+            than the source (hi-res, or an unprobeable source that got the
+            CDJ-safe 44.1 kHz forced on it). This is an irreversible quality
+            reduction the caller should tell the user about.
+        renamed: destination filenames that had to be disambiguated (``_1``,
+            ``_2``, …) because ``out_dir`` already held that name, or because two
+            sources in this run share a stem. Nothing is ever overwritten.
     """
 
     flac_converted: int = 0
@@ -131,6 +136,7 @@ class CdjExportResult:
     out_dir: Path | None = None
     track_errors: list[TrackError] = field(default_factory=list)
     resampled: list[str] = field(default_factory=list)
+    renamed: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +173,12 @@ def location_to_path(location: str) -> Path:
     # urlsplit puts "localhost" in netloc and the rest in path. Some exports use
     # the bare ``file:///C:/...`` form (empty netloc) -- both are valid.
     raw = urllib.parse.unquote(parsed.path)
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        # A non-localhost host is a network location (NAS/UNC library):
+        # ``file://NAS/music/x.flac`` -> ``\\NAS\music\x.flac``. Dropping the host
+        # yielded ``/music/x.flac``, a path that exists nowhere. Same fix
+        # ``tag_priors._location_to_path`` already carries for the import side.
+        return Path(f"//{parsed.netloc}{raw}")
     # raw is like "/C:/Users/dj/x.flac" on Windows or "/Users/dj/x.flac" on POSIX.
     if len(raw) >= 3 and raw[0] == "/" and raw[2] == ":":
         # Windows drive path: strip the leading slash -> "C:/Users/dj/x.flac".
@@ -179,12 +191,22 @@ def path_to_location(path: Path) -> str:
     """Convert a filesystem Path to a Rekordbox ``file://localhost/...`` URI.
 
     Inverse of :func:`location_to_path`. Produces the exact percent-encoded,
-    forward-slash form Rekordbox expects, including the drive letter on Windows.
+    forward-slash form Rekordbox expects, including the drive letter on Windows,
+    and the ``file://HOST/share/...`` form for a UNC (NAS) path.
     """
     abs_path = path.resolve()
+    raw = str(abs_path)
+    if raw.startswith(("\\\\", "//")):
+        # UNC: the FIRST component is a host, not a folder. `lstrip("/")` on the
+        # pathname2url output collapsed every leading slash, so \\NAS\music was
+        # written as file://localhost/NAS/music -- i.e. C:\NAS\music, a path that
+        # exists nowhere. Every track of a NAS export became a missing file in
+        # Rekordbox, silently: the export reports 0 errors either way.
+        host, _, rest = raw.replace("\\", "/").lstrip("/").partition("/")
+        return f"file://{host}/{urllib.parse.quote(rest)}"
     # pathname2url gives "/C:/Users/dj/x.aiff" on Windows (with drive) and
     # "/Users/dj/x.aiff" on POSIX, percent-encoding unsafe characters.
-    url_path = urllib.request.pathname2url(str(abs_path))
+    url_path = urllib.request.pathname2url(raw)
     # On Windows pathname2url yields "///C:/..." (it prepends slashes for the
     # would-be host); normalize to a single leading slash so we control the host.
     url_path = "/" + url_path.lstrip("/")
@@ -207,8 +229,20 @@ def _target_samplerate(src_rate: int) -> int:
     return src_rate if src_rate <= MAX_CDJ_SAMPLERATE else 44100
 
 
+def _ffmpeg_path() -> str | None:
+    """Absolute path to `ffmpeg`, or None.
+
+    `find_executable` rather than `shutil.which`: on Windows the cwd is searched
+    ahead of PATH, so an `ffmpeg.exe` sitting in a freshly unpacked sample-pack
+    folder (the very kind of folder an export runs against) would be executed
+    once per transcoded track. It also absolutizes, so the resolved program does
+    not re-resolve against wherever the subprocess happens to start.
+    """
+    return find_executable("ffmpeg")
+
+
 def _have_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return _ffmpeg_path() is not None
 
 
 def _soundfile_module():
@@ -297,6 +331,20 @@ def _resample_float(data, src_rate: int, dst_rate: int):
     return np.stack(cols, axis=1).astype(arr.dtype)
 
 
+def _declared_samplerate(track: ET.Element) -> int | None:
+    """The TRACK's declared ``SampleRate``, or None when absent/unparseable.
+
+    A probe-free second opinion on the source rate: Rekordbox writes it, and it
+    is the only signal left when neither ffprobe nor mutagen can read the file.
+    """
+    raw = (track.get("SampleRate") or "").strip()
+    try:
+        rate = int(float(raw))
+    except ValueError:
+        return None
+    return rate if rate > 0 else None
+
+
 def _probe_samplerate(src: Path) -> int | None:
     """Best-effort source sample rate WITHOUT soundfile (the ffmpeg path's case).
 
@@ -307,29 +355,33 @@ def _probe_samplerate(src: Path) -> int | None:
     default rather than guessing.
     """
     # ffprobe is bundled with ffmpeg and reads the rate straight from the header.
-    try:
-        proc = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "a:0",
-                "-show_entries",
-                "stream=sample_rate",
-                "-of",
-                "default=nw=1:nk=1",
-                str(src),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        out = (proc.stdout or "").strip()
-        if proc.returncode == 0 and out.isdigit():
-            return int(out)
-    except OSError:
-        pass
+    # Resolved the same cwd-discarding way as ffmpeg itself (see _ffmpeg_path);
+    # absent, we simply fall through to the mutagen header read below.
+    ffprobe = find_executable("ffprobe")
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=sample_rate",
+                    "-of",
+                    "default=nw=1:nk=1",
+                    str(src),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            out = (proc.stdout or "").strip()
+            if proc.returncode == 0 and out.isdigit():
+                return int(out)
+        except OSError:
+            pass
     # Fallback: read the FLAC header with mutagen (a core dependency).
     try:
         from mutagen.flac import FLAC  # noqa: PLC0415
@@ -343,23 +395,38 @@ def _probe_samplerate(src: Path) -> int | None:
 
 
 def _transcode_ffmpeg(src: Path, dst: Path) -> None:
-    """Fallback: ``ffmpeg -i src -c:a pcm_s16le dst``.
+    """Fallback: ``ffmpeg -i src -c:a pcm_s16be dst``.
 
-    pcm_s16le in an AIFF container gives a 16-bit AIFF. ffmpeg keeps the source
-    sample rate (and thus frame count) unless we ask otherwise; for >48 kHz
-    sources we add ``-ar 44100`` to keep the CDJ happy.
+    BIG-endian, deliberately. ffmpeg's aiff muxer switches to the AIFF-C variant
+    (``FORM….AIFC``, compression type ``sowt``) for any codec that isn't
+    big-endian PCM, so ``pcm_s16le`` emitted a structurally different container
+    from the primary soundfile path (``FORM….AIFF``) while the rewritten XML
+    labels both ``Kind="AIFF File"``. ``pcm_s16be`` makes the two paths agree on
+    the format this module exists to produce.
+
+    ffmpeg keeps the source sample rate (and thus frame count) unless we ask
+    otherwise; for >48 kHz sources we add ``-ar 44100`` to keep the CDJ happy.
 
     The source rate is probed via ffprobe/mutagen (NOT soundfile — it is
     guaranteed absent on this path). If the rate can't be determined we still
-    force ``-ar 44100``: it is always CDJ-safe and only a no-op resample for
-    tracks that are already <=48 kHz, which is far safer than shipping an
-    unplayable hi-res AIFF.
+    force ``-ar 44100``: always CDJ-safe, and far safer than shipping an
+    unplayable hi-res AIFF. That IS a real resample for an unprobeable 48 kHz
+    source, not a no-op — ``export_for_cdj`` reports it via ``result.resampled``.
     """
+    exe = _ffmpeg_path()
+    if exe is None:
+        # Reached directly (not via transcode_to_aiff's gate) or ffmpeg vanished
+        # between the check and here. Say so instead of handing subprocess a
+        # bare name that Windows would resolve against the current directory.
+        raise CdjExportError(
+            "`ffmpeg` is not on your PATH. Install it, or install the optional "
+            "'cdj' extra (`pip install vibechek[cdj]`) for the soundfile path."
+        )
     sr = _probe_samplerate(src)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    cmd = [exe, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
     if sr is None or sr > MAX_CDJ_SAMPLERATE:
         cmd += ["-ar", "44100"]
-    cmd += ["-c:a", "pcm_s16le", str(dst)]
+    cmd += ["-c:a", "pcm_s16be", str(dst)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except OSError as e:
@@ -386,7 +453,11 @@ def _copy_tags(src: Path, dst: Path) -> None:
         tags = read_all_tags(src)
         tags.pop("_unsupported", None)
         tags.pop("_error", None)
-        if tags:
+        # The snapshot always carries bookkeeping keys (`_snapshot_version`),
+        # so "anything to copy?" must look at the real tag fields, not at
+        # the dict's truthiness — a tagless FLAC would otherwise get an empty
+        # ID3 chunk written into the AIFF for nothing.
+        if any(not k.startswith("_") for k in tags):
             write_all_tags(dst, tags)
     except Exception as e:  # noqa: BLE001 -- tags are a nicety, never block export
         log.debug("Tag copy %s -> %s skipped: %s", src, dst, e)
@@ -441,6 +512,28 @@ def _is_flac_track(track: ET.Element) -> bool:
     return loc.endswith(".flac")
 
 
+def _collection_tracks(root: ET.Element) -> list[ET.Element]:
+    """The TRACK nodes that describe real audio files, never playlist references.
+
+    A standard Rekordbox export wraps them in ``<COLLECTION>``; a non-standard
+    one may omit that wrapper, and falling back to ``root.iter("TRACK")`` is what
+    keeps those exports working (without it the discovery pass found zero tracks
+    while the rewrite pass happily walked them — a green "Converted 0 FLAC"
+    success over an XML still pointing at unplayable FLACs).
+
+    But a bare ``iter()`` also walks the ``<PLAYLISTS>`` tree's
+    ``<TRACK Key="1"/>`` *reference* nodes, which carry no Location and point
+    back into the collection by TrackID. Counting those inflated `passthrough`
+    with entries that are not files at all, so the fallback subtracts them
+    explicitly (identity, not value — two reference nodes can look identical).
+    """
+    collection = root.find("COLLECTION")
+    if collection is not None:
+        return collection.findall("TRACK")
+    playlist_refs = {ref for pl in root.iter("PLAYLISTS") for ref in pl.iter("TRACK")}
+    return [t for t in root.iter("TRACK") if t not in playlist_refs]
+
+
 def rewrite_for_cdj(
     tree: ET.ElementTree,
     src_to_dst: dict[str, Path],
@@ -480,11 +573,9 @@ def rewrite_for_cdj(
 
     # Only rewrite COLLECTION/TRACK entries (they have Location + audio); the
     # PLAYLISTS tree's <TRACK Key="..."/> reference nodes carry no Location and
-    # are left untouched. Falling back to iter() keeps non-standard exports that
-    # omit a <COLLECTION> wrapper working.
-    collection = new_root.find("COLLECTION")
-    tracks = collection.findall("TRACK") if collection is not None else list(new_root.iter("TRACK"))
-    for track in tracks:
+    # are left untouched — see `_collection_tracks`, shared with the discovery
+    # pass so the two can never disagree about what a track is.
+    for track in _collection_tracks(new_root):
         if not _is_flac_track(track):
             continue
         location = track.get("Location")
@@ -614,9 +705,12 @@ def export_for_cdj(
     # must NOT count or touch — they point back into the collection by TrackID.
     flac_tracks: list[tuple[ET.Element, Path, Path]] = []  # (track, src, dst)
     used_stems: set[str] = set()
-    collection = root.find("COLLECTION")
-    collection_tracks = collection.findall("TRACK") if collection is not None else []
-    for track in collection_tracks:
+    # Same source of truth `rewrite_for_cdj` uses: without the COLLECTION-less
+    # fallback, a non-standard export that omits the <COLLECTION> wrapper found
+    # zero tracks here while the rewrite pass happily walked them — a green
+    # "Converted 0 FLAC" success over an XML still pointing at the unplayable
+    # FLACs. `_collection_tracks` keeps the playlist reference nodes out of it.
+    for track in _collection_tracks(root):
         location = track.get("Location")
         if not location:
             # A COLLECTION TRACK with no Location can't be exported.
@@ -636,12 +730,14 @@ def export_for_cdj(
             result.track_errors.append(TrackError(location, f"source file not found: {src}"))
             continue
         dst = _assign_dst(out_dir, src, used_stems)
+        if dst.stem.casefold() != src.stem.casefold():
+            result.renamed.append(dst.name)
         flac_tracks.append((track, src, dst))
 
     total = len(flac_tracks)
     src_to_dst: dict[str, Path] = {}
 
-    for i, (_track, src, dst) in enumerate(flac_tracks):
+    for i, (track, src, dst) in enumerate(flac_tracks):
         if on_progress:
             on_progress(i, total, src.name)
         if dry_run:
@@ -657,11 +753,17 @@ def export_for_cdj(
             result.flac_converted += 1
             result.flac_planned += 1
             # Record an irreversible down-sample so the caller/CLI can warn the
-            # user (the AIFF's real rate differs from the source hi-res rate).
+            # user. Compare against the rate the AIFF actually came out at, and
+            # fall back to the TRACK's declared SampleRate when the source can't
+            # be probed: the old test re-called the same deterministic
+            # `_probe_samplerate` and required it to exceed 48 kHz, which is
+            # exactly the branch the forced `-ar 44100` fires on when the probe
+            # returns None — structurally guaranteed to miss the tracks it was
+            # written to report.
             aiff_rate = _aiff_samplerate(dst)
-            if aiff_rate is not None and aiff_rate <= MAX_CDJ_SAMPLERATE:
-                src_rate = _probe_samplerate(src)
-                if src_rate is not None and src_rate > MAX_CDJ_SAMPLERATE:
+            if aiff_rate is not None:
+                src_rate = _probe_samplerate(src) or _declared_samplerate(track)
+                if src_rate is not None and src_rate > aiff_rate:
                     result.resampled.append(str(src))
         except CdjExportError as e:
             # A missing transcoder is fatal for the whole run -- re-raise so the
@@ -687,11 +789,19 @@ def export_for_cdj(
 
 
 def _assign_dst(out_dir: Path, src: Path, used_stems: set[str]) -> Path:
-    """Pick a collision-free ``<out_dir>/<stem>.aiff`` for a source file."""
+    """Pick a collision-free ``<out_dir>/<stem>.aiff`` for a source file.
+
+    Collision-free against BOTH this run's assignments and whatever already sits
+    in ``out_dir``. Seeding only from the in-memory set made the module's
+    "strictly additive ... no file is silently overwritten" promise true only
+    *within one run*: a DJ who keeps FLACs beside their own hand-edited AIFFs and
+    exports into that folder had ``Track.flac`` clobber ``Track.aiff`` — both
+    writers overwrite unconditionally (``sf.write``; ``ffmpeg -y``).
+    """
     stem = src.stem
     candidate = stem
     n = 1
-    while candidate.casefold() in used_stems:
+    while candidate.casefold() in used_stems or (out_dir / f"{candidate}.aiff").exists():
         candidate = f"{stem}_{n}"
         n += 1
     used_stems.add(candidate.casefold())

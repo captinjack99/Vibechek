@@ -7,7 +7,7 @@ Dedupe's audio-fingerprint phase — the one that catches *near*-duplicates
 ``fpcalc``. When ``fpcalc`` was missing, that phase silently no-op'd and the
 GUI dead-ended at "Fingerprint scan skipped — fpcalc not found" with no way to
 fix it. The user was left to discover, download, and install a command-line
-tool by hand: exactly the manual-setup dead end the zero-setup doctrine forbids
+tool by hand: exactly the manual-setup dead end this app avoids by design
 (detect -> SELF-HEAL -> run). This module heals the condition instead: it
 fetches the official, unmodified Chromaprint release binary for the current
 platform on demand, verifies a pinned SHA256, and stages it under the app data
@@ -38,7 +38,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from vibechek import config
+from vibechek import cancellation, config
 from vibechek.model_download import (
     _download_from_mirrors,
     _fmt_bytes,
@@ -130,34 +130,56 @@ def staged_fpcalc_path() -> Path:
     return tools_dir() / _binary_name()
 
 
-def find_staged_fpcalc() -> str | None:
-    """Return the staged fpcalc path if one is present and runnable, else None.
+# Real Chromaprint fpcalc builds are ~1.5-2.7 MB on every platform we stage. A
+# staged file far below that is not a binary we produced — it is a leftover stub
+# or a truncated extraction — and since the staged copy is now PREFERRED over
+# PATH, silently returning it would shadow a perfectly good system fpcalc.
+_STAGED_MIN_BYTES = 100_000
 
-    This is resolution step (b): a previous provision left a binary in the app
-    data dir. We do NOT re-hash it on every dedupe (that cost was paid at
-    extraction time); an existence + executable check is enough. On Windows
-    ``os.access(X_OK)`` is effectively an existence check, which is fine.
+
+def find_staged_fpcalc() -> str | None:
+    """Return the staged fpcalc path if one is present and plausible, else None.
+
+    This is resolution step (a): a previous provision left a binary in the app
+    data dir, extracted from an archive whose pinned SHA256 we verified. We do
+    NOT re-hash it on every dedupe (that cost was paid at extraction time), but
+    we do sanity-check size + executability so a truncated or stubbed file can't
+    shadow a working fpcalc on PATH. On Windows ``os.access(X_OK)`` is
+    effectively an existence check, which is fine.
     """
     p = staged_fpcalc_path()
     try:
-        if p.is_file() and os.access(p, os.X_OK):
-            return str(p)
+        if not (p.is_file() and os.access(p, os.X_OK)):
+            return None
+        size = p.stat().st_size
     except OSError:
-        pass
-    return None
+        return None
+    if size < _STAGED_MIN_BYTES:
+        log.warning(
+            "Staged fpcalc at %s is only %d bytes — ignoring it (a real "
+            "Chromaprint build is ~2 MB).", p, size,
+        )
+        return None
+    return str(p)
 
 
 def resolve_fpcalc() -> str | None:
     """Resolution steps (a) + (b) only — NO provisioning, NO network.
 
-    PATH wins over a staged copy (a system/user-managed fpcalc is preferred and
-    may be newer). Returns None when neither is present, which is the signal to
-    the caller that provisioning (step c) is needed.
+    The STAGED copy wins. It is the one binary whose provenance we know: this
+    module downloaded the official release asset, checked it against a pinned
+    SHA256, and extracted it into an app-owned directory. A PATH hit is an
+    arbitrary executable named `fpcalc` — and on Windows ``shutil.which`` searches
+    the process's current directory first, so a file dropped into a freshly
+    unpacked sample-pack folder would otherwise be run once per track. PATH is
+    still honoured (step b) when nothing is staged, so a system- or user-managed
+    install keeps working. Returns None when neither is present, which is the
+    signal to the caller that provisioning (step c) is needed.
     """
-    on_path = find_fpcalc()
-    if on_path:
-        return on_path
-    return find_staged_fpcalc()
+    staged = find_staged_fpcalc()
+    if staged:
+        return staged
+    return find_fpcalc()
 
 
 def _autoheal_disabled() -> bool:
@@ -289,9 +311,9 @@ def ensure_fpcalc(on_progress: ProgressCallback | None = None) -> str | None:
     """Return a usable fpcalc path, provisioning it on demand if needed.
 
     Resolution order:
-      (a) ``fpcalc`` on PATH / well-known locations (a user- or system-managed
-          install always wins).
-      (b) a previously staged binary under ``<DATA_DIR>/tools``.
+      (a) a previously staged binary under ``<DATA_DIR>/tools`` (hash-verified
+          at provision time — the only copy whose provenance we know).
+      (b) ``fpcalc`` on PATH / well-known locations.
       (c) neither present -> download the pinned official release asset for this
           platform, verify its SHA256, extract the binary into the tools dir,
           and return it.
@@ -327,8 +349,8 @@ def ensure_fpcalc(on_progress: ProgressCallback | None = None) -> str | None:
     archive_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Announce up-front — the small one-time download should be visible in the
-    # same progress channel the dedupe scan already uses, in plain-user words
-    # (the doctrine: clamps/fallbacks/heals are GUI-visible, not silent).
+    # same progress channel the dedupe scan already uses, in plain-user words:
+    # clamps/fallbacks/heals are GUI-visible, not silent.
     report_progress(
         on_progress, 0, 1,
         "Setting up the audio fingerprint tool (one-time, ~2 MB)…",
@@ -355,6 +377,14 @@ def ensure_fpcalc(on_progress: ProgressCallback | None = None) -> str | None:
         verify_model_sha256(archive_path, asset.sha256)
         _extract_binary(archive_path, asset, dest)
     except FpcalcProvisionError:
+        raise
+    except cancellation.CancelledError:
+        # A user cancel is NOT a download failure. Swallowing it here labelled the
+        # cancel "the download didn't complete (check your connection)" AND let
+        # duplicates.py's `except FpcalcProvisionError` continue the scan, so a
+        # cancelled dedupe returned a finished, near-duplicate-blind report. Let it
+        # unwind to the dispatcher's cancelled branch. (Mirrors
+        # native_install.setup_clap_native.)
         raise
     except Exception as e:  # noqa: BLE001 — classify everything into a banner reason
         # A failed verify leaves a poisoned archive around; drop it so the next

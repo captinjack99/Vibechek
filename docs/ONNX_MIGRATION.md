@@ -22,14 +22,14 @@ Status: **WIRED + VALIDATED TF-FREE + GPU-ACCELERATED (2026-06-02).** The ONNX e
 >   documented in this file (WSL on Windows, a managed venv on Linux/macOS,
 >   with GPU execution providers) is still opt-in on every platform. See
 >   [docs/INSTALL.md](INSTALL.md).
-> - **GPU worker counts are registration-gated, not VRAM-guessed (audit wave
->   2, `91fb4c9`).** The hybrid CPU+GPU worker pool used to size "N GPU
+> - **GPU worker counts are registration-gated, not VRAM-guessed (commit
+>   `91fb4c9`).** The hybrid CPU+GPU worker pool used to size "N GPU
 >   workers" off raw `nvidia-smi` VRAM even when the runtime couldn't actually
 >   register the device (TF/ORT both silently ran those workers on CPU); GPU
 >   workers are now counted only after a real registration probe, and the
 >   completion summary states what actually ran. Separately, the **in-app**
 >   ONNX installer paths (WSL bootstrap + the native-engine installer) pin
->   `onnxruntime-gpu` to the CUDA-12 line (`<1.27`; audit wave 3, `71939e0`) —
+>   `onnxruntime-gpu` to the CUDA-12 line (`<1.27`; commit `71939e0`) —
 >   an unpinned resolve had drifted to a CUDA-13-only build that crashed the
 >   ONNX engine on import. The `pyproject.toml` `[onnx-gpu]` extra used for
 >   manual `pip install` is **not** pinned; add `onnxruntime-gpu<1.27` by hand
@@ -314,5 +314,5 @@ Because we consume MTG's official ONNX (pre-processing baked in), the old "port 
 ## 9. Open questions
 
 - Do we package `onnxruntime` (CPU-only, ~12 MB) by default and let users `pip install onnxruntime-gpu` / `onnxruntime-directml` themselves, or ship platform-specific extras (`vibechek[gpu-cuda]`, `vibechek[gpu-directml]`)? Recommendation: platform extras, mirroring the current `vibechek[ml]` pattern.
-- **Route the tiny classifier heads to CPU even in GPU mode.** The audit's research found the small heads are GPU-neutral-to-negative on integrated GPUs (kernel-launch + transfer overhead dominates); only the EffNet/MAEST **backbone** is worth accelerating. So build the EP chain for the backbone session but pin the head sessions to `CPUExecutionProvider`, and do **not** market "DirectML 3–10× faster" as a blanket claim. Benchmark the backbone per EP and report real numbers.
+- **Route the tiny classifier heads to CPU even in GPU mode.** Measurement showed the small heads are GPU-neutral-to-negative on integrated GPUs (kernel-launch + transfer overhead dominates); only the EffNet/MAEST **backbone** is worth accelerating. So build the EP chain for the backbone session but pin the head sessions to `CPUExecutionProvider`, and do **not** market "DirectML 3–10× faster" as a blanket claim. Benchmark the backbone per EP and report real numbers.
 - **License:** several Discogs models are **CC BY-NC** (non-commercial). Hosting is moot (we use MTG's official ONNX), but if Vibechek pursues commercial distribution, the *usage* license must be cleared — track separately; it applies to today's `.pb` models too.

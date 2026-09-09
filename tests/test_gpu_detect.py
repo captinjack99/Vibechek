@@ -1,7 +1,9 @@
 """Tests for cross-vendor GPU detection (vibechek.gpu_detect).
 
-These mock every subprocess and `shutil.which` call so the tests stay
-deterministic regardless of the host hardware.
+These mock every subprocess call and every executable lookup (each module
+resolves its tools through `utils.find_executable`, not `shutil.which`, because
+every hit is then RUN) so the tests stay deterministic regardless of the host
+hardware.
 """
 
 from __future__ import annotations
@@ -92,7 +94,7 @@ def _fake_completed(stdout: str = "", returncode: int = 0) -> subprocess.Complet
 
 
 def _which_only(*tools: str):
-    """Return a `shutil.which` replacement that only finds the given tools."""
+    """Return a `find_executable` replacement that only finds the given tools."""
     allowed = set(tools)
     return lambda name: f"/usr/bin/{name}" if name in allowed else None
 
@@ -103,7 +105,14 @@ def _which_only(*tools: str):
 
 
 def test_nvidia_detection_via_nvidia_smi() -> None:
-    with patch("vibechek.resources.shutil.which", _which_only("nvidia-smi")), \
+    # Patch the module that actually does the work: `_detect_nvidia` delegates
+    # to `resources._gpu_devices_from_nvidia_smi`, and gpu_detect never looks
+    # nvidia-smi up itself. Naming gpu_detect here only ever worked because both
+    # modules shared the one `shutil`/`subprocess` module object — the patch
+    # leaked globally and the named target was a fiction. Both modules now
+    # resolve executables through `utils.find_executable` (cwd-discarding), so
+    # the lookup is patched by name on the module that owns it.
+    with patch("vibechek.resources.find_executable", _which_only("nvidia-smi")), \
          patch("vibechek.resources.subprocess.run",
                return_value=_fake_completed(NVIDIA_SMI_OUTPUT)):
         # Bypass platform-specific lspci / wmic detectors.
@@ -128,7 +137,7 @@ def test_nvidia_detection_via_nvidia_smi() -> None:
 
 def test_amd_detection_via_rocm_smi(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("rocm-smi"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("rocm-smi"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(ROCM_SMI_OUTPUT),
@@ -147,7 +156,7 @@ def test_amd_detection_via_rocm_smi(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_amd_detection_via_lspci(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("lspci"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("lspci"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(LSPCI_OUTPUT_AMD),
@@ -164,7 +173,7 @@ def test_amd_detection_via_lspci(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_amd_apu_classified_as_integrated(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("lspci"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("lspci"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(LSPCI_OUTPUT_AMD_APU),
@@ -176,7 +185,7 @@ def test_amd_apu_classified_as_integrated(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_amd_detection_on_windows_via_wmic(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("wmic"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("wmic"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(WMIC_OUTPUT_AMD),
@@ -192,12 +201,12 @@ def test_amd_detection_on_windows_via_wmic(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_amd_detection_skips_when_no_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(gpu_detect.shutil, "which", lambda _: None)
+    monkeypatch.setattr(gpu_detect, "find_executable", lambda _: None)
     assert gpu_detect._detect_amd() == []
 
 
 def test_amd_rocm_smi_handles_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("rocm-smi"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("rocm-smi"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed("not json"),
@@ -206,7 +215,7 @@ def test_amd_rocm_smi_handles_invalid_json(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_amd_lspci_handles_subprocess_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("lspci"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("lspci"))
 
     def _raise(*a, **kw):
         raise subprocess.TimeoutExpired(cmd="lspci", timeout=5)
@@ -222,7 +231,7 @@ def test_amd_lspci_handles_subprocess_timeout(monkeypatch: pytest.MonkeyPatch) -
 
 def test_intel_igpu_classified_as_integrated(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("lspci"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("lspci"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(LSPCI_OUTPUT_INTEL),
@@ -239,7 +248,7 @@ def test_intel_igpu_classified_as_integrated(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_intel_arc_classified_as_discrete(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("lspci"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("lspci"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(LSPCI_OUTPUT_INTEL_ARC),
@@ -251,7 +260,7 @@ def test_intel_arc_classified_as_discrete(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_intel_detection_on_windows_via_wmic(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("wmic"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("wmic"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(WMIC_OUTPUT_INTEL),
@@ -287,7 +296,7 @@ CIM_OUTPUT_COMMA_NAME = json.dumps(
 def test_windows_prefers_powershell_cim(monkeypatch: pytest.MonkeyPatch) -> None:
     """When PowerShell is available, CIM JSON is used (not wmic)."""
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("powershell"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("powershell"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(CIM_OUTPUT_SINGLE_AMD),
@@ -302,7 +311,7 @@ def test_windows_prefers_powershell_cim(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_cim_handles_array_and_vendor_filter(monkeypatch: pytest.MonkeyPatch) -> None:
     """An array of controllers is filtered by vendor."""
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("powershell"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("powershell"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(CIM_OUTPUT_ARRAY),
@@ -318,7 +327,7 @@ def test_cim_handles_array_and_vendor_filter(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_cim_comma_in_name_is_not_split(monkeypatch: pytest.MonkeyPatch) -> None:
     """The JSON path keeps a comma-containing adapter name intact."""
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("powershell"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("powershell"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(CIM_OUTPUT_COMMA_NAME),
@@ -330,7 +339,7 @@ def test_cim_comma_in_name_is_not_split(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_cim_returns_none_without_powershell(monkeypatch: pytest.MonkeyPatch) -> None:
     """No powershell/pwsh -> None so the caller falls back to wmic."""
-    monkeypatch.setattr(gpu_detect.shutil, "which", lambda _: None)
+    monkeypatch.setattr(gpu_detect, "find_executable", lambda _: None)
     assert gpu_detect._detect_gpus_cim("amd") is None
 
 
@@ -338,7 +347,7 @@ def test_wmic_csv_fallback_is_comma_safe(monkeypatch: pytest.MonkeyPatch) -> Non
     """When PowerShell is absent, the wmic CSV fallback uses the csv module so a
     quoted comma in the Name field no longer corrupts the column split."""
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("wmic"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("wmic"))
     wmic_csv = (
         "Node,AdapterRAM,Name\n"
         'DESKTOP,17179869184,"AMD Radeon RX 7800 XT, Gaming OC"\n'
@@ -360,7 +369,7 @@ def test_wmic_csv_fallback_is_comma_safe(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_apple_m1_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("system_profiler"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("system_profiler"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(SYSTEM_PROFILER_OUTPUT_M1),
@@ -379,7 +388,7 @@ def test_apple_m1_detection(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_apple_egpu_detection_amd(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gpu_detect.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(gpu_detect.shutil, "which", _which_only("system_profiler"))
+    monkeypatch.setattr(gpu_detect, "find_executable", _which_only("system_profiler"))
     monkeypatch.setattr(
         gpu_detect.subprocess, "run",
         lambda *a, **kw: _fake_completed(SYSTEM_PROFILER_OUTPUT_EGPU),
@@ -681,3 +690,39 @@ def test_system_info_rpc_threads_selected_engine(
     captured.clear()
     rpc_mod._system_info({"inference_engine": "TOTALLY_BOGUS"})
     assert captured["engine"] in ("essentia_tf", "onnx", "native")
+
+
+# ---------------------------------------------------------------------------
+# cwd-planted binaries
+#
+# Every tool this module resolves is then EXECUTED, so the lookups go through
+# `utils.find_executable`, which discards a hit in the process cwd. On Windows
+# `shutil.which` prepends the current directory to the search path
+# (NeedCurrentDirectoryForExePath; passing `path=` doesn't suppress it), so an
+# `lspci`/`rocm-smi` dropped into the folder the app was launched from would
+# have won over the real tool and been run on every Settings page load.
+# ---------------------------------------------------------------------------
+
+
+def test_detectors_ignore_a_tool_planted_in_the_current_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibechek import utils
+
+    for name in ("lspci", "rocm-smi"):
+        (tmp_path / name).write_bytes(b"planted")
+    monkeypatch.chdir(tmp_path)
+    # Drive the REAL find_executable: only the raw which() underneath is stubbed,
+    # exactly as Windows would answer with the cwd on the search path.
+    monkeypatch.setattr(
+        utils.shutil, "which", lambda name: str(tmp_path / name)
+    )
+
+    def _explode(*_a, **_kw):
+        raise AssertionError("the cwd copy must never be executed")
+
+    monkeypatch.setattr(gpu_detect.subprocess, "run", _explode)
+
+    assert gpu_detect._detect_amd_lspci() == []
+    assert gpu_detect._detect_intel_lspci() == []
+    assert gpu_detect._detect_amd_rocm_smi() == []

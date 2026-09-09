@@ -8,8 +8,7 @@ it and merges the values into each record's ``existing_tags`` so the SAME
 reconciliation the file tags get (``genres.reconcile_genre`` at the "tag"
 tier, key surfacing via ``_reconcile_record_key``) applies to them.
 
-What gets imported, and why only that (measured on the 72-track gold corpus,
-see internal/bughunt/score_tag_priors.py):
+What gets imported, and why only that (measured on the 72-track gold corpus):
 
 - **Genre** — the one field where curated tags beat the audio model (the
   shipping ``prefer_tag`` policy). The Rekordbox value REPLACES the file tag at

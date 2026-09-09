@@ -16,7 +16,7 @@ The profiles encode practical defaults different DJs want by default:
 The `timeslot_bpm_bands` field is advisory metadata only for now — it's
 emitted from `list_profiles()` so the UI can later highlight tracks whose
 ML BPM matches the profile's preferred range per timeslot. No analyzer
-code reads it today; we ship the data so the UI agent can build the
+code reads it today; we ship the data so the UI can build the
 visualization without a round-trip on us.
 
 Adding a new built-in profile is a one-line entry in `BUILT_IN_PROFILES`.
@@ -202,7 +202,11 @@ def load_profile(name: str) -> dict[str, Any]:
 
     Returns a small dict describing what happened — used by both the CLI
     and the eventual RPC method. Raises `KeyError` if the profile name is
-    unknown (the CLI catches it and prints a friendly error).
+    unknown (the CLI catches it and prints a friendly error), and
+    `config.ConfigSaveRefused` when the saved config couldn't be READ: this
+    is a load→save round trip, so on an unreadable file it would otherwise
+    write a profile-flavoured set of factory defaults over every real setting
+    the user still has on disk.
     """
     profile = get_profile(name)
     if profile is None:

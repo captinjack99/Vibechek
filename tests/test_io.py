@@ -132,7 +132,7 @@ def test_partial_name_is_unique_per_thread(tmp_path: Path) -> None:
     """Two threads writing the SAME destination must use DIFFERENT temp files.
 
     A shared fixed `.partial` name lets one writer truncate the other's bytes
-    mid-flight (audit HIGH: shared-.partial race). The per-writer pid.tid
+    mid-flight (a shared-.partial race). The per-writer pid.tid
     suffix guarantees each thread gets its own temp file.
     """
     target = tmp_path / "out.json"

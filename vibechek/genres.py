@@ -150,7 +150,7 @@ _KNOWN_GENRE_NAMES: frozenset[str] = frozenset(
 # The risk an alias carries is not accuracy in the abstract — it is landing in
 # the WRONG FAMILY, which moves organizer's destination folder and flips
 # reconcile's conflict flag. So each was checked against the family its files
-# independently resolve to (internal/bughunt/score_genre_aliases.py route 2: the
+# independently resolve to (route 2: the
 # tag's tracks joined to the 2,577 web-resolved labels over D:\Music\Tracks; HIT
 # = share whose resolved family equals the alias target's, against that library's
 # own base rate for it). `n` below is files carrying that exact tag of 12,092.
@@ -201,13 +201,38 @@ _PAREN_QUALIFIER = re.compile(r"\s*\([^()]*\)\s*$")
 
 
 def _alias_key(tag: str) -> str:
-    """Alias lookups ignore case and internal spacing; the hierarchy proper does not."""
+    """Lookups ignore case and internal spacing; the tables themselves are Title Case."""
     return " ".join(tag.split()).casefold()
 
 
 _GENRE_TAG_ALIAS_LOOKUP: dict[str, str] = {
     _alias_key(k): v for k, v in _GENRE_TAG_ALIASES.items()
 }
+
+# Case-folded index of every name the taxonomy knows → the hierarchy's own
+# spelling of it. The tables are keyed on Title Case, so a tag written "tech
+# house" or "TECH HOUSE" — routine output from Bandcamp downloads and hand-typed
+# genre fields — used to miss every lookup and fall through as its OWN top-level
+# genre: the wrong stored genre, a lost parent family (so organizer files it flat
+# instead of under `House/`), and a spurious `_genre_conflicts` hit against a
+# matching ML read. Same failure class as the "Hip-Hop"/"Hip Hop" split commit
+# 4d10dfa fixed via the alias table, one level down.
+#
+# Built keys-first so the resolved name is one the DOWNSTREAM tables can look up
+# (`DJ_GENRE_MAP` / `SUBGENRE_TO_PARENT` keys), falling back to canonical display
+# names that appear only as values.
+_GENRE_NAME_BY_KEY: dict[str, str] = {}
+for _name in (*DJ_GENRE_MAP, *GENRE_HIERARCHY, *SUBGENRE_TO_PARENT,
+              *DJ_GENRE_MAP.values()):
+    _GENRE_NAME_BY_KEY.setdefault(_alias_key(_name), _name)
+del _name
+
+
+def _canonical_genre_name(tag: str) -> str | None:
+    """The hierarchy's own spelling of `tag`, or None if it names nothing we know."""
+    if not tag:
+        return None
+    return _GENRE_NAME_BY_KEY.get(_alias_key(tag))
 
 
 def _resolve_tag_alias(tag: str) -> str:
@@ -220,8 +245,9 @@ def _resolve_tag_alias(tag: str) -> str:
     base = _PAREN_QUALIFIER.sub("", tag).strip()
     if base and base != tag:
         base = _GENRE_TAG_ALIAS_LOOKUP.get(_alias_key(base), base)
-        if base in _KNOWN_GENRE_NAMES:
-            return base
+        known = _canonical_genre_name(base)
+        if known is not None:
+            return known
     return tag
 
 
@@ -400,7 +426,7 @@ _GENERIC_GENRE_TAGS: frozenset[str] = frozenset({
 # read of one stands, but that taggers spray so indiscriminately over a whole
 # release/pool that the tag carries no information about the track.
 #
-# "Electro" is the measured case (internal/bughunt/score_generic_set.py, 86-track
+# "Electro" is the measured case (86-track
 # adjudicated corpus, through this function):
 #   keep trusting it .... 52.3% exact / 70.9% family   (web off)   72.1% / 84.9% (web on)
 #   distrust it ......... 53.5% exact / 72.1% family   (web off)   73.3% / 86.0% (web on)
@@ -429,7 +455,7 @@ _UNTRUSTED_GENRE_TAGS: frozenset[str] = _GENERIC_GENRE_TAGS | frozenset({
 #
 # The rule is deliberately narrow: 4+ words, NO list separator, and unplaceable in
 # the hierarchy. Wider structural rules were measured and REFUTED on the 86-track
-# adjudicated corpus (internal/bughunt/score_unplaceable_rule.py, through
+# adjudicated corpus (through
 # reconcile_genre, strict|accept x web off|on):
 #   distrust ALL unplaceable ....... 53.5->52.3% exact, 72.1->70.9% family, BROKE 2
 #       "Stutter House" (truth House, exact via the tag) -> audio said Bassline;
@@ -458,7 +484,7 @@ def _placeable_in_hierarchy(tag: str) -> bool:
     parent, sub = split_tag_genre(tag)
     if parent != sub:
         return True          # split found a parent, so the subgenre is known
-    return parent in _KNOWN_GENRE_NAMES
+    return _canonical_genre_name(parent) is not None
 
 
 def _is_playlist_phrase(tag: str) -> bool:
@@ -505,8 +531,11 @@ def split_tag_genre(tag: str) -> tuple[str, str]:
 
     A known spelling variant ('Hip-Hop', 'Techno (Peak Time / Driving)') is
     rewritten to the hierarchy's own name for it first — see `_GENRE_TAG_ALIASES`.
+    Case and internal spacing are ignored throughout: 'tech house' names the same
+    genre as 'Tech House' and must not become a second one.
     """
     t = _resolve_tag_alias((tag or "").strip())
+    t = _canonical_genre_name(t) or t
     canon = DJ_GENRE_MAP.get(t, t)
     if canon in SUBGENRE_TO_PARENT:
         parent = SUBGENRE_TO_PARENT[canon]

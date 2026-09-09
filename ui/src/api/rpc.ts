@@ -6,7 +6,7 @@
  *
  *     await rpc<AnalysisReport>("analyze_directory", { path, workers, ... });
  *
- * Two failure modes kept showing up in audits:
+ * Two failure modes kept showing up in practice:
  *   1. Method name typos / wrong-shaped params — the second arg is `object`,
  *      so anything compiles and the error only shows up at runtime.
  *   2. Drifting between the Python handler and the TS caller — Python adds
@@ -17,7 +17,7 @@
  *   - Compile-time checking on the param shape.
  *   - A single grep target ("api.analyzeDirectory") when a method's contract
  *     changes — no more hunting through string literals.
- *   - A canonical list (RPC_METHODS in ./methods) we can audit against the
+ *   - A canonical list (RPC_METHODS in ./methods) we can check against the
  *     Python METHODS dict to catch missed wrappers.
  *
  * --- Adding a new RPC method ---
@@ -50,6 +50,7 @@ import type {
   GetLogTailRequest,
   GetLogTailResult,
   HandleDuplicatesRequest,
+  HandleDuplicatesResult,
   ImportTagPriorsRequest,
   IncreaseWslMemoryResult,
   InstallCudaLibsInWSLRequest,
@@ -248,7 +249,7 @@ export function repairWSLShim(
 }
 
 /**
- * Raise the WSL VM's memory limit in the user's `.wslconfig` (WP-D2 self-heal).
+ * Raise the WSL VM's memory limit in the user's `.wslconfig` (memory self-heal).
  * Backs the "Give Vibechek more memory" recovery action on the CLAP out-of-
  * memory refusal. Reads + bumps the `memory=` line (never shrinking it), and
  * returns `restart_required` so the GUI can offer the WSL/Windows restart
@@ -335,12 +336,16 @@ export function findDuplicates(
 /**
  * Apply the configured action (report/delete/move) to a previously-computed
  * `DuplicateReport`. Returns a per-action stats dict.
+ *
+ * Pass `library_path` (the loaded library) so the sidecar syncs THAT library's
+ * saved analysis afterwards instead of inferring one by path-ancestry from the
+ * recents index — see `HandleDuplicatesRequest`.
  */
 export function handleDuplicates(
   params: HandleDuplicatesRequest,
   opId?: string,
-): Promise<Record<string, number>> {
-  return rpc<Record<string, number>>("handle_duplicates", withOpId(params, opId));
+): Promise<HandleDuplicatesResult> {
+  return rpc<HandleDuplicatesResult>("handle_duplicates", withOpId(params, opId));
 }
 
 // ---------------------------------------------------------------------------

@@ -29,7 +29,9 @@ import type { TrackAnalysis } from "../types";
 const okStats = {
   total: 1,
   genre_applied: 1,
+  genre_applied_parent_only: 0,
   genre_skipped_low_confidence: 0,
+  genre_skipped_write_disabled: 0,
   other_tags_applied: 1,
   errors: [],
 };
@@ -46,6 +48,7 @@ const oneTrack: TrackAnalysis[] = [
       ml_subgenre: "Deep House",
       ml_genre_confidence: 0.95,
       ml_genre_raw_confidence: 0.95,
+      ml_genre_audio_confidence: 0.95,
       ml_bpm: 124,
       ml_key: "8A",
       ml_energy: 3,
@@ -119,5 +122,43 @@ describe("useApplyTags — apply_ml_tags payload", () => {
     const params = (call![1] as { params: Record<string, unknown> }).params;
     expect(params.write_subgenre_as_main_genre).toBe(true);
     expect(params.backup_before_write).toBe(true);
+  });
+});
+
+/**
+ * Regression test: the Apply-tags UI under-reported how many files it
+ * tagged because genre_applied_parent_only was missing from the wire type.
+ *
+ * The backend counts three MUTUALLY EXCLUSIVE genre outcomes; the parent-only
+ * branch is a WRITE (the parent family lands in the TCON frame) and covers
+ * roughly half a typical library. Dropping it at the hook boundary made the
+ * result unrecoverable downstream, so the toast's applied + skipped never
+ * added up to the number of files that got a genre.
+ */
+describe("useApplyTags — parent-only genre writes", () => {
+  it("surfaces genre_applied_parent_only as `parentOnly`", async () => {
+    (invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
+      total: 100,
+      genre_applied: 30,
+      genre_applied_parent_only: 40,
+      genre_skipped_low_confidence: 30,
+      genre_skipped_write_disabled: 0,
+      other_tags_applied: 100,
+      errors: [],
+    });
+
+    const { result } = renderHook(() => useApplyTags());
+    const res = await result.current.apply(oneTrack);
+
+    expect(res).toEqual({
+      applied: 30,
+      parentOnly: 40,
+      skipped: 30,
+      skippedWriteDisabled: 0,
+      other: 100,
+      errors: [],
+    });
+    // Every track is accounted for — the defect was 30 + 30 = 60 of 100.
+    expect(res!.applied + res!.parentOnly + res!.skipped).toBe(100);
   });
 });

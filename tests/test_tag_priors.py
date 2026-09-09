@@ -1,7 +1,7 @@
 """Trust-UX #3: tag priors — Rekordbox XML import, key surfacing, MIK energy.
 
-Design ground truth (measured, internal/bughunt/score_tag_priors.py on the
-72-track gold corpus): embedded key/BPM tags are other tools' ALGORITHMIC
+Design ground truth (measured on the 72-track gold corpus): embedded
+key/BPM tags are other tools' ALGORITHMIC
 reads — tag key 49% exact vs audio 63% on the same tracks, audio right 10:1
 on disagreement — so priors NEVER change ml_key/ml_bpm; they surface. Genre is
 the editorial tier where tags win (the shipping prefer_tag policy), so the

@@ -11,7 +11,7 @@ def test_extract_bpm_from_trailing_number() -> None:
 
 
 # ---------------------------------------------------------------------------
-# BPM false-positive regressions (audit: support-modules MED)
+# BPM false-positive regressions
 # ---------------------------------------------------------------------------
 
 

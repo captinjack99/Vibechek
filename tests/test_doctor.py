@@ -65,7 +65,7 @@ def test_render_markdown_contains_all_top_level_sections() -> None:
 
 def test_model_integrity_unverified_surfaced_when_sha_table_empty(monkeypatch) -> None:
     """With an empty MODEL_SHA256 table the report flags integrity unverified
-    and the markdown surfaces it (audit: INFO -> surface)."""
+    and the markdown surfaces it."""
     from vibechek import analyzer
 
     monkeypatch.setattr(analyzer, "MODEL_SHA256", {}, raising=True)
@@ -91,7 +91,7 @@ def test_model_integrity_verified_when_sha_table_populated(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Engine-aware readiness + last-run sections (WP9)
+# Engine-aware readiness + last-run sections
 # ---------------------------------------------------------------------------
 
 
@@ -219,3 +219,160 @@ def test_cli_doctor_with_output_writes_file(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert output.exists()
     assert "# Vibechek diagnostic report" in output.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The log tail is the report's one raw-text section. The module
+# docstring promises no library contents and no user-private paths; the tail
+# used to carry both, straight onto the clipboard via "Copy diagnostic".
+# ---------------------------------------------------------------------------
+
+
+def test_scrub_log_line_elides_track_names_and_home() -> None:
+    home = str(Path.home())
+    line = (
+        "2026-09-05 10:00:01 WARNING duplicates: Could not hash "
+        + home + r"\Music\Secret Set\Bicep - Glue (Extended Mix).mp3: denied"
+    )
+    scrubbed = doctor._scrub_log_line(line)
+
+    assert home not in scrubbed
+    assert "Bicep" not in scrubbed
+    assert "Secret Set" not in scrubbed
+    # The diagnostic value — which log, which failure — survives.
+    assert "Could not hash" in scrubbed and "denied" in scrubbed
+    assert ".mp3" in scrubbed
+
+
+def test_scrub_log_line_elides_a_bare_track_filename() -> None:
+    line = "2026-09-05 10:00:00 INFO organizer: No genre tag, skipping: Artist - Title.flac"
+    scrubbed = doctor._scrub_log_line(line)
+    assert "Artist - Title" not in scrubbed
+    assert scrubbed.endswith("skipping: <track>.flac")
+
+
+def test_scrub_log_line_leaves_non_library_lines_alone() -> None:
+    line = "2026-09-05 10:00:00 INFO analyzer: loaded effnet-discogs.pb (86 MB)"
+    assert doctor._scrub_log_line(line) == line
+
+
+def test_log_tail_is_scrubbed_before_it_reaches_the_report(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from vibechek import logging_setup
+
+    log_file = tmp_path / "vibechek.log"
+    log_file.write_text(
+        "2026-09-05 10:00:00 INFO organizer: No genre tag, skipping: Bicep - Glue.mp3\n"
+        "2026-09-05 10:00:01 WARNING duplicates: Could not hash "
+        + str(Path.home()) + r"\Music\Secret Set\track.mp3: denied" + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(logging_setup, "LOG_FILE", log_file, raising=True)
+
+    report = doctor.build_report()
+    joined = "\n".join(report.log_tail)
+    assert "Bicep" not in joined
+    assert "Secret Set" not in joined
+    assert str(Path.home()) not in joined
+
+    md = doctor.render_markdown(report)
+    assert "Bicep" not in md
+    assert str(Path.home()) not in md  # also covers the Config/Models paths
+
+
+# ---------------------------------------------------------------------------
+# Shell log tail. The Tauri shell writes `vibechek-shell.log` beside
+# `vibechek.log`; on a windowed Windows build it is the ONLY record of a
+# sidecar crash. The diagnostic carries it so a user can attach it without
+# hunting for the data directory.
+# ---------------------------------------------------------------------------
+
+
+def _write_shell_log(monkeypatch, tmp_path: Path, text: str) -> Path:
+    """Point the log dir at tmp_path and drop a shell log next to the app log."""
+    from vibechek import logging_setup
+
+    monkeypatch.setattr(logging_setup, "LOG_FILE", tmp_path / "vibechek.log", raising=True)
+    shell_log = tmp_path / "vibechek-shell.log"
+    shell_log.write_text(text, encoding="utf-8")
+    return shell_log
+
+
+def test_shell_log_tail_is_collected_and_rendered(tmp_path: Path, monkeypatch) -> None:
+    _write_shell_log(
+        monkeypatch,
+        tmp_path,
+        "2026-09-05T10:00:00Z [shell] Vibechek desktop shell 0.9.1 starting\n"
+        "2026-09-05T10:00:03Z [shell] sidecar exited with code 3221225477\n",
+    )
+
+    report = doctor.build_report()
+    assert len(report.shell_log_tail) == 2
+    assert "3221225477" in report.shell_log_tail[-1]
+
+    md = doctor.render_markdown(report)
+    assert "## Shell log tail" in md
+    assert "3221225477" in md
+
+
+def test_shell_log_section_is_omitted_when_the_file_is_absent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """CLI-only install: no shell has ever run, so an empty block would read as
+    a missing file the user is supposed to go and find."""
+    from vibechek import logging_setup
+
+    monkeypatch.setattr(logging_setup, "LOG_FILE", tmp_path / "vibechek.log", raising=True)
+    report = doctor.build_report()
+    assert report.shell_log_tail == []
+    assert "## Shell log tail" not in doctor.render_markdown(report)
+
+
+def test_shell_log_tail_is_capped_to_the_requested_lines(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_shell_log(
+        monkeypatch, tmp_path, "".join(f"line {i}\n" for i in range(200))
+    )
+    report = doctor.build_report()
+    assert len(report.shell_log_tail) == 30
+    assert report.shell_log_tail[0] == "line 170"
+    assert report.shell_log_tail[-1] == "line 199"
+
+
+def test_shell_log_tail_is_scrubbed_like_the_main_log(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The shell relays the sidecar's stderr, so this file carries track paths
+    and the user's home dir too — same paste-safety promise as the app log."""
+    _write_shell_log(
+        monkeypatch,
+        tmp_path,
+        "2026-09-05T10:00:00Z [shell] stderr: No genre tag, skipping: Bicep - Glue.mp3\n"
+        "2026-09-05T10:00:01Z [shell] cwd " + str(Path.home()) + "\\Music\n",
+    )
+
+    report = doctor.build_report()
+    joined = "\n".join(report.shell_log_tail)
+    assert "Bicep" not in joined
+    assert str(Path.home()) not in joined
+    assert ".mp3" in joined  # the diagnostic value survives
+
+    assert "Bicep" not in doctor.render_markdown(report)
+
+
+def test_unreadable_shell_log_degrades_to_an_empty_tail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Best-effort like every other probe: a locked/undecodable shell log must
+    not take the whole diagnostic down."""
+    from vibechek import logging_setup
+
+    monkeypatch.setattr(logging_setup, "LOG_FILE", tmp_path / "vibechek.log", raising=True)
+    shell_log = tmp_path / "vibechek-shell.log"
+    shell_log.mkdir()  # a directory where a file is expected — open() raises
+
+    report = doctor.build_report()
+    assert report.shell_log_tail == []
+    assert "# Vibechek diagnostic report" in doctor.render_markdown(report)

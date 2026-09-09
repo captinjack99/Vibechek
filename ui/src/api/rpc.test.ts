@@ -28,6 +28,16 @@ import { describe, expect, it } from "vitest";
 import api from "./rpc";
 import * as rpcModule from "./rpc";
 import { RPC_METHODS, isKnownRpcMethod } from "./methods";
+import type {
+  ApplyStats,
+  BackupStats,
+  RemapRestoreStats,
+  RestoreStats,
+  TagApplyStats,
+  TagBackupStats,
+  TagRemapRestoreStats,
+  TagRestoreStats,
+} from "./methods";
 
 /**
  * Mirror of `vibechek/rpc.py:METHODS` keys. KEEP IN SYNC — the Python test
@@ -157,5 +167,75 @@ describe("api/rpc <-> vibechek/rpc.py sync", () => {
       }
     }
     expect(missing, `Methods missing wrappers in api/rpc.ts: ${missing.join(", ")}`).toEqual([]);
+  });
+});
+
+/**
+ * The four `Tag*Stats` payload types used to be hand-written copies of the
+ * `vibechek.tagger` dataclasses. `vibechek.tagger` is now covered by the TS
+ * codegen, so the copies were deleted and the names re-pointed at the generated
+ * types. These assignments are the guard: if the generated shape changes and
+ * something re-introduces a local copy, this file stops compiling.
+ */
+describe("tag stats types are the generated dataclasses, not copies", () => {
+  it("TagApplyStats IS the generated ApplyStats", () => {
+    const generated: ApplyStats = {
+      total: 4,
+      genre_applied: 1,
+      genre_applied_parent_only: 2,
+      genre_skipped_low_confidence: 1,
+      genre_skipped_write_disabled: 0,
+      other_tags_applied: 4,
+      errors: [],
+    };
+    // Assignable BOTH ways == same type, not merely compatible.
+    const asTag: TagApplyStats = generated;
+    const back: ApplyStats = asTag;
+    expect(back.genre_applied_parent_only).toBe(2);
+  });
+
+  it("TagBackupStats IS the generated BackupStats", () => {
+    const generated: BackupStats = {
+      total: 3,
+      backed_up: 3,
+      not_fully_backed_up: 1,
+      errors: [],
+    };
+    const asTag: TagBackupStats = generated;
+    const back: BackupStats = asTag;
+    expect(back.not_fully_backed_up).toBe(1);
+  });
+
+  it("TagRestoreStats IS the generated RestoreStats", () => {
+    const generated: RestoreStats = {
+      total: 3,
+      restored: 2,
+      skipped_missing: 1,
+      skipped_unsupported: 0,
+      errors: [],
+    };
+    const asTag: TagRestoreStats = generated;
+    const back: RestoreStats = asTag;
+    expect(back.skipped_unsupported).toBe(0);
+  });
+
+  it("TagRemapRestoreStats keeps the generated fields and narrows only `matches`", () => {
+    const remap: TagRemapRestoreStats = {
+      total: 1,
+      restored: 1,
+      skipped_missing: 0,
+      skipped_size_mismatch: 0,
+      matched_exact: 1,
+      matched_filename_size: 0,
+      matched_filename: 0,
+      errors: [],
+      // The Python field is `list[dict]`, so the generator can only emit
+      // Record<string, unknown>[]; the renderer needs the field names.
+      matches: [{ original: "D:/a.mp3", matched: "D:/b.mp3", strategy: "exact" }],
+    };
+    // Every field EXCEPT matches must still satisfy the generated dataclass.
+    const generatedFields: Omit<RemapRestoreStats, "matches"> = remap;
+    expect(generatedFields.matched_exact).toBe(1);
+    expect(remap.matches[0].strategy).toBe("exact");
   });
 });

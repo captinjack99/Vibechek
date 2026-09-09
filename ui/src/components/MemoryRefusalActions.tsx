@@ -6,8 +6,8 @@
  *     (`can_switch_classifier` / `can_increase_memory` on `error.data`).
  *   - Settings' worker-slider, when the computed budget refuses even one worker.
  *
- * The handlers live here ONCE so the two call sites can't drift (the audit
- * required a shared component/hook, not copy-pasted logic). Each button renders
+ * The handlers live here ONCE so the two call sites can't drift — a shared
+ * component/hook, not copy-pasted logic. Each button renders
  * only when its capability flag is set.
  *
  *   • "Switch to the standard genre model" flips `genre_classifier` to discogs
@@ -63,7 +63,7 @@ export function MemoryRefusalActions({
     try {
       const res = await increaseWslMemory();
       if (res.ok && res.changed && res.restart_required) {
-        // The doctrine's persistent+don't-auto-restart case: the limit is raised
+        // Persistent + don't-auto-restart case: the limit is raised
         // on disk but only bites after a restart, so make the notice stick and
         // say plainly what to do — we NEVER restart WSL/Windows for the user.
         const from = res.old ? `from ${res.old} ` : "";

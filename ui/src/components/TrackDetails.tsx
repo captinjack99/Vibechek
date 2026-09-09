@@ -19,7 +19,7 @@ import {
   useNotificationStore, usePlayerStore,
 } from "../stores";
 import { useApplyTags } from "../hooks/useApplyTags";
-import type { TrackAnalysis, ExistingTags, MLResult } from "../types";
+import type { TrackAnalysis, ExistingTags, MLResult, TaggingConfig } from "../types";
 import { TagBadge, EnergyBar } from "./TagBadges";
 import {
   compatibleCamelot,
@@ -33,6 +33,7 @@ import {
   reviewReason,
   type GenreProvenance,
 } from "../lib/review";
+import { decideGenre } from "../lib/genreGate";
 
 export function TrackDetails() {
   const selectedPath = useUIStore((s) => s.selectedTrackPath);
@@ -95,14 +96,27 @@ function DetailContent({
     try {
       const result = await applyTags([track]);
       if (!result) return; // failure already surfaced via useOperationStore.error
-      const wrote = result.applied + result.other;
-      if (wrote === 0 && result.skipped > 0) {
+      // Files actually written. `other` is bumped once per successfully
+      // written file whatever the genre outcome (tagger.py), so `applied` and
+      // `parentOnly` are subsets of it — same definition the bulk toast in
+      // LibraryBrowser uses, and summing the three would double-count.
+      const wrote = result.other;
+      if (wrote === 0 && result.skippedWriteDisabled > 0) {
+        notify("Genre not written — genre writing is off", {
+          detail: 'Turn on "Write genre" in Settings if you want it written.',
+          kind: "info",
+        });
+      } else if (wrote === 0 && result.skipped > 0) {
         notify("Genre skipped — confidence below threshold", {
           detail: "Lower the threshold in Settings if you want it written anyway.",
           kind: "info",
         });
       } else {
         notify(`Tags applied to ${track.filename}`, {
+          detail:
+            result.parentOnly > 0
+              ? "Genre written as the parent family — the subgenre wasn't confident enough."
+              : undefined,
           kind: result.errors.length > 0 ? "info" : "success",
         });
       }
@@ -153,7 +167,7 @@ function DetailContent({
 
         {ml ? (
           <>
-            <DiffSection existing={ext} ml={ml} confidenceThreshold={taggingCfg.genre_confidence_threshold} />
+            <DiffSection existing={ext} ml={ml} taggingCfg={taggingCfg} />
             <GenreSourcesSection existing={ext} ml={ml} />
             <CompatibleKeysSection mlKey={ml.ml_key} />
           </>
@@ -221,15 +235,20 @@ function FileSection({ track }: { track: TrackAnalysis }) {
 function DiffSection({
   existing,
   ml,
-  confidenceThreshold,
+  taggingCfg,
 }: {
   existing: ExistingTags;
   ml: MLResult;
-  confidenceThreshold: number;
+  taggingCfg: TaggingConfig;
 }) {
   const rows = buildDiffRows(existing, ml);
-  const willApplyGenre =
-    (ml.ml_genre_confidence ?? 0) >= confidenceThreshold && !!ml.ml_subgenre;
+  const confidenceThreshold = taggingCfg.genre_confidence_threshold;
+  // Run the tagger's real two-stage gate rather than a single-threshold
+  // approximation: the old check compared the FAMILY confidence against the
+  // strict SUBgenre threshold and demanded a subgenre, so it printed "won't be
+  // written" directly above the Apply button for every parent-fallback track —
+  // whose existing genre tag Apply then overwrote.
+  const decision = decideGenre(ml, taggingCfg);
 
   return (
     <Section title="Tags" subtitle="existing → ML">
@@ -251,9 +270,17 @@ function DiffSection({
           </div>
         )}
         <div className="mt-1 text-[11px] text-white/40">
-          {willApplyGenre
-            ? "Genre will be written when Apply is clicked."
-            : `Genre below ${Math.round(confidenceThreshold * 100)}% threshold — won't be written.`}
+          {decision.outcome === "subgenre" &&
+            `"${decision.genreToWrite}" will be written to the genre tag when Apply is clicked.`}
+          {decision.outcome === "parent-only" &&
+            `Subgenre below the ${Math.round(confidenceThreshold * 100)}% threshold, but the ` +
+              `${decision.genreToWrite} family clears ${Math.round(taggingCfg.parent_genre_confidence_threshold * 100)}% — ` +
+              `"${decision.genreToWrite}" will replace the existing genre tag.`}
+          {decision.outcome === "write-disabled" &&
+            'Genre writing is off in Settings — the genre tag won’t be touched.'}
+          {decision.outcome === "low-confidence" &&
+            `Genre below both the ${Math.round(confidenceThreshold * 100)}% subgenre and ` +
+              `${Math.round(taggingCfg.parent_genre_confidence_threshold * 100)}% parent thresholds — won't be written.`}
         </div>
       </div>
     </Section>

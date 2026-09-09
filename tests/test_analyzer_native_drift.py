@@ -1,4 +1,4 @@
-"""Tests for the managed-venv pre-run self-heal (WP-G2 — WSL parity).
+"""Tests for the managed-venv pre-run self-heal (parity with the WSL path).
 
 Mirrors tests/test_analyzer_wsl_drift.py's self-heal cases for the managed
 Linux/macOS venv path: `native_install.ensure_native_engine_runtime` (the
@@ -122,7 +122,8 @@ def test_ensure_reinstall_failure_passes_through_installer_trio(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """install_essentia_native's verify failure already ships a plain headline
-    (the WP-J1 clean-reinstall exhausted) — reuse it rather than re-wording."""
+    once the clean-reinstall attempt is exhausted — reuse it rather than
+    re-wording."""
     _enable_native(monkeypatch, tmp_path)
     monkeypatch.setattr(
         native_install, "_probe_native_stack_import",
@@ -338,7 +339,7 @@ def test_native_heal_failure_surfaces_clean_error_and_skips_dispatch(
 def test_native_heal_failure_uses_the_heal_results_own_trio(
     tmp_path: Path,
 ) -> None:
-    """When ensure returns headline/detail/kind (WP-H style), the analyzer must
+    """When ensure returns its own headline/detail/kind, the analyzer must
     pass them through verbatim instead of substituting its fallback."""
     (tmp_path / "x.flac").write_bytes(b"\x00")
 
