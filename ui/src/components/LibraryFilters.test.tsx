@@ -27,6 +27,7 @@ function track(
       ml_subgenre: null,
       ml_genre_confidence: null,
       ml_genre_raw_confidence: null,
+      ml_genre_audio_confidence: null,
       ml_bpm: null,
       ml_key: null,
       ml_energy: null,

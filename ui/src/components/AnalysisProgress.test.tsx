@@ -15,8 +15,9 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 
-import { AnalysisProgress } from "./AnalysisProgress";
+import { AnalysisProgress, KIND_LABELS } from "./AnalysisProgress";
 import { useOperationStore } from "../stores";
+import { OPERATION_KINDS } from "../stores/operation";
 import type { ProgressEvent } from "../types";
 
 const LONG_MESSAGE =
@@ -110,5 +111,48 @@ describe("<AnalysisProgress /> — right-anchored, fixed-width overlay", () => {
     useOperationStore.setState({ active: null, progress: null, startedAt: null });
     const { container } = render(<AnalysisProgress />);
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+/**
+ * Regression test for the audit finding "dedupe-handle has no KIND_LABELS
+ * entry": DuplicatesView calls `begin("dedupe-handle")` for the DESTRUCTIVE
+ * half of dedupe, `OperationKind` has the member, but the label table did not
+ * — so the overlay rendered the raw id "dedupe-handle" as its headline while
+ * files were being sent to the trash.
+ */
+describe("<AnalysisProgress /> — operation labels", () => {
+  it("labels the destructive dedupe pass instead of showing the raw kind", () => {
+    useOperationStore.setState({
+      active: "dedupe-handle",
+      opId: "test-op",
+      progress: { current: 1, total: 4, message: "" },
+      startedAt: Date.now(),
+      error: null,
+    });
+    render(<AnalysisProgress />);
+
+    expect(screen.getByText("Removing duplicates")).toBeInTheDocument();
+    expect(screen.queryByText("dedupe-handle")).not.toBeInTheDocument();
+  });
+
+  it("distinguishes the read-only scan from the destructive pass", () => {
+    expect(KIND_LABELS["dedupe"]).toBe("Finding duplicates");
+    expect(KIND_LABELS["dedupe-handle"]).toBe("Removing duplicates");
+    expect(KIND_LABELS["dedupe-handle"]).not.toBe(KIND_LABELS["dedupe"]);
+  });
+
+  it("has a label for every OperationKind the store can set", () => {
+    // Iterates the store's OWN runtime tuple — the one `OperationKind` is
+    // derived from — so a new kind is in this loop the moment it exists. The
+    // hand-written literal this replaced was typed `Exclude<OperationKind,
+    // null>[]`, and a SUBSET of a union satisfies that: adding a member left
+    // the list valid, unchanged and green, which is the one case the test
+    // claims to catch.
+    expect(OPERATION_KINDS.length).toBeGreaterThan(0);
+    for (const kind of OPERATION_KINDS) {
+      expect(KIND_LABELS[kind], `no label for ${kind}`).toBeTruthy();
+      expect(KIND_LABELS[kind]).not.toBe(kind);
+    }
   });
 });

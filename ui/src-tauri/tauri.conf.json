@@ -65,6 +65,9 @@
     }
   },
   "plugins": {
+    "shell": {
+      "open": "(?:[A-Za-z]:[\\\\/]|\\\\\\\\|/|mailto:|tel:|https?://).+"
+    },
     "updater": {
       "endpoints": [
         "https://github.com/captinjack99/Vibechek/releases/latest/download/latest.json"

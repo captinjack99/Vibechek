@@ -282,24 +282,41 @@ def _version(_params: dict) -> dict:
 
 
 def _scan_directory(params: dict) -> dict:
-    """List audio files under params['path']. No ML."""
+    """List audio files under params['path']. No ML.
+
+    Result: {count, files: [{path, filename, extension, size_mb, error?}]}.
+    `error` is OPTIONAL and present only on an entry we could not stat (the
+    file vanished mid-scan, or is unreadable) — `size_mb` is 0.0 there and the
+    entry is still listed rather than dropped. Consumers must treat it the way
+    the generated ScanDirectoryResult type does: absent on the happy path.
+    """
     from vibechek.utils import find_audio_files
 
     path = Path(params["path"])
     recursive = bool(params.get("recursive", True))
     files = find_audio_files(path, recursive=recursive)
-    return {
-        "count": len(files),
-        "files": [
-            {
-                "path": str(p),
-                "filename": p.name,
-                "extension": p.suffix.lower(),
-                "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
-            }
-            for p in files
-        ],
-    }
+    entries: list[dict] = []
+    for p in files:
+        entry = {
+            "path": str(p),
+            "filename": p.name,
+            "extension": p.suffix.lower(),
+            "size_mb": 0.0,
+        }
+        try:
+            entry["size_mb"] = round(p.stat().st_size / (1024 * 1024), 2)
+        except OSError as e:
+            # find_audio_files hardens the WALK against one unreadable entry so
+            # a single broken file can't abort a 12k-track scan; an unguarded
+            # stat here undid that. The whole walk finishes before this pass
+            # runs, so a sync client / DJ app deleting a file in that window
+            # raised FileNotFoundError, which _dispatch reports as
+            # INVALID_PARAMS — i.e. "the folder you picked is missing". Degrade
+            # the one file the way _scan_only already does, loudly.
+            log.warning("Could not stat %s during scan: %s", p, e)
+            entry["error"] = str(e)
+        entries.append(entry)
+    return {"count": len(entries), "files": entries}
 
 
 def _scan_only(params: dict) -> dict:
@@ -418,19 +435,75 @@ def _analyze_directory(params: dict) -> dict:
             "to restore them."
         )
 
+    auto_save = bool(params.get("auto_save", True))
+    # analyze_directory checkpoints an incremental report every 50 tracks — but
+    # ONLY when it has an output_path, and the GUI never sent one. So hours of
+    # GPU work lived solely in the sidecar's RAM and every abort path (Cancel,
+    # the stall watchdog) discarded all of it: record_analysis below is never
+    # reached, and the streamed track_analyzed records the user can see on
+    # screen are persisted nowhere. Give GUI runs a checkpoint file so the
+    # analyzer can hand the finished records back on an abort (see the except
+    # branch below). Only when we're the one persisting: an auto_save=False
+    # caller asked us not to touch library state at all.
+    out_param = params.get("output_path")
+    checkpoint_path: Path | None = None
+    if out_param:
+        output_path: Path | None = Path(out_param)
+    elif auto_save:
+        checkpoint_path = library_state.checkpoint_path_for(str(library_path))
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path = checkpoint_path
+    else:
+        output_path = None
+
     _run_started = time.monotonic()
-    report = analyze_directory(
-        library_path,
-        config=config,
-        on_progress=_emit_progress,
-        on_track=_emit_track_analyzed,
-        output_path=Path(params["output_path"]) if params.get("output_path") else None,
-        # skip/limit are counts — a negative value would slice unexpectedly.
-        skip=_nonneg_int(params.get("skip", 0), 0),
-        limit=_nonneg_int(params.get("limit") or 0, 0) or None,
-        skip_paths=skip_set,
-        tag_priors=tag_priors_map,
-    )
+    try:
+        report = analyze_directory(
+            library_path,
+            config=config,
+            on_progress=_emit_progress,
+            on_track=_emit_track_analyzed,
+            output_path=output_path,
+            # skip/limit are counts — a negative value would slice unexpectedly.
+            skip=_nonneg_int(params.get("skip", 0), 0),
+            limit=_nonneg_int(params.get("limit") or 0, 0) or None,
+            skip_paths=skip_set,
+            tag_priors=tag_priors_map,
+        )
+    except (cancellation.CancelledError, UserFacingError) as e:
+        # A cancel / stall-abort unwinds with the finished records still local
+        # to analyze_directory; it attaches what it had as `partial_report`.
+        # Persist that before re-raising so the completed tracks survive — the
+        # abort still surfaces to the caller, it just no longer costs the user
+        # every hour of analysis that DID finish.
+        partial = getattr(e, "partial_report", None)
+        if partial is not None and auto_save:
+            try:
+                # An aborted run only ever holds the tracks it actually reached,
+                # so its track list is ALWAYS a strict subset of the library —
+                # whether or not the run was incremental. Merge EVERY previously
+                # saved record back (skip_set=None), not just the ones this run
+                # was told to skip: gating this on `skip_set` meant a cancelled
+                # full re-analyze (the GUI's primary Analyze button sends no
+                # skip_paths) replaced a complete 12k-track analysis with "the
+                # 50 tracks we got through", destroying the ML results AND the
+                # user-resolved genre decisions stored alongside them.
+                partial = _reattach_skipped_records(partial, None, str(library_path))
+                # A report reached via an abort is partial by definition; stamp
+                # it so the next launch renders it as such instead of "complete".
+                partial["status"] = "in_progress"
+                library_state.record_analysis(library_path, partial)
+                # Only AFTER the merged report is safely on disk — until then
+                # the checkpoint is a copy we may still need.
+                _discard_checkpoint(checkpoint_path)
+            except Exception as persist_err:  # noqa: BLE001
+                # Keep the checkpoint file in this case — it is the only copy
+                # of the finished work left.
+                log.warning(
+                    "Could not persist the partial analysis after an abort: %s",
+                    persist_err,
+                )
+        raise
     _run_duration_sec = round(time.monotonic() - _run_started, 1)
 
     # The WSL / managed-venv routes reconcile inside the subprocess from file
@@ -480,9 +553,10 @@ def _analyze_directory(params: dict) -> dict:
     if skip_set:
         report = _reattach_skipped_records(report, skip_set, str(library_path))
 
-    if bool(params.get("auto_save", True)):
+    if auto_save:
         try:
             library_state.record_analysis(library_path, report)
+            _discard_checkpoint(checkpoint_path)
         except Exception as e:  # noqa: BLE001
             # The analyze itself SUCCEEDED (potentially 30+ min of GPU/CPU work)
             # but persisting it failed — disk full, a OneDrive/Google-Drive or
@@ -510,6 +584,17 @@ def _analyze_directory(params: dict) -> dict:
     return report
 
 
+def _discard_checkpoint(path: Path | None) -> None:
+    """Drop the in-flight checkpoint once the report it approximates is saved."""
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        # Cosmetic leftover only — the authoritative analysis is already saved.
+        log.warning("Could not remove the analyze checkpoint %s: %s", path, e)
+
+
 def _record_run_history(report: dict, config: AnalysisConfig, duration_sec: float) -> None:
     """Append a compact summary of this completed analyze run to the durable
     run-history log (`doctor`'s "last analyze run" section reads it back).
@@ -530,18 +615,27 @@ def _record_run_history(report: dict, config: AnalysisConfig, duration_sec: floa
 
 
 def _reattach_skipped_records(
-    report: dict, skip_set: set[str], library_path: str
+    report: dict, skip_set: set[str] | None, library_path: str
 ) -> dict:
     """Merge the previously saved records for skipped paths back into an
     incremental analyze report, rebuilding the summary/statistics over the
     full set.
 
     Skipped records are re-attached as-is (already final-reconciled;
-    re-reconciling would clobber user-resolved review decisions), records for
-    files that vanished from disk are dropped (preserving the GUI's
-    missing-path-means-deleted contract), and the new tracks keep whatever the
-    fresh analyze produced. Best-effort: with no previous analysis there is
-    nothing to re-attach.
+    re-reconciling would clobber user-resolved review decisions) and the new
+    tracks keep whatever the fresh analyze produced. On a COMPLETED run, records
+    for files that vanished from disk are dropped, preserving the GUI's
+    missing-path-means-deleted contract. Best-effort: with no previous analysis
+    there is nothing to re-attach.
+
+    `skip_set=None` means "re-attach every previously saved path the report
+    does not itself carry". That is the ABORT contract: an aborted report is a
+    subset of the library by construction, so a path's absence from it means
+    "we never got there", not "deleted" — the opposite of the completed-run
+    contract, where absence really does mean the file is gone. The same reading
+    applies to the disk check: on an abort a path we cannot see is UNKNOWN, not
+    deleted, because the commonest cause of an abort is the library's volume
+    going away. A run that did not finish never gets to delete results.
     """
     from vibechek import library_state  # noqa: PLC0415
     from vibechek.analyzer import _build_report  # noqa: PLC0415
@@ -570,11 +664,19 @@ def _reattach_skipped_records(
         return report
 
     new_paths = {t.get("path") for t in report.get("tracks") or []}
+    # On the COMPLETED-run contract a saved path that is no longer on disk was
+    # deleted, so it is dropped. On the ABORT contract it is only UNKNOWN: the
+    # commonest reason a run aborts is the library's volume going away (drive
+    # unplugged, NAS share dropped), and that makes every previously saved path
+    # invisible at once — the existence filter then re-attached NOTHING and the
+    # truncated partial was written over the complete saved analysis. An abort
+    # must never be able to delete results it did not produce.
+    aborted = skip_set is None
     reattached = [
         t for t in prev.get("tracks") or []
-        if t.get("path") in skip_set
+        if (aborted or t.get("path") in skip_set)
         and t.get("path") not in new_paths
-        and os.path.exists(t.get("path") or "")
+        and (aborted or os.path.exists(t.get("path") or ""))
     ]
     if not reattached:
         return report
@@ -637,6 +739,30 @@ def _engine_gpu_status(params: dict) -> dict:
     return engine_gpu_info_to_dict(info)
 
 
+def _library_longest_track_seconds(library_path: Any) -> float | None:
+    """Longest track in `library_path`, or None when we cannot measure one.
+
+    The same measurement the analyze run feeds `compute_worker_budget`, so the
+    Settings slider's max and the plan the run actually makes come from the same
+    number. Deliberately BEST-EFFORT and silent on failure: this is a slider
+    hint, and a library that is missing, unreadable or on a disconnected share
+    must answer with the flat budget (what this RPC returned before the
+    track-length term existed), never with an error the user has to dismiss
+    before they can move a slider.
+    """
+    if not library_path:
+        return None
+    from vibechek import resources as _resources  # noqa: PLC0415
+    from vibechek.utils import find_audio_files  # noqa: PLC0415
+
+    try:
+        files = find_audio_files(Path(str(library_path)))
+    except (OSError, ValueError) as e:
+        log.debug("worker_budget: could not scan %s: %s", library_path, e)
+        return None
+    return _resources.probe_longest_track_seconds(files)
+
+
 def _worker_budget(params: dict) -> dict:
     """Compute the effective worker plan for (engine × genre_classifier × the
     MEASURED environment) so the Settings slider binds its max to what actually
@@ -649,11 +775,21 @@ def _worker_budget(params: dict) -> dict:
     back to the host total and say so via `ram_pool`. GPU sizing is intentionally
     skipped here (the slider max is RAM/core-bound); the GPU split is a run-time
     concern surfaced separately by `engine_gpu_status`.
+
+    Measures the RIGHT LIBRARY too, when the GUI names one via `library_path`. A
+    worker holds its whole track decoded, so the per-worker budget is only flat
+    for a library of singles — the analyze run probes the longest track and sizes
+    against it (analyzer.py). Without the same probe here the two halves of the
+    shared model disagree by construction: on a set-heavy library the slider
+    offered 8 while the run planned 6, which is the exact class of bug this
+    shared model exists to prevent. `library_path` is optional and best-effort:
+    an absent, missing or unreadable library falls back to the flat budget, which
+    is what this RPC always answered before.
     """
     import dataclasses
 
-    from vibechek.resources import compute_worker_budget, detect
-    from vibechek.wsl import IS_WINDOWS, wsl_vm_memory_mb
+    from vibechek.resources import _MEASURE_AVAILABLE, compute_worker_budget, detect
+    from vibechek.wsl import IS_WINDOWS, wsl_vm_available_mb, wsl_vm_memory_mb
 
     engine = _valid_engine(params.get("engine"))
     genre_classifier = _valid_genre_classifier(params.get("genre_classifier"))
@@ -664,6 +800,8 @@ def _worker_budget(params: dict) -> dict:
     cpu = res.cpu_count
     ram_pool = "host"
     under_wsl = False
+    # Default: let the budget measure THIS process's free RAM (the host pool).
+    available_mb: int | None | Any = _MEASURE_AVAILABLE
 
     # essentia_tf/onnx on Windows route through WSL — measure the VM, not the host.
     if IS_WINDOWS and engine in ("essentia_tf", "onnx"):
@@ -673,6 +811,16 @@ def _worker_budget(params: dict) -> dict:
             total_ram_mb = vm_mb
             ram_pool = "wsl_vm"
             under_wsl = True
+            # The run happens INSIDE the VM and always feeds the budget its own
+            # psutil availability, so leaving this unmeasured made the slider
+            # skip the availability cap and offer a worker count the run then
+            # silently reduced ("8" on the slider, 5 planned). The budget
+            # refuses to measure a wsl_vm pool from here — correctly, this
+            # process sees the HOST — so read the VM's own free RAM out of the
+            # same cached `free -m` the total came from. None (old procps, probe
+            # failure) means "couldn't measure it", which skips the cap exactly
+            # as it did before.
+            available_mb = wsl_vm_available_mb(distro)
         # else: no distro or probe failed → keep the host total (ram_pool="host").
 
     budget = compute_worker_budget(
@@ -684,6 +832,9 @@ def _worker_budget(params: dict) -> dict:
         under_wsl=under_wsl,
         use_gpu="off",  # slider max is RAM/core-bound; GPU split is run-time only
         ram_pool=ram_pool,
+        available_mb=available_mb,
+        longest_track_seconds=_library_longest_track_seconds(
+            params.get("library_path")),
     )
     return dataclasses.asdict(budget)
 
@@ -880,12 +1031,23 @@ def _find_duplicates(params: dict) -> dict:
         ),
         0.95,
     )
+    # Same seam guard as _handle_duplicates: this call only SCANS, but the
+    # config it builds carries the destructive fields, so a bad value is worth
+    # rejecting before a 12k-track scan rather than after. The action itself is
+    # always validated here. The review folder is NOT: it is only read by `move`
+    # (see _dedupe_review_folder), so it is checked only on a move-scan carrying
+    # a non-empty value — a stale relative path in Settings used to block a scan
+    # that never looks at the field. So the early-warning promise now covers
+    # exactly that one case; a move-scan that omits the key entirely still
+    # builds review_folder=None here and only fails at the move itself, which is
+    # what the pre-guard code did too.
+    action = _validated_dedupe_action(params.get("action", "report"))
     config = DuplicateConfig(
         use_md5=bool(params.get("use_md5", True)),
         use_chromaprint=bool(params.get("use_chromaprint", True)),
         chromaprint_similarity_threshold=threshold,
-        action=params.get("action", "report"),
-        review_folder=Path(params["review_folder"]) if params.get("review_folder") else None,
+        action=action,
+        review_folder=_dedupe_review_folder(params, action),
         # Variant awareness (see DuplicateConfig). Safe defaults: keep distinct
         # versions, collapse to the single best encoding within a version.
         keep_distinct_versions=bool(params.get("keep_distinct_versions", True)),
@@ -913,15 +1075,338 @@ def _find_duplicates(params: dict) -> dict:
     return report.to_dict()
 
 
+def _validated_dedupe_action(raw: Any) -> str:
+    """The dedupe action, or InvalidParams.
+
+    An unknown value used to reach `DuplicateAction(config.action)` deep inside
+    duplicates.py and surface as INTERNAL_ERROR + a full traceback — a caller
+    mistake reported as a server fault.
+    """
+    from vibechek.duplicates import DuplicateAction  # noqa: PLC0415
+
+    action = str(raw).strip().lower()
+    valid = {a.value for a in DuplicateAction}
+    if action not in valid:
+        raise InvalidParams(
+            f"Unknown dedupe action {action!r}. Expected one of: "
+            f"{', '.join(sorted(valid))}."
+        )
+    return action
+
+
+def _validated_review_folder(raw: Any) -> Path:
+    """The absolute folder duplicates get moved into, or InvalidParams.
+
+    _plan_organization / _organize both fail fast via validate_organize_target
+    because "the sidecar is the enforcement point"; the equally destructive
+    dedupe-move path had no guard at all. The GUI's only check accepts anything
+    containing a slash, so "dupes/review" got through — and a RELATIVE Path
+    resolves against the sidecar's working directory, so the files leave the
+    library, the summary reports a clean "moved: N", and the journal records a
+    relative dst that makes even the one-click undo CWD-dependent.
+    """
+    text = str(raw).strip()
+    if not text:
+        raise InvalidParams(
+            "Moving duplicates to review needs a review folder."
+        )
+    folder = Path(text)
+    if not folder.is_absolute():
+        raise InvalidParams(
+            f"Review folder must be an absolute path. Got: {text!r}. A relative "
+            "path resolves against Vibechek's working directory, not your "
+            "library, so the duplicates would land somewhere you can't find "
+            "them. Type the full path (e.g. C:\\Music\\dupes on Windows, "
+            "/Users/you/Music/dupes on macOS) or click the folder picker."
+        )
+    return folder.resolve()
+
+
+def _dedupe_review_folder(params: dict, action: str) -> Path | None:
+    """The validated review folder for `action`, or None when it is irrelevant.
+
+    Only `move` reads the review folder; `report` and `trash` ignore it
+    entirely. Validating it for EVERY action meant a stale relative value left
+    in the Settings field — which the GUI forwards unconditionally, its own
+    trim/looks-like-a-path check running only for `move` — hard-blocked a plain
+    Trash with "Review folder must be an absolute path": an operation that
+    never touches that folder, and that used to work.
+    """
+    if action != "move":
+        return None
+    raw = params.get("review_folder")
+    return _validated_review_folder(raw) if raw else None
+
+
+def _path_key(raw: Any) -> str:
+    """Case/separator-normalized key for matching a path against a saved record.
+
+    The same file reaches us spelled several ways — `D:/Music/a.mp3` from the
+    GUI's folder picker, a backslash-spelled one from a filesystem walk, and
+    Windows compares the two case-insensitively. A bare `==` therefore matches
+    NOTHING in the common case, which for _prune_analysis_after_dedupe means
+    silently leaving behind the ghost rows it exists to remove.
+    """
+    return os.path.normcase(os.path.normpath(str(raw)))
+
+
+def _rewrite_analysis_tracks(
+    report: dict, removed: set[str], moved: dict[str, str],
+) -> int:
+    """Drop `removed` track rows and re-point `moved` ones, in place.
+
+    Returns how many rows changed (0 means "don't bother rewriting the file").
+    """
+    tracks = report.get("tracks")
+    if not isinstance(tracks, list):
+        return 0
+    kept: list[Any] = []
+    changed = 0
+    for t in tracks:
+        # A hand-edited / older report can carry wrong-shape rows; leave them
+        # exactly as found rather than crashing post-dedupe housekeeping.
+        if not isinstance(t, dict) or not t.get("path"):
+            kept.append(t)
+            continue
+        key = _path_key(t["path"])
+        if key in removed:
+            changed += 1
+            continue
+        dst = moved.get(key)
+        if dst is not None:
+            t["path"] = dst
+            # `filename` is a STORED field, not derived from `path`, and the
+            # move renames a colliding duplicate ("a.mp3" -> "a (1).mp3"), so a
+            # stale one desyncs every basename-keyed lookup (count_new_tracks
+            # matches on basenames precisely so a moved library still reads).
+            if "filename" in t:
+                t["filename"] = Path(dst).name
+            changed += 1
+        kept.append(t)
+    if not changed:
+        return 0
+    report["tracks"] = kept
+    summary = report.get("summary")
+    if isinstance(summary, dict):
+        # Counts that no longer describe the rows beneath them are how a
+        # "1,200 tracks" header ends up over a 1,150-row list.
+        if "total_files" in summary:
+            summary["total_files"] = len(kept)
+        # Use the analyzer's OWN rule, not a local "has an ml_analysis dict":
+        # a decode/embedding failure leaves `error` unset and `ml_analysis` a
+        # truthy {"ml_error": …}, so the loose rule counted failures as
+        # analyzed. `_build_report` was fixed; this post-dedupe recompute kept
+        # the old rule and fed the drifted number to refresh_record_counts, so
+        # the recents index quietly re-inflated `analyzed_count`. And `errors`
+        # was never recomputed at all — it still described the pre-dedupe rows.
+        from vibechek.analyzer import _record_failed  # noqa: PLC0415
+
+        rows = [t for t in kept if isinstance(t, dict)]
+        if "analyzed" in summary:
+            summary["analyzed"] = sum(
+                1 for t in rows if t.get("ml_analysis") and not _record_failed(t)
+            )
+        if "errors" in summary:
+            summary["errors"] = sum(1 for t in rows if _record_failed(t))
+    return changed
+
+
+def _split_moves_by_root(
+    moved: dict[str, str], library_root: Any,
+) -> tuple[dict[str, str], set[str]]:
+    """Partition `moved` into (landed inside `library_root`, left it).
+
+    The saved analysis describes ONE library. Re-pointing a row at a destination
+    outside that library's root keeps a track in the analysis that is no longer
+    in the library — and organize plans every row it finds, with no containment
+    filter, so the next Preview/Execute files them straight back in. That is how
+    a dedupe "Move to review" into `D:\\Dupes` got undone: 300 quarantined
+    duplicates re-pathed, then organized back under `D:\\Music\\<Genre>\\` where
+    they no longer even collide with their keepers. A row whose file left the
+    library leaves the analysis instead.
+
+    A blank/unknown root can't decide containment, so everything is treated as
+    inside — the behaviour before this split existed.
+    """
+    if not str(library_root or "").strip():
+        return dict(moved), set()
+    root = _path_key(library_root)
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    inside: dict[str, str] = {}
+    outside: set[str] = set()
+    for src, dst in moved.items():
+        if _path_key(dst).startswith(prefix):
+            inside[src] = dst
+        else:
+            outside.add(src)
+    return inside, outside
+
+
+def _sync_saved_analysis_paths(
+    removed: set[str], moved: dict[str, str], library_path: Any, what: str,
+    *, drop_moves_outside_root: bool = False,
+) -> None:
+    """Apply a filesystem change to the SAVED analysis JSON of the library.
+
+    `removed` / `moved` are keyed by `_path_key`.
+
+    `drop_moves_outside_root` treats a destination OUTSIDE the library's own
+    root as a REMOVAL rather than a re-path — the file left the library, so its
+    row leaves the analysis (see `_split_moves_by_root`). Dedupe sets it: a
+    quarantined duplicate is redundant with the keeper row that stays behind,
+    and keeping it is what let the next organize file it back in. Organize does
+    NOT: a user who deliberately organizes into a target outside their library
+    has moved their whole library there, and dropping every row would throw away
+    the entire ML analysis with nothing to replace it.
+
+    Deliberately BEST-EFFORT: the
+    destructive step has already succeeded by the time we get here, so a
+    locked/corrupt analysis is logged loudly and the op still returns its
+    result. Turning housekeeping into a failed handler would tell the user
+    nothing happened when their files really moved.
+    """
+    if not removed and not moved:
+        return
+
+    from vibechek import library_state  # noqa: PLC0415
+
+    state = library_state.load_state()
+    explicit = str(library_path or "").strip()
+    if explicit:
+        records = [r for r in state.recent if r.path == explicit]
+    else:
+        # No library_path from this client. The GUI sends one now, but the CLI
+        # and older builds don't, so the inference stays: a file we just trashed
+        # or moved can only be a ghost in a saved analysis whose library
+        # CONTAINS it, so match by ancestry — exact, and it correctly hits both
+        # rows when the user has nested libraries in recents.
+        touched = [*removed, *moved]
+        records = [
+            r for r in state.recent
+            if any(k.startswith(_path_key(r.path) + os.sep) for k in touched)
+        ]
+
+    for record in records:
+        rewritten: dict | None = None
+        # Decided PER RECORD: containment is relative to the library whose
+        # analysis we are about to rewrite, and the ancestry fallback above can
+        # legitimately return two nested libraries.
+        if drop_moves_outside_root:
+            repathed, left_library = _split_moves_by_root(moved, record.path)
+            record_removed = removed | left_library
+        else:
+            repathed, record_removed = moved, removed
+        try:
+            # Same lock resolve_genre_conflicts / import_tag_priors take: all
+            # of them do a whole-report load -> mutate -> save, and the last
+            # writer would otherwise silently discard the others' work.
+            with library_state.analysis_mutation(record) as report:
+                if not report:
+                    continue
+                if _rewrite_analysis_tracks(report, record_removed, repathed):
+                    library_state.save_analysis(record, report)
+                    rewritten = report
+        except (library_state.AnalysisUnreadable, OSError) as e:
+            log.warning(
+                "Could not sync the saved analysis for %s after %s (%s) — "
+                "reload the library or re-analyze to clear stale rows",
+                record.path, what, e,
+            )
+            continue
+        if rewritten is None:
+            continue
+        # OUTSIDE the analysis lock (refresh_record_counts takes _STATE_LOCK;
+        # holding both at once is the deadlock the two-lock split exists to
+        # avoid). save_analysis deliberately leaves the recents index alone, so
+        # after a dedupe prune drops rows the index row still advertises the
+        # pre-prune "1,200 tracks" on the startup screen. Best-effort like the
+        # rewrite above: the files are already gone, so a failed index touch is
+        # logged, not raised.
+        try:
+            library_state.refresh_record_counts(record, rewritten)
+        except OSError as e:
+            log.warning(
+                "Could not refresh the recent-libraries counts for %s after %s "
+                "(%s) — the track count shown on the startup screen stays stale "
+                "until the next analyze",
+                record.path, what, e,
+            )
+
+
+def _sync_saved_analysis_after_organize(stats: Any, params: dict) -> None:
+    """Re-point the saved analysis at where organize actually put the files.
+
+    Sibling of the dedupe prune, and the cause named in _resolve_genre_conflicts'
+    "none of the selected tracks are in the saved analysis" branch: organize
+    moves the files and the GUI store follows them in memory, but the analysis
+    JSON on disk keeps its PRE-move paths. Reload the library and every path
+    misses — approvals, tag writes and a second organize all silently match
+    nothing. dry-run never reaches here (moved_pairs is empty).
+    """
+    moved: dict[str, str] = {}
+    for pair in getattr(stats, "moved_pairs", None) or []:
+        if len(pair) == 2 and all(pair):
+            moved[_path_key(pair[0])] = str(pair[1])
+    _sync_saved_analysis_paths(set(), moved, params.get("library_path"), "organize")
+
+
+def _prune_analysis_after_dedupe(summary: dict, params: dict) -> None:
+    """Sync the SAVED analysis JSON with what the dedupe just did on disk.
+
+    handle_duplicates acts on the filesystem; the analysis JSON is what the GUI
+    reloads on the next launch. Leave them out of step and every trashed
+    duplicate comes back as a ghost row pointing at a file that no longer
+    exists — and every moved one keeps its pre-move path, so tagging, organize
+    and the conflict queue all miss it.
+
+    Reads the per-file lists duplicates.handle_duplicates reports —
+    `deleted_paths` (trash branch) and `moved_pairs` (move branch) — via `.get`
+    so an older sidecar/summary without them is a no-op rather than a crash.
+
+    The write itself (recents lookup, lock, best-effort failure) is shared with
+    the organize path — see `_sync_saved_analysis_paths`.
+    """
+    deleted = summary.get("deleted_paths") or []
+    removed = {_path_key(p) for p in deleted if p}
+    moved: dict[str, str] = {}
+    for pair in summary.get("moved_pairs") or []:
+        # Contract: [src, dst]. Skip a malformed row instead of raising.
+        if isinstance(pair, (list, tuple)) and len(pair) == 2 and all(pair):
+            moved[_path_key(pair[0])] = str(pair[1])
+    _sync_saved_analysis_paths(
+        removed, moved, params.get("library_path"), "dedupe",
+        # The review folder is normally OUTSIDE the library (`D:/Dupes`), and a
+        # row re-pointed there is a track the analysis still claims is in the
+        # library — which the next organize then files straight back in, undoing
+        # the quarantine. See `_split_moves_by_root`.
+        drop_moves_outside_root=True,
+    )
+
+
 def _handle_duplicates(params: dict) -> dict:
+    """Act on a duplicate report: report / move-to-review / trash.
+
+    Returns duplicates.handle_duplicates's summary UNTOUCHED, so its per-file
+    lists reach the GUI verbatim: `deleted_paths`, `moved_pairs` (each
+    `[src, dst]`) and `journal_incomplete` — the last says the undo journal
+    could not record everything that happened, which the GUI must show before
+    offering a one-click revert.
+
+    Optional `library_path` names the library whose saved analysis should be
+    synced afterwards; without it the library is inferred from the acted-on
+    paths. See _prune_analysis_after_dedupe.
+    """
     from vibechek.duplicates import (
         handle_duplicates,
     )
 
-    config = DuplicateConfig(
-        action=params.get("action", "report"),
-        review_folder=Path(params["review_folder"]) if params.get("review_folder") else None,
-    )
+    action = _validated_dedupe_action(params.get("action", "report"))
+    review_folder = _dedupe_review_folder(params, action)
+    if action == "move" and review_folder is None:
+        # duplicates.py raises a bare ValueError here, which _dispatch maps to
+        # INTERNAL_ERROR; it is plainly a caller error.
+        raise InvalidParams("Moving duplicates to review needs a review folder.")
+    config = DuplicateConfig(action=action, review_folder=review_folder)
     # Reconstruct the report from its dict form
     report = _rebuild_report(params["report"])
     try:
@@ -934,8 +1419,12 @@ def _handle_duplicates(params: dict) -> dict:
         partial = getattr(e, "partial_summary", None)
         if partial is not None:
             partial["cancelled"] = True
+            # A CANCELLED run still trashed/moved real files, so the saved
+            # analysis is exactly as stale as after a completed one.
+            _prune_analysis_after_dedupe(partial, params)
             return partial
         raise
+    _prune_analysis_after_dedupe(summary, params)
     return summary
 
 
@@ -977,6 +1466,38 @@ def _rebuild_report(d: dict) -> Any:
     )
 
 
+def _normalized_target_root(params: dict) -> Path | None:
+    """The organize target the validator actually blessed, or None for "default".
+
+    validate_organize_target decides on the STRIPPED value — a whitespace-only
+    string is "blank, use the default", and a leading space is trimmed off
+    before the absoluteness probe — but the config that drives the move used to
+    take the raw string. `Path("   ")` and `Path(" /Music/Sorted")` are
+    RELATIVE, so a green validation could still root the whole genre tree in the
+    sidecar's working directory. Normalize once, here, so the check and the move
+    can't diverge.
+    """
+    raw = params.get("target_root")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return Path(text) if text else None
+
+
+def _organize_library_root(params: dict) -> str | None:
+    """The authoritative library root for planning, or None to infer it.
+
+    `""` is not None, and plan_organization tests `library_root is not None`, so
+    an empty string used to mean base_dir = Path("") = "." — the sidecar's CWD.
+    Treat blank the same way target_root does: fall through to inference.
+    """
+    raw = params.get("library_path")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
 def _plan_organization(params: dict) -> dict:
     from vibechek.organizer import plan_organization, validate_organize_target
 
@@ -992,16 +1513,26 @@ def _plan_organization(params: dict) -> dict:
     config = OrganizationConfig(
         use_subgenres=bool(params.get("use_subgenres", True)),
         min_genre_size=int(params.get("min_genre_size", 10)),
-        target_root=Path(params["target_root"]) if params.get("target_root") else None,
+        target_root=_normalized_target_root(params),
     )
     analysis_data = _load_analysis_payload(params)
     # The loaded library's own root is authoritative for where the genre tree
     # goes when no explicit target is set. Without it, planning falls back to
     # guessing from the track paths, which lands one level too deep the moment
     # the library is already sorted into genre folders.
-    plan = plan_organization(
-        analysis_data, config, library_root=params.get("library_path"),
-    )
+    try:
+        plan = plan_organization(
+            analysis_data, config, library_root=_organize_library_root(params),
+        )
+    except ValueError as e:
+        # organizer refuses to GUESS a library root it can't infer — tracks
+        # spread across two drives have no common ancestor, and the old
+        # first-track's-parent fallback silently planned the whole tree inside
+        # one genre folder. It raises a finished, user-facing sentence; a plain
+        # ValueError out of a handler is INTERNAL_ERROR + a traceback at the
+        # dispatch seam, i.e. "Vibechek crashed" for what is really "pick a
+        # destination folder". Re-label it as the caller error it is.
+        raise InvalidParams(str(e)) from e
     return {
         "base_dir": str(plan.base_dir),
         "small_genres": sorted(plan.small_genres),
@@ -1011,6 +1542,16 @@ def _plan_organization(params: dict) -> dict:
             {
                 "source": str(m.source),
                 "destination": str(m.destination),
+                # The generated PlannedMove type declares these as required and
+                # the confirm-modal preview renders relative_destination;
+                # hand-building the dict without them silently shipped
+                # `undefined` to every consumer. `original_source` is the
+                # caller's OWN spelling of the path (the resolved `source` may
+                # be a different Unicode normalization), which is what a client
+                # keying its store off the plan has to match on — typed
+                # `string`, so a missing one compiles and fails only at runtime.
+                "relative_destination": m.relative_destination,
+                "original_source": m.original_source,
                 "genre": m.genre,
                 "subgenre": m.subgenre,
                 "reason": m.reason,
@@ -1035,7 +1576,7 @@ def _organize(params: dict) -> dict:
     config = OrganizationConfig(
         use_subgenres=bool(params.get("use_subgenres", True)),
         min_genre_size=int(params.get("min_genre_size", 10)),
-        target_root=Path(params["target_root"]) if params.get("target_root") else None,
+        target_root=_normalized_target_root(params),
     )
     analysis_data = _load_analysis_payload(params)
     try:
@@ -1044,8 +1585,14 @@ def _organize(params: dict) -> dict:
             config,
             on_progress=_emit_progress,
             dry_run=bool(params.get("dry_run", False)),
-            library_root=params.get("library_path"),
+            library_root=_organize_library_root(params),
         )
+    except ValueError as e:
+        # Same seam as _plan_organization: an un-inferable library root (mixed
+        # drives) is a caller problem with a written-out fix, not a server
+        # fault. Listed BEFORE CancelledError only for readability — the two
+        # hierarchies are disjoint (CancelledError is a RuntimeError).
+        raise InvalidParams(str(e)) from e
     except cancellation.CancelledError as e:
         # A cancelled organize has usually already moved SOME files and written a
         # revert journal. Surface those partial stats (incl. journal_path) as a
@@ -1056,8 +1603,12 @@ def _organize(params: dict) -> dict:
         if partial is not None:
             result = asdict(partial)
             result["cancelled"] = True
+            # A CANCELLED organize has still moved real files — the saved
+            # analysis is exactly as stale as after a completed one.
+            _sync_saved_analysis_after_organize(partial, params)
             return result
         raise
+    _sync_saved_analysis_after_organize(stats, params)
     return asdict(stats)
 
 
@@ -1507,17 +2058,62 @@ def _get_config(_params: dict) -> dict:
     defaults. Without this the GUI renders a silently-reverted default as if the
     user chose it — Settings shows a one-time "some saved settings were invalid
     and reset" toast off this list.
+
+    Also attaches `load_failed: true` when the config file EXISTS but could not
+    be read. That is categorically worse than a snapped-back value: the payload
+    below is FACTORY DEFAULTS standing in for settings that are still on disk,
+    so a client that treats it as the user's baseline will autosave those
+    defaults straight over them. useConfigPersistence reads this flag to hold
+    its debounced autosave; the key is omitted entirely on the healthy path.
     """
     cfg = VibechekConfig.load()
     payload = _config_to_jsonable(cfg)
     warnings = getattr(cfg, "load_warnings", None)
     if warnings:
         payload["config_warnings"] = list(warnings)
+    if getattr(cfg, "load_failed", False):
+        payload["load_failed"] = True
     return payload
 
 
+def _config_load_failure() -> VibechekConfig | None:
+    """The on-disk config's load-failure marker, or None when it reads fine.
+
+    `VibechekConfig.save()` refuses to overwrite the file THAT INSTANCE failed
+    to load — a guard that only fires on a load -> mutate -> save round trip.
+    Every config the RPC writes is built from the CLIENT's dict instead
+    (`_from_dict`), so it carries no marker at all and save()'s guard is
+    structurally blind to this path: the GUI's debounced autosave would happily
+    flatten an unreadable config.json with factory defaults. Ask disk directly.
+    """
+    cfg = VibechekConfig.load()
+    return cfg if getattr(cfg, "load_failed", False) else None
+
+
+def _adopt_load_failure(cfg: VibechekConfig, failed: VibechekConfig | None) -> None:
+    """Copy a load-failure marker onto a client-built config before a forced save.
+
+    Without this, `save(force=True)` sees no marker, skips the quarantine
+    branch, and the unreadable bytes are gone for good. With it, the original
+    file is renamed aside as `<name>.corrupt-<timestamp>` first — which is the
+    whole point of making "overwrite anyway" an explicit choice.
+    """
+    if failed is None:
+        return
+    cfg.load_failed = True
+    cfg.load_failed_path = failed.load_failed_path
+    cfg.load_failed_reason = failed.load_failed_reason
+
+
 def _save_config(params: dict) -> dict:
-    """Persist a VibechekConfig dict to disk. Returns the saved file path."""
+    """Persist a VibechekConfig dict to disk. Returns the saved file path.
+
+    Refuses (INVALID_PARAMS) when the file on disk exists but can't be read,
+    unless `force` is set — see `_config_load_failure`. The refusal is raised
+    HERE rather than left to `VibechekConfig.save()`'s ConfigSaveRefused so the
+    user gets exactly one error for one cause; save()'s own guard stays as the
+    library-level backstop for load->mutate->save callers.
+    """
     data = params.get("config", {})
     # Guard the payload type explicitly: a non-dict (list/str/number) would hit
     # `_from_dict`'s `.get(...)` and raise AttributeError, which the dispatcher
@@ -1525,15 +2121,33 @@ def _save_config(params: dict) -> dict:
     # payload is a caller bug, so surface it as INVALID_PARAMS instead.
     if not isinstance(data, dict):
         raise InvalidParams("'config' must be an object")
+    force = bool(params.get("force"))
+    failed = _config_load_failure()
+    if failed is not None and not force:
+        raise InvalidParams(
+            "The saved settings file could not be read; refusing to overwrite "
+            f"it. Fix or remove {failed.load_failed_path} first."
+        )
     cfg = VibechekConfig._from_dict(data)
-    path = cfg.save()
+    if force:
+        _adopt_load_failure(cfg, failed)
+    path = cfg.save(force=force)
     return {"saved_to": str(path)}
 
 
 def _restore_default_config(_params: dict) -> dict:
-    """Reset config to defaults and save."""
+    """Reset config to defaults and save.
+
+    This IS the deliberate "overwrite it anyway" path for an unreadable config
+    (ConfigSaveRefused names it), so it never refuses — but it must still adopt
+    the load-failure marker so save() quarantines the unreadable bytes as
+    `<name>.corrupt-<timestamp>`. A bare `VibechekConfig().save()` carries no
+    marker, so the branch never ran and the user's only copy of their settings
+    was destroyed by the button that promises to hand it back.
+    """
     cfg = VibechekConfig()
-    path = cfg.save()
+    _adopt_load_failure(cfg, _config_load_failure())
+    path = cfg.save(force=True)
     return {"saved_to": str(path), "config": _config_to_jsonable(cfg)}
 
 
@@ -1623,20 +2237,47 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _optional_onnx_filenames() -> set[str]:
+    """ONNX files `download-models` fetches BEST-EFFORT, so their absence is not
+    a broken install.
+
+    Authoritative source is model_download.py's own `required` expression in
+    `_download_onnx_set`: a head's `.onnx` weights are required except
+    `genre_discogs400.onnx` (the backbone already emits genre), and a head's
+    class-label `.json` is required only for `genre_discogs400` (without those
+    400 labels the engine loads "ready" and silently emits no genre).
+
+    Mirrors `vibechek.cli._optional_onnx_filenames`; a test pins the two
+    together so they cannot drift.
+    """
+    from vibechek.analyzer import _ONNX_HEAD_STEMS
+
+    optional = {"genre_discogs400.onnx"}
+    optional.update(
+        f"{stem}.json" for stem in _ONNX_HEAD_STEMS if stem != "genre_discogs400"
+    )
+    return optional
+
+
 def _verify_models(params: dict) -> dict:
     """Verify the downloaded model files' SHA256 against the pinned table.
 
-    Engine-aware: the ONNX engine stages its heads + backbone under
-    ``<models>/onnx`` and never downloads the essentia ``.pb`` set, so verifying
-    the flat ``.pb``/``.json`` files for an ONNX-only install would report every
-    file "missing" (a false alarm) while never integrity-checking the ``.onnx``
-    files the analyze pipeline actually loads. We pick the file set from the
-    active engine (``params['engine']`` if given, else config.inference_engine).
+    Engine-aware: the ONNX-family engines (``onnx`` AND ``native``, which runs
+    the same ONNX bundle through the native venv) stage their heads + backbone
+    under ``<models>/onnx`` and never download the essentia ``.pb`` set, so
+    verifying the flat ``.pb``/``.json`` files for such an install would report
+    every file "missing" (a false alarm) while never integrity-checking the
+    ``.onnx`` files the analyze pipeline actually loads. `native` is the Windows
+    default, so leaving it out of this branch false-alarmed the whole default
+    platform. We pick the file set from the active engine (``params['engine']``
+    if given, else config.inference_engine).
 
     Returns {"results": [{name, suffix, ok, expected, computed}, ...], "engine": ...}.
     `ok=True` for files matching the pinned digest, `ok=None` for files we have
     no pin for yet (the essentia table is populated on the release build),
-    `ok=False` for actual mismatches or missing required files.
+    `ok=False` for actual mismatches or missing required files. The ONNX
+    backbone IS pinned (`model_download.BACKBONE_ONNX_SHA256`) and is checked
+    like every other file — it is the first thing the ONNX stack loads.
     """
     from vibechek.config import MODELS_DIR
 
@@ -1646,12 +2287,13 @@ def _verify_models(params: dict) -> dict:
 
     results: list[dict] = []
 
-    if engine == "onnx":
+    if engine in ("onnx", "native"):
         from vibechek.analyzer import (
             _ONNX_HEAD_STEMS,
             _ONNX_SUBDIR,
             MODEL_SHA256_ONNX,
         )
+        from vibechek.model_download import BACKBONE_ONNX_SHA256
         from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
 
         onnx_dir = MODELS_DIR / _ONNX_SUBDIR
@@ -1661,10 +2303,30 @@ def _verify_models(params: dict) -> dict:
             filenames.append(f"{stem}.onnx")
             filenames.append(f"{stem}.json")
 
+        # The backbone's pin lives in model_download (it is FETCHED from
+        # upstream, not converted here by scripts/convert_heads_to_onnx.py), so
+        # it is deliberately absent from MODEL_SHA256_ONNX. Looking it up there
+        # therefore always missed, and the GUI integrity check reported the one
+        # file the whole ONNX stack loads first as "no pin" — the tamper check
+        # it exists for never ran on it. cli.py's verify-models already uses the
+        # real pin; this table makes the two agree.
+        pins = {**MODEL_SHA256_ONNX, BACKBONE_ONNX_FILENAME: BACKBONE_ONNX_SHA256}
+        optional = _optional_onnx_filenames()
+
         for fname in filenames:
             path = onnx_dir / fname
-            expected = MODEL_SHA256_ONNX.get(fname)
+            expected = pins.get(fname)
             if not path.exists():
+                if fname in optional:
+                    # download-models fetches these best-effort and does not
+                    # error when they fail, so calling them missing here told a
+                    # healthy install it was broken. ok=None (not False) keeps
+                    # them out of the GUI's failure count.
+                    results.append({
+                        "name": fname, "suffix": "onnx", "ok": None,
+                        "reason": "optional-missing",
+                    })
+                    continue
                 results.append({
                     "name": fname, "suffix": "onnx", "ok": False,
                     "reason": "missing",
@@ -1672,12 +2334,13 @@ def _verify_models(params: dict) -> dict:
                 continue
             computed = _sha256_file(path)
             if expected is None:
-                # Backbone has no pin (fetched from essentia upstream); report
-                # informational ok=None rather than a scary failure.
+                # A head we haven't pinned yet (the conversion pass populates
+                # these); report informational ok=None rather than a scary
+                # failure. The backbone is NOT in this branch any more.
                 results.append({
                     "name": fname, "suffix": "onnx", "ok": None,
                     "computed": computed,
-                    "reason": "no pin (upstream backbone / unpinned head)",
+                    "reason": "no pin (unpinned head)",
                 })
             else:
                 results.append({
@@ -1876,8 +2539,10 @@ def _resolve_genre_conflicts(params: dict) -> dict:
     queue. This NEVER writes file tags — it only resolves the in-library review
     state; the existing apply_ml_tags flow (backup-first) writes to disk.
 
-    Returns {"ok", "updated": int, "tracks": [updated TrackAnalysis...]} so the
-    GUI can sync the exact persisted records.
+    Returns {"ok", "requested", "matched", "updated": int, "tracks": [updated
+    TrackAnalysis...]} so the GUI can sync the exact persisted records. `ok` is
+    False when NOTHING was persisted (with a `reason`): a resolve that matched
+    none of the selected paths must not look like a success.
     """
     from vibechek import library_state  # noqa: PLC0415
     from vibechek.genres import split_tag_genre  # noqa: PLC0415
@@ -1887,15 +2552,53 @@ def _resolve_genre_conflicts(params: dict) -> dict:
     for it in params.get("items") or []:
         if isinstance(it, dict) and it.get("path"):
             actions[str(it["path"])] = "revert" if it.get("action") == "revert" else "approve"
+    # Every ok:false return carries `requested`/`matched` too: the GUI reads
+    # them to word its "0 of N resolved" message, and two of the branches used
+    # to omit them — so an early refusal arrived with a DIFFERENT payload shape
+    # than a late one and those fields read as undefined.
     if not library_path or not actions:
-        return {"ok": False, "reason": "missing library_path or items", "updated": 0, "tracks": []}
+        return {"ok": False, "reason": "missing library_path or items",
+                "requested": len(actions), "matched": 0,
+                "updated": 0, "tracks": []}
 
     state = library_state.load_state()
     record = next((r for r in state.recent if r.path == library_path), None)
     if not record:
-        return {"ok": False, "reason": "library not in recents", "updated": 0, "tracks": []}
+        return {"ok": False, "reason": "library not in recents",
+                "requested": len(actions), "matched": 0,
+                "updated": 0, "tracks": []}
+    matched = 0
+    updated: list[dict] = []
+    # Serialized against import_tag_priors (and a second resolve): both do a
+    # whole-report load -> mutate -> save, and the last writer used to silently
+    # discard the other's decisions.
     try:
-        report = library_state.load_analysis(record)
+        with library_state.analysis_mutation(record) as report:
+            if not report:
+                return {"ok": False, "reason": "no saved analysis for library",
+                        "requested": len(actions), "matched": 0,
+                        "updated": 0, "tracks": []}
+
+            for t in report.get("tracks") or []:
+                if t.get("path") not in actions:
+                    continue
+                matched += 1
+                ml = t.get("ml_analysis")
+                if not ml:
+                    continue
+                if actions[t["path"]] == "revert":
+                    tag = ((t.get("existing_tags") or {}).get("genre") or "").strip()
+                    if tag:
+                        parent, sub = split_tag_genre(tag)
+                        ml["ml_genre"], ml["ml_subgenre"] = parent, sub
+                        ml["ml_genre_source"] = "tag"
+                else:
+                    ml["ml_genre_source"] = "approved"
+                ml["ml_genre_conflict"] = False
+                updated.append(t)
+
+            if updated:
+                library_state.save_analysis(record, report)
     except library_state.AnalysisUnreadable as e:
         # Don't clobber a locked/corrupt saved analysis with a partial resolve —
         # and tell the user why, so they retry once the lock clears instead of
@@ -1903,31 +2606,27 @@ def _resolve_genre_conflicts(params: dict) -> dict:
         return {"ok": False,
                 "reason": f"saved analysis is unreadable ({e.cause}) — could not "
                           "resolve; retry once any lock on it clears",
+                "requested": len(actions), "matched": 0,
                 "updated": 0, "tracks": []}
-    if not report:
-        return {"ok": False, "reason": "no saved analysis for library", "updated": 0, "tracks": []}
 
-    updated: list[dict] = []
-    for t in report.get("tracks") or []:
-        if t.get("path") not in actions:
-            continue
-        ml = t.get("ml_analysis")
-        if not ml:
-            continue
-        if actions[t["path"]] == "revert":
-            tag = ((t.get("existing_tags") or {}).get("genre") or "").strip()
-            if tag:
-                parent, sub = split_tag_genre(tag)
-                ml["ml_genre"], ml["ml_subgenre"] = parent, sub
-                ml["ml_genre_source"] = "tag"
-        else:
-            ml["ml_genre_source"] = "approved"
-        ml["ml_genre_conflict"] = False
-        updated.append(t)
+    if not updated:
+        # Nothing was written. Returning ok:true here made the GUI clear the
+        # selection and toast "Approved 0 genres" as a success — the DJ's
+        # decisions silently didn't persist. The realistic trigger is an
+        # in-place organize: the store now holds post-move paths while the saved
+        # report still holds the pre-move ones, so every path misses.
+        reason = (
+            f"none of the {len(actions)} selected tracks are in the saved "
+            "analysis — re-analyze this library after organizing it, then "
+            "resolve again"
+            if matched == 0 else
+            f"none of the {matched} matched tracks have ML analysis to resolve"
+        )
+        return {"ok": False, "reason": reason, "requested": len(actions),
+                "matched": matched, "updated": 0, "tracks": []}
 
-    if updated:
-        library_state.save_analysis(record, report)
-    return {"ok": True, "updated": len(updated), "tracks": updated}
+    return {"ok": True, "requested": len(actions), "matched": matched,
+            "updated": len(updated), "tracks": updated}
 
 
 def _import_tag_priors(params: dict) -> dict:
@@ -1962,20 +2661,6 @@ def _import_tag_priors(params: dict) -> dict:
         return {"ok": False, "reason": "library not in recents",
                 "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
     try:
-        report = library_state.load_analysis(record)
-    except library_state.AnalysisUnreadable as e:
-        # Same guard as _resolve_genre_conflicts: a locked/corrupt saved
-        # analysis must not be silently overwritten by the import, and the user
-        # deserves an actionable reason rather than "no saved analysis".
-        return {"ok": False,
-                "reason": f"saved analysis is unreadable ({e.cause}) — import "
-                          "not applied; retry once any lock on it clears",
-                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
-    if not report:
-        return {"ok": False, "reason": "no saved analysis for library",
-                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
-
-    try:
         priors = tag_priors.parse_rekordbox_collection(xml_path)
     except CdjExportError as e:
         return {"ok": False, "reason": str(e),
@@ -1986,14 +2671,35 @@ def _import_tag_priors(params: dict) -> dict:
 
     policy = _valid_genre_policy(params.get("genre_source_policy"))
     override = _clamp01(params.get("genre_ml_override_confidence", 0.90), 0.90)
-    updated, matched = tag_priors.apply_priors_to_report(report, priors, policy, override)
 
-    if updated:
-        library_state.save_analysis(record, report)
-    # Persist (merge over any earlier import) even when nothing changed NOW —
-    # the sidecar is what makes future re-analyzes keep the import.
-    merged_sidecar = {**tag_priors.load_priors(record.analysis_path), **priors}
-    tag_priors.save_priors(record.analysis_path, merged_sidecar)
+    # Serialized against resolve_genre_conflicts (and a second import): both do
+    # a whole-report load -> mutate -> save, and the last writer used to
+    # silently discard the other's work. The priors SIDECAR merge below is the
+    # same read-modify-write shape on a second file, so it rides the same lock.
+    try:
+        with library_state.analysis_mutation(record) as report:
+            if not report:
+                return {"ok": False, "reason": "no saved analysis for library",
+                        "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
+
+            updated, matched = tag_priors.apply_priors_to_report(
+                report, priors, policy, override,
+            )
+
+            if updated:
+                library_state.save_analysis(record, report)
+            # Persist (merge over any earlier import) even when nothing changed
+            # NOW — the sidecar is what makes future re-analyzes keep the import.
+            merged_sidecar = {**tag_priors.load_priors(record.analysis_path), **priors}
+            tag_priors.save_priors(record.analysis_path, merged_sidecar)
+    except library_state.AnalysisUnreadable as e:
+        # Same guard as _resolve_genre_conflicts: a locked/corrupt saved
+        # analysis must not be silently overwritten by the import, and the user
+        # deserves an actionable reason rather than "no saved analysis".
+        return {"ok": False,
+                "reason": f"saved analysis is unreadable ({e.cause}) — import "
+                          "not applied; retry once any lock on it clears",
+                "xml_tracks": 0, "matched": 0, "updated": 0, "tracks": []}
 
     return {"ok": True, "xml_tracks": len(priors), "matched": matched,
             "updated": len(updated), "tracks": updated}
@@ -2024,10 +2730,22 @@ def _revert_journal(params: dict) -> dict:
     `trashed_not_reverted`. Returns the revert summary.
     """
     from vibechek import journal
-    return journal.revert_journal(
-        Path(params["journal_path"]),
-        on_progress=_emit_progress,
-    )
+    try:
+        return journal.revert_journal(
+            Path(params["journal_path"]),
+            on_progress=_emit_progress,
+        )
+    except cancellation.CancelledError as e:
+        # Same contract as _organize / _handle_duplicates: a cancelled revert
+        # has already moved SOME files back. The GUI rewrites its in-memory
+        # track paths from `reverted_pairs`, so dropping the partial summary
+        # left the store pointing at organized paths for files that are now
+        # back at their originals — silently stale until a re-scan.
+        partial = getattr(e, "partial_summary", None)
+        if partial is not None:
+            partial["cancelled"] = True
+            return partial
+        raise
 
 
 # ---------------------------------------------------------------------------

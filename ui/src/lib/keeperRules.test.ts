@@ -79,6 +79,23 @@ describe("pickKeeper", () => {
     expect(winner).toBe(newer);
   });
 
+  it("keeps the shallower file, not the one with the shorter name", () => {
+    // The rule promises "files at the top of your library win over copies
+    // buried in subfolders", so DEPTH decides — comparing raw character length
+    // inverted it for any deeply-nested file with a terse name.
+    const deep = file({ path: "/DJ/Sets/2024/Peak/A.mp3" });          // 6 levels, 24 chars
+    const shallow = file({ path: "/Archive/Artist - Title (Extended Mix).mp3" }); // 3 levels, 42 chars
+    const rules: KeeperRule[] = [{ criterion: "shortest_path", enabled: true }];
+    expect(pickKeeper([deep, shallow], rules)).toBe(shallow);
+  });
+
+  it("uses path length as the tiebreak when two files sit at the same depth", () => {
+    const terse = file({ path: "/Music/a.mp3" });
+    const verbose = file({ path: "/Music/a (copy 2) [dupe].mp3" });
+    const rules: KeeperRule[] = [{ criterion: "shortest_path", enabled: true }];
+    expect(pickKeeper([verbose, terse], rules)).toBe(terse);
+  });
+
   it("returns the only file when given a single-element list", () => {
     const only = file({ path: "/only.mp3" });
     expect(pickKeeper([only], DEFAULT_RULES)).toBe(only);
@@ -107,13 +124,16 @@ describe("explainPick", () => {
 
   it("explains the folder-depth win in plain 'levels', not 'path segments'", () => {
     // Codec/bitrate/size/mtime all tie → shortest_path decides. The shallower
-    // path wins and the detail reads in user language.
-    const deep = file({ path: "/a/b/c/d/track.mp3" });
-    const shallow = file({ path: "/track.mp3" });
+    // path wins and the detail reads in user language. Deliberately a case
+    // where DEPTH and character length DISAGREE: the shallow winner has the
+    // longer string, so a comparator that ranked by characters would pick the
+    // other file and the assertion below would fail.
+    const deep = file({ path: "/DJ/Sets/2024/Peak/A.mp3" });          // 6 levels, 24 chars
+    const shallow = file({ path: "/Archive/Artist - Title (Extended Mix).mp3" }); // 3 levels, 42 chars
     const rules: KeeperRule[] = [{ criterion: "shortest_path", enabled: true }];
     const reason = explainPick(shallow, [deep], rules);
     expect(reason.criterion).toBe("shortest_path");
-    expect(reason.detail).toMatch(/levels/);
+    expect(reason.detail).toBe("3 levels");
     expect(reason.detail).not.toMatch(/segments/);
   });
 });

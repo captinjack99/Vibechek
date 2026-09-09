@@ -244,5 +244,13 @@ Full detail (signing, retag, troubleshooting) is in [RELEASING.md](RELEASING.md)
 | ML models (~800 MB) | `<data_dir>/Vibechek/models/` |
 | Auto-saved analyses | `<data_dir>/Vibechek/analyses/` |
 | Operation journals | `<data_dir>/Vibechek/journals/` |
-| Logs | `<data_dir>/Vibechek/logs/vibechek.log` |
+| Logs (Python sidecar) | `<data_dir>/Vibechek/logs/vibechek.log` |
+| Logs (Tauri shell) | `<data_dir>/Vibechek/logs/vibechek-shell.log` |
 | Run history (last 50 analyzes) | `<data_dir>/Vibechek/logs/run_history.jsonl` |
+
+`vibechek-shell.log` is written by the Rust shell (`ui/src-tauri/src/shell_log.rs`), not by
+`logging_setup`: 1 MB with one backup (`.log.1`), one UTC ISO-8601 timestamp per line. It holds
+sidecar spawn/exit diagnostics, relayed child stderr and Rust panics — the failures that happen on
+our side of the pipe, before the sidecar ever configures Python logging. It exists because release
+builds are Windows-GUI-subsystem, where `eprintln!` writes to a NULL stderr handle and std reports
+that as a *success*, so every shell diagnostic was silently discarded on the platform most users run.

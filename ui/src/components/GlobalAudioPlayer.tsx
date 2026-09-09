@@ -19,8 +19,17 @@ import { open as openPath } from "@tauri-apps/plugin-shell";
 import WaveSurfer from "wavesurfer.js";
 import { Play, Pause, X, AlertCircle, Loader2, Music, FolderOpen } from "lucide-react";
 
-import { usePlayerStore } from "../stores";
+import { useNotificationStore, usePlayerStore } from "../stores";
 import { ACCENT } from "../lib/colors";
+
+/** Plain text for a rejected promise — the message when there is one, the
+ *  stringified value otherwise. */
+function rejectionText(e: unknown): string {
+  if (typeof e === "object" && e !== null && "message" in e) {
+    return String((e as { message: unknown }).message);
+  }
+  return String(e);
+}
 
 function formatTime(seconds: number): string {
   if (!isFinite(seconds)) return "--:--";
@@ -190,13 +199,21 @@ export function GlobalAudioPlayer() {
 
   // Reveal the unplayable file in the OS file manager so the user can inspect it
   // (wrong codec, 0-byte, moved). Opens the CONTAINING folder via the same
-  // shell-open capability App.tsx uses for "Open install folder". Best-effort —
-  // if the opener is unavailable the "Details" text still stands on its own.
+  // shell-open capability App.tsx uses for "Open install folder".
+  //
+  // A failure here is REPORTED, not swallowed. This button is the recovery step
+  // offered when a preview won't play, so a silent no-op leaves the user with a
+  // dead control at exactly the moment something is already wrong. It goes on
+  // the notification channel rather than the operation-error one: nothing
+  // long-running failed, so ErrorToast's Retry/Restart affordances would lie.
   const handleShowInFolder = () => {
     if (!path) return;
     const folder = path.replace(/[\\/][^\\/]*$/, "") || path;
-    void openPath(folder).catch(() => {
-      /* opener unavailable — no-op */
+    void openPath(folder).catch((e: unknown) => {
+      useNotificationStore.getState().notify("Couldn't open the folder", {
+        kind: "warning",
+        detail: `${folder}\n${rejectionText(e)}`,
+      });
     });
   };
 

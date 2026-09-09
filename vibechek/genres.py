@@ -201,13 +201,38 @@ _PAREN_QUALIFIER = re.compile(r"\s*\([^()]*\)\s*$")
 
 
 def _alias_key(tag: str) -> str:
-    """Alias lookups ignore case and internal spacing; the hierarchy proper does not."""
+    """Lookups ignore case and internal spacing; the tables themselves are Title Case."""
     return " ".join(tag.split()).casefold()
 
 
 _GENRE_TAG_ALIAS_LOOKUP: dict[str, str] = {
     _alias_key(k): v for k, v in _GENRE_TAG_ALIASES.items()
 }
+
+# Case-folded index of every name the taxonomy knows → the hierarchy's own
+# spelling of it. The tables are keyed on Title Case, so a tag written "tech
+# house" or "TECH HOUSE" — routine output from Bandcamp downloads and hand-typed
+# genre fields — used to miss every lookup and fall through as its OWN top-level
+# genre: the wrong stored genre, a lost parent family (so organizer files it flat
+# instead of under `House/`), and a spurious `_genre_conflicts` hit against a
+# matching ML read. Same failure class as the "Hip-Hop"/"Hip Hop" split commit
+# 4d10dfa fixed via the alias table, one level down.
+#
+# Built keys-first so the resolved name is one the DOWNSTREAM tables can look up
+# (`DJ_GENRE_MAP` / `SUBGENRE_TO_PARENT` keys), falling back to canonical display
+# names that appear only as values.
+_GENRE_NAME_BY_KEY: dict[str, str] = {}
+for _name in (*DJ_GENRE_MAP, *GENRE_HIERARCHY, *SUBGENRE_TO_PARENT,
+              *DJ_GENRE_MAP.values()):
+    _GENRE_NAME_BY_KEY.setdefault(_alias_key(_name), _name)
+del _name
+
+
+def _canonical_genre_name(tag: str) -> str | None:
+    """The hierarchy's own spelling of `tag`, or None if it names nothing we know."""
+    if not tag:
+        return None
+    return _GENRE_NAME_BY_KEY.get(_alias_key(tag))
 
 
 def _resolve_tag_alias(tag: str) -> str:
@@ -220,8 +245,9 @@ def _resolve_tag_alias(tag: str) -> str:
     base = _PAREN_QUALIFIER.sub("", tag).strip()
     if base and base != tag:
         base = _GENRE_TAG_ALIAS_LOOKUP.get(_alias_key(base), base)
-        if base in _KNOWN_GENRE_NAMES:
-            return base
+        known = _canonical_genre_name(base)
+        if known is not None:
+            return known
     return tag
 
 
@@ -458,7 +484,7 @@ def _placeable_in_hierarchy(tag: str) -> bool:
     parent, sub = split_tag_genre(tag)
     if parent != sub:
         return True          # split found a parent, so the subgenre is known
-    return parent in _KNOWN_GENRE_NAMES
+    return _canonical_genre_name(parent) is not None
 
 
 def _is_playlist_phrase(tag: str) -> bool:
@@ -505,8 +531,11 @@ def split_tag_genre(tag: str) -> tuple[str, str]:
 
     A known spelling variant ('Hip-Hop', 'Techno (Peak Time / Driving)') is
     rewritten to the hierarchy's own name for it first — see `_GENRE_TAG_ALIASES`.
+    Case and internal spacing are ignored throughout: 'tech house' names the same
+    genre as 'Tech House' and must not become a second one.
     """
     t = _resolve_tag_alias((tag or "").strip())
+    t = _canonical_genre_name(t) or t
     canon = DJ_GENRE_MAP.get(t, t)
     if canon in SUBGENRE_TO_PARENT:
         parent = SUBGENRE_TO_PARENT[canon]

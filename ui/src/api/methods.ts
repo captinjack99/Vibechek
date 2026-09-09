@@ -22,7 +22,11 @@
 
 import type {
   AnalysisReport,
+  ApplyStats,
+  BackupStats,
   DuplicateReport,
+  RemapRestoreStats,
+  RestoreStats,
   VibechekConfig,
 } from "../types";
 
@@ -30,8 +34,10 @@ import type {
 // for both the params and the result shape in one place.
 export type {
   AnalysisReport,
+  ApplyStats,
   BackupHistory,
   BackupRecord,
+  BackupStats,
   DuplicateReport,
   EngineGpuInfo,
   LibraryState,
@@ -39,6 +45,8 @@ export type {
   OrganizePlan,
   OrganizeStats,
   PreflightResult,
+  RemapRestoreStats,
+  RestoreStats,
   SystemResources,
   VibechekConfig,
   WorkerBudget,
@@ -154,6 +162,16 @@ export interface WorkerBudgetRequest {
   workers?: number;
   /** Usable WSL distro (from preflight) so the VM RAM pool is measured. */
   distro?: string | null;
+  /**
+   * The loaded library's root, when there is one. The run sizes per-worker RAM
+   * from the longest track it finds under this path (a 90-minute set holds far
+   * more decoded audio than a library of singles), so without it the slider
+   * reports the flat-budget maximum while the run plans fewer workers — the
+   * exact slider/run divergence this shared budget model exists to prevent.
+   * Omitted when no library is loaded; the backend then falls back to the flat
+   * budget.
+   */
+  library_path?: string;
 }
 
 export interface PreflightRequest {
@@ -262,6 +280,12 @@ export interface ScanDirectoryResult {
     filename: string;
     extension: string;
     size_mb: number;
+    /** Set when the file was found by the walk but could not be stat'd (moved
+     *  or locked between the walk and the size pass, permissions). The entry is
+     *  still counted, with `size_mb` left at 0 — see `_scan_directory` in
+     *  vibechek/rpc.py. Callers that summarise a scan must surface it; a
+     *  silently-zero size reads as a 0-byte file. */
+    error?: string;
   }>;
 }
 
@@ -333,6 +357,48 @@ export interface HandleDuplicatesRequest {
   /** "report" | "move" | "trash". */
   action?: string;
   review_folder?: string | null;
+  /**
+   * The library whose SAVED analysis the sidecar should sync after acting
+   * (`vibechek/rpc.py::_prune_analysis_after_dedupe`). Send the loaded library
+   * path whenever there is one: without it the sidecar has to INFER the library
+   * by testing whether a recents entry is an ancestor of the acted-on files,
+   * which is a guess — it misses a library recorded under a different spelling
+   * of the same folder, and can touch a second, nested library's analysis too.
+   */
+  library_path?: string;
+}
+
+/**
+ * What `handle_duplicates` returns.
+ *
+ * Typed as a bare `Record<string, number>` until now, which structurally HID
+ * every non-numeric key the handler has always sent: the per-file failure list,
+ * the journal path, the cancellation flag. The index signature stays (the
+ * counters are open-ended: `moved`, `deleted`, `errors`, `skipped`…) but every
+ * key the UI actually reads is declared.
+ */
+export interface HandleDuplicatesResult extends Record<string, unknown> {
+  /** Files moved to the review folder (0 for a trash run). */
+  moved?: number;
+  /** Files sent to the OS trash (0 for a move run). */
+  deleted?: number;
+  /** Count of files the sidecar could not act on. */
+  errors?: number;
+  /** One line per failure, formatted "<path>: reason". */
+  error_messages?: string[];
+  /** Undo journal for a move run (absent for trash — the OS bin is the undo). */
+  journal_path?: string | null;
+  /** `_handle_duplicates` RESOLVES rather than rejects on cancellation, so a
+   *  user-cancelled partial batch arrives as a normal payload with this set. */
+  cancelled?: boolean;
+  /** The sidecar could not record every action in the journal, so an undo puts
+   *  back only part of the run. */
+  journal_incomplete?: boolean;
+  /** The files actually deleted / moved, by path — authoritative, where the
+   *  counts above only allow the caller to GUESS which files were touched.
+   *  Optional: a sidecar that predates them sends neither. */
+  deleted_paths?: string[];
+  moved_pairs?: [string, string][];
 }
 
 // --- organize ---
@@ -417,53 +483,37 @@ export interface RestoreTagsWithRemapRequest {
   library_root: string;
 }
 
-/** Shared shape for the four tag-related result payloads (dataclass.asdict). */
-export interface TagApplyStats {
-  total: number;
-  genre_applied: number;
-  genre_skipped_low_confidence: number;
-  other_tags_applied: number;
-  errors: string[];
+/**
+ * The four tag-related result payloads.
+ *
+ * These are ALIASES of the codegen'd dataclass types (types/generated.ts), not
+ * hand copies. They used to be re-declared field-by-field here, which is how
+ * `genre_applied_parent_only` and `not_fully_backed_up` sat on the wire for
+ * releases without the UI ever reading them. `vibechek.tagger` is discovered by
+ * the TS codegen now (scripts/generate_ts_types.py `all_dataclass_modules()`),
+ * so drift is a compile error rather than something only review could catch.
+ *
+ * The `Tag*` names are kept because every call site imports them.
+ */
+export type TagApplyStats = ApplyStats;
+export type TagBackupStats = BackupStats;
+export type TagRestoreStats = RestoreStats;
+
+/** One row of `RemapRestoreStats.matches`. The Python field is `list[dict]`, so
+ *  the generator can only emit `Record<string, unknown>[]` — this is the only
+ *  part of the payload the codegen cannot describe, and the renderer needs the
+ *  field names. Everything else comes from the generated type. */
+export interface RemapMatch {
+  original: string;
+  matched: string | null;
+  strategy: string | null;
+  error?: string | null;
+  substrategy?: string;
 }
 
-export interface TagBackupStats {
-  total: number;
-  backed_up: number;
-  /** Files written into the backup whose format has no tag reader (or whose
-   *  tags failed to read) — they carry NO tags, so a restore can't put anything
-   *  back. The backend (BackupStats.not_fully_backed_up) has always computed
-   *  this; surfacing it stops "Backup complete" from implying zero loss. */
-  not_fully_backed_up: number;
-  errors: string[];
-}
-
-export interface TagRestoreStats {
-  total: number;
-  restored: number;
-  skipped_missing: number;
-  /** Backup entries whose format had no reader at backup time — there is
-   *  nothing to restore for them (distinct from "already up to date"). */
-  skipped_unsupported: number;
-  errors: string[];
-}
-
-export interface TagRemapRestoreStats {
-  total: number;
-  restored: number;
-  skipped_missing: number;
-  skipped_size_mismatch: number;
-  matched_exact: number;
-  matched_filename_size: number;
-  matched_filename: number;
-  errors: string[];
-  matches: Array<{
-    original: string;
-    matched: string | null;
-    strategy: string | null;
-    error?: string | null;
-    substrategy?: string;
-  }>;
-}
+export type TagRemapRestoreStats = Omit<RemapRestoreStats, "matches"> & {
+  matches: RemapMatch[];
+};
 
 // --- models ---
 
@@ -526,6 +576,15 @@ export interface SetupGenreEngineResult {
 
 export interface SaveConfigRequest {
   config: VibechekConfig;
+  /**
+   * Overwrite a settings file the sidecar could not READ. Without it
+   * `save_config` refuses with INVALID_PARAMS rather than replace bytes it
+   * couldn't parse (`vibechek/rpc.py::_save_config`); with it, `save()`
+   * quarantines the unreadable file as `<name>.corrupt-<timestamp>` first.
+   * `restore_default_config` is the same deliberate path with defaults as the
+   * payload — prefer it unless the user explicitly wants what's on screen kept.
+   */
+  force?: boolean;
 }
 
 export interface SaveConfigResult {
@@ -672,6 +731,11 @@ export interface RevertJournalResult {
    * undone. Feed to useLibraryStore.updateTrackPaths so the in-memory
    * library follows the files back (mirrors organize's moved_pairs). */
   reverted_pairs: Array<[string, string]>;
+  /** `revert_journal` RESOLVES rather than rejects on cancellation, so a
+   *  user-cancelled undo arrives as a normal payload with this set and the
+   *  counts covering only the entries processed before the stop. Treat it as
+   *  a PARTIAL undo: never latch "Undone", never claim success. */
+  cancelled?: boolean;
 }
 
 // --- diagnostics / models ---

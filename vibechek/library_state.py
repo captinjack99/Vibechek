@@ -19,6 +19,8 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -325,8 +327,101 @@ def save_analysis(record: LibraryRecord, report: dict[str, Any]) -> None:
     genre conflicts from the review queue — that must survive a reload. Unlike
     record_analysis it does NOT touch the recents index (no count/last-analyzed
     changes); it only rewrites the analysis JSON the load path reads back.
+
+    When the rewrite ADDS or DROPS track rows (the post-dedupe prune), follow it
+    with `refresh_record_counts` — see there.
     """
     atomic_write_json(Path(record.analysis_path), report, indent=2, ensure_ascii=False)
+
+
+def refresh_record_counts(record: LibraryRecord, report: dict[str, Any]) -> LibraryRecord | None:
+    """Re-derive one recents row's track/analyzed counts from a rewritten report.
+
+    `save_analysis` deliberately never touches the index, which is right for a
+    mutation that only edits fields inside existing rows (a genre approval). It
+    is wrong for one that REMOVES rows: after a dedupe prune the index still
+    claims the pre-prune totals, so the startup screen offers "1,200 tracks ·
+    1,200 analyzed" for a library whose saved analysis now holds 1,150 — and the
+    number the user picks the library by is quietly a lie until the next full
+    analyze rewrites it.
+
+    Split out rather than folded into `save_analysis` because the two need
+    DIFFERENT locks: save_analysis runs inside `analysis_mutation`'s per-file
+    lock, and this needs `_STATE_LOCK`. Call it AFTER the `analysis_mutation`
+    block has exited, so the two are never held at once — every other index
+    mutator takes _STATE_LOCK alone, and taking them in one order here and the
+    other order elsewhere is how a deadlock gets built.
+
+    Only the counts move: no `_bump_to_front`, no `last_analyzed` touch. A
+    prune is housekeeping, not a new analysis, and re-ordering recents behind
+    the user's back is its own bug. A summary key the report doesn't carry
+    leaves the stored count alone (`_rewrite_analysis_tracks` only updates the
+    keys that were already there).
+
+    Returns the updated record, or None when the path is no longer in recents.
+    """
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    with _STATE_LOCK:
+        state = load_state()
+        existing = _find(state, record.path)
+        if existing is None:
+            return None
+        existing.track_count = _as_count(summary.get("total_files"), existing.track_count)
+        existing.analyzed_count = _as_count(summary.get("analyzed"), existing.analyzed_count)
+        save_state(state)
+        return existing
+
+
+def _as_count(raw: Any, fallback: int) -> int:
+    """Coerce a report summary count to int, keeping `fallback` on anything odd.
+
+    Reports are user-visible JSON on disk and can be hand-edited; a stray string
+    must not take down post-dedupe housekeeping that runs AFTER the files were
+    already trashed.
+    """
+    if raw is None:
+        return fallback
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return fallback
+
+
+# One re-entrant lock per analysis FILE. Different libraries never contend;
+# two mutators of the same saved analysis serialize. See analysis_mutation.
+_ANALYSIS_LOCKS: dict[str, threading.RLock] = {}
+_ANALYSIS_LOCKS_GUARD = threading.Lock()
+
+
+def _analysis_lock(analysis_path: str) -> threading.RLock:
+    with _ANALYSIS_LOCKS_GUARD:
+        lock = _ANALYSIS_LOCKS.get(analysis_path)
+        if lock is None:
+            lock = threading.RLock()
+            _ANALYSIS_LOCKS[analysis_path] = lock
+        return lock
+
+
+@contextmanager
+def analysis_mutation(record: LibraryRecord) -> Iterator[dict[str, Any] | None]:
+    """Serialize one library's load -> mutate -> save of its saved analysis.
+
+    `save_analysis` is atomic against a TORN file but says nothing about a LOST
+    UPDATE, and _STATE_LOCK only guards the small recents index. Both
+    resolve_genre_conflicts and import_tag_priors load the whole multi-megabyte
+    report, mutate it and write it back, and neither is a cancellable long op —
+    so the 8-worker dispatch pool runs them concurrently and whichever saves
+    last silently discards the other's work (400 approvals, or a whole Rekordbox
+    import) behind an ok:true.
+
+    Yields the loaded report (None when the file is genuinely absent; raises
+    AnalysisUnreadable exactly like load_analysis when it exists but can't be
+    parsed). Mutate it and call save_analysis INSIDE the block.
+    """
+    with _analysis_lock(record.analysis_path):
+        yield load_analysis(record)
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +436,19 @@ def _analysis_path_for(library_path: str) -> Path:
     digest = hashlib.sha1(library_path.encode("utf-8")).hexdigest()[:12]
     safe_name = "".join(c if c.isalnum() else "_" for c in Path(library_path).name)[:48]
     return ANALYSES_DIR / f"{safe_name}-{digest}.json"
+
+
+def checkpoint_path_for(library_path: str) -> Path:
+    """Where an in-flight analyze writes its every-50-tracks checkpoint.
+
+    Deliberately NOT the analysis path itself: a checkpoint is a partial report,
+    and writing it over the live file would replace a good 12k-track analysis
+    with "50 tracks, status=in_progress" the moment a re-analyze is killed. The
+    authoritative file is only ever replaced by a finished report (or, on a
+    cancel/stall-abort, by the reconciled partial the RPC handler records).
+    """
+    p = _analysis_path_for(library_path)
+    return p.with_name(f"{p.stem}.checkpoint{p.suffix}")
 
 
 def _find(state: LibraryState, path: str) -> LibraryRecord | None:
@@ -373,6 +481,7 @@ __all__ = [
     "forget",
     "load_analysis",
     "save_analysis",
+    "refresh_record_counts",
     "rename_library",
     "tag_library",
 ]

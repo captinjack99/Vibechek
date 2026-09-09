@@ -20,11 +20,15 @@ Type mapping (Python -> TS)
     tuple[X, ...] / Tuple        -> X[]   (TOML/JSON has no tuple)
     set[X] / frozenset[X]        -> X[]   (serialized as arrays)
     dict[str, X] / Dict[str, X]  -> Record<string, X>
+    bare dict                    -> Record<string, unknown>
+    bare list/set/tuple          -> unknown[]
     X | None / Optional[X]       -> X | null
     Union[A, B, ...]             -> A | B | ...
     Any                          -> unknown
     Custom dataclass             -> the matching interface name
-    Unknown                      -> unknown   (with a warning)
+    Anything else                -> HARD ERROR (see `_degrade`) — a silent
+                                    `unknown` would make the drift gate green
+                                    over a contract it stopped enforcing.
 
 @property methods on dataclasses are emitted as readonly fields when they
 appear in `PROPERTY_FIELDS` below — manually maintained because property
@@ -59,8 +63,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# Modules to walk for dataclasses, in emission order.
-MODULES = [
+# Emission order for the modules that were already covered — keeping them first
+# keeps `generated.ts` diffs readable. This list used to BE the whole walk, and
+# it reached 10 of the 19 `vibechek/*.py` modules that define dataclasses, so
+# tagger's ApplyStats / BackupStats / RestoreStats — returned verbatim over
+# JSON-RPC — could be renamed without `--check` noticing a thing. Every other
+# dataclass-defining module is now discovered from the source tree and appended
+# (sorted) by `all_dataclass_modules()`.
+_MODULE_ORDER = [
     "vibechek.resources",
     "vibechek.config",
     "vibechek.wsl",
@@ -72,6 +82,38 @@ MODULES = [
     "vibechek.library_state",
     "vibechek.backup_history",
 ]
+
+# `@dataclass` / `@dataclasses.dataclass`, with or without arguments.
+_DATACLASS_DECORATOR_RE = re.compile(r"^\s*@(?:dataclasses\.)?dataclass\b", re.MULTILINE)
+
+# Fields/classes whose TS type degraded to `unknown` during a render. A
+# populated list aborts the run — see `main()`. `typing.Any` is the ONE
+# deliberate `unknown` and is not recorded.
+_DEGRADED: list[str] = []
+
+
+def all_dataclass_modules() -> list[str]:
+    """Every `vibechek/*.py` module that defines a dataclass, in emission order.
+
+    Derived from the source tree rather than hand-maintained, so a new module
+    of wire payloads can't quietly sit outside the drift gate.
+    """
+    pkg_dir = ROOT / "vibechek"
+    found = [
+        f"vibechek.{path.stem}"
+        for path in sorted(pkg_dir.glob("*.py"))
+        if path.name != "__init__.py"
+        and _DATACLASS_DECORATOR_RE.search(path.read_text(encoding="utf-8"))
+    ]
+    stale = [m for m in _MODULE_ORDER if m not in found]
+    if stale:
+        raise SystemExit(
+            f"generate_ts_types: {stale} are listed in _MODULE_ORDER but no "
+            f"longer define dataclasses — update the list in this script."
+        )
+    return [m for m in _MODULE_ORDER if m in found] + [
+        m for m in found if m not in _MODULE_ORDER
+    ]
 
 # @property fields to surface as readonly interface members. `dataclasses.fields()`
 # doesn't see properties; their return types are introspected from annotations
@@ -156,12 +198,16 @@ def _unwrap_optional(tp: object) -> tuple[object, bool]:
     return tp, False
 
 
-def translate(tp: object, known: set[str]) -> str:
-    """Translate a Python type annotation to TS, given the set of dataclass names."""
+def translate(tp: object, known: set[str], context: str = "<unknown>") -> str:
+    """Translate a Python type annotation to TS, given the set of dataclass names.
+
+    `context` names the class.field being rendered so a fallback to `unknown`
+    can be reported against something actionable (see `_DEGRADED`).
+    """
     # Unwrap Optional first
     inner, optional = _unwrap_optional(tp)
     if optional:
-        return f"{translate(inner, known)} | null"
+        return f"{translate(inner, known, context)} | null"
 
     if tp is type(None):
         return "null"
@@ -190,18 +236,18 @@ def translate(tp: object, known: set[str]) -> str:
             inner_tp = args[0] if args else typing.Any
         else:
             inner_tp = args[0]
-        return f"{translate(inner_tp, known)}[]"
+        return f"{translate(inner_tp, known, context)}[]"
 
     if origin is dict:
         key_tp, val_tp = args if len(args) == 2 else (str, typing.Any)
-        key_ts = translate(key_tp, known)
+        key_ts = translate(key_tp, known, context)
         # JSON / TS object keys must be strings.
         if key_ts != "string":
             key_ts = "string"
-        return f"Record<string, {translate(val_tp, known)}>"
+        return f"Record<string, {translate(val_tp, known, context)}>"
 
     if origin is typing.Union or origin is types.UnionType:
-        parts = [translate(a, known) for a in args if a is not type(None)]
+        parts = [translate(a, known, context) for a in args if a is not type(None)]
         if any(a is type(None) for a in args):
             parts.append("null")
         return " | ".join(parts)
@@ -210,18 +256,38 @@ def translate(tp: object, known: set[str]) -> str:
     if _is_dataclass_type(tp):
         return tp.__name__
 
+    # Unparameterised containers (`meta: dict`, `names: list`). No element type
+    # to translate, but the JSON shape is still known — don't degrade these.
+    if tp is dict:
+        return "Record<string, unknown>"
+    if tp in (list, set, frozenset, tuple):
+        return "unknown[]"
+
     # Bare classes — fall back to the class name if we know it, else unknown.
     if isinstance(tp, type):
         if tp.__name__ in known:
             return tp.__name__
-        print(f"  warning: unknown type {tp!r} -> unknown", file=sys.stderr)
-        return "unknown"
+        return _degrade(context, f"unknown type {tp!r}")
 
     # String forward refs (resolved by get_type_hints normally, but be safe)
     if isinstance(tp, str):
-        return tp if tp in known else "unknown"
+        if tp in known:
+            return tp
+        return _degrade(context, f"unresolved forward reference {tp!r}")
 
-    print(f"  warning: unhandled annotation {tp!r} -> unknown", file=sys.stderr)
+    return _degrade(context, f"unhandled annotation {tp!r}")
+
+
+def _degrade(context: str, reason: str) -> str:
+    """Record a field that couldn't be typed and return the `unknown` stand-in.
+
+    `unknown` is assignable from anything in TS, so emitting it silently keeps
+    the frontend compiling while the wire contract this generator exists to
+    enforce has evaporated for that field — and a `--check` that diffs a
+    degraded render against a file degraded the same way is green forever.
+    `main()` refuses to write or pass with any of these recorded.
+    """
+    _DEGRADED.append(f"{context}: {reason}")
     return "unknown"
 
 
@@ -285,7 +351,13 @@ def emit_interface(cls: type, known: set[str]) -> str:
     try:
         hints = typing.get_type_hints(cls)
     except Exception as e:  # noqa: BLE001
-        print(f"  warning: could not resolve hints for {cls.__name__}: {e}", file=sys.stderr)
+        # Every module here uses `from __future__ import annotations`, so a
+        # failed resolve leaves `f.type` a bare string and EVERY field of the
+        # class degrades to `unknown`. That aborts the run, it doesn't warn.
+        _DEGRADED.append(
+            f"{cls.__name__}: could not resolve type hints ({e}) — every field "
+            f"would degrade to `unknown`"
+        )
         hints = {}
 
     overrides: dict[str, str] = getattr(cls, "__ts_overrides__", {}) or {}
@@ -297,7 +369,7 @@ def emit_interface(cls: type, known: set[str]) -> str:
             _validate_override(cls.__name__, f.name, ts, known)
         else:
             tp = hints.get(f.name, f.type)
-            ts = translate(tp, known)
+            ts = translate(tp, known, f"{cls.__name__}.{f.name}")
         lines.append(f"  {f.name}: {ts};")
 
     for prop_name, ts in PROPERTY_FIELDS.get(cls.__name__, []):
@@ -385,7 +457,7 @@ def main() -> int:
     # the committed generated.ts/keeperConstants.ts wire contract.
     check_only = "--check" in sys.argv[1:]
 
-    classes = collect_dataclasses(MODULES)
+    classes = collect_dataclasses(all_dataclass_modules())
     known = {c.__name__ for c in classes} | EXTERNAL_TYPES
 
     blocks = [HEADER]
@@ -396,6 +468,21 @@ def main() -> int:
         blocks.append(emit_interface(cls, known))
     output = "\n\n".join(blocks) + "\n"
     constants_output = emit_shared_constants()
+
+    if _DEGRADED:
+        print(
+            "generate_ts_types: refusing to emit a degraded wire contract — "
+            "these fields could not be typed:",
+            file=sys.stderr,
+        )
+        for msg in _DEGRADED:
+            print(f"  - {msg}", file=sys.stderr)
+        print(
+            "Annotate them with a type translate() understands, or teach "
+            "translate() the new form.",
+            file=sys.stderr,
+        )
+        return 1
 
     if check_only:
         stale: list[str] = []

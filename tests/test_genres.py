@@ -415,3 +415,36 @@ def test_mlresult_declares_provenance_fields() -> None:
         "ml_vocal_audio", "ml_vocal_source",
     ):
         assert getattr(m, fname) is None
+
+
+def test_genre_matching_ignores_case() -> None:
+    """A lowercase or upper-case tag names the SAME genre, and used to become its
+    own top-level genre instead: the wrong stored label, no parent family (so
+    organizer files it flat rather than under `House/`), and a spurious conflict
+    against a matching ML read. Same failure class as the "Hip-Hop"/"Hip Hop"
+    split of 4d10dfa, one level below the alias table.
+    """
+    for spelling in ("Tech House", "tech house", "TECH HOUSE", "Tech  House"):
+        assert split_tag_genre(spelling) == ("House", "Tech House"), spelling
+    assert split_tag_genre("deep house") == ("House", "Deep House")
+    assert split_tag_genre("psytrance") == ("Trance", "Psytrance")
+    assert split_tag_genre("house") == ("House", "House")
+    # the bracketed-qualifier rule is case-insensitive too
+    assert split_tag_genre("techno (peak time / driving)") == ("Techno", "Techno")
+
+
+def test_case_variant_tag_is_not_a_conflict_with_a_matching_ml_read() -> None:
+    """The downstream harm: a correct lowercase tag disagreed with an identical
+    ML read, which flags the track for review and — above the override floor —
+    replaces the user's tag with `ml_override`."""
+    same = reconcile_genre("House", "Tech House", 0.95, "tech house")
+    assert same.source == "tag"
+    assert same.conflict is False
+    assert (same.genre, same.subgenre) == ("House", "Tech House")
+
+
+def test_case_folding_does_not_rescue_a_genre_the_hierarchy_lacks() -> None:
+    """Scope guard: matching ignores case, it does not invent entries. A name the
+    taxonomy has no entry for stays its own label, verbatim casing included."""
+    for gap in ("reggaeton", "SOUNDTRACK", "Bossa Nova", "chemicals (extended mix)"):
+        assert split_tag_genre(gap) == (gap, gap), gap

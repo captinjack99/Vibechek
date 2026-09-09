@@ -111,10 +111,12 @@ MODELS: dict[str, tuple[str, str, str]] = {
 # Pinned 2026-07-02 from the canonical essentia.upf.edu set (digests computed
 # over the exact files this downloader fetched and every accuracy/parity run
 # validated — the upstream filenames are version-suffixed `-1` and have been
-# stable for years). Weights (.pb) verify STRICTLY: a mismatch deletes the
-# file and raises with a `vibechek verify-models` remediation hint. Metadata
-# (.json) mismatches warn only — class-label files can drift harmlessly, and
-# a hostile graph can only ride in the weights.
+# stable for years). BOTH suffixes verify STRICTLY: a mismatch deletes the
+# file and raises with a `vibechek verify-models` remediation hint. The .json
+# used to warn only ("class labels can drift harmlessly") — that is the wrong
+# threat model for this app. The `classes` list in the metadata IS the genre
+# string written into the user's tags and the folder name organize moves the
+# track into, and a same-length permutation of it passes every other check.
 MODEL_SHA256: dict[str, dict[str, str]] = {
     "effnet": {
         "pb": "3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1",
@@ -428,15 +430,26 @@ def download_models(
                 # Keep any existing metadata file — a failed refetch must not
                 # delete a good cached file (the `.partial` is cleaned downstream).
                 # Still record the descriptor — the .pb may be usable without metadata
-        # SHA256 for metadata is best-effort: metadata mismatch is far less
-        # dangerous than weights mismatch (class labels can drift across model
-        # versions without security impact), but a mismatch here likely means
-        # version skew, so we warn loudly rather than fail.
+        # Metadata verifies as strictly as the weights. `classes` from this very
+        # file is what get_best_genre maps the 400-way sigmoid onto — the value
+        # written into the user's genre tag and used as the destination folder
+        # name by organize — and _class_index picks the vocal column out of it BY
+        # NAME. A rotated or renamed label list is a silently mislabelled library,
+        # so a pin mismatch deletes the file and fails the model, exactly like the
+        # .pb branch above and the ONNX head loop below.
         if metadata_path.exists():
             try:
                 verify_model_sha256(metadata_path, _expected_sha256(name, "json"))
             except RuntimeError as e:
-                log.warning("Metadata SHA256 mismatch for %s: %s", name, e)
+                log.error("Metadata SHA256 verification failed for %s: %s", name, e)
+                errors.append(f"{name}.json: {e}")
+                metadata_path.unlink(missing_ok=True)
+                continue
+            except OSError as e:
+                # Same per-model (not loop-aborting) degradation as the .pb arm.
+                log.error("Could not read %s metadata for verification: %s", name, e)
+                errors.append(f"{name}.json: unreadable for verification: {e}")
+                continue
         emit(metadata_step, None, f"{name} metadata ready")
 
         desc: dict[str, Any] = {
@@ -510,6 +523,13 @@ def download_models(
                 log.error("SHA256 verification failed for the ONNX backbone: %s", e)
                 errors.append(f"{BACKBONE_ONNX_FILENAME}: {e}")
                 onnx_path.unlink(missing_ok=True)
+            except OSError as e:
+                # Per-model degradation, not a loop-aborting crash (this runs
+                # inside _worker_init) — same arm as the .pb verify above.
+                log.error("Could not read the ONNX backbone for verification: %s", e)
+                errors.append(
+                    f"{BACKBONE_ONNX_FILENAME}: unreadable for verification: {e}"
+                )
         descriptors["effnet_onnx"] = {"weights": str(onnx_path)}
 
         # ---- converted classification heads (.onnx + .json) ----
@@ -558,6 +578,15 @@ def download_models(
                         if required:
                             errors.append(f"{fname}: {e}")
                         dest.unlink(missing_ok=True)
+                    except OSError as e:
+                        # Unreadable (locked/flaky volume) must not unwind the
+                        # whole loop out of a pool worker's initializer.
+                        (log.error if required else log.warning)(
+                            "Could not read ONNX head %s for verification: %s",
+                            fname, e,
+                        )
+                        if required:
+                            errors.append(f"{fname}: unreadable for verification: {e}")
             descriptors[f"onnx_{stem}"] = {"weights": str(onnx_dir / f"{stem}.onnx")}
 
     if errors:
@@ -614,7 +643,16 @@ def _needs_download(path: Path, url: str, expected_sha256: str | None = None) ->
     # ({"classes":["sad","non_sad"]}); 200 wrongly rejected them. Weights (.pb /
     # .onnx) are always >>100KB. Integrity for pinned files is the SHA check.
     min_size = 16 if path.suffix == ".json" else 100_000
-    local_size = path.stat().st_size
+    try:
+        local_size = path.stat().st_size
+    except OSError as e:
+        # The file vanished between exists() and stat(), or the volume is flaky /
+        # the file is locked (AV scan, cloud-sync client, network share). This
+        # helper is called from _worker_init via load_models, OUTSIDE the caller's
+        # per-model try — an escaping OSError killed every pool worker at init.
+        # Degrade to "refetch" and let the download path report per-model.
+        log.warning("Could not stat cached %s (%s) — refetching.", path.name, e)
+        return True
     if local_size < min_size:
         log.warning(
             "Local %s is %d bytes — too small to be a real model file (min %d). Refetching.",
@@ -637,6 +675,15 @@ def _needs_download(path: Path, url: str, expected_sha256: str | None = None) ->
             return False
         except RuntimeError:
             log.warning("Cached %s fails its pinned SHA256 — refetching.", path.name)
+            return True
+        except OSError as e:
+            # Unreadable (locked / flaky volume) is NOT "verified good": we could
+            # not check it, so don't claim it. Refetch, and let the caller's own
+            # `except OSError` arm name the file if it is still unreadable.
+            log.warning(
+                "Could not read cached %s for verification (%s) — refetching.",
+                path.name, e,
+            )
             return True
 
     # Unpinned: fall back to a HEAD completeness probe (server Content-Length).

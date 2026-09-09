@@ -12,6 +12,8 @@
 //!      tauri.conf.json — Tauri appends a platform triple at bundle time).
 //!   3. `vibechek` on PATH (development fallback).
 
+use crate::shell_log; // brings the `shell_log!` macro into scope
+
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -386,7 +388,7 @@ impl SidecarHandle {
 /// reader tasks so they land on the runtime Tauri owns.
 pub fn spawn(app: AppHandle) -> Result<SidecarHandle> {
     let binary = resolve_sidecar_binary().context("locate vibechek sidecar binary")?;
-    eprintln!("Spawning sidecar: {} rpc", binary);
+    shell_log!("Spawning sidecar: {} rpc", binary);
 
     tauri::async_runtime::block_on(async move { spawn_in_runtime(binary, app).await })
 }
@@ -455,13 +457,13 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
                 Ok(0) => break, // EOF — child closed stderr
                 Ok(_) => {
                     let line = String::from_utf8_lossy(&buf);
-                    eprintln!("[sidecar] {}", line.trim_end_matches(['\r', '\n']));
+                    shell_log!("[sidecar] {}", line.trim_end_matches(['\r', '\n']));
                 }
                 Err(e) => {
                     // A genuine I/O error (not bad UTF-8 — lossy decoding
                     // can't fail): the pipe itself is gone, nothing left to
                     // drain.
-                    eprintln!("[sidecar] stderr read error: {e}");
+                    shell_log!("[sidecar] stderr read error: {e}");
                     break;
                 }
             }
@@ -487,7 +489,7 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
                 buf.clear();
                 match reader.read_until(b'\n', &mut buf).await {
                     Ok(0) => {
-                        eprintln!(
+                        shell_log!(
                             "sidecar stdout EOF — process is dead (binary: {})",
                             inner.binary_path
                         );
@@ -497,11 +499,11 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
                     Ok(_) => {
                         let line = String::from_utf8_lossy(&buf).into_owned();
                         if let Err(e) = handle_message(&inner, &app, &line).await {
-                            eprintln!("dispatch error on '{line}': {e}");
+                            shell_log!("dispatch error on '{line}': {e}");
                         }
                     }
                     Err(e) => {
-                        eprintln!(
+                        shell_log!(
                             "sidecar stdout read error: {e} (binary: {})",
                             inner.binary_path
                         );
@@ -526,17 +528,17 @@ async fn spawn_in_runtime(binary: String, app: AppHandle) -> Result<SidecarHandl
         tauri::async_runtime::spawn(async move {
             tokio::select! {
                 status = child.wait() => match status {
-                    Ok(status) => eprintln!(
+                    Ok(status) => shell_log!(
                         "sidecar exited with {status} (binary: {})",
                         inner.binary_path
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => shell_log!(
                         "sidecar wait failed: {e} (binary: {})",
                         inner.binary_path
                     ),
                 },
                 _ = kill_rx => {
-                    eprintln!(
+                    shell_log!(
                         "killing sidecar that was declared dead (binary: {})",
                         inner.binary_path
                     );
@@ -596,7 +598,7 @@ async fn mark_dead_and_drain(inner: &Arc<Inner>) {
         let _ = tx.send(err);
     }
     if count > 0 {
-        eprintln!("sidecar drain: aborted {count} in-flight request(s)");
+        shell_log!("sidecar drain: aborted {count} in-flight request(s)");
     }
 }
 
@@ -623,7 +625,7 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
                 // Looks like JSON but didn't parse — worth a louder log so
                 // we notice if the sidecar's JSON writer ever emits malformed
                 // frames.
-                eprintln!("sidecar: skipping malformed JSON line ({e}): {line}");
+                shell_log!("sidecar: skipping malformed JSON line ({e}): {line}");
             } else {
                 // Clearly stray printf noise — keep the log quiet but record
                 // it so we can grep for it during debugging.
@@ -654,7 +656,7 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
                 // Expected when a slow op finished just after its wall-clock
                 // timeout dropped the pending entry (the result is discarded —
                 // the caller already got a timeout error). Not an error.
-                eprintln!("[sidecar] late/duplicate response for id {id} (likely post-timeout) — ignoring");
+                shell_log!("[sidecar] late/duplicate response for id {id} (likely post-timeout) — ignoring");
             }
             return Ok(());
         }
@@ -662,7 +664,7 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
         // We never issue such ids, so this is a protocol oddity worth logging
         // rather than silently treating as a notification.
         if !id_val.is_null() {
-            eprintln!("[sidecar] response with non-numeric id {id_val} — cannot match a pending request; ignoring");
+            shell_log!("[sidecar] response with non-numeric id {id_val} — cannot match a pending request; ignoring");
             return Ok(());
         }
     }
@@ -699,10 +701,10 @@ async fn handle_message(inner: &Arc<Inner>, app: &AppHandle, line: &str) -> Resu
 }
 
 /// Log a stray non-JSON line from the sidecar's stdout (native printf noise).
-/// We keep these as eprintln at trace-ish level — too useful to drop entirely
-/// (debugging "why didn't my analyze finish") but too noisy to enable by
-/// default once we wire up a real logger. For now: always print to stderr
-/// with a clear prefix so users can grep/filter.
+/// Kept at trace-ish level — too useful to drop entirely (debugging "why
+/// didn't my analyze finish") but too noisy to promote. It goes through
+/// `shell_log!` with a clear prefix so users can grep/filter it out of the
+/// rolling shell log (which is size-capped, so noise can't grow unbounded).
 fn log_native_noise(line: &str) {
     // Truncate long lines so a giant stack dump or binary blob doesn't fill
     // the user's terminal. 200 chars is enough to identify the source.
@@ -715,7 +717,7 @@ fn log_native_noise(line: &str) {
     if truncated.len() < line.len() {
         truncated.push('…');
     }
-    eprintln!("[sidecar stdout noise, ignored] {truncated}");
+    shell_log!("[sidecar stdout noise, ignored] {truncated}");
 }
 
 fn resolve_sidecar_binary() -> Result<String> {

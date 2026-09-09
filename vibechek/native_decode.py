@@ -26,11 +26,12 @@ into the native engine's load path first (or check the bundled essentia).
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
+
+from vibechek.utils import find_executable
 
 log = logging.getLogger(__name__)
 
@@ -76,12 +77,16 @@ def _decode_soundfile(path: str, sample_rate: int) -> np.ndarray:
 
 
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    # find_executable, not a bare which: a bogus ffmpeg.exe sitting in the
+    # working folder must not make us claim the fallback is available.
+    return find_executable("ffmpeg") is not None
 
 
 def _decode_ffmpeg(path: str, sample_rate: int) -> np.ndarray:
     """Decode via ffmpeg to raw mono float32 little-endian at `sample_rate`."""
-    ffmpeg = shutil.which("ffmpeg")
+    # Absolute, and never the cwd copy — this path is handed straight to
+    # subprocess and would otherwise re-resolve against the child's directory.
+    ffmpeg = find_executable("ffmpeg")
     if ffmpeg is None:
         raise DecodeError("ffmpeg not found on PATH")
     cmd = [ffmpeg, "-v", "error", "-i", path, "-ac", "1", "-ar", str(sample_rate), "-f", "f32le", "-"]

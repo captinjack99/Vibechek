@@ -7,7 +7,9 @@ import {
 } from "lucide-react";
 import { AnimatePresence } from "framer-motion";
 
-import { useConfigStore, useNotificationStore, useOperationStore } from "../stores";
+import {
+  useConfigStore, useLibraryStore, useNotificationStore, useOperationStore,
+} from "../stores";
 import { isCancellation, rpc, sidecarStatus } from "../hooks/useSidecar";
 import { setupOnnxEngine, setupClapEngine, setupGenreResolver } from "../api/rpc";
 import {
@@ -34,6 +36,48 @@ import { MemoryRefusalActions } from "./MemoryRefusalActions";
 // this via config.toml anyway, and we now display a warning when their value
 // exceeds the detected core count.
 const WORKERS_MAX = 96;
+
+/** Smallest gap the vocal-band sliders can hold — one step of either slider. */
+const VOCAL_BAND_STEP = 0.01;
+
+/** Round to the sliders' 0.01 grid so float arithmetic can't leave 0.8899999. */
+function snapVocal(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+/**
+ * Keep the vocal-band cutoffs ordered.
+ *
+ * `apply_ml_tags` HARD-REJECTS `vocal_instrumental_max >= vocal_full_min`
+ * (vibechek/rpc.py), before it constructs the TaggingConfig — so an inverted
+ * pair doesn't just break the vocal field, it aborts every tag write (genre,
+ * energy, mood, BPM, key) with a message naming two identifiers this screen
+ * never shows. The two sliders' ranges overlap on [0.5, 0.95] and the Hint
+ * tells the user to raise the first one, so the inverted pair was one drag
+ * away. Nudge the OTHER cutoff instead of letting the pair cross; `moved` is
+ * whichever slider the user is actually dragging.
+ */
+export function orderedVocalBands(
+  instrumentalMax: number,
+  fullMin: number,
+  moved: "instrumental" | "vocal",
+): { vocal_instrumental_max: number; vocal_full_min: number } {
+  let inst = snapVocal(instrumentalMax);
+  let full = snapVocal(fullMin);
+  if (inst >= full) {
+    if (moved === "instrumental") {
+      full = snapVocal(Math.min(1, inst + VOCAL_BAND_STEP));
+      // The 1.0 ceiling can leave the pair still crossed (only reachable from a
+      // hand-edited config.json); give way on the dragged slider rather than
+      // persisting a pair the tagger will reject.
+      if (inst >= full) inst = snapVocal(full - VOCAL_BAND_STEP);
+    } else {
+      inst = snapVocal(Math.max(0, full - VOCAL_BAND_STEP));
+      if (inst >= full) full = snapVocal(inst + VOCAL_BAND_STEP);
+    }
+  }
+  return { vocal_instrumental_max: inst, vocal_full_min: full };
+}
 
 export function Settings() {
   const cfg = useConfigStore((s) => s.config);
@@ -81,6 +125,13 @@ export function Settings() {
       const result = await rpc<{ config: VibechekConfig }>("restore_default_config");
       if (!isMounted.current) return;
       setConfig(result.config, true);
+      // The file on disk IS what's on screen now — the unreadable one was
+      // quarantined and a fresh one written — so the untrusted-load verdict is
+      // stale. Leaving it set keeps the first-launch tour suppressed and keeps
+      // the worker slider from seeding itself for the rest of the session, for
+      // a config that is no longer in doubt. `useConfigPersistence`'s toast
+      // action clears it after the identical RPC; this path must too.
+      useConfigStore.getState().setLoadUntrusted(false);
     } catch (e) {
       fail(e);
     }
@@ -103,6 +154,10 @@ export function Settings() {
   // the user pick more workers than actually fit (the 16→2 CLAP/WSL bug). Re-
   // fetched when engine or genre_classifier changes (see the effect below).
   const [budget, setBudget] = useState<WorkerBudget | null>(null);
+  // Subscribed, not just read at call time: the budget also depends on the
+  // loaded library's longest track, so switching libraries while this screen is
+  // mounted has to re-fetch it (see the effect below).
+  const libraryPath = useLibraryStore((s) => s.libraryPath);
 
   const notify = useNotificationStore((s) => s.notify);
 
@@ -417,15 +472,22 @@ export function Settings() {
    * the captured closure) so the effect that fires on a change sends the NEW
    * values. Passes the usable WSL distro so the VM's RAM is measured, not the
    * host total. Non-fatal — the slider falls back to the static ceiling.
+   *
+   * Also sends the loaded library's root when there is one: the run sizes each
+   * worker for the longest track it finds there, so a slider computed without
+   * the path would promise more workers than the run will actually start.
+   * Read from the store at call time, same as the config.
    */
   const refreshWorkerBudget = () => {
     if (!isMounted.current) return;
     const st = useConfigStore.getState().config.analysis;
+    const root = useLibraryStore.getState().libraryPath;
     fetchWorkerBudget({
       engine: st.inference_engine,
       genre_classifier: st.genre_classifier,
       workers: st.workers,
       distro: preflightResult?.wsl?.usable_distro ?? null,
+      ...(root ? { library_path: root } : {}),
     })
       .then((b) => {
         if (isMounted.current) setBudget(b);
@@ -485,7 +547,16 @@ export function Settings() {
       .then((info) => {
         if (!isMounted.current) return;
         setSysInfo(info);
-        if (setWorkers && cfgRef.current.analysis.workers === 0) {
+        // NEVER seed while the load is untrusted. This is an automatic write
+        // fired by merely opening the Settings tab, and the persistence hook
+        // arms its autosave on the first config change it sees — it cannot
+        // tell this apart from a deliberate edit. Seeding here would write
+        // DEFAULT_CONFIG over a config.json that is very likely intact.
+        if (
+          setWorkers &&
+          cfgRef.current.analysis.workers === 0 &&
+          !useConfigStore.getState().loadUntrusted
+        ) {
           updateAnalysis({ workers: info.recommended_workers });
         }
       })
@@ -540,10 +611,14 @@ export function Settings() {
   // onnx/native measure a different RAM pool than essentia_tf routes to. The
   // doctrine: "the slider should be based on the model we're using — when CLAP
   // is selected, it should slide to the max workers supported."
+  //
+  // The library root is in here for the same reason: the run budgets a worker
+  // for the longest track under it, so a library of 90-minute sets plans fewer
+  // workers than a library of singles and the slider must say so.
   useEffect(() => {
     refreshWorkerBudget();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cfg.analysis.inference_engine, cfg.analysis.genre_classifier]);
+  }, [cfg.analysis.inference_engine, cfg.analysis.genre_classifier, libraryPath]);
 
   // Re-probe the engine GPU whenever the user switches inference engines.
   // The probe is engine-specific server-side (ONNX populates provider/runtime
@@ -569,6 +644,18 @@ export function Settings() {
   }, [cfg.analysis.inference_engine]);
 
   const handleDownloadModels = async () => {
+    // Same guard as PreflightDialog's runWithProgress. The in-page button is
+    // gated on `active !== null`, but the verify-models toast's inline
+    // "Download models" action is NOT — and a toast outlives the click that
+    // raised it. Starting here mid-op would overwrite the running op's global
+    // active/progress state, and the sidecar's busy-rejection would then land
+    // in fail(), clearing `active` while the real op was still running.
+    if (useOperationStore.getState().active !== null) {
+      notify("Another operation is running — wait for it to finish first.", {
+        kind: "info",
+      });
+      return;
+    }
     const opId = begin("download-models");
     try {
       // read the latest models_dir from the store
@@ -1118,7 +1205,15 @@ export function Settings() {
             <input
               type="range" min={0.3} max={0.95} step={0.01}
               value={cfg.tagging.vocal_instrumental_max}
-              onChange={(e) => updateTagging({ vocal_instrumental_max: Number(e.target.value) })}
+              onChange={(e) =>
+                updateTagging(
+                  orderedVocalBands(
+                    Number(e.target.value),
+                    cfg.tagging.vocal_full_min,
+                    "instrumental",
+                  ),
+                )
+              }
               className="flex-1 accent-accent"
             />
             <span className="text-sm font-mono w-12 text-right tabular-nums">
@@ -1130,7 +1225,15 @@ export function Settings() {
             <input
               type="range" min={0.5} max={1} step={0.01}
               value={cfg.tagging.vocal_full_min}
-              onChange={(e) => updateTagging({ vocal_full_min: Number(e.target.value) })}
+              onChange={(e) =>
+                updateTagging(
+                  orderedVocalBands(
+                    cfg.tagging.vocal_instrumental_max,
+                    Number(e.target.value),
+                    "vocal",
+                  ),
+                )
+              }
               className="flex-1 accent-accent"
             />
             <span className="text-sm font-mono w-12 text-right tabular-nums">
@@ -1139,7 +1242,8 @@ export function Settings() {
           </div>
           <Hint>
             Below the first cutoff → Instrumental; above the second → Vocal; between → Light Vocal.
-            Raise the first if instrumentals are tagged "Vocal". Re-tag to apply (no re-analysis needed).
+            Raise the first if instrumentals are tagged "Vocal" — the second follows it up if needed.
+            Re-tag to apply (no re-analysis needed).
           </Hint>
         </Field>
 

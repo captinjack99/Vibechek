@@ -1056,8 +1056,8 @@ def test_verify_models_onnx_checks_onnx_dir_not_pb(monkeypatch: pytest.MonkeyPat
     good = analyzer_mod.MODEL_SHA256_ONNX[f"{stem}.onnx"]
     # Find content whose sha256 equals the pin? We can't — instead write a file
     # whose hash we DON'T control and assert the mismatch is reported as ok=False
-    # (not 'missing'), proving the ONNX branch ran. Also write the backbone so it
-    # shows up as ok=None (no pin) rather than missing.
+    # (not 'missing'), proving the ONNX branch ran. Same for the backbone, which
+    # IS pinned (in model_download, not MODEL_SHA256_ONNX).
     (onnx_dir / f"{stem}.onnx").write_bytes(b"not the real weights")
     (onnx_dir / BACKBONE_ONNX_FILENAME).write_bytes(b"fake backbone")
 
@@ -1076,8 +1076,44 @@ def test_verify_models_onnx_checks_onnx_dir_not_pb(monkeypatch: pytest.MonkeyPat
     assert dance["ok"] is False
     assert dance.get("reason") != "missing"
     assert dance["expected"] == good
-    # The backbone has no pin → ok=None (informational), not a scary failure.
-    assert by_name[BACKBONE_ONNX_FILENAME]["ok"] is None
+    # The backbone IS pinned — wrong content must fail the integrity check, not
+    # sail through as an informational "no pin".
+    from vibechek.model_download import BACKBONE_ONNX_SHA256
+    backbone = by_name[BACKBONE_ONNX_FILENAME]
+    assert backbone["ok"] is False
+    assert backbone["expected"] == BACKBONE_ONNX_SHA256
+
+
+def test_verify_models_reports_best_effort_onnx_files_as_optional_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """model_download fetches genre_discogs400.onnx and the non-genre heads'
+    class-label .json best-effort — a failed fetch does not fail the download.
+    Reporting them as a hard `missing` told a healthy install it was broken;
+    the required files must still fail.
+    """
+    from vibechek import config as cfg_mod
+    from vibechek.config import VibechekConfig
+
+    monkeypatch.setattr(cfg_mod, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(rpc, "VibechekConfig", VibechekConfig)
+    cfg = VibechekConfig()
+    cfg.analysis.inference_engine = "onnx"
+    monkeypatch.setattr(VibechekConfig, "load", classmethod(lambda cls: cfg))
+    (tmp_path / "onnx").mkdir()   # empty: nothing has been downloaded at all
+
+    out = rpc._verify_models({})
+    by_name = {r["name"]: r for r in out["results"]}
+
+    for fname in rpc._optional_onnx_filenames():
+        assert by_name[fname]["ok"] is None, fname
+        assert by_name[fname]["reason"] == "optional-missing", fname
+
+    # Everything else is still a hard failure.
+    assert by_name["mood_happy.onnx"]["ok"] is False
+    assert by_name["mood_happy.onnx"]["reason"] == "missing"
+    assert by_name["genre_discogs400.json"]["ok"] is False
+    assert by_name["genre_discogs400.json"]["reason"] == "missing"
 
 
 def test_verify_models_param_engine_overrides_config(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -1399,3 +1435,1252 @@ def test_organize_cancel_returns_partial_stats_with_journal(monkeypatch, tmp_pat
     assert res["cancelled"] is True
     assert res["moved"] == 3
     assert res["journal_path"].endswith("organize.jsonl")
+
+def test_revert_journal_cancel_returns_partial_summary(monkeypatch, tmp_path) -> None:
+    """A cancelled undo has already moved SOME files back. Dropping the summary
+    left the GUI's in-memory library pointing at the ORGANIZED paths for files
+    that are now at their originals — silently stale until a re-scan. Mirror
+    _organize/_handle_duplicates: return the partial tagged cancelled=True.
+    """
+    from vibechek import cancellation
+
+    partial = {
+        "reverted": 2, "skipped": 0, "errors": 0,
+        "reverted_pairs": [("/lib/House/a.mp3", "/lib/a.mp3")],
+        "error_messages": [],
+    }
+
+    def fake_revert(*_a, **_k):
+        e = cancellation.CancelledError("Operation 'revert' cancelled by user")
+        e.partial_summary = partial  # type: ignore[attr-defined]
+        raise e
+
+    monkeypatch.setattr("vibechek.journal.revert_journal", fake_revert)
+    res = rpc._revert_journal({"journal_path": str(tmp_path / "organize.jsonl")})
+    assert res["cancelled"] is True
+    assert res["reverted"] == 2
+    assert res["reverted_pairs"] == [("/lib/House/a.mp3", "/lib/a.mp3")]
+
+
+def test_revert_journal_cancel_keeps_every_summary_key_and_stays_resumable(
+    monkeypatch, tmp_path
+) -> None:
+    """End-to-end (real journal, real cancel): the cancelled result must be a
+    COMPLETE summary — every key the finished shape has, plus cancelled=True —
+    and the journal must not be latched as "already reverted", so a second
+    Undo finishes the rest.
+    """
+    import shutil
+
+    from vibechek import cancellation, journal
+
+    monkeypatch.setattr(journal, "JOURNALS_DIR", tmp_path / "journals")
+    lib = tmp_path / "lib"
+    org = tmp_path / "org" / "House"
+    lib.mkdir()
+    org.mkdir(parents=True)
+    writer = journal.start_journal(journal.KIND_ORGANIZE, root=tmp_path / "org")
+    for i in range(4):
+        src = lib / f"t{i}.mp3"
+        dst = org / f"t{i}.mp3"
+        src.write_bytes(b"x")
+        shutil.move(str(src), str(dst))
+        writer.record_move(src, dst)
+    writer.close()
+
+    def cancel_on_the_second_file(current: int, _total: int, _message: str = "") -> None:
+        if current == 2:
+            cancellation.cancel()
+
+    monkeypatch.setattr(rpc, "_emit_progress", cancel_on_the_second_file)
+    cancellation.begin("revert")
+    try:
+        res = rpc._revert_journal({"journal_path": str(writer.path)})
+    finally:
+        cancellation.end()
+
+    assert res["cancelled"] is True
+    # A partial that is missing keys the GUI reads is a different bug than the
+    # one this fix closed; pin the whole shape.
+    assert set(res) == {
+        "reverted", "skipped", "errors", "trashed_not_reverted",
+        "error_messages", "reverted_pairs", "cancelled",
+    }
+    assert res["reverted"] == 2
+    assert len(res["reverted_pairs"]) == 2
+    # The pairs describe the REAL filesystem state, newest-first.
+    assert res["reverted_pairs"] == [
+        (str(org / "t3.mp3"), str(lib / "t3.mp3")),
+        (str(org / "t2.mp3"), str(lib / "t2.mp3")),
+    ]
+
+    # Nothing marked the journal as spent: it is still listed, and re-running
+    # the revert picks up exactly the files the cancel left behind.
+    listed = journal.list_journals()
+    assert [j["path"] for j in listed] == [str(writer.path)]
+
+    monkeypatch.setattr(rpc, "_emit_progress", lambda *_a, **_k: None)
+    res2 = rpc._revert_journal({"journal_path": str(writer.path)})
+    assert "cancelled" not in res2
+    assert res2["reverted"] == 2      # t1 and t0
+    assert res2["skipped"] == 2       # t3/t2 already home — dst is gone
+    assert res2["errors"] == 0
+    assert sorted(p.name for p in lib.iterdir()) == [
+        "t0.mp3", "t1.mp3", "t2.mp3", "t3.mp3",
+    ]
+    assert list(org.iterdir()) == []
+
+
+def test_revert_journal_cancel_without_partial_still_raises(monkeypatch, tmp_path) -> None:
+    """No partial to salvage → the cancel must still surface, not be swallowed."""
+    from vibechek import cancellation
+
+    def fake_revert(*_a, **_k):
+        raise cancellation.CancelledError("cancelled by user")
+
+    monkeypatch.setattr("vibechek.journal.revert_journal", fake_revert)
+    with pytest.raises(cancellation.CancelledError):
+        rpc._revert_journal({"journal_path": str(tmp_path / "organize.jsonl")})
+
+
+# ---------------------------------------------------------------------------
+# organize: what gets VALIDATED is what MOVES the files
+# ---------------------------------------------------------------------------
+
+
+def _one_track_plan_params(lib, **extra) -> dict:
+    track = lib / "a.mp3"
+    track.write_bytes(b"audio")
+    params = {
+        "analysis": {"tracks": [{
+            "path": str(track),
+            "ml_analysis": {
+                "ml_genre": "House", "ml_subgenre": "House",
+                "ml_genre_confidence": 0.95,
+            },
+        }]},
+        "min_genre_size": 1,
+        "use_subgenres": False,
+    }
+    params.update(extra)
+    return params
+
+
+def test_whitespace_target_root_plans_against_the_library_not_the_cwd(tmp_path) -> None:
+    """validate_organize_target reads a whitespace-only target as "blank, use
+    the default" — but the config that drives the move took the raw string, and
+    Path("   ") is RELATIVE, so the whole genre tree was planned under the
+    sidecar's working directory while validation reported ok.
+    """
+    from pathlib import Path as _P
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    out = rpc._plan_organization(
+        _one_track_plan_params(lib, library_path=str(lib), target_root="   "),
+    )
+    assert out["base_dir"] == str(lib)
+    assert out["moves"], "the track should still be planned for a move"
+    for m in out["moves"]:
+        assert _P(m["destination"]).is_absolute()
+
+
+def test_blank_library_path_does_not_anchor_the_plan_at_the_cwd(tmp_path) -> None:
+    """An empty string is not None, and plan_organization tests
+    `library_root is not None` — so a blank library_path meant
+    base_dir = Path("") = the sidecar's working directory.
+    """
+    from pathlib import Path as _P
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    out = rpc._plan_organization(_one_track_plan_params(lib, library_path=""))
+    assert out["base_dir"] != "."
+    assert _P(out["base_dir"]).is_absolute()
+
+
+def test_plan_organization_move_carries_relative_destination(tmp_path) -> None:
+    """generated.ts declares relative_destination as a REQUIRED field of
+    PlannedMove and the destructive confirm modal renders it, but the hand-built
+    wire dict dropped it — so it was undefined in production.
+    """
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    out = rpc._plan_organization(
+        _one_track_plan_params(lib, library_path=str(lib)),
+    )
+    move = out["moves"][0]
+    assert set(move) == {
+        "source", "destination", "relative_destination", "original_source",
+        "genre", "subgenre", "reason",
+    }
+    assert move["relative_destination"]
+    assert move["relative_destination"] != move["destination"]
+    # `original_source` is the caller's OWN spelling of the path — `source` is
+    # whichever NFC/NFD form resolve_existing_path found on disk, and a client
+    # keying its store off the plan has to match on what it sent.
+    assert move["original_source"]
+
+
+# ---------------------------------------------------------------------------
+# scan_directory survives one unreadable file (find_audio_files already does)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_directory_survives_a_file_that_vanished_mid_scan(monkeypatch, tmp_path) -> None:
+    """The whole walk finishes before the stat pass runs, so a sync client
+    deleting a file in that window raised FileNotFoundError out of the handler —
+    which _dispatch reports as INVALID_PARAMS, i.e. the folder the user picked
+    is missing — and lost all 12k entries.
+    """
+    good = tmp_path / "a.mp3"
+    good.write_bytes(b"x" * 200_000)   # big enough to round to a non-zero size_mb
+    gone = tmp_path / "b.mp3"
+
+    monkeypatch.setattr(
+        "vibechek.utils.find_audio_files", lambda *_a, **_k: [good, gone],
+    )
+    out = rpc._scan_directory({"path": str(tmp_path)})
+    assert out["count"] == 2
+    by_name = {f["filename"]: f for f in out["files"]}
+    assert by_name["a.mp3"]["size_mb"] > 0
+    assert "error" not in by_name["a.mp3"]
+    # The vanished one is reported, loudly, per-file — like _scan_only does.
+    assert by_name["b.mp3"]["size_mb"] == 0.0
+    assert by_name["b.mp3"]["error"]
+
+
+# ---------------------------------------------------------------------------
+# verify_models: `native` runs the same ONNX bundle as `onnx`
+# ---------------------------------------------------------------------------
+
+
+def test_verify_models_native_engine_checks_the_onnx_bundle(monkeypatch, tmp_path) -> None:
+    """`native` is the WINDOWS DEFAULT and download_models stages it under
+    <models>/onnx exactly like `onnx` — so checking the flat .pb set for it
+    reported all 16 models missing on a healthy default install.
+    """
+    from vibechek import config as cfg_mod
+    from vibechek.config import VibechekConfig
+    from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
+
+    monkeypatch.setattr(cfg_mod, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(rpc, "VibechekConfig", VibechekConfig)
+    cfg = VibechekConfig()
+    cfg.analysis.inference_engine = "native"
+    monkeypatch.setattr(VibechekConfig, "load", classmethod(lambda cls: cfg))
+
+    onnx_dir = tmp_path / "onnx"
+    onnx_dir.mkdir()
+    (onnx_dir / BACKBONE_ONNX_FILENAME).write_bytes(b"fake backbone")
+
+    out = rpc._verify_models({})
+    assert out["engine"] == "native"
+    names = {r["name"] for r in out["results"]}
+    assert BACKBONE_ONNX_FILENAME in names
+    assert "effnet" not in names  # the essentia .pb model key must NOT appear
+    by_name = {r["name"]: r for r in out["results"]}
+    # Staged backbone → hashed against its real pin, NOT reported missing.
+    assert by_name[BACKBONE_ONNX_FILENAME]["ok"] is False
+    assert by_name[BACKBONE_ONNX_FILENAME].get("reason") != "missing"
+
+
+# ---------------------------------------------------------------------------
+# a cancelled / stalled analyze must not throw away the finished tracks
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_cancel_persists_the_partial_report(monkeypatch, tmp_path) -> None:
+    """The GUI never sent an output_path, so analyze_directory's every-50-tracks
+    checkpoint was dead and every abort path discarded hours of GPU work:
+    record_analysis sits AFTER the call and never ran.
+    """
+    from vibechek import cancellation, library_state
+
+    monkeypatch.setattr(library_state, "STATE_FILE", tmp_path / "library_state.json")
+    monkeypatch.setattr(library_state, "ANALYSES_DIR", tmp_path / "analyses")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+
+    captured: dict = {}
+
+    def fake_analyze(_path, **kw):
+        captured["output_path"] = kw.get("output_path")
+        e = cancellation.CancelledError("Analysis cancelled by user")
+        e.partial_report = {  # type: ignore[attr-defined]
+            "status": "complete",   # must be re-stamped: this run did NOT finish
+            "tracks": [{"path": str(lib / "a.mp3"), "ml_analysis": {"ml_genre": "House"}}],
+            "summary": {"total_files": 2, "analyzed": 1},
+        }
+        raise e
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+
+    with pytest.raises(cancellation.CancelledError):
+        rpc._analyze_directory({"path": str(lib)})
+
+    # A GUI run (no output_path param) now checkpoints to its own file, NOT over
+    # the authoritative analysis.
+    assert captured["output_path"] == library_state.checkpoint_path_for(str(lib))
+
+    record = next(
+        r for r in library_state.load_state().recent if r.path == str(lib)
+    )
+    saved = library_state.load_analysis(record)
+    assert saved is not None
+    assert saved["status"] == "in_progress"
+    assert [t["path"] for t in saved["tracks"]] == [str(lib / "a.mp3")]
+
+
+def test_cancelled_full_reanalyze_keeps_the_previously_saved_tracks(
+    monkeypatch, tmp_path
+) -> None:
+    """A cancelled NON-incremental re-analyze must not replace a complete saved
+    analysis with the handful of tracks it got through.
+
+    The GUI's main Analyze button sends no skip_paths, so the abort merge used
+    to be skipped entirely and the truncated partial was written straight over
+    the authoritative file — a 3-track library became a 1-track one, taking the
+    user-resolved genre decisions with it.
+    """
+    from vibechek import cancellation, library_state
+
+    monkeypatch.setattr(library_state, "STATE_FILE", tmp_path / "library_state.json")
+    monkeypatch.setattr(library_state, "ANALYSES_DIR", tmp_path / "analyses")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    files = [lib / "a.mp3", lib / "b.mp3", lib / "c.mp3"]
+    for f in files:
+        f.write_bytes(b"x")
+
+    library_state.record_analysis(lib, {
+        "status": "complete",
+        "tracks": [
+            {
+                "path": str(f),
+                "ml_analysis": {"ml_genre": "House", "ml_genre_source": "approved"},
+            }
+            for f in files
+        ],
+        "summary": {"total_files": 3, "analyzed": 3},
+    })
+
+    def fake_analyze(_path, **_kw):
+        e = cancellation.CancelledError("Analysis cancelled by user")
+        e.partial_report = {  # type: ignore[attr-defined]
+            "status": "complete",
+            "tracks": [
+                {"path": str(files[0]), "ml_analysis": {"ml_genre": "Techno"}}
+            ],
+            "summary": {"total_files": 3, "analyzed": 1},
+        }
+        raise e
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+
+    with pytest.raises(cancellation.CancelledError):
+        rpc._analyze_directory({"path": str(lib)})  # NO skip_paths: full re-analyze
+
+    record = next(
+        r for r in library_state.load_state().recent if r.path == str(lib)
+    )
+    saved = library_state.load_analysis(record)
+    assert saved is not None
+    assert saved["status"] == "in_progress"
+    by_path = {t["path"]: t for t in saved["tracks"]}
+    assert set(by_path) == {str(f) for f in files}
+    # The one track this run reached carries the FRESH result...
+    assert by_path[str(files[0])]["ml_analysis"]["ml_genre"] == "Techno"
+    # ...and the two it never reached keep their saved records, including the
+    # user's resolved genre decision.
+    for f in files[1:]:
+        assert by_path[str(f)]["ml_analysis"]["ml_genre"] == "House"
+        assert by_path[str(f)]["ml_analysis"]["ml_genre_source"] == "approved"
+
+
+def test_cancelled_reanalyze_keeps_records_for_files_it_cannot_see(
+    monkeypatch, tmp_path
+) -> None:
+    """On the ABORT contract a path we cannot see is UNKNOWN, not deleted.
+
+    The merge used to apply the completed-run rule here and drop every saved
+    record whose file was invisible at abort time — but the commonest reason a
+    run aborts is the library's volume going away (drive unplugged, NAS share
+    dropped), which makes ALL of them invisible at once. The merge then
+    re-attached nothing and the truncated partial was written over the complete
+    saved analysis. A run that did not finish never gets to delete results; the
+    next completed run applies the deleted-means-gone rule."""
+    from vibechek import cancellation, library_state
+
+    monkeypatch.setattr(library_state, "STATE_FILE", tmp_path / "library_state.json")
+    monkeypatch.setattr(library_state, "ANALYSES_DIR", tmp_path / "analyses")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    kept = lib / "kept.mp3"
+    kept.write_bytes(b"x")
+    gone = lib / "gone.mp3"  # never created
+
+    library_state.record_analysis(lib, {
+        "status": "complete",
+        "tracks": [
+            {"path": str(kept), "ml_analysis": {"ml_genre": "House"}},
+            {"path": str(gone), "ml_analysis": {"ml_genre": "House"}},
+        ],
+        "summary": {"total_files": 2, "analyzed": 2},
+    })
+
+    def fake_analyze(_path, **_kw):
+        e = cancellation.CancelledError("Analysis cancelled by user")
+        e.partial_report = {  # type: ignore[attr-defined]
+            "status": "complete", "tracks": [], "summary": {},
+        }
+        raise e
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+    with pytest.raises(cancellation.CancelledError):
+        rpc._analyze_directory({"path": str(lib)})
+
+    record = next(
+        r for r in library_state.load_state().recent if r.path == str(lib)
+    )
+    saved = library_state.load_analysis(record)
+    assert {t["path"] for t in saved["tracks"]} == {str(kept), str(gone)}
+
+
+def test_cancelled_reanalyze_survives_the_library_volume_disappearing(
+    monkeypatch, tmp_path
+) -> None:
+    """The finding's own scenario: a complete 5-track analysis, then a run that
+    aborts BECAUSE the library went away. Every saved path is invisible, so the
+    existence filter re-attached nothing and record_analysis wrote the 1-track
+    partial over the complete file — the abort destroyed four finished tracks."""
+    from vibechek import cancellation, library_state
+
+    monkeypatch.setattr(library_state, "STATE_FILE", tmp_path / "library_state.json")
+    monkeypatch.setattr(library_state, "ANALYSES_DIR", tmp_path / "analyses")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    files = [lib / f"t{i}.mp3" for i in range(5)]
+    for f in files:
+        f.write_bytes(b"x")
+
+    library_state.record_analysis(lib, {
+        "status": "complete",
+        "tracks": [{"path": str(f), "ml_analysis": {"ml_genre": "House"}} for f in files],
+        "summary": {"total_files": 5, "analyzed": 5},
+    })
+
+    def fake_analyze(_path, **_kw):
+        # The volume goes away mid-run: that IS what aborted it.
+        for f in files:
+            f.unlink()
+        e = cancellation.CancelledError("Analysis stalled and was stopped")
+        e.partial_report = {  # type: ignore[attr-defined]
+            "status": "complete",
+            "tracks": [{"path": str(files[0]), "ml_analysis": {"ml_genre": "Techno"}}],
+            "summary": {"total_files": 5, "analyzed": 1},
+        }
+        raise e
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+    with pytest.raises(cancellation.CancelledError):
+        rpc._analyze_directory({"path": str(lib)})
+
+    record = next(
+        r for r in library_state.load_state().recent if r.path == str(lib)
+    )
+    saved = library_state.load_analysis(record)
+    by_path = {t["path"]: t for t in saved["tracks"]}
+    assert set(by_path) == {str(f) for f in files}
+    assert by_path[str(files[0])]["ml_analysis"]["ml_genre"] == "Techno"
+
+
+def test_incremental_analyze_still_drops_records_for_files_gone_from_disk(
+    monkeypatch, tmp_path
+) -> None:
+    """The completed-run contract is unchanged: when the run FINISHED, a saved
+    record whose file is gone really is a deleted track and must not be
+    resurrected. Only the abort path treats invisible as unknown."""
+    from vibechek import library_state
+
+    monkeypatch.setattr(library_state, "STATE_FILE", tmp_path / "library_state.json")
+    monkeypatch.setattr(library_state, "ANALYSES_DIR", tmp_path / "analyses")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    kept = lib / "kept.mp3"
+    kept.write_bytes(b"x")
+    gone = lib / "gone.mp3"  # never created
+
+    library_state.record_analysis(lib, {
+        "status": "complete",
+        "tracks": [
+            {"path": str(kept), "ml_analysis": {"ml_genre": "House"}},
+            {"path": str(gone), "ml_analysis": {"ml_genre": "House"}},
+        ],
+        "summary": {"total_files": 2, "analyzed": 2},
+    })
+
+    fresh = {"status": "complete", "tracks": [], "summary": {}}
+    merged = rpc._reattach_skipped_records(fresh, {str(kept), str(gone)}, str(lib))
+
+    assert [t["path"] for t in merged["tracks"]] == [str(kept)]
+
+
+def test_analyze_cancel_without_partial_persists_nothing(monkeypatch, tmp_path) -> None:
+    """No partial attached → nothing is invented and the cancel still surfaces."""
+    from vibechek import cancellation, library_state
+
+    monkeypatch.setattr(library_state, "STATE_FILE", tmp_path / "library_state.json")
+    monkeypatch.setattr(library_state, "ANALYSES_DIR", tmp_path / "analyses")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+
+    def fake_analyze(_path, **_kw):
+        raise cancellation.CancelledError("Analysis cancelled by user")
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+    with pytest.raises(cancellation.CancelledError):
+        rpc._analyze_directory({"path": str(lib)})
+    assert library_state.load_state().recent == []
+
+
+def test_analyze_auto_save_false_gets_no_checkpoint(monkeypatch, tmp_path) -> None:
+    """auto_save=False callers (CLI one-offs with their own --output) asked us
+    not to touch library state; don't quietly start writing into it."""
+    from vibechek import library_state
+
+    monkeypatch.setattr(library_state, "STATE_FILE", tmp_path / "library_state.json")
+    monkeypatch.setattr(library_state, "ANALYSES_DIR", tmp_path / "analyses")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+
+    captured: dict = {}
+
+    def fake_analyze(_path, **kw):
+        captured["output_path"] = kw.get("output_path")
+        return {"status": "complete", "tracks": [], "summary": {}}
+
+    monkeypatch.setattr("vibechek.analyzer.analyze_directory", fake_analyze)
+    rpc._analyze_directory({"path": str(lib), "auto_save": False})
+    assert captured["output_path"] is None
+
+
+# ---------------------------------------------------------------------------
+# organize: "no common ancestor" is a caller problem, not a server crash
+# ---------------------------------------------------------------------------
+
+
+def _tracks_with_no_common_ancestor() -> list[dict]:
+    """Two analyzed tracks `os.path.commonpath` cannot reconcile.
+
+    Windows fails on mixed DRIVES; POSIX has a single root, so the only way to
+    fail there is mixing an absolute path with a relative one (which a
+    hand-edited or relocated analysis.json really can carry).
+    """
+    import os as _os
+
+    pair = (
+        (r"C:\Music\a.mp3", r"D:\Music\b.mp3") if _os.name == "nt"
+        else ("/music/a.mp3", "music/b.mp3")
+    )
+    return [
+        {"path": p, "ml_analysis": {"ml_genre": "House", "ml_subgenre": "House",
+                                    "ml_genre_confidence": 0.9}}
+        for p in pair
+    ]
+
+
+def test_plan_organization_without_a_common_root_is_invalid_params() -> None:
+    """organizer refuses to guess a library root it can't infer and raises a
+    finished, user-facing sentence. A plain ValueError out of a handler is
+    INTERNAL_ERROR + a traceback at the dispatch seam, so the user saw
+    "Vibechek crashed" for what is really "pick a destination folder".
+    """
+    with pytest.raises(rpc.InvalidParams) as excinfo:
+        rpc._plan_organization({
+            "analysis": {"tracks": _tracks_with_no_common_ancestor()},
+            "min_genre_size": 1,
+        })
+    assert "different drives or roots" in str(excinfo.value)
+
+
+def test_organize_without_a_common_root_is_invalid_params() -> None:
+    """Same seam on the EXECUTE path — it must fail before moving anything."""
+    with pytest.raises(rpc.InvalidParams) as excinfo:
+        rpc._organize({
+            "analysis": {"tracks": _tracks_with_no_common_ancestor()},
+            "min_genre_size": 1,
+        })
+    assert "different drives or roots" in str(excinfo.value)
+
+
+def test_organize_empty_analysis_is_also_invalid_params() -> None:
+    """Sibling of the same ValueError seam: no tracks AND no target is a caller
+    error too, not an internal fault.
+    """
+    with pytest.raises(rpc.InvalidParams):
+        rpc._organize({"analysis": {"tracks": []}})
+
+
+# ---------------------------------------------------------------------------
+# config: an UNREADABLE config.json must never be silently overwritten
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_the_config_file():
+    """Leave unparseable bytes where VibechekConfig.load() looks; return the path.
+
+    conftest's autouse fixture already points CONFIG_FILE at a tmp dir.
+    """
+    from vibechek import config as cfg_mod
+
+    cfg_mod.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cfg_mod.CONFIG_FILE.write_text("{ this is not json", encoding="utf-8")
+    return cfg_mod.CONFIG_FILE
+
+
+def test_get_config_flags_a_config_file_it_could_not_read() -> None:
+    """load() answers an unreadable file with pristine DEFAULTS, so without this
+    flag the GUI adopts factory settings as the user's baseline and its
+    debounced autosave writes them straight over the real ones.
+    """
+    _corrupt_the_config_file()
+    payload = rpc._get_config({})
+    assert payload["load_failed"] is True
+    assert payload["config_warnings"], "the reason must travel with the flag"
+
+
+def test_get_config_omits_load_failed_on_a_healthy_config() -> None:
+    from vibechek.config import VibechekConfig
+
+    VibechekConfig().save()
+    payload = rpc._get_config({})
+    assert "load_failed" not in payload
+
+
+def test_save_config_refuses_to_overwrite_an_unreadable_file() -> None:
+    """The config being saved is built from the CLIENT's dict, so it carries
+    none of the markers VibechekConfig.save() checks — that guard is
+    structurally blind to this path and the autosave would flatten the user's
+    settings.
+    """
+    path = _corrupt_the_config_file()
+    before = path.read_text(encoding="utf-8")
+
+    with pytest.raises(rpc.InvalidParams) as excinfo:
+        rpc._save_config({"config": {"analysis": {"workers": 3}}})
+
+    message = str(excinfo.value)
+    assert "could not be read" in message
+    assert str(path) in message, "the user needs to know WHICH file to fix"
+    assert path.read_text(encoding="utf-8") == before, "must not have written"
+
+
+def test_save_config_force_writes_and_quarantines_the_original() -> None:
+    """`force` is the deliberate "take the defaults" path — but the unreadable
+    bytes must survive as `<name>.corrupt-<ts>` for a hand-repair.
+    """
+    path = _corrupt_the_config_file()
+    out = rpc._save_config({"config": {"analysis": {"workers": 3}}, "force": True})
+
+    assert out["saved_to"] == str(path)
+    assert json.loads(path.read_text(encoding="utf-8"))["analysis"]["workers"] == 3
+    quarantined = list(path.parent.glob(f"{path.name}.corrupt-*"))
+    assert quarantined, "the original bytes must be kept aside, not destroyed"
+    assert quarantined[0].read_text(encoding="utf-8") == "{ this is not json"
+
+
+def test_save_config_still_writes_when_the_file_reads_fine() -> None:
+    from pathlib import Path as _Path
+
+    out = rpc._save_config({"config": {"analysis": {"workers": 2}}})
+    saved = json.loads(_Path(out["saved_to"]).read_text(encoding="utf-8"))
+    assert saved["analysis"]["workers"] == 2
+
+
+def test_restore_defaults_quarantines_instead_of_destroying() -> None:
+    """Restore Defaults IS the "overwrite it anyway" button, so it never
+    refuses — but a bare VibechekConfig().save() carried no marker, so the
+    quarantine branch never ran and the user's only copy was destroyed by the
+    button that promises to hand it back.
+    """
+    path = _corrupt_the_config_file()
+    out = rpc._restore_default_config({})
+
+    assert out["saved_to"] == str(path)
+    quarantined = list(path.parent.glob(f"{path.name}.corrupt-*"))
+    assert quarantined
+    assert quarantined[0].read_text(encoding="utf-8") == "{ this is not json"
+
+
+# ---------------------------------------------------------------------------
+# handle_duplicates: the saved analysis must follow the files
+# ---------------------------------------------------------------------------
+
+
+_EMPTY_DUPE_REPORT = {"summary": {}, "exact_duplicates": [], "audio_duplicates": []}
+
+
+def _seed_analysis(lib, paths: list):
+    """Record a saved analysis for `lib` holding one row per path."""
+    from vibechek import library_state
+
+    report = {
+        "tracks": [
+            {"path": str(p), "filename": p.name, "extension": ".mp3",
+             "size_mb": 1.0, "ml_analysis": {"ml_genre": "House"}}
+            for p in paths
+        ],
+        "summary": {"total_files": len(paths), "analyzed": len(paths)},
+    }
+    return library_state.record_analysis(str(lib), report)
+
+
+def _saved_paths(record) -> list[str]:
+    from vibechek import library_state
+
+    return [t["path"] for t in library_state.load_analysis(record)["tracks"]]
+
+
+def _stub_handle_duplicates(monkeypatch, summary: dict) -> None:
+    monkeypatch.setattr(
+        "vibechek.duplicates.handle_duplicates",
+        lambda *_a, **_k: summary,
+    )
+
+
+def test_handle_duplicates_passes_the_per_file_lists_through(monkeypatch, tmp_path) -> None:
+    """deleted_paths / moved_pairs / journal_incomplete are the contract the GUI
+    reads to show what actually happened (and whether the undo journal is
+    complete). The RPC must not reshape or drop them.
+    """
+    summary = {
+        "moved": 1, "deleted": 1, "errors": 0, "error_messages": [],
+        "deleted_paths": [str(tmp_path / "lib" / "gone.mp3")],
+        "moved_pairs": [
+            [str(tmp_path / "lib" / "m.mp3"), str(tmp_path / "review" / "m.mp3")],
+        ],
+        "journal_incomplete": True,
+    }
+    _stub_handle_duplicates(monkeypatch, summary)
+
+    out = rpc._handle_duplicates({"report": _EMPTY_DUPE_REPORT, "action": "trash"})
+    assert out["deleted_paths"] == summary["deleted_paths"]
+    assert out["moved_pairs"] == summary["moved_pairs"]
+    assert out["journal_incomplete"] is True
+
+
+def test_handle_duplicates_drops_trashed_tracks_from_the_saved_analysis(
+    monkeypatch, tmp_path,
+) -> None:
+    """A trashed duplicate left in the saved analysis comes back as a ghost row
+    on the next launch, pointing at a file that no longer exists.
+    """
+    from vibechek import library_state
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    keep, gone = lib / "keep.mp3", lib / "gone.mp3"
+    record = _seed_analysis(lib, [keep, gone])
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+        "deleted_paths": [str(gone)], "journal_incomplete": False,
+    })
+    rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "trash", "library_path": str(lib),
+    })
+
+    assert _saved_paths(record) == [str(keep)]
+    summary = library_state.load_analysis(record)["summary"]
+    assert summary["total_files"] == 1, "the header count must match the rows"
+    assert summary["analyzed"] == 1
+
+
+def test_handle_duplicates_repaths_a_move_that_stayed_inside_the_library(
+    monkeypatch, tmp_path,
+) -> None:
+    """A review folder INSIDE the library keeps the file in the library, so the
+    row must FOLLOW it — a stale pre-move path misses in tagging, organize and
+    the conflict queue alike. The basename can change too (`_unique_path`
+    renames a collision).
+    """
+    from vibechek import library_state
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    keep, moved = lib / "keep.mp3", lib / "dupe.mp3"
+    record = _seed_analysis(lib, [keep, moved])
+    dst = lib / "_review" / "dupe (1).mp3"
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 1, "deleted": 0, "errors": 0, "error_messages": [],
+        "moved_pairs": [[str(moved), str(dst)]], "journal_incomplete": False,
+    })
+    rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "move",
+        "review_folder": str(lib / "_review"), "library_path": str(lib),
+    })
+
+    saved = library_state.load_analysis(record)
+    by_path = {t["path"]: t for t in saved["tracks"]}
+    assert set(by_path) == {str(keep), str(dst)}
+    assert by_path[str(dst)]["filename"] == "dupe (1).mp3"
+    # A re-path is not a removal — the count must NOT drop.
+    assert saved["summary"]["total_files"] == 2
+
+
+def test_handle_duplicates_drops_rows_a_move_took_out_of_the_library(
+    monkeypatch, tmp_path,
+) -> None:
+    """The review folder is normally OUTSIDE the library (`D:/Dupes`), and a
+    row re-pointed there is a track the analysis still claims is in the library.
+
+    `plan_organization` applies no containment filter: it plans EVERY row it
+    finds into `<base>/<Genre>/`. So the next Organize picked up all 300
+    quarantined duplicates at `D:/Dupes/*`, moved them back under
+    `D:/Music/House/...` — where they no longer even collide with their keepers,
+    so a re-scan wouldn't flag them again — and the user's whole dedupe pass was
+    silently undone. A file that left the library leaves the analysis.
+    """
+    from vibechek import library_state
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    keep, moved = lib / "keep.mp3", lib / "dupe.mp3"
+    record = _seed_analysis(lib, [keep, moved])
+    dst = tmp_path / "review" / "dupe.mp3"
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 1, "deleted": 0, "errors": 0, "error_messages": [],
+        "moved_pairs": [[str(moved), str(dst)]], "journal_incomplete": False,
+    })
+    rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "move",
+        "review_folder": str(tmp_path / "review"), "library_path": str(lib),
+    })
+
+    saved = library_state.load_analysis(record)
+    assert [t["path"] for t in saved["tracks"]] == [str(keep)]
+    assert saved["summary"]["total_files"] == 1
+
+
+def test_split_moves_by_root_keys_containment_off_the_library_root(tmp_path) -> None:
+    """The unit behind both cases, including the no-root fallback and (on
+    Windows) the case/separator spellings the rest of the sync path normalizes.
+    """
+    import os
+
+    lib = tmp_path / "lib"
+    inside, outside = rpc._split_moves_by_root(
+        {"a": str(lib / "House" / "a.mp3"), "b": str(tmp_path / "Dupes" / "b.mp3")},
+        str(lib),
+    )
+    assert set(inside) == {"a"}
+    assert outside == {"b"}
+
+    # A sibling directory that merely SHARES a prefix is outside.
+    inside2, outside2 = rpc._split_moves_by_root(
+        {"c": str(tmp_path / "lib2" / "c.mp3")}, str(lib),
+    )
+    assert inside2 == {} and outside2 == {"c"}
+
+    if os.name == "nt":
+        # The same folder reaches us spelled several ways; a bare `==` would
+        # match nothing in the common case.
+        inside3, outside3 = rpc._split_moves_by_root(
+            {"a": str(lib / "House" / "a.mp3")},
+            str(lib).upper().replace("\\", "/"),
+        )
+        assert set(inside3) == {"a"} and outside3 == set()
+
+    # No root to compare against → everything is treated as inside, which is
+    # what this path did before the split existed. (`normpath("")` is ".", so
+    # the blank check has to happen before normalization.)
+    assert rpc._split_moves_by_root({"d": "/x/d.mp3"}, "") == ({"d": "/x/d.mp3"}, set())
+    assert rpc._split_moves_by_root({"d": "/x/d.mp3"}, None) == ({"d": "/x/d.mp3"}, set())
+
+
+def test_handle_duplicates_finds_the_library_without_an_explicit_path(
+    monkeypatch, tmp_path,
+) -> None:
+    """The GUI now sends library_path, but a client that doesn't (an older
+    build, the CLI) must still be served: a file we just trashed can only be a
+    ghost in a library that CONTAINS it, so match by ancestry.
+    """
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    keep, gone = lib / "keep.mp3", lib / "gone.mp3"
+    record = _seed_analysis(lib, [keep, gone])
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+        "deleted_paths": [str(gone)],
+    })
+    rpc._handle_duplicates({"report": _EMPTY_DUPE_REPORT, "action": "trash"})
+
+    assert _saved_paths(record) == [str(keep)]
+
+
+def test_handle_duplicates_leaves_other_libraries_alone(monkeypatch, tmp_path) -> None:
+    """Ancestry matching must not reach into a library the dedupe never touched."""
+    lib, other = tmp_path / "lib", tmp_path / "other"
+    lib.mkdir()
+    other.mkdir()
+    gone = lib / "gone.mp3"
+    _seed_analysis(lib, [gone])
+    untouched = _seed_analysis(other, [other / "gone.mp3"])
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+        "deleted_paths": [str(gone)],
+    })
+    rpc._handle_duplicates({"report": _EMPTY_DUPE_REPORT, "action": "trash"})
+
+    assert _saved_paths(untouched) == [str(other / "gone.mp3")]
+
+
+def test_handle_duplicates_survives_a_summary_without_the_new_keys(
+    monkeypatch, tmp_path,
+) -> None:
+    """An older duplicates.py reports counts only. That must be a no-op, not an
+    AttributeError that reports a completed trash as a failure.
+    """
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    record = _seed_analysis(lib, [lib / "a.mp3"])
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+    })
+    out = rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "trash", "library_path": str(lib),
+    })
+
+    assert out["deleted"] == 1
+    assert _saved_paths(record) == [str(lib / "a.mp3")]
+
+
+def test_handle_duplicates_prunes_after_a_cancel_too(monkeypatch, tmp_path) -> None:
+    """A cancelled run still trashed real files, so the saved analysis is
+    exactly as stale as after a completed one.
+    """
+    from vibechek import cancellation
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    keep, gone = lib / "keep.mp3", lib / "gone.mp3"
+    record = _seed_analysis(lib, [keep, gone])
+
+    def fake_handle(*_a, **_k):
+        e = cancellation.CancelledError("cancelled")
+        e.partial_summary = {
+            "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+            "deleted_paths": [str(gone)], "journal_path": None,
+        }
+        raise e
+
+    monkeypatch.setattr("vibechek.duplicates.handle_duplicates", fake_handle)
+    out = rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "trash", "library_path": str(lib),
+    })
+
+    assert out["cancelled"] is True
+    assert _saved_paths(record) == [str(keep)]
+
+
+def test_handle_duplicates_still_returns_when_the_analysis_is_unreadable(
+    monkeypatch, tmp_path,
+) -> None:
+    """The destructive step has ALREADY succeeded by the time we prune. Turning
+    best-effort housekeeping into a failed handle_duplicates would tell the user
+    nothing happened when their files really moved.
+    """
+    from pathlib import Path as _Path
+
+    from vibechek import library_state
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    gone = lib / "gone.mp3"
+    record = _seed_analysis(lib, [gone])
+    _Path(record.analysis_path).write_text("{ truncated", encoding="utf-8")
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+        "deleted_paths": [str(gone)],
+    })
+    out = rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "trash", "library_path": str(lib),
+    })
+
+    assert out["deleted"] == 1
+    # Untouched — a corrupt file must not be half-rewritten by the prune.
+    assert _Path(record.analysis_path).read_text(encoding="utf-8") == "{ truncated"
+    with pytest.raises(library_state.AnalysisUnreadable):
+        library_state.load_analysis(record)
+
+
+def test_handle_duplicates_refreshes_the_recents_counts(monkeypatch, tmp_path) -> None:
+    """The recents row's counts must follow the prune.
+
+    `save_analysis` deliberately leaves the index alone, so a prune that dropped
+    50 ghost rows still left the startup screen advertising the pre-prune
+    "1,200 tracks · 1,200 analyzed" for a library whose saved report now holds
+    1,150 — the number the user picks the library BY, wrong until the next full
+    analyze rewrote it.
+    """
+    from vibechek import library_state
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    keep, gone = lib / "keep.mp3", lib / "gone.mp3"
+    record = _seed_analysis(lib, [keep, gone])
+    assert (record.track_count, record.analyzed_count) == (2, 2)
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+        "deleted_paths": [str(gone)],
+    })
+    rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "trash", "library_path": str(lib),
+    })
+
+    row = next(r for r in library_state.load_state().recent if r.path == str(lib))
+    assert (row.track_count, row.analyzed_count) == (1, 1)
+
+
+def test_handle_duplicates_count_refresh_is_housekeeping_not_a_new_analysis(
+    monkeypatch, tmp_path,
+) -> None:
+    """Only the counts move: no re-ordering of recents, no `last_analyzed` bump.
+
+    A dedupe is not an analyze, and silently promoting a library to the top of
+    the startup list (or claiming it was just analyzed) is its own bug.
+    """
+    from vibechek import library_state
+
+    lib, newer = tmp_path / "lib", tmp_path / "newer"
+    lib.mkdir()
+    newer.mkdir()
+    gone = lib / "gone.mp3"
+    _seed_analysis(lib, [lib / "keep.mp3", gone])
+    _seed_analysis(newer, [newer / "a.mp3"])  # recorded last → front of recents
+
+    before = next(r for r in library_state.load_state().recent if r.path == str(lib))
+    analyzed_at = before.last_analyzed
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+        "deleted_paths": [str(gone)],
+    })
+    rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "trash", "library_path": str(lib),
+    })
+
+    recent = library_state.load_state().recent
+    assert [r.path for r in recent] == [str(newer), str(lib)]
+    row = next(r for r in recent if r.path == str(lib))
+    assert row.last_analyzed == analyzed_at
+    assert row.track_count == 1
+
+
+def test_handle_duplicates_leaves_the_counts_alone_when_nothing_changed(
+    monkeypatch, tmp_path,
+) -> None:
+    """No row changed → no index write. The prune must not touch a library whose
+    saved analysis it did not rewrite.
+    """
+    from vibechek import library_state
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    _seed_analysis(lib, [lib / "keep.mp3", lib / "other.mp3"])
+
+    _stub_handle_duplicates(monkeypatch, {
+        "moved": 0, "deleted": 1, "errors": 0, "error_messages": [],
+        # A path that is not in the saved analysis at all.
+        "deleted_paths": [str(tmp_path / "elsewhere" / "gone.mp3")],
+    })
+    rpc._handle_duplicates({
+        "report": _EMPTY_DUPE_REPORT, "action": "trash", "library_path": str(lib),
+    })
+
+    row = next(r for r in library_state.load_state().recent if r.path == str(lib))
+    assert (row.track_count, row.analyzed_count) == (2, 2)
+
+
+def test_verify_models_pins_the_onnx_backbone(monkeypatch, tmp_path) -> None:
+    """The backbone's pin lives in model_download (it is FETCHED upstream, not
+    converted here), so looking it up in MODEL_SHA256_ONNX always missed and the
+    GUI reported the first file the ONNX stack loads as an unpinned "no pin" —
+    the tamper check never ran on it. cli.py's verify-models already used the
+    real pin; the two must agree.
+    """
+    from vibechek import config as cfg_mod
+    from vibechek.config import VibechekConfig
+    from vibechek.model_download import BACKBONE_ONNX_SHA256
+    from vibechek.onnx_backend import BACKBONE_ONNX_FILENAME
+
+    monkeypatch.setattr(cfg_mod, "MODELS_DIR", tmp_path)
+    monkeypatch.setattr(rpc, "VibechekConfig", VibechekConfig)
+    cfg = VibechekConfig()
+    cfg.analysis.inference_engine = "onnx"
+    monkeypatch.setattr(VibechekConfig, "load", classmethod(lambda cls: cfg))
+
+    onnx_dir = tmp_path / "onnx"
+    onnx_dir.mkdir()
+    (onnx_dir / BACKBONE_ONNX_FILENAME).write_bytes(b"tampered backbone")
+
+    by_name = {r["name"]: r for r in rpc._verify_models({})["results"]}
+    backbone = by_name[BACKBONE_ONNX_FILENAME]
+    assert backbone["expected"] == BACKBONE_ONNX_SHA256
+    assert backbone["ok"] is False
+    assert backbone.get("reason") != "missing"
+
+
+def test_organize_repaths_the_saved_analysis(monkeypatch, tmp_path) -> None:
+    """Sibling of the dedupe prune, and the cause named in
+    _resolve_genre_conflicts' "none of the selected tracks are in the saved
+    analysis" branch: organize moves the files and the GUI store follows them in
+    memory, but the analysis JSON on disk kept its PRE-move paths — so after a
+    reload every approval, tag write and second organize matched nothing.
+    """
+    from vibechek import library_state
+    from vibechek.organizer import OrganizeStats
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    src = lib / "a.mp3"
+    record = _seed_analysis(lib, [src])
+    dst = lib / "House" / "a.mp3"
+
+    monkeypatch.setattr(
+        "vibechek.organizer.organize_from_analysis",
+        lambda *_a, **_k: OrganizeStats(
+            planned=1, moved=1, moved_pairs=[(str(src), str(dst))],
+        ),
+    )
+    rpc._organize({
+        "analysis": {"tracks": []}, "library_path": str(lib),
+    })
+
+    assert _saved_paths(record) == [str(dst)]
+    # A re-path is not a removal.
+    assert library_state.load_analysis(record)["summary"]["total_files"] == 1
+
+
+def test_organize_dry_run_leaves_the_saved_analysis_alone(monkeypatch, tmp_path) -> None:
+    """A dry run moves nothing, so it must rewrite nothing (organize_from_analysis
+    returns empty moved_pairs for it — this pins that the RPC honours that).
+    """
+    from vibechek.organizer import OrganizeStats
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    src = lib / "a.mp3"
+    record = _seed_analysis(lib, [src])
+
+    monkeypatch.setattr(
+        "vibechek.organizer.organize_from_analysis",
+        lambda *_a, **_k: OrganizeStats(planned=1, moved=0),
+    )
+    rpc._organize({
+        "analysis": {"tracks": []}, "library_path": str(lib), "dry_run": True,
+    })
+
+    assert _saved_paths(record) == [str(src)]
+
+
+# ---------------------------------------------------------------------------
+# post-dedupe summary recompute uses the analyzer's own analyzed/errors rule
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_analysis_tracks_recomputes_analyzed_and_errors_honestly() -> None:
+    """A per-track ML failure leaves `error` unset and `ml_analysis` a truthy
+    `{"ml_error": ...}`, so the old "has an ml_analysis dict" rule counted
+    failures as analyzed — and `errors` was never recomputed at all. That
+    drifted summary is fed to library_state.refresh_record_counts, so the
+    recents index re-inflated analyzed_count after every dedupe.
+    """
+    report = {
+        "tracks": [
+            {"path": "/lib/gone.mp3", "ml_analysis": {"ml_genre": "House"}},
+            {"path": "/lib/ok.mp3", "ml_analysis": {"ml_genre": "Techno"}},
+            {"path": "/lib/decode_fail.mp3",
+             "ml_analysis": {"ml_error": "Could not decode audio"}},
+            {"path": "/lib/hard_fail.mp3", "error": "unreadable"},
+        ],
+        "summary": {"total_files": 4, "analyzed": 4, "errors": 0},
+    }
+
+    changed = rpc._rewrite_analysis_tracks(report, {rpc._path_key("/lib/gone.mp3")}, {})
+
+    assert changed == 1
+    assert report["summary"] == {"total_files": 3, "analyzed": 1, "errors": 2}
+
+
+def test_rewrite_analysis_tracks_never_double_counts_a_failure() -> None:
+    """A row carrying BOTH `error` and `ml_error` is one error, not two — same
+    as analyzer._build_report."""
+    report = {
+        "tracks": [
+            {"path": "/lib/gone.mp3"},
+            {"path": "/lib/both.mp3", "error": "boom",
+             "ml_analysis": {"ml_error": "boom"}},
+        ],
+        "summary": {"total_files": 2, "analyzed": 2, "errors": 0},
+    }
+
+    rpc._rewrite_analysis_tracks(report, {rpc._path_key("/lib/gone.mp3")}, {})
+
+    assert report["summary"] == {"total_files": 1, "analyzed": 0, "errors": 1}
+
+
+def test_rewrite_analysis_tracks_survives_a_corrupt_ml_analysis_row() -> None:
+    """A hand-edited or half-written analysis JSON can hold a truthy
+    `ml_analysis` that is not a dict. The recompute's `(x or {}).get(...)` raised
+    AttributeError on it, and nothing between here and `_handle_duplicates`
+    catches that — so the user was told the dedupe FAILED after their duplicates
+    had already been trashed. A row we cannot read counts as failed."""
+    report = {
+        "tracks": [
+            {"path": "/lib/gone.mp3", "ml_analysis": {"ml_genre": "House"}},
+            {"path": "/lib/ok.mp3", "ml_analysis": {"ml_genre": "Techno"}},
+            {"path": "/lib/weird.mp3", "ml_analysis": "legacy string"},
+        ],
+        "summary": {"total_files": 3, "analyzed": 3, "errors": 0},
+    }
+
+    changed = rpc._rewrite_analysis_tracks(report, {rpc._path_key("/lib/gone.mp3")}, {})
+
+    assert changed == 1
+    assert report["summary"] == {"total_files": 2, "analyzed": 1, "errors": 1}
+
+
+def test_organize_to_a_target_outside_the_library_still_repaths_its_rows(
+    monkeypatch, tmp_path,
+) -> None:
+    """The containment rule is scoped to DEDUPE on purpose.
+
+    A user who organizes into a target outside their library has moved the whole
+    library there; dropping every row would discard the entire ML analysis with
+    nothing to replace it. A quarantined duplicate is different — its keeper's
+    row stays behind, so the row that left is redundant.
+    """
+    from vibechek import library_state
+
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    track = lib / "t.mp3"
+    record = _seed_analysis(lib, [track])
+    dst = tmp_path / "sorted" / "House" / "t.mp3"
+
+    from types import SimpleNamespace
+
+    stats = SimpleNamespace(moved_pairs=[(str(track), str(dst))])
+    rpc._sync_saved_analysis_after_organize(stats, {"library_path": str(lib)})
+
+    saved = library_state.load_analysis(record)
+    assert [t["path"] for t in saved["tracks"]] == [str(dst)]

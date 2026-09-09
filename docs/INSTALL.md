@@ -295,6 +295,7 @@ vibechek download-models   # one-time, ~800 MB
 | `<data_dir>/Vibechek/models/` | Downloaded ML model `.pb` files (~800 MB total) | `%LOCALAPPDATA%\Vibechek\Vibechek\models\` |
 | `<data_dir>/Vibechek/analyses/` | Auto-saved per-library analysis JSONs | `%LOCALAPPDATA%\Vibechek\Vibechek\analyses\` |
 | `<data_dir>/Vibechek/logs/vibechek.log` | Rotating log file (10 MB × 5 backups) | `%LOCALAPPDATA%\Vibechek\Vibechek\logs\vibechek.log` |
+| `<data_dir>/Vibechek/logs/vibechek-shell.log` | Tauri shell log (1 MB × 1 backup, UTC timestamps) — sidecar spawn/exit diagnostics and Rust panics | `%LOCALAPPDATA%\Vibechek\Vibechek\logs\vibechek-shell.log` |
 
 `<config_dir>` and `<data_dir>` come from [platformdirs](https://platformdirs.readthedocs.io/) and are correct per OS.
 

@@ -129,6 +129,12 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
 
   const isWindows = preflight.wsl?.is_windows ?? false;
 
+  // Every one-click install button in this dialog is disabled while ANY other
+  // step or long op is running. The handlers each carry an active-guard, but a
+  // guard that fires after the click still lets the user believe they started
+  // something; greying the button out is the honest state.
+  const blocked = busyAction !== null || active !== null;
+
   const reCheck = async (autoCloseIfReady = true) => {
     // After an install we MUST do the slow WSL probe — that's the only way to
     // detect that essentia just landed inside a distro. Ask the sidecar for a
@@ -260,7 +266,22 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
   };
 
   const handleDownloadModels = async () => {
+    // The same guard runWithProgress carries, for the same reason (see its
+    // comment): begin() would overwrite the global active/progress state of an
+    // install already in flight, the sidecar busy-rejects this call, and the
+    // fail() below would then clear `active` while the REAL op is still
+    // running — orphaning its progress overlay and Cancel button and
+    // re-enabling every active-gated control in the app mid-install.
+    //
+    // NOT routed through runWithProgress itself: `download_models` returns
+    // {models_dir, models}, not an InstallResult, so that helper's `!result.ok`
+    // check would report every successful download as a failure.
+    if (useOperationStore.getState().active !== null) {
+      setActionMessage("Another operation is running — wait for it to finish (or cancel it) first.");
+      return;
+    }
     setBusyAction("models");
+    setActionMessage(null);
     const opId = begin("download-models");
     opIdRef.current = opId;
     try {
@@ -318,6 +339,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             <WindowsFlow
               preflight={preflight}
               busyAction={busyAction}
+              blocked={blocked}
               isOnnx={isOnnx}
               onInstallWsl={handleInstallWsl}
               onInstallDistro={handleInstallDistro}
@@ -327,6 +349,7 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
             <UnixEssentiaFlow
               preflight={preflight}
               busyAction={busyAction}
+              blocked={blocked}
               isOnnx={isOnnx}
               onInstallEssentiaNative={handleInstallEssentiaNative}
             />
@@ -335,9 +358,23 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
           <ModelsRow
             check={preflight.models}
             busy={busyAction === "models"}
+            blocked={blocked}
             isOnnx={isOnnx}
             onDownload={handleDownloadModels}
           />
+
+          {/* `blocked` greys out every install button. When the block is this
+              dialog's OWN install the busy row explains itself, but the dialog
+              can also be opened from Settings while an unrelated op runs — and
+              then the click-time "another operation is running" message can
+              never fire, because the click is suppressed. Dead buttons with no
+              reason on screen read as a broken dialog, so say it up front. */}
+          {busyAction === null && active !== null && (
+            <div className="panel-pad bg-accent-yellow/10 border-accent-yellow/30 text-xs text-accent-yellow/90">
+              Another operation is running — wait for it to finish (or cancel it)
+              before starting a setup step.
+            </div>
+          )}
 
           {actionMessage && (
             <div className="panel-pad bg-accent-red/10 border-accent-red/30 text-xs text-accent-red">
@@ -444,6 +481,8 @@ export function PreflightDialog({ preflight, onRefresh, onClose, onReady }: Prop
 interface WindowsFlowProps {
   preflight: PreflightResult;
   busyAction: Action;
+  /** Another setup step, or any long op elsewhere in the app, is running. */
+  blocked: boolean;
   isOnnx: boolean;
   onInstallWsl: () => void;
   onInstallDistro: () => void;
@@ -453,6 +492,7 @@ interface WindowsFlowProps {
 function WindowsFlow({
   preflight,
   busyAction,
+  blocked,
   isOnnx,
   onInstallWsl,
   onInstallDistro,
@@ -473,6 +513,7 @@ function WindowsFlow({
           <ActionButton
             label="Install WSL + Ubuntu"
             busy={busyAction === "wsl"}
+            disabled={blocked}
             onClick={onInstallWsl}
           />
         }
@@ -491,6 +532,7 @@ function WindowsFlow({
           <ActionButton
             label="Install Ubuntu"
             busy={busyAction === "distro"}
+            disabled={blocked}
             onClick={onInstallDistro}
           />
         }
@@ -530,6 +572,7 @@ function WindowsFlow({
               icon={<Terminal className="w-4 h-4" />}
               label={`Install in ${target}`}
               busy={busyAction === "vibechek"}
+              disabled={blocked}
               onClick={() => onInstallVibechekInWsl(target)}
             />
           }
@@ -555,6 +598,8 @@ function WindowsFlow({
 interface UnixFlowProps {
   preflight: PreflightResult;
   busyAction: Action;
+  /** Another setup step, or any long op elsewhere in the app, is running. */
+  blocked: boolean;
   isOnnx: boolean;
   onInstallEssentiaNative: () => void;
 }
@@ -562,6 +607,7 @@ interface UnixFlowProps {
 function UnixEssentiaFlow({
   preflight,
   busyAction,
+  blocked,
   isOnnx,
   onInstallEssentiaNative,
 }: UnixFlowProps) {
@@ -621,6 +667,7 @@ function UnixEssentiaFlow({
           icon={<Terminal className="w-4 h-4" />}
           label="Install Essentia"
           busy={busyAction === "vibechek"}
+          disabled={blocked}
           onClick={onInstallEssentiaNative}
         />
       }
@@ -635,11 +682,13 @@ function UnixEssentiaFlow({
 function ModelsRow({
   check,
   busy,
+  blocked,
   isOnnx,
   onDownload,
 }: {
   check: PreflightResult["models"];
   busy: boolean;
+  blocked: boolean;
   isOnnx: boolean;
   onDownload: () => void;
 }) {
@@ -659,6 +708,7 @@ function ModelsRow({
           icon={<Download className="w-4 h-4" />}
           label="Download models"
           busy={busy}
+          disabled={blocked}
           onClick={onDownload}
         />
       )}
@@ -710,15 +760,19 @@ function ActionButton({
   label,
   icon,
   busy,
+  disabled = false,
   onClick,
 }: {
   label: string;
   icon?: React.ReactNode;
   busy: boolean;
+  /** Blocked by something else (another setup step, or any long op elsewhere
+   *  in the app). Greys the button out WITHOUT claiming this step is working. */
+  disabled?: boolean;
   onClick: () => void;
 }) {
   return (
-    <button className="btn-primary" onClick={onClick} disabled={busy}>
+    <button className="btn-primary" onClick={onClick} disabled={busy || disabled}>
       {busy ? (
         <>
           <Loader2 className="w-4 h-4 animate-spin" />

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
+import pytest
 from click.testing import CliRunner
 
 from vibechek.cli import main
@@ -516,3 +518,273 @@ def test_organize_wrong_shape_json_no_traceback(tmp_path: Path) -> None:
     assert result.exit_code != 0
     assert "Traceback" not in result.output
     assert "TypeError" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Exit status of the mutating commands — a batch where every operation failed
+# must not exit 0 (`vibechek organize a.json && rm a.json` used to proceed).
+# ---------------------------------------------------------------------------
+
+
+def test_organize_exits_nonzero_when_every_move_fails(
+    synthetic_analysis: dict, tmp_path: Path
+) -> None:
+    """A read-only target puts every track in stats.errors and moves nothing."""
+    analysis_file = tmp_path / "analysis.json"
+    analysis_file.write_text(json.dumps(synthetic_analysis), encoding="utf-8")
+
+    def boom(*_a, **_kw):
+        raise OSError(30, "Read-only file system")
+
+    with mock.patch("vibechek.organizer.shutil.move", boom):
+        result = CliRunner().invoke(
+            main,
+            ["organize", str(analysis_file), "--min-genre-size", "1",
+             "--target-root", str(tmp_path / "library")],
+        )
+    assert result.exit_code != 0, result.output
+    assert "Nothing was moved" in result.output
+    # The green "Done." must not front a run in which nothing worked.
+    assert "Done (with errors)." in result.output
+
+
+def test_organize_error_list_says_how_many_were_withheld(
+    synthetic_analysis: dict, tmp_path: Path
+) -> None:
+    """Truncating to 5 with no remainder count hid the scale of the failure."""
+    analysis_file = tmp_path / "analysis.json"
+    analysis_file.write_text(json.dumps(synthetic_analysis), encoding="utf-8")
+
+    def boom(*_a, **_kw):
+        raise OSError(30, "Read-only file system")
+
+    with mock.patch("vibechek.organizer.shutil.move", boom):
+        result = CliRunner().invoke(
+            main,
+            ["organize", str(analysis_file), "--min-genre-size", "1",
+             "--target-root", str(tmp_path / "library")],
+        )
+    assert "and 2 more" in result.output  # 7 tracks, 5 shown
+
+
+def test_restore_tags_exits_nonzero_when_nothing_restored(tmp_path: Path) -> None:
+    """Every file failing to restore is a failed run, not a green one."""
+    from vibechek.tagger import RestoreStats
+
+    backup = tmp_path / "tags_backup.json"
+    backup.write_text(json.dumps({"files": {}}), encoding="utf-8")
+
+    stats = RestoreStats(total=3, restored=0, errors=["a: boom", "b: boom", "c: boom"])
+    with mock.patch("vibechek.tagger.restore_tags", return_value=stats):
+        result = CliRunner().invoke(main, ["restore-tags", str(backup)])
+    assert result.exit_code != 0, result.output
+    assert "Nothing was restored" in result.output
+
+
+# ---------------------------------------------------------------------------
+# logging — a CLI run must write to the same rotating log the sidecar and
+# `doctor`'s log tail read (the group body never called configure()).
+# ---------------------------------------------------------------------------
+
+
+def test_cli_configures_logging(tmp_path: Path) -> None:
+    """`vibechek <anything>` installs the file handler, so log.info is recorded."""
+    import logging
+
+    from vibechek import logging_setup
+
+    assert not logging_setup.LOG_FILE.exists()  # conftest points this at a tmp dir
+    result = CliRunner().invoke(main, ["journals"])
+    assert result.exit_code == 0, result.output
+
+    logging.getLogger("vibechek.test-probe").warning("probe-line")
+    assert logging_setup.LOG_FILE.exists()
+    assert "probe-line" in logging_setup.LOG_FILE.read_text(encoding="utf-8")
+
+
+def test_cli_still_runs_when_the_log_dir_cannot_be_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Logging is a diagnostic, not a precondition. `configure()` now runs in the
+    click group body, so an OSError there (read-only data dir, permissions) would
+    otherwise traceback out of EVERY command — including `doctor`, the one a user
+    runs precisely because their install is broken."""
+    from vibechek import logging_setup
+
+    # A file where the log DIRECTORY should be: mkdir(parents=True) raises
+    # NotADirectoryError/FileExistsError (both OSError) on every platform.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_bytes(b"x")
+    monkeypatch.setattr(logging_setup, "LOG_DIR", blocker / "logs")
+    monkeypatch.setattr(logging_setup, "LOG_FILE", blocker / "logs" / "vibechek.log")
+    monkeypatch.setattr(logging_setup, "_configured", False)
+
+    result = CliRunner().invoke(main, ["journals"])
+
+    assert result.exit_code == 0, result.output
+    assert not isinstance(result.exception, OSError)
+    # click only captures stderr SEPARATELY from 8.2 onward; pyproject pins
+    # `click>=8.1`, and on 8.1 `CliRunner` defaults to mix_stderr=True and
+    # `result.stderr` raises ValueError. Read whichever stream this click gives
+    # us so the test asserts the warning, not the click version.
+    try:
+        err = result.stderr
+    except ValueError:  # pragma: no cover - only on click < 8.2
+        err = ""
+    assert "could not open the log file" in (err or "") + result.output
+
+
+def test_route_exits_nonzero_when_every_copy_fails(tmp_path: Path) -> None:
+    """Sibling of the organize/tag case: `route` counts errors and ignored them."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    lib = tmp_path / "lib"
+    lib.mkdir()
+
+    summary = {"copied": 0, "skipped_no_genre": 0, "skipped_exists": 0,
+               "routed_to_other": 0, "errors": 4}
+    with mock.patch("vibechek.organizer.route_new_tracks", return_value=summary):
+        result = CliRunner().invoke(main, ["route", str(staging), str(lib)])
+    assert result.exit_code != 0, result.output
+    assert "Nothing was copied" in result.output
+
+
+def test_organize_target_root_help_describes_the_real_default() -> None:
+    """The help documented "first track's parent" — the resolution 68c59df
+    deleted as destructive. plan_organization now uses the commonpath of every
+    analysed track's parent, so the old text pointed users at the wrong lever."""
+    result = CliRunner().invoke(main, ["organize", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "first track's parent" not in result.output
+    assert "common parent folder" in result.output
+
+
+# ---------------------------------------------------------------------------
+# tag — the summary line has to account for every track
+# ---------------------------------------------------------------------------
+
+
+def _flat(text: str) -> str:
+    """Collapse Rich's soft wrapping so assertions can name a whole phrase."""
+    return " ".join(text.split())
+
+
+def test_tag_summary_reports_parent_only_and_write_disabled(tmp_path: Path) -> None:
+    """`applied + parent-only + skipped_*` is the track count, so the summary
+    must print all four buckets. It printed only applied + low-conf, so the
+    parent-genre fallback and the `write_genre`-off tracks vanished — 10 tracks
+    in, "Genre applied: 2 (skipped low-conf: 1)" out."""
+    from vibechek.tagger import ApplyStats
+
+    analysis = tmp_path / "a.json"
+    analysis.write_text(
+        json.dumps({"tracks": [{"path": str(tmp_path / "x.mp3")}]}), encoding="utf-8"
+    )
+    stats = ApplyStats(
+        total=10,
+        genre_applied=2,
+        genre_applied_parent_only=5,
+        genre_skipped_low_confidence=1,
+        genre_skipped_write_disabled=2,
+        other_tags_applied=10,
+    )
+    with mock.patch("vibechek.tagger.apply_ml_tags", return_value=stats):
+        result = CliRunner().invoke(main, ["tag", str(analysis)])
+    assert result.exit_code == 0, result.output
+    out = _flat(result.output)
+    assert "Genre applied: 2" in out
+    assert "parent-only: 5" in out
+    assert "skipped low-conf: 1" in out
+    assert "Genre writes off in config: 2" in out
+
+
+def test_tag_summary_hides_write_disabled_when_zero(tmp_path: Path) -> None:
+    """The write-disabled bucket is the abnormal case — a normal run must not
+    grow a "0" term for a toggle the user never touched."""
+    from vibechek.tagger import ApplyStats
+
+    analysis = tmp_path / "a.json"
+    analysis.write_text(
+        json.dumps({"tracks": [{"path": str(tmp_path / "x.mp3")}]}), encoding="utf-8"
+    )
+    stats = ApplyStats(total=3, genre_applied=3, other_tags_applied=3)
+    with mock.patch("vibechek.tagger.apply_ml_tags", return_value=stats):
+        result = CliRunner().invoke(main, ["tag", str(analysis)])
+    assert result.exit_code == 0, result.output
+    out = _flat(result.output)
+    assert "parent-only: 0" in out  # always shown: it's part of the accounting
+    assert "config" not in out
+
+
+def test_tag_parent_only_writes_count_as_success(tmp_path: Path) -> None:
+    """A parent-genre fallback IS a tag on disk. It was left out of the
+    success count, so a run where every genre came from the fallback and one
+    file errored exited 1 with "Nothing was tagged"."""
+    from vibechek.tagger import ApplyStats
+
+    analysis = tmp_path / "a.json"
+    analysis.write_text(
+        json.dumps({"tracks": [{"path": str(tmp_path / "x.mp3")}]}), encoding="utf-8"
+    )
+    stats = ApplyStats(
+        total=4,
+        genre_applied=0,
+        genre_applied_parent_only=3,
+        other_tags_applied=0,
+        errors=["x.mp3: unreadable"],
+    )
+    with mock.patch("vibechek.tagger.apply_ml_tags", return_value=stats):
+        result = CliRunner().invoke(main, ["tag", str(analysis)])
+    assert result.exit_code == 0, result.output
+    assert "Nothing was tagged" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# profile load — an unreadable config.json must not traceback
+# ---------------------------------------------------------------------------
+
+
+def test_profile_load_reports_a_refused_save_cleanly(tmp_path: Path) -> None:
+    """`load_profile` is a load→save round trip; on an unreadable config.json
+    `save()` raises ConfigSaveRefused rather than writing factory defaults over
+    the user's real settings. Only KeyError was caught, so that refusal reached
+    the user as a raw traceback."""
+    from vibechek.config import ConfigSaveRefused
+
+    refusal = ConfigSaveRefused(
+        "Your settings file couldn't be read, so Vibechek is showing factory "
+        "defaults — saving now would erase the settings still on disk.",
+        detail="config.json could not be loaded",
+    )
+    with mock.patch("vibechek.profiles.load_profile", side_effect=refusal):
+        result = CliRunner().invoke(main, ["profile", "load", "house-dj"])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "couldn't be read" in _flat(result.output)
+
+
+def test_profile_load_unknown_name_still_reports_cleanly() -> None:
+    """Sibling of the above — the KeyError path must keep working."""
+    result = CliRunner().invoke(main, ["profile", "load", "not-a-profile"])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "Unknown profile" in _flat(result.output)
+
+
+def test_organize_warns_when_the_undo_journal_is_incomplete(
+    synthetic_analysis: dict, tmp_path: Path
+) -> None:
+    """`OrganizeStats.journal_incomplete` says completed moves are MISSING from
+    the undo journal (a full volume, an AV/cloud-sync lock). The CLI dropped
+    the flag, so a later `revert` silently restored only part of the run."""
+    from vibechek.organizer import OrganizeStats
+
+    analysis_file = tmp_path / "analysis.json"
+    analysis_file.write_text(json.dumps(synthetic_analysis), encoding="utf-8")
+    stats = OrganizeStats(planned=5, moved=5, journal_incomplete=True)
+    with mock.patch("vibechek.organizer.organize_from_analysis", return_value=stats):
+        result = CliRunner().invoke(main, ["organize", str(analysis_file)])
+    assert result.exit_code == 0, result.output
+    out = _flat(result.output)
+    assert "undo journal is INCOMPLETE" in out
+    assert "only restore part" in out

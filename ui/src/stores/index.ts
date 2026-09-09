@@ -17,7 +17,7 @@
 export { useLibraryStore } from "./library";
 export { useOperationStore } from "./operation";
 export { useUIStore } from "./ui";
-export { useConfigStore } from "./config";
+export { useConfigStore, DEFAULT_CONFIG } from "./config";
 export { useNotificationStore } from "./notification";
 export { usePlayerStore } from "./player";
 

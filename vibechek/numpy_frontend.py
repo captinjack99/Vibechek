@@ -48,6 +48,18 @@ N_MELS = 96
 # kept as a named constant so any future essentia change is a one-line fix.
 MEL_SCALE_K = 1.0
 
+# How many frames one pass materializes. The whole-track version of this
+# function held ~56 bytes of float64/complex128 scratch per INPUT SAMPLE (frame
+# matrix + windowed copy + complex spectrum), i.e. ~1.4 GB on a 20-minute mix
+# inside a worker the budget sizes at 800 MB plus a track-length term
+# (resources.per_worker_mb), which allows for the DECODE, not this scratch — long
+# recorded sets are first-class content for a DJ library. Blocking the frames
+# makes the scratch a constant (~15 MB here) instead of a function of track
+# length; the maths is unchanged because every frame's spectrum and mel
+# projection depend on that frame alone, so a blocked run is bit-identical to a
+# whole-track one (test_numpy_frontend covers exactly that).
+_BLOCK_FRAMES = 1024
+
 
 @lru_cache(maxsize=4)
 def _slaney_mel_filterbank(
@@ -115,17 +127,31 @@ def musicnn_mel(audio: np.ndarray) -> np.ndarray:
     number of full 512-sample frames at hop 256. Short/empty input yields an
     empty ``(0, 96)`` array — the caller's patcher handles the zero-frame case
     (matching ``onnx_backend._make_patches``).
+
+    Frames are processed ``_BLOCK_FRAMES`` at a time so peak scratch memory is a
+    constant rather than a multiple of the track length; see that constant.
     """
-    audio = np.asarray(audio, dtype=np.float64)
+    audio = np.asarray(audio)
+    if audio.dtype.kind != "f":
+        audio = audio.astype(np.float64)
     n = audio.shape[0]
     if n < FRAME_SIZE:
         return np.zeros((0, N_MELS), dtype=np.float32)
 
     # FrameGenerator(startFromZero=True): frames fully inside the signal, the
-    # first starting at sample 0, stepping by HOP_SIZE.
-    starts = range(0, n - FRAME_SIZE + 1, HOP_SIZE)
-    frames = np.stack([audio[s:s + FRAME_SIZE] for s in starts])
-    spec = np.fft.rfft(frames * _hann(FRAME_SIZE), n=FRAME_SIZE, axis=1)
-    power = np.abs(spec) ** 2  # MelBands(type="power") squares the magnitude spectrum
-    mel_power = power @ _slaney_mel_filterbank().T
-    return np.log10(1.0 + 10000.0 * MEL_SCALE_K * mel_power).astype(np.float32)
+    # first starting at sample 0, stepping by HOP_SIZE. sliding_window_view is a
+    # strided VIEW — the per-block `frames * window` below is the only copy, and
+    # it upcasts a float32 buffer to float64 exactly as the old whole-track
+    # `astype` did.
+    n_frames = (n - FRAME_SIZE) // HOP_SIZE + 1
+    all_frames = np.lib.stride_tricks.sliding_window_view(audio, FRAME_SIZE)[::HOP_SIZE]
+    window = _hann(FRAME_SIZE)
+    fb_t = _slaney_mel_filterbank().T
+
+    out = np.empty((n_frames, N_MELS), dtype=np.float32)
+    for lo in range(0, n_frames, _BLOCK_FRAMES):
+        hi = min(lo + _BLOCK_FRAMES, n_frames)
+        spec = np.fft.rfft(all_frames[lo:hi] * window, n=FRAME_SIZE, axis=1)
+        power = np.abs(spec) ** 2  # MelBands(type="power") squares the magnitude spectrum
+        out[lo:hi] = np.log10(1.0 + 10000.0 * MEL_SCALE_K * (power @ fb_t))
+    return out

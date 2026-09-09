@@ -32,18 +32,45 @@ MARKER_START = "<!-- STATS_LINE_START -->"
 MARKER_END = "<!-- STATS_LINE_END -->"
 
 
+class StatsError(RuntimeError):
+    """A count could not be established. Never guess — the number gets committed."""
+
+
 def count_tests() -> int:
-    """Run pytest --collect-only to get the actual collected test count."""
+    """Run pytest --collect-only to get the actual collected test count.
+
+    Raises rather than returning a number it can't stand behind: a collection
+    abort (broken conftest, missing dev dep, pytest absent) prints no
+    "N tests collected" line at all, and the old `return 0` fallback wrote
+    "**0 Python tests**" into the README and exited 0. A PARTIAL collection
+    ("N tests collected, M errors") is just as fabricated — the modules that
+    failed to import contribute nothing — so that's a failure too.
+    """
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "tests/"],
         capture_output=True, text=True, cwd=ROOT,
     )
     # Last non-empty line is like "317 tests collected in 0.37s"
+    collected = None
     for line in reversed(result.stdout.strip().splitlines()):
         m = re.search(r"(\d+)\s+tests?\s+collected", line)
         if m:
-            return int(m.group(1))
-    return 0
+            collected = int(m.group(1))
+            break
+    if result.returncode != 0 or collected is None:
+        raise StatsError(
+            f"pytest collection failed (exit {result.returncode}); refusing to "
+            f"write a made-up test count.\n"
+            f"--- pytest stdout (tail) ---\n"
+            f"{_tail(result.stdout)}\n"
+            f"--- pytest stderr (tail) ---\n"
+            f"{_tail(result.stderr)}"
+        )
+    return collected
+
+
+def _tail(text: str, lines: int = 20) -> str:
+    return "\n".join(text.strip().splitlines()[-lines:]) or "(empty)"
 
 
 def count_rpc_methods() -> int:
@@ -51,10 +78,13 @@ def count_rpc_methods() -> int:
     sys.path.insert(0, str(ROOT))
     spec = importlib.util.spec_from_file_location("vibechek.rpc", ROOT / "vibechek" / "rpc.py")
     if spec is None or spec.loader is None:
-        return 0
+        raise StatsError(f"could not load {ROOT / 'vibechek' / 'rpc.py'} to count RPC methods")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return len(getattr(mod, "METHODS", {}))
+    methods = getattr(mod, "METHODS", None)
+    if not methods:
+        raise StatsError("vibechek/rpc.py exposes no non-empty METHODS dict")
+    return len(methods)
 
 
 def count_modules() -> int:
@@ -81,9 +111,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    tests = count_tests()
-    rpcs = count_rpc_methods()
-    modules = count_modules()
+    try:
+        tests = count_tests()
+        rpcs = count_rpc_methods()
+        modules = count_modules()
+    except StatsError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
     new_block = render_block(tests, rpcs, modules)
     text = README.read_text(encoding="utf-8")
@@ -111,6 +145,8 @@ def main() -> int:
             f"ERROR: README stats are stale.\n"
             f"  Current README block:  {pattern.search(text).group()!r}\n"
             f"  Expected:              {new_block!r}\n"
+            f"If the counts above look wrong, fix the suite first — this "
+            f"script refuses to write a count it could not establish.\n"
             f"Run: ./.venv/Scripts/python.exe scripts/update_readme_stats.py",
             file=sys.stderr,
         )

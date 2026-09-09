@@ -2,6 +2,7 @@ import { motion } from "framer-motion";
 import { Loader2, StopCircle } from "lucide-react";
 
 import { useOperationStore } from "../stores";
+import type { OperationKind } from "../stores/operation";
 import { rpc } from "../hooks/useSidecar";
 
 // Cancelling is best-effort. The sidecar may already have moved past the
@@ -13,9 +14,13 @@ function logCancelFailure(e: unknown): void {
   console.warn("cancel_operation RPC failed:", e);
 }
 
-export const KIND_LABELS: Record<string, string> = {
+const LABELS = {
   analyze: "Analyzing library",
   dedupe: "Finding duplicates",
+  // The DESTRUCTIVE half of dedupe. It had no entry, so the overlay fell back
+  // to rendering the raw kind ("dedupe-handle") as its headline while files
+  // were being trashed — the one moment the label has to be unambiguous.
+  "dedupe-handle": "Removing duplicates",
   organize: "Organizing files",
   tag: "Writing tags",
   backup: "Backing up tags",
@@ -24,7 +29,18 @@ export const KIND_LABELS: Record<string, string> = {
   "install-essentia": "Setting up the analysis engine",
   "install-cuda": "Installing GPU libraries",
   revert: "Undoing operation",
-};
+} satisfies Record<Exclude<OperationKind, null>, string>;
+
+/**
+ * Plain-language headline per operation kind.
+ *
+ * Widened to `Record<string, string>` for callers that index with an arbitrary
+ * string (an unknown kind falls back to the raw id). The `satisfies` clause on
+ * `LABELS` above is the real guard: adding a member to `OperationKind` without
+ * a label here is now a compile error, so a new op kind can never again reach
+ * the overlay as a raw identifier.
+ */
+export const KIND_LABELS: Record<string, string> = LABELS;
 
 export function AnalysisProgress() {
   const active = useOperationStore((s) => s.active);

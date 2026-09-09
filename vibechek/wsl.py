@@ -20,12 +20,12 @@ imports don't fail there.
 
 from __future__ import annotations
 
+import codecs
 import concurrent.futures
 import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -35,6 +35,7 @@ from pathlib import Path
 
 from vibechek.config import engine_venv_subdir
 from vibechek.platform import IS_WINDOWS
+from vibechek.utils import find_executable
 
 # Distros that aren't real Linux environments — probing them with bash will
 # either fail with garbage output or hang for the full subprocess timeout.
@@ -92,6 +93,24 @@ def wsl_missing_error() -> dict:
         ),
         "can_install_wsl": True,
     }
+
+
+def _wsl_exe() -> str | None:
+    """Locate `wsl.exe`, returning an ABSOLUTE path, or None when it isn't there.
+
+    Every launcher below RUNS what this returns, so the lookup goes through
+    `find_executable` rather than `shutil.which`: on Windows which() searches the
+    process cwd ahead of PATH (`NeedCurrentDirectoryForExePath`, which passing
+    `path=` does not suppress), so a `wsl.exe` dropped into whatever folder the
+    app was started from — an unpacked sample pack, say — would beat the real
+    System32 copy and then be handed our install / analyze command lines.
+    `find_executable` discards a cwd hit and absolutizes, so the resolved path
+    doesn't re-resolve against whichever directory a child process starts in.
+
+    Both spellings are tried because PATHEXT makes the bare name work in a
+    normal shell but not in every embedded environment.
+    """
+    return find_executable("wsl") or find_executable("wsl.exe")
 
 
 # ---------------------------------------------------------------------------
@@ -174,21 +193,27 @@ def detect_wsl(quick: bool = False, venv_subdir: str = "venv") -> WSLStatus:
     if not IS_WINDOWS:
         return status
 
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return status
     status.wsl_available = True
 
-    # `wsl --status` is the cheapest "is the feature enabled?" probe
+    # `wsl --status` is the cheapest "is the feature enabled?" probe, but it is
+    # NOT the last word: older in-box wsl.exe builds reject the flag outright,
+    # and a cold LxssManager can blow the 5 s budget. Treating either as "the
+    # feature is off" told users with a fully provisioned Ubuntu that WSL was
+    # not installed, and offered them a UAC-elevated `wsl --install`. So record
+    # WHY it was unhappy and let the distro inventory below settle it.
+    status_error: str | None = None
     try:
         result = _wsl_run([wsl, "--status"], timeout=5)
+        status.wsl_feature_enabled = result.returncode == 0
+        if not status.wsl_feature_enabled:
+            status_error = (result.stderr or result.stdout or "").strip() or (
+                f"wsl --status exited {result.returncode}"
+            )
     except Exception as e:  # noqa: BLE001
-        status.error = f"wsl --status failed: {e}"
-        return status
-
-    status.wsl_feature_enabled = result.returncode == 0
-    if not status.wsl_feature_enabled:
-        return status
+        status_error = f"wsl --status failed: {e}"
 
     # Parse `wsl --list --verbose` for the distro inventory
     try:
@@ -201,6 +226,22 @@ def detect_wsl(quick: bool = False, venv_subdir: str = "venv") -> WSLStatus:
     except Exception as e:  # noqa: BLE001
         log.debug("wsl --list failed: %s", e)
 
+    if status.distros and not status.wsl_feature_enabled:
+        # A real distro inventory is proof the feature IS on — `--status` lied.
+        log.info(
+            "wsl --status was unhelpful (%s) but `wsl -l -v` listed %d distro(s) "
+            "- treating the WSL feature as enabled.",
+            status_error, len(status.distros),
+        )
+        status.wsl_feature_enabled = True
+        status_error = None
+
+    if not status.wsl_feature_enabled:
+        # Explain the verdict instead of silently offering an install: the
+        # non-zero-exit branch used to return with error=None.
+        status.error = status_error
+        return status
+
     status.recommended_distro = "Ubuntu-24.04"
 
     if quick:
@@ -212,12 +253,28 @@ def detect_wsl(quick: bool = False, venv_subdir: str = "venv") -> WSLStatus:
     if linux_distros:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(linux_distros)) as ex:
             futures = {ex.submit(_probe_distro, d, wsl, venv_subdir): d for d in linux_distros}
-            for fut in concurrent.futures.as_completed(futures, timeout=30):
-                d = futures[fut]
-                try:
-                    fut.result()
-                except Exception as e:  # noqa: BLE001
-                    log.debug("probe %s failed: %s", d.name, e)
+            try:
+                # 45 s, not 30: each probe already gets its own 30 s, and
+                # as_completed's clock starts BEFORE the worker reaches Popen, so
+                # an equal budget deterministically fires first on a cold distro.
+                for fut in concurrent.futures.as_completed(futures, timeout=45):
+                    d = futures[fut]
+                    try:
+                        fut.result()
+                    except Exception as e:  # noqa: BLE001
+                        log.debug("probe %s failed: %s", d.name, e)
+            except concurrent.futures.TimeoutError:
+                # as_completed raises from the `for`, OUTSIDE the handler above.
+                # Unguarded it escaped detect_wsl -> preflight -> analyze and
+                # killed a just-queued run; a slow probe must only degrade the
+                # status we report, never abort the caller.
+                #
+                # MUST be concurrent.futures.TimeoutError, not the builtin: it
+                # only became an alias of the builtin in 3.11, and on 3.10 (our
+                # floor, and a CI leg) it is concurrent.futures._base.TimeoutError
+                # — a plain Exception subclass that sails straight past
+                # `except TimeoutError`.
+                log.debug("distro probes timed out; reporting partial WSL status")
 
     return status
 
@@ -297,6 +354,10 @@ if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
     # truncated the shim FIRST, so a disk-full between truncate and copy left
     # `vibechek` empty — and this repair runs on every status probe.
     if grep -v "cuda-env.sh" "$SHIM" > "$TMP" && [ -s "$TMP" ]; then
+        # `mktemp` makes the temp 0600 and `mv` renames that mode onto the
+        # shim, so the repaired entry point would lose its +x bit and fail
+        # every `[ -x ]` readiness gate. Carry the original mode across.
+        chmod --reference="$SHIM" "$TMP" 2>/dev/null || chmod 0755 "$TMP"
         mv "$TMP" "$SHIM"
         printf 'repaired=1\n'
     fi
@@ -355,6 +416,18 @@ done
         # the same CRLF-stripping pattern.
         clean = script.replace("\r\n", "\n").replace("\r", "\n")
         stdout_bytes, _ = proc.communicate(input=clean.encode("utf-8"), timeout=30)
+    except subprocess.TimeoutExpired as e:
+        # `communicate` does NOT kill the child on timeout. Abandoning it left a
+        # live wsl.exe (and the `bash -s` inside the VM) holding three pipes and
+        # pinning the distro awake - one stray per Settings refresh. Same
+        # kill-then-drain arm the sibling GPU probes already use.
+        log.debug("probe %s timed out: %s", distro.name, e)
+        try:
+            proc.kill()
+            proc.communicate(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return
     except Exception as e:  # noqa: BLE001
         log.debug("probe %s failed: %s", distro.name, e)
         return
@@ -768,7 +841,7 @@ def _apply_onnx_json(info: EngineGpuInfo, onnx_out: dict, gpu_name: str | None) 
 def _probe_wsl_onnx_gpu(distro: str) -> EngineGpuInfo:
     """ONNX GPU probe inside `distro`'s venv-onnx (onnxruntime EPs)."""
     info = EngineGpuInfo(engine="wsl", distro=distro)
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         info.error = "wsl.exe not on PATH"
         return info
@@ -1001,7 +1074,9 @@ def _probe_native_engine_gpu() -> EngineGpuInfo:
     info.gpu_available = info.gpu_count > 0
 
     # nvidia-smi truth (separate from TF probe — works on Linux/macOS too)
-    smi = shutil.which("nvidia-smi")
+    # `find_executable`, not `shutil.which`: the hit is EXECUTED, and on Windows
+    # which() searches the process cwd ahead of PATH.
+    smi = find_executable("nvidia-smi")
     if smi:
         try:
             r = subprocess.run(
@@ -1095,7 +1170,7 @@ def _probe_wsl_engine_gpu(distro: str) -> EngineGpuInfo:
     """
     info = EngineGpuInfo(engine="wsl", distro=distro)
 
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         info.error = "wsl.exe not on PATH"
         return info
@@ -1635,8 +1710,16 @@ def _user_bootstrap(engine: str = "essentia_tf") -> str:
 
 echo "[3/4] Creating ~/.vibechek/{subdir} venv..."
 mkdir -p "$HOME/.vibechek"
-if [ ! -d "$HOME/.vibechek/{subdir}" ]; then
-    python3 -m venv "$HOME/.vibechek/{subdir}"
+# LIVENESS, not existence. A distro release-upgrade (or an install killed
+# during this very step) leaves the venv DIRECTORY intact while its shebang'd
+# interpreter is gone - the exact state _probe_distro reports as py_broken=1
+# and ensure_engine_runtime promises to repair. The old `[ ! -d ]` guard then
+# skipped creation and ran the venv's own pip, whose shebang names the dead
+# interpreter, so every "Set up now" and every auto-repair died at the first
+# pip line, forever. `--clear` rebuilds in place (no bare rm -rf).
+VENV_DIR="$HOME/.vibechek/{subdir}"
+if [ ! -x "$VENV_DIR/bin/python" ] || ! "$VENV_DIR/bin/python" -c "import sys" >/dev/null 2>&1; then
+    python3 -m venv --clear "$VENV_DIR"
 fi
 
 echo "[4/4] Installing Vibechek + {label} (this is the slow part)..."
@@ -1680,7 +1763,7 @@ def install_vibechek_in_wsl(
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
 
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return wsl_missing_error()
 
@@ -1894,7 +1977,7 @@ def upgrade_vibechek_in_wsl(
     """
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return wsl_missing_error()
 
@@ -2122,7 +2205,7 @@ def _run_managed_wsl_script(
     same dict shape as the install/upgrade helpers."""
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return wsl_missing_error()
 
@@ -2409,6 +2492,10 @@ if [ -f "$SHIM" ] && grep -q "cuda-env.sh" "$SHIM"; then
     # first (a disk-full mid-copy would zero the entry point).
     TMP_SHIM="$(mktemp)"
     if grep -v "cuda-env.sh" "$SHIM" > "$TMP_SHIM" && [ -s "$TMP_SHIM" ]; then
+        # `mktemp` makes the temp 0600 and `mv` renames that mode onto the
+        # shim, so the repaired entry point would lose its +x bit and fail
+        # every `[ -x ]` readiness gate. Carry the original mode across.
+        chmod --reference="$SHIM" "$TMP_SHIM" 2>/dev/null || chmod 0755 "$TMP_SHIM"
         mv "$TMP_SHIM" "$SHIM"
         echo "      Shim repaired."
     fi
@@ -2552,7 +2639,7 @@ def repair_wsl_shim(distro: str) -> dict:
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
 
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return wsl_missing_error()
 
@@ -2570,6 +2657,10 @@ if grep -q "cuda-env.sh" "$SHIM"; then
     # `cat "$TMP" > "$SHIM"`) risked leaving `vibechek` empty on a disk-full.
     TMP="$(mktemp)"
     if grep -v "cuda-env.sh" "$SHIM" > "$TMP" && [ -s "$TMP" ]; then
+        # `mktemp` makes the temp 0600 and `mv` renames that mode onto the
+        # shim, so the repaired entry point would lose its +x bit and fail
+        # every `[ -x ]` readiness gate. Carry the original mode across.
+        chmod --reference="$SHIM" "$TMP" 2>/dev/null || chmod 0755 "$TMP"
         mv "$TMP" "$SHIM"
         rm -f "$TMP"
         echo "REPAIRED"
@@ -2664,7 +2755,7 @@ def install_cuda_libs_in_wsl(
     if not IS_WINDOWS:
         return {"ok": False, "error": "Not running on Windows"}
 
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return wsl_missing_error()
 
@@ -2915,7 +3006,7 @@ def _probe_engine_stack_import(distro: str, engine: str) -> tuple[bool, str]:
     launch (no wsl.exe, Popen/timeout error) returns ``(True, "<reason>")`` so we
     never false-flag a healthy install as broken and trigger a needless reinstall.
     """
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return True, "probe skipped: wsl.exe not on PATH"
     subdir = engine_venv_subdir(engine)
@@ -2939,7 +3030,16 @@ def _probe_engine_stack_import(distro: str, engine: str) -> tuple[bool, str]:
         stdout_bytes, stderr_bytes = proc.communicate(
             input=clean.encode("utf-8"), timeout=120,
         )
-    except (OSError, subprocess.TimeoutExpired) as e:
+    except subprocess.TimeoutExpired as e:
+        # Same leak as _probe_distro: `communicate` abandons the child on
+        # timeout, and this probe runs before every analyze.
+        try:
+            proc.kill()
+            proc.communicate(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return True, f"probe inconclusive: {type(e).__name__}: {e}"
+    except OSError as e:
         return True, f"probe inconclusive: {type(e).__name__}: {e}"
     if proc.returncode == 0:
         return True, ""
@@ -2981,7 +3081,7 @@ def ensure_engine_runtime(
     """
     if not IS_WINDOWS:
         return {"ok": True, "skipped": "not-windows"}
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         return wsl_missing_error()
 
@@ -3137,7 +3237,7 @@ def run_vibechek_in_wsl(
 
     from vibechek import cancellation
 
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
+    wsl = _wsl_exe()
     if not wsl:
         raise FileNotFoundError("wsl.exe not on PATH")
 
@@ -3330,20 +3430,29 @@ def run_vibechek_in_wsl(
     # main thread blocks reading stdout, a verbose child filling the ~64KB
     # stderr pipe buffer deadlocks both sides (child blocks on write, parent
     # blocks on stdout read). The callback is optional; the drain is not.
+    stderr_reader: _threading.Thread | None = None
     if proc.stderr is not None:
         def _reader() -> None:
             for line in proc.stderr:  # type: ignore[union-attr]
                 if on_stderr_line:
                     on_stderr_line(line.rstrip())
 
-        t = _threading.Thread(target=_reader, daemon=True)
-        t.start()
+        stderr_reader = _threading.Thread(target=_reader, daemon=True)
+        stderr_reader.start()
 
     if proc.stdout is not None:
         for line in proc.stdout:
             stdout_chunks.append(line)
 
     rc = proc.wait(timeout=timeout)
+    # `wait` returns the instant the child exits; whatever is still sitting in
+    # the stderr pipe reaches on_stderr_line AFTERWARDS. The caller reads that
+    # shared tail the moment we return - both to decide the version-drift retry
+    # and to build the user-facing crash detail - so the lines most worth having
+    # (the traceback, the OOM kill, click's "No such option") must be in hand
+    # first. Bounded: the pipe is already at EOF, so this is a formality.
+    if stderr_reader is not None:
+        stderr_reader.join(timeout=5)
     cancel_event.set()  # tell the watchdog we're done
     token_file.unlink(missing_ok=True)  # PID handoff file
     launcher_path.unlink(missing_ok=True)  # staged bash launcher
@@ -3414,9 +3523,66 @@ def _detect_wsl_encoding_order(sample: bytes) -> tuple[str, ...]:
 
 # Cache the WSL VM's RAM readout — `free -m` inside a distro is a ~1s wsl.exe
 # round-trip and the Settings slider re-fetches on every engine/genre change.
-_WSL_VM_MEM_CACHE: dict[str, tuple[int | None, float]] = {}
+# One entry holds BOTH figures the budget needs (total, available): they come
+# out of the same `free -m` line, and probing them separately would double the
+# round-trip AND let the slider size against a total and an availability taken
+# a second apart.
+_WSL_VM_MEM_CACHE: dict[str, tuple[tuple[int | None, int | None], float]] = {}
 _WSL_VM_MEM_CACHE_LOCK = threading.Lock()
 _WSL_VM_MEM_CACHE_TTL_SEC = 60.0
+
+
+def _wsl_vm_memory_probe(
+    distro: str, *, force: bool = False,
+) -> tuple[int | None, int | None]:
+    """(total_mb, available_mb) inside `distro`, both from ONE `free -m` read.
+
+    Returns (None, None) when it can't be measured (not Windows, no wsl.exe, bad
+    distro name, probe failure) — every caller then falls back to whatever it
+    used before the probe existed. Cached 60s (see `_WSL_VM_MEM_CACHE`).
+    """
+    if not IS_WINDOWS or not distro or not _VALID_DISTRO_RE.match(distro):
+        return (None, None)
+    now = time.time()
+    if not force:
+        with _WSL_VM_MEM_CACHE_LOCK:
+            cached = _WSL_VM_MEM_CACHE.get(distro)
+        if cached is not None and (now - cached[1]) < _WSL_VM_MEM_CACHE_TTL_SEC:
+            return cached[0]
+
+    wsl = _wsl_exe()
+    mem: tuple[int | None, int | None] = (None, None)
+    if wsl:
+        try:
+            # `free -m` prints "Mem: <total> <used> <free> <shared> <buff/cache>
+            # <available>"; fields 2 and 7 are total and available MB. Read both
+            # in one round-trip so the two halves of the worker budget describe
+            # the same instant.
+            proc = _wsl_run(
+                [wsl, "-d", distro, "--", "bash", "-lc",
+                 "free -m | awk '/^Mem:/{print $2, $7}'"],
+                timeout=15,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        total = int(parts[0])
+                        # `available` is missing on ancient procps builds — a
+                        # total with no availability is still worth having.
+                        avail = (
+                            int(parts[1])
+                            if len(parts) > 1 and parts[1].isdigit()
+                            else None
+                        )
+                        mem = (total, avail)
+                        break
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.debug("wsl_vm_memory probe failed for %s: %s", distro, e)
+
+    with _WSL_VM_MEM_CACHE_LOCK:
+        _WSL_VM_MEM_CACHE[distro] = (mem, now)
+    return mem
 
 
 def wsl_vm_memory_mb(distro: str, *, force: bool = False) -> int | None:
@@ -3431,37 +3597,23 @@ def wsl_vm_memory_mb(distro: str, *, force: bool = False) -> int | None:
     Returns None when it can't be measured (not Windows, no wsl.exe, bad distro
     name, probe failure) — the caller then falls back to the host total.
     """
-    if not IS_WINDOWS or not distro or not _VALID_DISTRO_RE.match(distro):
-        return None
-    now = time.time()
-    if not force:
-        with _WSL_VM_MEM_CACHE_LOCK:
-            cached = _WSL_VM_MEM_CACHE.get(distro)
-        if cached is not None and (now - cached[1]) < _WSL_VM_MEM_CACHE_TTL_SEC:
-            return cached[0]
+    return _wsl_vm_memory_probe(distro, force=force)[0]
 
-    wsl = shutil.which("wsl") or shutil.which("wsl.exe")
-    mem: int | None = None
-    if wsl:
-        try:
-            # `free -m` prints "Mem:  <total> <used> ..."; field 2 is total MB.
-            proc = _wsl_run(
-                [wsl, "-d", distro, "--", "bash", "-lc",
-                 "free -m | awk '/^Mem:/{print $2}'"],
-                timeout=15,
-            )
-            if proc.returncode == 0:
-                for line in proc.stdout.splitlines():
-                    s = line.strip()
-                    if s.isdigit():
-                        mem = int(s)
-                        break
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log.debug("wsl_vm_memory_mb probe failed for %s: %s", distro, e)
 
-    with _WSL_VM_MEM_CACHE_LOCK:
-        _WSL_VM_MEM_CACHE[distro] = (mem, now)
-    return mem
+def wsl_vm_available_mb(distro: str, *, force: bool = False) -> int | None:
+    """RAM (MB) actually FREE inside the WSL VM right now.
+
+    The sibling of `wsl_vm_memory_mb`, and the reason it exists: the analyze run
+    happens INSIDE the VM and always passes its own `psutil` availability to
+    `compute_worker_budget`, so without this reading the Settings slider (which
+    runs in the Windows sidecar) skipped the availability cap entirely and
+    offered a worker count the run then silently reduced — the exact slider/run
+    divergence the one shared budget model exists to prevent.
+
+    Returns None when it can't be measured; the budget then applies the
+    total-RAM cap alone, which is what it did before this probe existed.
+    """
+    return _wsl_vm_memory_probe(distro, force=force)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -3515,6 +3667,14 @@ def _parse_wsl_size_to_mb(value: str | None) -> int | None:
     return int(num * factor)
 
 
+def _wsl_default_memory_mb(host_total_mb: int) -> int:
+    """What WSL2 hands the VM when `.wslconfig` has no `memory=` key: 50% of
+    host RAM, capped at 8 GB (the rule this module documents at the top of the
+    section). This is the real "current" value on the overwhelmingly common
+    machine where nothing ever wrote that file."""
+    return min(host_total_mb // 2, 8192)
+
+
 def _choose_wslconfig_memory_target_mb(host_total_mb: int | None) -> int | None:
     """Pick a safe `memory=` target (whole GB, in MB) from measured host RAM.
 
@@ -3531,7 +3691,14 @@ def _choose_wslconfig_memory_target_mb(host_total_mb: int | None) -> int | None:
     target_gb = target // 1024
     if target_gb < 1:
         return None
-    return target_gb * 1024
+    # Floor at what WSL already gives with no `memory=` key at all. Below ~16 GB
+    # of host RAM the `host - 8192` term drops UNDER that default, so the
+    # "Increase memory available to Vibechek" button used to write a SMALLER
+    # number than the VM already had - 1 GB on a 9 GB laptop, on the very screen
+    # that just refused the run for lack of memory. Rounded down to whole GB for
+    # a clean value; bump_wslconfig_memory then refuses to write a non-increase.
+    default_gb = _wsl_default_memory_mb(host_total_mb) // 1024
+    return max(target_gb, default_gb) * 1024
 
 
 def _rewrite_wslconfig_memory(text: str, new_value: str) -> str:
@@ -3586,6 +3753,42 @@ def _rewrite_wslconfig_memory(text: str, new_value: str) -> str:
     return result
 
 
+# `.wslconfig` is a file only the USER ever created, and the two ways Windows
+# tutorials tell them to create it - PowerShell 5.1 redirection and Notepad -
+# both emit a BOM (UTF-16 LE and UTF-8 respectively). Reading either as plain
+# UTF-8 with errors="replace" mangled the BOM into U+FFFD (which destroys a
+# UTF-16 file on write-back, silently dropping the user's processors/swap/kernel
+# settings) and hid the `[wsl2]` header behind the BOM, so we appended a SECOND
+# [wsl2] section with a second memory=. Sniff the BOM and round-trip in it.
+_WSLCONFIG_BOMS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF8, "utf-8"),
+    (codecs.BOM_UTF16_LE, "utf-16-le"),
+    (codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+
+
+def _decode_wslconfig(raw: bytes) -> tuple[str, bytes]:
+    """Decode `.wslconfig` bytes -> (text, the BOM to write back with).
+
+    Strict on purpose: an undecodable file raises UnicodeDecodeError so the
+    caller reports the fatal error shape instead of "saved!" over a mangled
+    config (fail loud, never fake).
+    """
+    for bom, codec in _WSLCONFIG_BOMS:
+        if raw.startswith(bom):
+            return raw[len(bom):].decode(codec), bom
+    return raw.decode("utf-8"), b""
+
+
+def _encode_wslconfig(text: str, bom: bytes) -> bytes:
+    """Inverse of _decode_wslconfig - same codec, same BOM, back to bytes."""
+    codec = {
+        codecs.BOM_UTF16_LE: "utf-16-le",
+        codecs.BOM_UTF16_BE: "utf-16-be",
+    }.get(bom, "utf-8")
+    return bom + text.encode(codec)
+
+
 def read_wslconfig_memory(*, path: Path | None = None) -> dict:
     """Read the current `[wsl2] memory=` from `.wslconfig`.
 
@@ -3597,10 +3800,14 @@ def read_wslconfig_memory(*, path: Path | None = None) -> dict:
         return {"ok": True, "path": str(p), "exists": False,
                 "memory": None, "memory_mb": None}
     try:
-        text = p.read_text(encoding="utf-8", errors="replace")
+        text, _bom = _decode_wslconfig(p.read_bytes())
     except OSError as e:
         return {"ok": False, "path": str(p), "exists": True,
                 "error": str(e), "memory": None, "memory_mb": None}
+    except UnicodeDecodeError as e:
+        return {"ok": False, "path": str(p), "exists": True,
+                "error": f"{p} is not readable text: {e}",
+                "memory": None, "memory_mb": None}
     value = _read_wslconfig_memory_value(text)
     return {
         "ok": True, "path": str(p), "exists": True,
@@ -3665,9 +3872,10 @@ def bump_wslconfig_memory(
         }
 
     text = ""
+    bom = b""
     try:
         if p.exists():
-            text = p.read_text(encoding="utf-8", errors="replace")
+            text, bom = _decode_wslconfig(p.read_bytes())
     except OSError as e:
         return {
             "ok": False, "changed": False, "path": str(p),
@@ -3676,22 +3884,54 @@ def bump_wslconfig_memory(
             "detail": f"Reading {p} failed: {e}",
             "error": str(e),
         }
+    except UnicodeDecodeError as e:
+        # Refuse rather than rewrite a file we could not read. The old lossy
+        # errors="replace" read turned a UTF-16 config into a mixed-encoding
+        # blob and still reported success.
+        return {
+            "ok": False, "changed": False, "path": str(p),
+            "restart_required": False, "kind": "fatal",
+            "headline": "Couldn't read the Windows Subsystem for Linux settings file.",
+            "detail": (
+                f"{p} isn't in a text encoding Vibechek recognises, so it was "
+                "left untouched. Open it in Notepad, save it as UTF-8, and try "
+                "again."
+            ),
+            "error": str(e),
+        }
 
     old_value = _read_wslconfig_memory_value(text)
     old_mb = _parse_wsl_size_to_mb(old_value)
     new_value = f"{target_mb // 1024}GB"
 
-    # Never shrink a limit the user already set higher than our target.
-    if old_mb is not None and old_mb >= target_mb:
+    # A `.wslconfig` with no `memory=` line is NOT "no limit" - WSL2 still caps
+    # the VM at 50% of host RAM (max 8 GB), and that is the normal case ("Nothing
+    # in the app wrote that file before"). Treating it as zero let the bump write
+    # a value BELOW the VM's actual size and call it an increase.
+    effective_mb = old_mb
+    if effective_mb is None and host_total_mb:
+        effective_mb = _wsl_default_memory_mb(host_total_mb)
+
+    # Never shrink: neither a limit the user set higher, nor WSL's own default.
+    if effective_mb is not None and effective_mb >= target_mb:
+        if old_mb is None:
+            message = (
+                "Windows already gives the Linux analysis environment about "
+                f"{effective_mb // 1024} GB (half this PC's memory, capped at "
+                "8 GB) - at least as much as Vibechek would set, so there's "
+                "nothing to raise."
+            )
+        else:
+            message = (
+                "The Linux analysis environment is already allowed "
+                f"{old_value}, which is enough."
+            )
         return {
             "ok": True, "changed": False, "path": str(p),
             "old": old_value, "new": old_value,
             "old_mb": old_mb, "new_mb": old_mb,
             "restart_required": False,
-            "message": (
-                "The Linux analysis environment is already allowed "
-                f"{old_value}, which is enough."
-            ),
+            "message": message,
         }
 
     new_text = _rewrite_wslconfig_memory(text, new_value)
@@ -3699,7 +3939,9 @@ def bump_wslconfig_memory(
         p.parent.mkdir(parents=True, exist_ok=True)
         # Write atomically so a crash mid-write can't corrupt the user's config.
         tmp = p.parent / (p.name + ".vibechek-tmp")
-        tmp.write_text(new_text, encoding="utf-8")
+        # Write back in the codec we read (BOM and all) so a UTF-16 or BOM'd
+        # config survives the edit intact.
+        tmp.write_bytes(_encode_wslconfig(new_text, bom))
         os.replace(tmp, p)
     except OSError as e:
         return {
@@ -3755,6 +3997,7 @@ __all__ = [
     "run_vibechek_in_wsl",
     "probe_engine_gpu",
     "wsl_vm_memory_mb",
+    "wsl_vm_available_mb",
     "wsl_missing_error",
     "wslconfig_path",
     "read_wslconfig_memory",

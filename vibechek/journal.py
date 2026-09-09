@@ -76,6 +76,13 @@ class JournalWriter:
     kind: str
     _fh: Any = field(default=None, repr=False)
     entries: int = 0
+    # Records that never reached the journal — a swallowed OSError (the data
+    # volume filled mid-organize) or a no-op writer (`start_journal` couldn't
+    # create the file at all). Non-zero means the undo log is INCOMPLETE: the
+    # moves it's missing happened on disk anyway, so a revert of this journal
+    # silently restores only part of the run. Callers must surface it; see
+    # OrganizeStats.journal_incomplete.
+    failed: int = 0
 
     def record_move(self, src: Path | str, dst: Path | str) -> None:
         self._write({"action": "move", "src": str(src), "dst": str(dst)})
@@ -85,6 +92,10 @@ class JournalWriter:
 
     def _write(self, obj: dict[str, Any]) -> None:
         if self._fh is None:
+            # No-op writer (start_journal failed). The op still runs, but this
+            # record is lost — count it so the caller can say "no undo record"
+            # instead of quietly omitting the Undo button.
+            self.failed += 1
             return
         try:
             self._fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -95,8 +106,11 @@ class JournalWriter:
             self.entries += 1
         except OSError as e:
             # A journal-write failure must NOT abort the operation it's
-            # recording — the move already happened. Log and carry on; worst
-            # case that one entry is missing from the undo log.
+            # recording — the move already happened. Log and carry on, but
+            # COUNT it: a journal missing entries reverts cleanly and reports
+            # "Undo complete" while the unrecorded files stay stranded, which
+            # is the one outcome the user must never be told is fine.
+            self.failed += 1
             log.warning("Journal write failed (continuing): %s", e)
 
     def close(self) -> None:
@@ -231,7 +245,9 @@ def revert_journal(
     — i.e. (dst, src) — for every move actually undone, so the GUI can rewrite
     its in-memory track paths back (mirroring organize's moved_pairs; without
     it every post-undo Preview / tag-apply targeted paths that no longer
-    exist). Honors cancellation between entries.
+    exist). Honors cancellation between entries — a Cancel raises
+    `CancelledError` with `partial_summary` set to the summary built so far
+    (same keys), so the caller can still apply the reverts that DID happen.
     """
     from vibechek import cancellation
 
@@ -268,29 +284,39 @@ def revert_journal(
     # Reverse order: if organize created nested folders (Genre/Subgenre/x.mp3),
     # unwinding newest-first keeps each move's destination parent valid.
     total = len(moves)
-    for i, entry in enumerate(reversed(moves)):
-        cancellation.check()
-        src = Path(entry["src"])   # original location (where we move back TO)
-        dst = Path(entry["dst"])   # current location (where the file IS now)
-        if on_progress:
-            on_progress(i + 1, total, dst.name)
+    try:
+        for i, entry in enumerate(reversed(moves)):
+            cancellation.check()
+            src = Path(entry["src"])   # original location (where we move back TO)
+            dst = Path(entry["dst"])   # current location (where the file IS now)
+            if on_progress:
+                on_progress(i + 1, total, dst.name)
 
-        if not dst.exists():
-            summary["skipped"] += 1
-            continue
-        if src.exists():
-            # Something is already at the original path — don't overwrite it.
-            summary["skipped"] += 1
-            error_messages.append(f"{src}: original path occupied, left {dst} in place")
-            continue
-        try:
-            src.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(dst), str(src))
-            summary["reverted"] += 1
-            reverted_pairs.append((str(dst), str(src)))
-        except OSError as e:
-            summary["errors"] += 1
-            error_messages.append(f"{dst} -> {src}: {e}")
+            if not dst.exists():
+                summary["skipped"] += 1
+                continue
+            if src.exists():
+                # Something is already at the original path — don't overwrite it.
+                summary["skipped"] += 1
+                error_messages.append(f"{src}: original path occupied, left {dst} in place")
+                continue
+            try:
+                src.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dst), str(src))
+                summary["reverted"] += 1
+                reverted_pairs.append((str(dst), str(src)))
+            except OSError as e:
+                summary["errors"] += 1
+                error_messages.append(f"{dst} -> {src}: {e}")
+    except cancellation.CancelledError as exc:
+        # Same contract organize and dedupe already honor: the files reverted
+        # before Cancel really are back at their original paths, so their
+        # `reverted_pairs` must reach the caller. Dropping them left the GUI's
+        # in-memory library pointing at the vacated destinations, and a second
+        # undo can't recover them (their `dst` no longer exists, so they just
+        # count as skipped).
+        exc.partial_summary = summary  # type: ignore[attr-defined]
+        raise
 
     return summary
 

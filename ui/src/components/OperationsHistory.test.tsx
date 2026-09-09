@@ -13,7 +13,8 @@ import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 
 import { OperationsHistory } from "./OperationsHistory";
-import { useNotificationStore, useUIStore } from "../stores";
+import { useLibraryStore, useNotificationStore, useUIStore } from "../stores";
+import type { TrackAnalysis } from "../types";
 
 type MockFn = ReturnType<typeof vi.fn>;
 
@@ -90,5 +91,69 @@ describe("<OperationsHistory /> — undo partial-failure panel", () => {
       expect(msgs.some((m) => /undo complete/i.test(m))).toBe(true);
     });
     expect(screen.queryByText(/stayed in place/i)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * F058/F047 — a cancelled revert resolves like a success.
+ *
+ * The sidecar now returns the partial summary with `cancelled: true` instead
+ * of rejecting, and its skipped/errors are 0 because the remaining entries
+ * were never attempted. Reporting that as "Undo complete — Restored 1" is a
+ * confident false claim: most files are still at their organized paths.
+ */
+describe("<OperationsHistory /> — cancelled undo", () => {
+  beforeEach(() => {
+    useUIStore.setState({ historyOpen: true });
+  });
+
+  const CANCELLED = {
+    reverted: 1,
+    skipped: 0,
+    errors: 0,
+    trashed_not_reverted: 0,
+    error_messages: [] as string[],
+    reverted_pairs: [["D:/Music/House/b.mp3", "D:/Music/b.mp3"]] as [string, string][],
+    cancelled: true,
+  };
+
+  it("reports it as cancelled, not complete", async () => {
+    const user = userEvent.setup();
+    routeInvoke(CANCELLED);
+
+    render(<OperationsHistory />);
+    await user.click(await screen.findByRole("button", { name: /undo/i }));
+
+    await waitFor(() => {
+      const toast = useNotificationStore
+        .getState()
+        .items.find((n) => /undo cancelled/i.test(n.message));
+      expect(toast).toBeTruthy();
+      // 3 = the journal's move_count, i.e. what the run had to put back.
+      expect(toast!.message).toMatch(/restored 1 of 3 before stopping/i);
+      expect(toast!.kind).not.toBe("success");
+    });
+    const msgs = useNotificationStore.getState().items.map((n) => n.message);
+    expect(msgs.some((m) => /undo complete/i.test(m))).toBe(false);
+  });
+
+  it("still re-paths the rows it did restore", async () => {
+    const user = userEvent.setup();
+    routeInvoke(CANCELLED);
+    useLibraryStore.setState({
+      libraryPath: "D:/Music",
+      tracks: [
+        { path: "D:/Music/House/a.mp3", filename: "a.mp3" },
+        { path: "D:/Music/House/b.mp3", filename: "b.mp3" },
+      ] as unknown as TrackAnalysis[],
+    });
+
+    render(<OperationsHistory />);
+    await user.click(await screen.findByRole("button", { name: /undo/i }));
+
+    await waitFor(() => {
+      const paths = useLibraryStore.getState().tracks.map((t) => t.path).sort();
+      expect(paths).toEqual(["D:/Music/House/a.mp3", "D:/Music/b.mp3"]);
+    });
   });
 });

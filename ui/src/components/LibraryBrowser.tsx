@@ -18,6 +18,7 @@ import {
 } from "../stores";
 import { rpc } from "../hooks/useSidecar";
 import { importTagPriors } from "../api/rpc";
+import type { ScanDirectoryResult } from "../api/methods";
 import { useApplyTags } from "../hooks/useApplyTags";
 import type {
   AnalysisReport, LibraryRecord, LibraryState, PreflightResult, TrackAnalysis,
@@ -25,8 +26,9 @@ import type {
 import { TagBadge, EnergyBar } from "./TagBadges";
 import { PreflightDialog } from "./PreflightDialog";
 import { ConfirmModal } from "./ConfirmModal";
-import { FilterChips, applyFilters, emptyFilters, useLibraryFiltersStore } from "./LibraryFilters";
+import { FilterChips, applyFilters, emptyFilters, isEmpty, useLibraryFiltersStore } from "./LibraryFilters";
 import { needsReview, reviewReason } from "../lib/review";
+import { decideGenre } from "../lib/genreGate";
 
 /** Compact number formatter — "12k" instead of "12,466". */
 const compactFmt = new Intl.NumberFormat(undefined, {
@@ -69,6 +71,20 @@ function displayName(record: LibraryRecord): string {
   const explicit = (record as LibraryRecord & { name?: string }).name;
   if (explicit && explicit.trim()) return explicit;
   return basename(record.path);
+}
+
+/**
+ * True when a track carries a USABLE ML analysis.
+ *
+ * A per-track ML failure does not clear `ml_analysis` — the analyzer leaves a
+ * truthy `{ml_error: "…"}` record behind (vibechek/analyzer.py `_record_failed`
+ * makes the same distinction on the Python side). Treating that as "analyzed"
+ * meant "Analyze new" shipped every failed track in `skip_paths`, so a decode
+ * failure or a model that wasn't loaded could NEVER be retried without a full
+ * re-analyze of the whole library.
+ */
+function hasMlAnalysis(t: TrackAnalysis): boolean {
+  return !!t.ml_analysis && !t.ml_analysis.ml_error;
 }
 
 /** Wire shape for the count_new_tracks RPC. */
@@ -115,6 +131,10 @@ export function LibraryBrowser() {
   const { apply: applyTags } = useApplyTags();
 
   const [scanCount, setScanCount] = useState<number | null>(null);
+  // How many entries of the last scan carried a stat error (see
+  // ScanDirectoryResult.error). They're counted in `scanCount` but their size
+  // is 0, so reporting the bare total would present unreadable files as fine.
+  const [scanUnreadable, setScanUnreadable] = useState(0);
   const [preflightResult, setPreflightResult] = useState<PreflightResult | null>(null);
   // Snapshot the bulk-tag scope at modal-open time. Was previously just a
   // "selected" | "all" enum, but that re-reads `selectedIds` on confirm —
@@ -321,35 +341,53 @@ export function LibraryBrowser() {
     }
   };
 
+  // Counts the tracks with a usable analysis — a failed one is NOT analyzed
+  // (see hasMlAnalysis). This is what "Analyze new (N)" offers to run, so a
+  // failed track has to land in `unanalyzedCount` or it can never be retried.
   const analyzedCount = useMemo(
-    () => tracks.filter((t) => t.ml_analysis).length,
+    () => tracks.filter(hasMlAnalysis).length,
     [tracks],
   );
   const unanalyzedCount = tracks.length - analyzedCount;
 
-  // Genre breakdown for the bulk-tag confirm modal: only count tracks whose
-  // genre will actually be written (confidence >= threshold). Tracks without
-  // a confidence are counted as zero (won't be written either).
+  // Genre breakdown for the bulk-tag confirm modal.
+  //
+  // This is the informed-consent screen for the app's one irreversible write,
+  // so it runs the SAME two-stage gate the tagger runs (`decideGenre`) rather
+  // than a single-threshold approximation of it. Modelling only stage 1 put
+  // every parent-fallback track — the tagger's own comment says that tier is
+  // ~47% of a typical library — in the "will be skipped" bucket while their
+  // TCON frames were about to be rewritten, and it labelled stage-1 writes
+  // with the subgenre even where the parent is what lands.
   //
   // Uses the snapshotted `confirmBulkTag.targets` rather than re-deriving
   // from `selectedIds` — see the note on the snapshot's declaration.
   const tagPreview = useMemo(() => {
     if (!confirmBulkTag) return null;
     const targets = confirmBulkTag.targets;
-    const threshold = taggingCfg.genre_confidence_threshold;
 
     const counts = new Map<string, number>();
     let belowThreshold = 0;
+    let parentOnly = 0;
+    let writeDisabled = 0;
     for (const t of targets) {
-      const ml = t.ml_analysis;
-      const conf = ml?.ml_genre_confidence;
-      if (!ml?.ml_genre || conf == null || conf < threshold) {
+      const decision = decideGenre(t.ml_analysis, taggingCfg);
+      if (decision.outcome === "write-disabled") {
+        // Confident enough, but the genre toggle is off — not a skip for
+        // "low confidence" and not a write either. Its own bucket.
+        writeDisabled += 1;
+        continue;
+      }
+      if (!decision.willWrite) {
         belowThreshold += 1;
         continue;
       }
-      // Prefer subgenre when present — that's what gets written.
-      const label = ml.ml_subgenre || ml.ml_genre;
-      counts.set(label, (counts.get(label) ?? 0) + 1);
+      if (decision.outcome === "parent-only") parentOnly += 1;
+      // Count the label that actually lands in the main genre frame.
+      counts.set(
+        decision.genreToWrite,
+        (counts.get(decision.genreToWrite) ?? 0) + 1,
+      );
     }
     const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
     const top = sorted.slice(0, 5);
@@ -364,8 +402,10 @@ export function LibraryBrowser() {
       otherGenres,
       willWrite,
       belowThreshold,
+      parentOnly,
+      writeDisabled,
     };
-  }, [confirmBulkTag, taggingCfg.genre_confidence_threshold]);
+  }, [confirmBulkTag, taggingCfg]);
 
   // Tracks with either a top-level scan/decode error or an ML failure.
   const errorCount = useMemo(
@@ -421,10 +461,13 @@ export function LibraryBrowser() {
 
     const next = emptyFilters();
 
-    // Energy ±1 (chip filter is discrete int levels, so we just enumerate)
+    // Energy ±1 (chip filter is discrete int levels, so we just enumerate).
+    // The domain is 0-5, not 1-5 (analyzer.py clamps to max(0, min(5, ...)) and
+    // 0 is a legitimate "calmest track" level, not "unset") — clamping at 1
+    // dropped the seed track itself out of its own compatible set.
     if (ml.ml_energy != null) {
       const e = ml.ml_energy;
-      next.energies = new Set([e - 1, e, e + 1].filter((x) => x >= 1 && x <= 5));
+      next.energies = new Set([e - 1, e, e + 1].filter((x) => x >= 0 && x <= 5));
     }
 
     // Direction: match the seed track's direction if known, else default Up.
@@ -442,15 +485,26 @@ export function LibraryBrowser() {
     }
 
     setFilters(next);
-    // BPM ±5 isn't a chip — we don't want to overwrite the search box, so
-    // we surface it as a toast hint instead. Users can use the search box
-    // to narrow further if they really want BPM-tight matches.
+    // BPM isn't a chip dimension — `applyFilters` has no BPM clause at all — and
+    // we don't want to overwrite the search box, so BPM is NOT filtered. Say so:
+    // the toast used to list "±5 BPM" alongside three constraints that really
+    // are applied, so a 174 BPM roller read as beat-matchable with a 124 seed.
     if (ml.ml_bpm) {
       const bpm = Math.round(ml.ml_bpm);
-      notify(`Filtering for tracks compatible with ${bpm} BPM`, {
-        kind: "info",
-        detail: `±5 BPM, ±1 energy, ${ml.ml_key ?? "any key"}, ${ml.ml_direction || "Up"}`,
-      });
+      // A seed can carry BPM without energy (energy is a separate head and can
+      // fail on its own), and no energy chip was set in that case — so name the
+      // constraint only when it actually exists, rather than "at energy null".
+      const energyPhrase = ml.ml_energy != null ? ` at energy ${ml.ml_energy}` : "";
+      notify(
+        `Filtered to tracks that mix with ${ml.ml_key ?? "this key"}${energyPhrase}`,
+        {
+          kind: "info",
+          detail:
+            `${ml.ml_energy != null ? "±1 energy, " : ""}${ml.ml_key ?? "any key"}, ` +
+            `${ml.ml_direction || "Up"}. ` +
+            `BPM is not filtered — the seed is ${bpm} BPM, so check each row's BPM badge.`,
+        },
+      );
     }
   }, [selectedTrack, setFilters, notify]);
 
@@ -520,10 +574,32 @@ export function LibraryBrowser() {
     setShowErrorsOnly(false);
     setShowReviewOnly(false);
     setTracks([]);
+    // Drop the previous folder's unreadable-file count — a failed scan below
+    // would otherwise leave it attached to the newly-chosen library.
+    setScanUnreadable(0);
     begin("analyze");
     try {
-      const result = await rpc<{ count: number }>("scan_directory", { path: selected });
+      const result = await rpc<ScanDirectoryResult>("scan_directory", {
+        path: selected,
+      });
       setScanCount(result.count);
+      // The sidecar degrades a file it can't stat instead of failing the whole
+      // scan (rpc.py `_scan_directory`), leaving `size_mb` at 0 and an `error`
+      // on the entry. Silently swallowing that made unreadable files look like
+      // 0-byte ones; say so up front, before the user runs a long analyze.
+      const unreadable = result.files.filter((f) => f.error).length;
+      setScanUnreadable(unreadable);
+      if (unreadable > 0) {
+        notify(
+          `${unreadable} file${unreadable === 1 ? "" : "s"} could not be read`,
+          {
+            kind: "warning",
+            detail:
+              `${unreadable} of ${result.count} files in this folder couldn't be opened ` +
+              "(moved, locked, or no permission). They'll be counted but may fail to analyze.",
+          },
+        );
+      }
       finish();
     } catch (e) {
       fail(e);
@@ -555,8 +631,11 @@ export function LibraryBrowser() {
   // files don't linger as ghosts in the UI.
   const runAnalyze = async (incremental = false) => {
     if (!libraryPath) return;
+    // Only tracks with a USABLE analysis are skipped. Sending a failed track
+    // (ml_analysis present but ml_error set) in skip_paths made "Analyze new"
+    // permanently unable to retry it.
     const alreadyAnalyzed = incremental
-      ? tracks.filter((t) => t.ml_analysis).map((t) => t.path)
+      ? tracks.filter(hasMlAnalysis).map((t) => t.path)
       : [];
     const myGen = ++analyzeGen.current;
     // Authorize live-merge of streamed `track_analyzed` events for THIS run,
@@ -669,8 +748,21 @@ export function LibraryBrowser() {
         });
       }
       finish();
+      // Re-probe the new-tracks banner. It's a snapshot taken at library-open
+      // time, and the banner's own "Analyze + sort" button lands here — without
+      // this it keeps asserting "500 new tracks" straight after the run that
+      // analyzed them, and offers to run it again. Best-effort (the probe
+      // swallows its own errors and just clears the banner).
+      checkNewTracks(libraryPath);
     } catch (e) {
-      if (analyzeGen.current === myGen) fail(e);
+      // The generic rpc-replay retry can't help here: it discards the resolved
+      // AnalysisReport, so a "Try again" would re-run for an hour and never
+      // reach the store. Hand fail() a closure that re-enters THIS path (same
+      // incremental flag, same generation/token guards). It owns its own
+      // failure handling, so it must not be double-wrapped.
+      if (analyzeGen.current === myGen) {
+        fail(e, { retryAction: () => runAnalyze(incremental) });
+      }
     } finally {
       // Close this run's live-merge authorization. No-ops if a newer run (or a
       // library switch) already superseded us, so we never wipe a fresh run's
@@ -701,17 +793,32 @@ export function LibraryBrowser() {
     const result = await applyTags(writable);
     if (!result) return; // failure already surfaced via useOperationStore.error
     const threshold = Math.round(taggingCfg.genre_confidence_threshold * 100);
+    const parentThreshold = Math.round(
+      taggingCfg.parent_genre_confidence_threshold * 100,
+    );
+    // The parent-only tier is a genre WRITE, not a skip. Reporting only
+    // applied+skipped left those files on neither line, so the user read the
+    // detail block as "40 files untouched" and re-tagged them by hand.
     const detail =
       `Genre (conf >= ${threshold}%): ${result.applied}\n` +
+      `Parent genre only (>= ${parentThreshold}%): ${result.parentOnly}\n` +
       `Skipped (low confidence): ${result.skipped}\n` +
+      (result.skippedWriteDisabled > 0
+        ? `Skipped (genre writing off in Settings): ${result.skippedWriteDisabled}\n`
+        : "") +
       `Other tags (energy / mood / etc): ${result.other}` +
       (result.errors.length > 0 ? `\nErrors: ${result.errors.length}` : "");
-    const wrote = result.applied + result.other;
+    // The headline counts FILES WRITTEN, not tag tiers. `other` is bumped once
+    // per successfully written file whatever the genre outcome (tagger.py), so
+    // `applied` and `parentOnly` are subsets of it — summing the three
+    // double-counts every genre-written file (100 files reported as 170). The
+    // per-tier breakdown lives in `detail` above.
+    const wrote = result.other;
     const numErrors = result.errors.length;
     const headline =
       numErrors > 0
-        ? `Tagged ${wrote} files — ${numErrors} error${numErrors === 1 ? "" : "s"}`
-        : `Tagged ${wrote} files`;
+        ? `Wrote tags to ${wrote} files — ${numErrors} error${numErrors === 1 ? "" : "s"}`
+        : `Wrote tags to ${wrote} files`;
     notify(headline, {
       detail,
       kind: numErrors > 0 ? "info" : "success",
@@ -725,7 +832,11 @@ export function LibraryBrowser() {
   // it persists the decision to the saved analysis (survives reload); the
   // separate "Apply ML tags" flow is what writes to disk.
   const runResolveConflicts = async (action: "approve" | "revert") => {
-    if (!libraryPath || resolving) return;
+    // `importingPriors` too: import_tag_priors re-reconciles and rewrites the
+    // WHOLE saved analysis, so a resolve racing it either resolves against a
+    // record the import is about to replace or has its own write clobbered.
+    // Neither op sets the operation store's `active`, so this is the only guard.
+    if (!libraryPath || resolving || importingPriors) return;
     // Only the flagged tracks in the selection — the sidecar skips the rest, but
     // filtering here keeps the count + toast honest.
     const targets = tracks.filter(
@@ -749,6 +860,10 @@ export function LibraryBrowser() {
     try {
       const result = await rpc<{
         ok: boolean;
+        /** How many items the call asked for (== targets.length). */
+        requested?: number;
+        /** How many of those paths were found in the saved analysis. */
+        matched?: number;
         updated: number;
         reason?: string;
         tracks: TrackAnalysis[];
@@ -770,17 +885,34 @@ export function LibraryBrowser() {
       // cleared conflict flag drops them from the review filter automatically.
       mergeAnalyzedTracks(result.tracks);
       clearSelection();
+      // Report BOTH numbers the sidecar now returns. A bare "Approved 8 genres"
+      // read as "all done" even when 8 of 40 selected tracks were touched:
+      // `matched` is how many of the requested paths exist in the saved
+      // analysis, `updated` how many actually changed. (Both are optional so an
+      // older sidecar that sends neither degrades to the selection counts.)
+      const requested = result.requested ?? targets.length;
+      const matched = result.matched ?? requested;
       const n = result.updated;
+      const detailLines = [
+        action === "approve"
+          ? "Cleared from review. Nothing written to your files — use Apply ML tags for that."
+          : "The existing tag is kept as the genre and cleared from review.",
+      ];
+      if (matched < requested) {
+        detailLines.push(
+          `${requested - matched} selected track${requested - matched === 1 ? " was" : "s were"} ` +
+            "not in the saved analysis — re-analyze the library to include them.",
+        );
+      }
       notify(
         action === "approve"
-          ? `Approved ${n} genre${n === 1 ? "" : "s"} — kept Vibechek's call`
-          : `Reverted ${n} genre${n === 1 ? "" : "s"} to the file tag`,
+          ? `Approved ${n} of ${matched} genre${matched === 1 ? "" : "s"} — kept Vibechek's call`
+          : `Reverted ${n} of ${matched} genre${matched === 1 ? "" : "s"} to the file tag`,
         {
-          kind: "success",
-          detail:
-            action === "approve"
-              ? "Cleared from review. Nothing written to your files — use Apply ML tags for that."
-              : "The existing tag is kept as the genre and cleared from review.",
+          // Not everything the user asked for landed — that is a caution, not a
+          // clean success.
+          kind: n < requested ? "warning" : "success",
+          detail: detailLines.join("\n"),
         },
       );
     } catch (e) {
@@ -797,7 +929,10 @@ export function LibraryBrowser() {
   // export is safe. The component owns the RPC and hands the returned records
   // to the store (stores stay rpc-free) — same shape as runResolveConflicts.
   const handleImportPriors = async () => {
-    if (!libraryPath || importingPriors || active !== null) return;
+    // `resolving` too — same mutual exclusion as runResolveConflicts: both
+    // rewrite the saved analysis and neither sets the store's `active`, so
+    // whichever finishes last silently wins.
+    if (!libraryPath || importingPriors || resolving || active !== null) return;
     const selected = await openDialog({
       multiple: false,
       filters: [{ name: "Rekordbox XML", extensions: ["xml"] }],
@@ -989,7 +1124,11 @@ export function LibraryBrowser() {
               </h2>
               <p className="text-white/50 mb-6">
                 {libraryPath
-                  ? `Found ${scanCount ?? "?"} audio files in ${libraryPath}. Run analysis to detect genre, energy, mood, and more — or jump straight to dedup / organize using existing tags.`
+                  ? `Found ${scanCount ?? "?"} audio files in ${libraryPath}` +
+                    (scanUnreadable > 0
+                      ? ` (${scanUnreadable} could not be read)`
+                      : "") +
+                    `. Run analysis to detect genre, energy, mood, and more — or jump straight to dedup / organize using existing tags.`
                   : "Vibechek will scan your music folder, then let you analyze, dedupe, tag, or reorganize it."}
               </p>
               {libraryPath ? (
@@ -1184,7 +1323,10 @@ export function LibraryBrowser() {
               <button
                 className="btn-primary"
                 onClick={() => runResolveConflicts("approve")}
-                disabled={active !== null || resolving || selectedReviewCount === 0}
+                disabled={
+                  active !== null || resolving || importingPriors ||
+                  selectedReviewCount === 0
+                }
                 title="Accept Vibechek's genre for the selected flagged tracks and clear them from review (doesn't write file tags)"
               >
                 {resolving ? (
@@ -1197,13 +1339,23 @@ export function LibraryBrowser() {
               <button
                 className="btn-ghost"
                 onClick={() => runResolveConflicts("revert")}
-                disabled={active !== null || resolving || selectedReviewCount === 0}
+                disabled={
+                  active !== null || resolving || importingPriors ||
+                  selectedReviewCount === 0
+                }
                 title="Keep the genre already in the file's tag for the selected tracks and clear them from review"
               >
                 <Undo2 className="w-4 h-4" />
                 Revert to tag
               </button>
-              <button className="btn-ghost" onClick={() => clearSelection()}>
+              {/* Clearing the selection mid-flight would pull the ground out
+                  from under the resolve/import that is about to merge its
+                  results and clear it itself. */}
+              <button
+                className="btn-ghost"
+                onClick={() => clearSelection()}
+                disabled={resolving || importingPriors}
+              >
                 Clear
               </button>
             </>
@@ -1247,7 +1399,7 @@ export function LibraryBrowser() {
                 className="btn-ghost"
                 onClick={() => runAnalyze(true)}
                 disabled={active !== null}
-                title={`Run ML on the ${unanalyzedCount} tracks that haven't been analyzed yet`}
+                title={`Run ML on the ${unanalyzedCount} tracks that haven't been analyzed yet (or whose analysis failed)`}
               >
                 <Sparkles className="w-4 h-4" />
                 Analyze new ({unanalyzedCount})
@@ -1273,7 +1425,9 @@ export function LibraryBrowser() {
             <button
               className="btn-ghost"
               onClick={handleImportPriors}
-              disabled={active !== null || importingPriors || !libraryPath}
+              disabled={
+                active !== null || importingPriors || resolving || !libraryPath
+              }
               title="Import genre / key / MIK-energy priors from a Rekordbox collection XML (never writes file tags)"
             >
               {importingPriors ? (
@@ -1385,25 +1539,55 @@ export function LibraryBrowser() {
       {/* Track list */}
       <div className="flex-1 min-h-0">
         {showReviewOnly && filtered.length === 0 ? (
-          // Review queue drained — every flagged conflict has been approved or
-          // reverted. Give the user a clear "you're done" instead of a blank
-          // virtualized list, with a one-click way back to the full library.
-          <div className="h-full flex items-center justify-center px-8">
-            <div className="text-center max-w-sm">
-              <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-accent-green/10 flex items-center justify-center">
-                <Check className="w-6 h-6 text-accent-green" />
+          // Empty review list. Review-only composes WITH the chips and the
+          // search box, so an empty list does NOT prove the queue is drained —
+          // claiming "all caught up" while `reviewCount` still reads 300 in the
+          // pill above is how a user abandons a review pass with 300 unreviewed
+          // conflicts. Only say "all caught up" when nothing else is narrowing.
+          reviewCount === 0 || (isEmpty(filters) && !searchFilter) ? (
+            <div className="h-full flex items-center justify-center px-8">
+              <div className="text-center max-w-sm">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-accent-green/10 flex items-center justify-center">
+                  <Check className="w-6 h-6 text-accent-green" />
+                </div>
+                <h3 className="text-base font-display font-semibold mb-1">
+                  All caught up
+                </h3>
+                <p className="text-sm text-white/50 mb-4">
+                  No genre conflicts left to review in this library.
+                </p>
+                <button className="btn-ghost" onClick={() => setShowReviewOnly(false)}>
+                  Back to full library
+                </button>
               </div>
-              <h3 className="text-base font-display font-semibold mb-1">
-                All caught up
-              </h3>
-              <p className="text-sm text-white/50 mb-4">
-                No genre conflicts left to review in this library.
-              </p>
-              <button className="btn-ghost" onClick={() => setShowReviewOnly(false)}>
-                Back to full library
-              </button>
             </div>
-          </div>
+          ) : (
+            <div className="h-full flex items-center justify-center px-8">
+              <div className="text-center max-w-sm">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-xl bg-accent-yellow/10 flex items-center justify-center">
+                  <AlertTriangle className="w-6 h-6 text-accent-yellow" />
+                </div>
+                <h3 className="text-base font-display font-semibold mb-1">
+                  No matches in the review queue
+                </h3>
+                <p className="text-sm text-white/50 mb-4">
+                  {reviewCount === 1
+                    ? "1 track still needs review"
+                    : `${reviewCount.toLocaleString()} tracks still need review`}
+                  {" — your filters or search just don't match any of them."}
+                </p>
+                <button
+                  className="btn-ghost"
+                  onClick={() => {
+                    useLibraryFiltersStore.getState().clearFilters();
+                    setSearchFilter("");
+                  }}
+                >
+                  Clear filters and search
+                </button>
+              </div>
+            </div>
+          )
         ) : (
           <Virtuoso
             data={filtered}
@@ -1435,9 +1619,24 @@ export function LibraryBrowser() {
                 <div className="text-xs uppercase tracking-wider text-white/40 mb-2">
                   Will write
                 </div>
-                {tagPreview.willWrite === 0 ? (
+                {!taggingCfg.write_genre ? (
                   <div className="text-sm text-accent-yellow">
-                    No tracks above the {Math.round(taggingCfg.genre_confidence_threshold * 100)}% confidence threshold —
+                    Genre writing is off in Settings — no genre tag will be written
+                    {tagPreview.writeDisabled > 0 && (
+                      <>
+                        {" "}(
+                        <span className="font-mono">
+                          {tagPreview.writeDisabled.toLocaleString()}
+                        </span>{" "}
+                        track{tagPreview.writeDisabled === 1 ? "" : "s"} would
+                        otherwise have qualified)
+                      </>
+                    )}
+                    .
+                  </div>
+                ) : tagPreview.willWrite === 0 ? (
+                  <div className="text-sm text-accent-yellow">
+                    No tracks cleared the genre confidence gates —
                     nothing will be written.
                   </div>
                 ) : (
@@ -1459,10 +1658,20 @@ export function LibraryBrowser() {
                     )}
                   </div>
                 )}
+                {taggingCfg.write_genre && tagPreview.parentOnly > 0 && (
+                  <div className="mt-2 text-xs text-white/50">
+                    {tagPreview.parentOnly.toLocaleString()} of those{" "}
+                    {tagPreview.parentOnly === 1 ? "is" : "are"} the parent genre only
+                    (over {Math.round(taggingCfg.parent_genre_confidence_threshold * 100)}% on the
+                    family but under {Math.round(taggingCfg.genre_confidence_threshold * 100)}% on
+                    the subgenre) — the existing genre tag is still replaced.
+                  </div>
+                )}
                 {tagPreview.belowThreshold > 0 && (
                   <div className="mt-2 text-xs text-white/50">
                     {tagPreview.belowThreshold.toLocaleString()} track{tagPreview.belowThreshold === 1 ? "" : "s"} will be
-                    skipped (below {Math.round(taggingCfg.genre_confidence_threshold * 100)}% genre confidence,
+                    skipped (below both the {Math.round(taggingCfg.genre_confidence_threshold * 100)}% subgenre and{" "}
+                    {Math.round(taggingCfg.parent_genre_confidence_threshold * 100)}% parent-genre thresholds,
                     or not yet analyzed). Energy / mood / timeslot tags will still be written for analyzed files.
                   </div>
                 )}

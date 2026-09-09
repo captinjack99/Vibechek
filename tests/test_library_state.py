@@ -379,3 +379,199 @@ def test_old_state_file_without_new_fields_loads() -> None:
     assert state.recent[0].name == ""
     assert state.recent[0].tags == []
     assert state.recent[0].display_name() == "old"
+
+# ---------------------------------------------------------------------------
+# analysis_mutation — serializing load -> mutate -> save of one saved analysis
+# ---------------------------------------------------------------------------
+
+
+def test_analysis_mutation_yields_the_loaded_report() -> None:
+    record = library_state.record_analysis("/lib", {"tracks": [{"path": "/lib/a.mp3"}]})
+    with library_state.analysis_mutation(record) as report:
+        assert report is not None
+        assert report["tracks"][0]["path"] == "/lib/a.mp3"
+        report["tracks"][0]["marked"] = True
+        library_state.save_analysis(record, report)
+    assert library_state.load_analysis(record)["tracks"][0]["marked"] is True
+
+
+def test_analysis_mutation_yields_none_when_the_file_is_absent(tmp_path: Path) -> None:
+    record = library_state.LibraryRecord(
+        path="/lib", analysis_path=str(tmp_path / "gone.json"),
+    )
+    with library_state.analysis_mutation(record) as report:
+        assert report is None
+
+
+def test_analysis_mutation_propagates_unreadable(tmp_path: Path) -> None:
+    """An existing-but-corrupt file must still raise AnalysisUnreadable rather
+    than read as "never analyzed" — the lock changes nothing about that."""
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    record = library_state.LibraryRecord(path="/lib", analysis_path=str(bad))
+    with pytest.raises(library_state.AnalysisUnreadable):
+        with library_state.analysis_mutation(record):
+            pass
+
+
+def test_analysis_mutation_serializes_two_writers(analysis_lock_contention) -> None:  # noqa: ANN001
+    """save_analysis is atomic against a TORN file but not a LOST UPDATE: two
+    handlers doing load -> mutate -> save concurrently used to have the later
+    writer silently discard the earlier one's whole report.
+
+    "The second writer blocked" is proven by the lock reporting contention, not
+    by a 200 ms `join` — `is_alive()` is equally true for a thread the OS just
+    hasn't scheduled, so an unlocked second writer on a loaded runner passed the
+    old assertion. See the `analysis_lock_contention` fixture.
+    """
+    import threading
+
+    blocked = analysis_lock_contention
+    record = library_state.record_analysis("/lib", {"counter": 0})
+    inside = threading.Event()
+    release = threading.Event()
+
+    def _slow_writer() -> None:
+        with library_state.analysis_mutation(record) as report:
+            inside.set()
+            release.wait(5)
+            report["counter"] += 1
+            library_state.save_analysis(record, report)
+
+    t = threading.Thread(target=_slow_writer)
+    t.start()
+    try:
+        assert inside.wait(5)
+        # The second writer must BLOCK here until the first has saved, so it
+        # reads counter=1 and the increments compose instead of clobbering.
+        second = threading.Thread(target=_fast_increment, args=(record,))
+        second.start()
+        assert blocked.wait(5), "the second writer must block on the lock"
+        release.set()
+        second.join(5)
+    finally:
+        release.set()
+        t.join(5)
+    assert library_state.load_analysis(record)["counter"] == 2
+
+
+def _fast_increment(record: library_state.LibraryRecord) -> None:
+    with library_state.analysis_mutation(record) as report:
+        report["counter"] += 1
+        library_state.save_analysis(record, report)
+
+
+def test_analysis_mutation_locks_are_per_file() -> None:
+    """Different libraries must never contend with each other."""
+    a = library_state.record_analysis("/lib/a", {"tracks": []})
+    b = library_state.record_analysis("/lib/b", {"tracks": []})
+    with library_state.analysis_mutation(a):
+        # Would deadlock if the lock were global rather than per analysis file.
+        with library_state.analysis_mutation(b) as report:
+            assert report == {"tracks": []}
+
+
+# ---------------------------------------------------------------------------
+# checkpoint_path_for
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_path_is_not_the_analysis_path() -> None:
+    """An in-flight checkpoint is a PARTIAL report; writing it over the live
+    file would replace a good 12k-track analysis with "50 tracks, in_progress"
+    the moment a re-analyze is killed."""
+    analysis = library_state._analysis_path_for("/lib")
+    checkpoint = library_state.checkpoint_path_for("/lib")
+    assert checkpoint != analysis
+    assert checkpoint.parent == analysis.parent
+    assert checkpoint.suffix == ".json"
+    assert "checkpoint" in checkpoint.name
+
+
+# ---------------------------------------------------------------------------
+# refresh_record_counts
+# ---------------------------------------------------------------------------
+
+
+def _seed(path: str, total: int, analyzed: int):
+    return library_state.record_analysis(
+        path,
+        {"tracks": [], "summary": {"total_files": total, "analyzed": analyzed}},
+    )
+
+
+def test_refresh_record_counts_updates_the_index_row() -> None:
+    """save_analysis never touches the index, so a rewrite that DROPS rows
+    leaves the recents row advertising the pre-prune totals."""
+    record = _seed("/lib", 1200, 1200)
+    assert (record.track_count, record.analyzed_count) == (1200, 1200)
+
+    out = library_state.refresh_record_counts(
+        record, {"summary": {"total_files": 1150, "analyzed": 1100}},
+    )
+    assert out is not None
+    row = next(r for r in library_state.load_state().recent if r.path == "/lib")
+    assert (row.track_count, row.analyzed_count) == (1150, 1100)
+
+
+def test_refresh_record_counts_only_moves_the_counts() -> None:
+    """A prune is housekeeping, not a new analysis: no recents re-ordering, no
+    last_analyzed bump, name/tags untouched."""
+    record = _seed("/lib", 10, 10)
+    library_state.rename_library("/lib", "Friday Set")
+    library_state.tag_library("/lib", ["Brunch"])
+    _seed("/newer", 1, 1)  # recorded last → front of recents
+    before = next(r for r in library_state.load_state().recent if r.path == "/lib")
+
+    library_state.refresh_record_counts(
+        record, {"summary": {"total_files": 9, "analyzed": 9}},
+    )
+
+    recent = library_state.load_state().recent
+    assert [r.path for r in recent] == ["/newer", "/lib"]
+    row = next(r for r in recent if r.path == "/lib")
+    assert row.last_analyzed == before.last_analyzed
+    assert row.name == "Friday Set"
+    assert row.tags == ["Brunch"]
+    assert row.track_count == 9
+
+
+def test_refresh_record_counts_keeps_the_stored_value_for_absent_keys() -> None:
+    """`_rewrite_analysis_tracks` only rewrites summary keys that were already
+    there, so an absent one means "unknown", not "zero"."""
+    record = _seed("/lib", 10, 7)
+
+    library_state.refresh_record_counts(record, {"summary": {"total_files": 9}})
+
+    row = next(r for r in library_state.load_state().recent if r.path == "/lib")
+    assert (row.track_count, row.analyzed_count) == (9, 7)
+
+
+def test_refresh_record_counts_survives_a_hand_edited_summary() -> None:
+    """The destructive step already happened; a stray string in a hand-edited
+    report must not take down post-dedupe housekeeping."""
+    record = _seed("/lib", 10, 10)
+
+    library_state.refresh_record_counts(
+        record, {"summary": {"total_files": "lots", "analyzed": None}},
+    )
+
+    row = next(r for r in library_state.load_state().recent if r.path == "/lib")
+    assert (row.track_count, row.analyzed_count) == (10, 10)
+
+
+def test_refresh_record_counts_returns_none_for_an_unknown_library() -> None:
+    record = _seed("/lib", 5, 5)
+    library_state.forget("/lib")
+
+    assert library_state.refresh_record_counts(
+        record, {"summary": {"total_files": 1, "analyzed": 1}},
+    ) is None
+
+
+def test_refresh_record_counts_ignores_a_report_without_a_summary() -> None:
+    record = _seed("/lib", 5, 5)
+
+    assert library_state.refresh_record_counts(record, {"tracks": []}) is None
+    row = next(r for r in library_state.load_state().recent if r.path == "/lib")
+    assert row.track_count == 5

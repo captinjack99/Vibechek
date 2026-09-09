@@ -64,6 +64,7 @@ from pathlib import Path
 
 CALL_TIMEOUT_SEC = 120  # generous: a cold analyze error path may probe engines
 NOISE_PREVIEW = 400     # how much of an unparseable line to echo
+_STDERR_TAIL_LINES = 40  # sidecar stderr lines to echo when it dies
 
 # Full-tier ceilings. These bound the silent GAP between sidecar output lines,
 # not the whole call: progress notifications keep the clock fresh, so they only
@@ -144,15 +145,32 @@ class Sidecar:
     def __init__(self, state_dir: Path) -> None:
         cmd = [*_find_binary(), "rpc"]
         print(f"spawning: {cmd}")
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            env=_sandboxed_env(state_dir),
-        )
+        # Capture stderr to a FILE, not DEVNULL. A startup/import failure or a
+        # native crash writes its only diagnostic there, and this harness is the
+        # weekly gate against exactly that — discarding it left "sidecar stdout
+        # EOF before the response (crashed?)" as the whole postmortem, on a
+        # runner whose temp dir is destroyed minutes later. A file (rather than
+        # PIPE) also can't wedge the child on a full pipe buffer.
+        state_dir.mkdir(parents=True, exist_ok=True)  # _sandboxed_env does it too, but later
+        self.stderr_path = state_dir / "sidecar-stderr.log"
+        self._stderr_fh = self.stderr_path.open("wb")
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._stderr_fh,
+                text=True,
+                encoding="utf-8",
+                env=_sandboxed_env(state_dir),
+            )
+        except BaseException:
+            # Popen itself can fail (VIBECHEK_BIN points at nothing). `close()`
+            # is never reached because the caller never gets a Sidecar, so the
+            # handle would leak — and on Windows an open handle keeps main()'s
+            # rmtree from removing the temp dir.
+            self._stderr_fh.close()
+            raise
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._next_id = 0
         # Reader thread: select() doesn't work on Windows pipes, and CI devs
@@ -193,9 +211,15 @@ class Sidecar:
             try:
                 line = self._lines.get(timeout=timeout)
             except queue.Empty:
-                _fail(f"{method}: no output for {timeout}s")
+                # A hang is as opaque as a crash without the child's own words:
+                # a wedged import, a native library printing to stderr and never
+                # returning. Same postmortem as the EOF path.
+                _fail(f"{method}: no output for {timeout}s{self._stderr_report()}")
             if line is None:
-                _fail(f"{method}: sidecar stdout EOF before the response (crashed?)")
+                _fail(
+                    f"{method}: sidecar stdout EOF before the response (crashed?)"
+                    f"{self._stderr_report()}"
+                )
             line = line.strip()
             if not line:
                 continue
@@ -214,6 +238,34 @@ class Sidecar:
                     print(f"  · {text[:110]}")
             # other notifications / stale frames — fine, keep reading
 
+    def _stderr_report(self) -> str:
+        """Exit status + the tail of the sidecar's stderr, for a crash message."""
+        # On the EOF path stdout is already closed, so the child is essentially
+        # gone — reap it so returncode is a number and not a racy None. On the
+        # hang path it is still alive and stays that way; say so rather than
+        # printing a bare "None".
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        rc = self.proc.returncode
+        parts = [
+            "\n  sidecar exit code: "
+            + (str(rc) if rc is not None else "still running (never exited)")
+        ]
+        try:
+            self._stderr_fh.flush()
+            text = self.stderr_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return f"{parts[0]}\n  (could not read {self.stderr_path}: {e})"
+        tail = text.strip().splitlines()[-_STDERR_TAIL_LINES:]
+        if tail:
+            parts.append("  sidecar stderr (tail):")
+            parts.extend(f"    {ln}" for ln in tail)
+        else:
+            parts.append(f"  sidecar stderr was empty ({self.stderr_path})")
+        return "\n".join(parts)
+
     def close(self) -> None:
         try:
             if self.proc.stdin is not None:
@@ -221,6 +273,8 @@ class Sidecar:
             self.proc.wait(timeout=10)
         except Exception:  # noqa: BLE001 — teardown must never mask the verdict
             self.proc.kill()
+        finally:
+            self._stderr_fh.close()
 
 
 def main() -> None:

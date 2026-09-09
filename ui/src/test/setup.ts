@@ -73,14 +73,38 @@ beforeEach(async () => {
     searchFilter: "",
   });
 
+  // Every mutable field of the operation store. `opId` and `organizePlanKey`
+  // were missing, so a test that ran an op leaked its correlation id and — worse
+  // — its plan fingerprint into the next test: OrganizeView gates Execute on the
+  // key matching the current params, so a stale key silently armed or disarmed
+  // the staleness check depending on test order.
   stores.useOperationStore.setState({
     active: null,
+    opId: null,
     progress: null,
     startedAt: null,
     error: null,
     errorInfo: null,
     duplicateReport: null,
     organizePlan: null,
+    organizePlanKey: null,
+  });
+
+  // Toasts are append-only within a test run; several suites were resetting
+  // this by hand, which means the ones that didn't were asserting against
+  // whatever the previous test left behind.
+  stores.useNotificationStore.setState({ items: [] });
+
+  // The config store is a singleton too, and tests mutate it (a tagging
+  // toggle, an engine, `loadUntrusted`) with at best an inline restore at the
+  // END of the test body — which never runs when an assertion above it fails.
+  // One real failure then cascaded into unrelated ones in later suites, and
+  // re-running the failing test alone passed: the classic order-dependent
+  // debug dead end. Reset it here so no test can leak `write_genre: false`.
+  stores.useConfigStore.setState({
+    config: stores.DEFAULT_CONFIG,
+    loaded: false,
+    loadUntrusted: false,
   });
 
   stores.useUIStore.setState({

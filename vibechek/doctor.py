@@ -4,7 +4,9 @@ Builds a markdown-formatted dump of the user's environment that's safe to
 paste into a GitHub issue. The report deliberately avoids anything that could
 leak credentials, library contents, or full file paths under user-private
 directories: it only surfaces *paths + sizes + version strings*, never the
-files themselves.
+files themselves. The log tail is the one raw-text section, so it goes through
+`_scrub_log_line` (home directory → `~`, audio filenames → `<track>.ext`)
+before it lands in the report — the same promise, kept by construction.
 
 The output is consumed by:
   - Humans (CLI: `vibechek doctor` → stdout, `vibechek doctor --output X.md`).
@@ -21,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import platform
+import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -67,6 +70,10 @@ class DiagnosticReport:
     # users should be able to see in the diagnostic.
     model_integrity_verified: bool = False
     log_tail: list[str] = field(default_factory=list)
+    # Tail of the Tauri shell's OWN log (`vibechek-shell.log`), when the desktop
+    # shell has ever run. Empty for a CLI-only install — the section is then
+    # omitted rather than rendered as a missing file the user should go find.
+    shell_log_tail: list[str] = field(default_factory=list)
     wsl: dict[str, Any] | None = None
     native_venv: dict[str, Any] | None = None
     tempfile_leaks: int = 0
@@ -158,14 +165,120 @@ def _collect_model_integrity() -> bool:
         return False
 
 
+# Audio extensions the log routinely names. Matched case-insensitively.
+_TRACK_EXTS = "mp3|flac|wav|aiff|aif|m4a|mp4|ogg|opus|wma|aac|alac"
+# A path- or filename-shaped run ending in one of those extensions. Track names
+# contain spaces, so the left edge is bounded by the Windows-illegal characters
+# instead — `:` in particular, which is what keeps the log's own prefix
+# ("... skipping: ") out of the match. Directory segments are only consumed
+# after a real path anchor (drive, `~`, or a separator), else the prose ahead of
+# an absolute path would be swallowed with it.
+_TRACK_RE = re.compile(
+    rf"(?:(?:[A-Za-z]:[\\/]|~[\\/]|(?<![\w.])[\\/])"  # path anchor …
+    rf"(?:[^\\/\r\n:*?\"<>|]+[\\/])*)?"                # … then directories
+    rf"[^\\/\r\n:*?\"<>|]*?(\.(?:{_TRACK_EXTS}))\b",   # basename + extension
+    re.IGNORECASE,
+)
+
+
+def _scrub_home(text: str) -> str:
+    """Replace the user's home directory prefix with `~`.
+
+    Case-insensitive and separator-agnostic because Windows logs mix `\\` and
+    `/` and don't preserve case. The username is the one identifier in this
+    report the user can't un-paste.
+    """
+    try:
+        home = str(Path.home())
+    except RuntimeError:  # no HOME/USERPROFILE — nothing to redact against
+        return text
+    if not home or home in ("/", "\\"):
+        return text
+    for variant in {home, home.replace("\\", "/"), home.replace("/", "\\")}:
+        # Rebuild by case-insensitive search rather than re.sub so a path with
+        # regex metacharacters (perfectly legal in a folder name) is literal.
+        lowered_variant = variant.lower()
+        out: list[str] = []
+        rest = text
+        while True:
+            idx = rest.lower().find(lowered_variant)
+            if idx < 0:
+                out.append(rest)
+                break
+            out.append(rest[:idx])
+            out.append("~")
+            rest = rest[idx + len(variant):]
+        text = "".join(out)
+    return text
+
+
+def _scrub_log_line(line: str) -> str:
+    """Make one log line safe to paste into a public issue.
+
+    The module docstring promises this report leaks neither library contents
+    nor full user-private paths, but the log tail is a RAW read: `organizer`
+    logs one line per skipped track, and the duplicates/hash/move warnings log
+    absolute paths under the user's home. Track names ARE the library, so both
+    the home prefix and any audio-file path collapse here — the surrounding
+    message (which is the diagnostic value) is untouched.
+    """
+    def _elide(m: re.Match[str]) -> str:
+        text = m.group(0)
+        lead = text[: len(text) - len(text.lstrip())]
+        # Keep the shape (was it a bare name or a path?) — that distinction
+        # matters when reading the log — but not the names themselves.
+        prefix = ".../" if ("/" in text or "\\" in text) else ""
+        return f"{lead}{prefix}<track>{m.group(1)}"
+
+    return _TRACK_RE.sub(_elide, _scrub_home(line))
+
+
 def _collect_log_tail(n: int = 50) -> list[str]:
     """Lazy import of logging_setup so doctor.py is importable in tests
-    that monkeypatch LOG_FILE after import."""
+    that monkeypatch LOG_FILE after import.
+
+    Scrubbed at COLLECTION time, not render time, so no consumer of the
+    dataclass can accidentally publish the raw lines.
+    """
     try:
         from vibechek import logging_setup
-        return logging_setup.tail(n)
+        return [_scrub_log_line(line) for line in logging_setup.tail(n)]
     except Exception as e:  # noqa: BLE001
         log.debug("log tail failed: %s", e)
+        return []
+
+
+# The Tauri shell's own sink, written beside `vibechek.log` by
+# `ui/src-tauri/src/shell_log.rs` (1 MB, one backup).
+_SHELL_LOG_NAME = "vibechek-shell.log"
+
+
+def _collect_shell_log_tail(n: int = 30) -> list[str]:
+    """Tail of the desktop shell's log, scrubbed exactly like the main tail.
+
+    A windowed Windows build has no stderr (writes to the NULL handle "succeed"
+    and go nowhere), so the shell's own diagnostics — losing the sidecar,
+    killing it, a dropped JSON-RPC frame, a Python crash that happens BEFORE
+    `logging_setup.configure()` gets to open `vibechek.log` — exist ONLY in
+    this file. Folding it into the diagnostic is what lets a user attach a
+    shell-side crash without hunting for the data directory.
+
+    The path is derived from the live `logging_setup.LOG_FILE` rather than a
+    second constant, so "beside vibechek.log" stays true by construction (and
+    a test that relocates the log dir relocates both).
+    """
+    try:
+        from vibechek import logging_setup
+        shell_log = logging_setup.LOG_FILE.parent / _SHELL_LOG_NAME
+        if not shell_log.exists():
+            return []
+        # Same scrubbing as `_collect_log_tail`, at COLLECTION time: the shell
+        # relays child stderr, so this file carries track paths too.
+        with open(shell_log, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return [_scrub_log_line(line.rstrip("\n")) for line in lines[-n:]]
+    except Exception as e:  # noqa: BLE001
+        log.debug("shell log tail failed: %s", e)
         return []
 
 
@@ -301,6 +414,7 @@ def _collect_tempfile_leaks() -> int:
 def build_report(
     models_dir: Path | None = None,
     log_lines: int = 50,
+    shell_log_lines: int = 30,
 ) -> DiagnosticReport:
     """Assemble all probes into a `DiagnosticReport`. Never raises."""
     from vibechek.resources import detect
@@ -334,6 +448,7 @@ def build_report(
         models=models,
         model_integrity_verified=_collect_model_integrity(),
         log_tail=_collect_log_tail(log_lines),
+        shell_log_tail=_collect_shell_log_tail(shell_log_lines),
         wsl=_collect_wsl(),
         native_venv=_collect_native_venv(),
         tempfile_leaks=_collect_tempfile_leaks(),
@@ -396,7 +511,9 @@ def render_markdown(report: DiagnosticReport) -> str:
     lines.append("")
 
     lines.append("## Config")
-    lines.append(f"- Path: `{report.config_file_path}`")
+    # Same promise as the log tail: this report gets pasted into public issues,
+    # and these paths sit under the user's home (i.e. carry their real name).
+    lines.append(f"- Path: `{_scrub_home(report.config_file_path)}`")
     lines.append(f"- Size: {_fmt_size(report.config_file_size)}")
     lines.append(f"- Parse-ok: **{report.config_file_parse_ok}**")
     if report.config_file_error:
@@ -404,7 +521,7 @@ def render_markdown(report: DiagnosticReport) -> str:
     lines.append("")
 
     lines.append("## Models")
-    lines.append(f"- Directory: `{report.models_dir}`")
+    lines.append(f"- Directory: `{_scrub_home(report.models_dir)}`")
     present = sum(1 for m in report.models if m.get("present"))
     lines.append(f"- Present: **{present} / {len(report.models)}**")
     if report.model_integrity_verified:
@@ -502,7 +619,7 @@ def render_markdown(report: DiagnosticReport) -> str:
         if "error" in nv and nv.get("error") and len(nv) == 1:
             lines.append(f"- Error: `{nv['error']}`")
         else:
-            lines.append(f"- Venv dir: `{nv.get('venv_dir')}`")
+            lines.append(f"- Venv dir: `{_scrub_home(str(nv.get('venv_dir')))}`")
             lines.append(f"- Venv present: **{nv.get('venv_present')}**")
             lines.append(f"- essentia installed: **{nv.get('essentia_installed')}** "
                          f"(version: `{nv.get('essentia_version')}`)")
@@ -529,6 +646,22 @@ def render_markdown(report: DiagnosticReport) -> str:
         lines.append("(no log file or log is empty)")
     lines.append("```")
     lines.append("")
+
+    # Only when the shell has actually written a log: a CLI-only user has never
+    # run the desktop shell, and an empty block would read as a file they are
+    # supposed to go and find.
+    if report.shell_log_tail:
+        lines.append("## Shell log tail (last 30 lines)")
+        lines.append("_Desktop shell (`vibechek-shell.log`) — sidecar startup, "
+                     "crashes and panics that never reach the Python log._")
+        lines.append("```")
+        # Hard-cap to 30 even if the caller asked for more, defensive — same
+        # belt-and-braces as the main log tail.
+        for line in report.shell_log_tail[-30:]:
+            lines.append(line)
+        lines.append("```")
+        lines.append("")
+
     return "\n".join(lines)
 
 

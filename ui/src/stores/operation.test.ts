@@ -5,7 +5,7 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 
-import type { ProgressEvent } from "../types";
+import type { OrganizePlan, ProgressEvent } from "../types";
 import { RpcError } from "../hooks/useSidecar";
 import { newOpId, progressMatches, useOperationStore } from "./operation";
 
@@ -126,19 +126,75 @@ describe("useOperationStore.fail() error classification", () => {
   });
 
   it("carries the retry (method, params) for a retryable envelope", () => {
-    useOperationStore.getState().begin("dedupe");
     useOperationStore.getState().fail(
       rpcError(
         {
-          message: "The library scan is taking longer than expected.",
-          data: { kind: "retryable", headline: "The library scan is taking longer than expected." },
+          message: "Checking your setup is taking longer than expected.",
+          data: { kind: "retryable", headline: "Checking your setup is taking longer than expected." },
         },
-        { method: "find_duplicates", params: { path: "D:/Music" } },
+        { method: "preflight", params: { deep: true } },
       ),
     );
     const info = useOperationStore.getState().errorInfo!;
     expect(info.kind).toBe("retryable");
-    expect(info.retry).toEqual({ method: "find_duplicates", params: { path: "D:/Music" } });
+    expect(info.retry).toEqual({ method: "preflight", params: { deep: true } });
+  });
+
+  it("stamps the running op's kind on the retry handle (so the replay gets a progress panel)", () => {
+    useOperationStore.getState().begin("install-wsl");
+    useOperationStore.getState().fail(
+      rpcError(
+        {
+          message: "Installing Windows' Linux environment is taking longer than expected.",
+          data: { kind: "retryable", headline: "Installing is taking longer than expected." },
+        },
+        { method: "install_wsl", params: { op_id: "dead-op" } },
+      ),
+    );
+    const info = useOperationStore.getState().errorInfo!;
+    expect(info.retry).toEqual({
+      method: "install_wsl",
+      params: { op_id: "dead-op" },
+      kind: "install-wsl",
+    });
+  });
+
+  it("refuses a generic replay handle for a result-bearing long op", () => {
+    // A bare re-issue of analyze_directory would run for hours with no
+    // begin() (no progress panel, no Cancel) and then throw the report away.
+    // Those sites must pass an explicit retryAction instead.
+    useOperationStore.getState().begin("analyze");
+    useOperationStore.getState().fail(
+      rpcError(
+        {
+          message: "Analysis stopped unexpectedly while processing your library.",
+          data: { kind: "retryable", headline: "Analysis stopped unexpectedly." },
+        },
+        { method: "analyze_directory", params: { path: "D:/Music", op_id: "dead-op" } },
+      ),
+    );
+    const info = useOperationStore.getState().errorInfo!;
+    expect(info.kind).toBe("retryable");
+    expect(info.retry).toBeUndefined();
+    expect(info.retryAction).toBeUndefined();
+  });
+
+  it("refuses a generic replay for the other result-bearing / mutating long ops", () => {
+    for (const method of [
+      "find_duplicates",
+      "handle_duplicates",
+      "organize",
+      "apply_ml_tags",
+      "backup_tags",
+    ]) {
+      useOperationStore.getState().fail(
+        rpcError(
+          { message: "x", data: { kind: "retryable", headline: "x" } },
+          { method, params: {} },
+        ),
+      );
+      expect(useOperationStore.getState().errorInfo?.retry, method).toBeUndefined();
+    }
   });
 
   it("attaches the analyzed-track count on a mid-analyze death (from the last progress frame)", () => {
@@ -211,5 +267,78 @@ describe("useOperationStore.fail() error classification", () => {
     expect(s.error).toBeNull();
     expect(s.errorInfo).toBeNull();
     expect(s.active).toBeNull();
+  });
+});
+
+describe("useOperationStore.setOrganizePlan — staleness key", () => {
+  const plan = { moves: [], base_dir: "D:/Music", errors: [] } as unknown as OrganizePlan;
+
+  beforeEach(() => {
+    useOperationStore.setState({ organizePlan: null, organizePlanKey: null });
+  });
+
+  it("stores the params fingerprint alongside the plan", () => {
+    useOperationStore.getState().setOrganizePlan(plan, "D:/Music|sub:true|min:10");
+    const s = useOperationStore.getState();
+    expect(s.organizePlan).toBe(plan);
+    expect(s.organizePlanKey).toBe("D:/Music|sub:true|min:10");
+  });
+
+  it("clears the key with the plan (a cleared plan can't stay 'fresh')", () => {
+    useOperationStore.getState().setOrganizePlan(plan, "key-a");
+    useOperationStore.getState().setOrganizePlan(null);
+    const s = useOperationStore.getState();
+    expect(s.organizePlan).toBeNull();
+    expect(s.organizePlanKey).toBeNull();
+  });
+
+  it("never lets a new plan inherit the previous plan's key", () => {
+    useOperationStore.getState().setOrganizePlan(plan, "key-a");
+    // Old call shape (no key) — the plan is explicitly unkeyed, so a consumer
+    // gating Execute on the key treats it as stale rather than as key-a.
+    useOperationStore.getState().setOrganizePlan(plan);
+    expect(useOperationStore.getState().organizePlanKey).toBeNull();
+  });
+});
+
+/**
+ * The global vitest setup (src/test/setup.ts) resets the operation store before
+ * every test. It used to omit `opId` and `organizePlanKey`, so a test that ran
+ * an op leaked both into the next one — and `organizePlanKey` is what
+ * OrganizeView gates Execute on, so a stale key silently armed or disarmed the
+ * plan-staleness check depending on test ORDER.
+ *
+ * These two cases run in declaration order: the first dirties every field, the
+ * second asserts it started clean.
+ */
+describe("operation store — per-test reset covers every field", () => {
+  it("(1) dirties the whole store", () => {
+    const store = useOperationStore.getState();
+    store.begin("organize");
+    store.setOrganizePlan(
+      { base_dir: "D:/Music", moves: [], small_genres: [], genre_counts: {},
+        existing_genre_counts: {}, errors: [] } as OrganizePlan,
+      "min=10|sub=true|root=D:/Music",
+    );
+    store.setDuplicateReport(null);
+    store.fail(new Error("boom"));
+
+    const dirty = useOperationStore.getState();
+    expect(dirty.organizePlanKey).toBe("min=10|sub=true|root=D:/Music");
+    expect(dirty.error).toBeTruthy();
+  });
+
+  it("(2) starts the next test from a clean store", () => {
+    const s = useOperationStore.getState();
+    expect(s.active).toBeNull();
+    expect(s.opId).toBeNull();
+    expect(s.progress).toBeNull();
+    expect(s.startedAt).toBeNull();
+    expect(s.error).toBeNull();
+    expect(s.errorInfo).toBeNull();
+    expect(s.duplicateReport).toBeNull();
+    expect(s.organizePlan).toBeNull();
+    // The two that used to leak.
+    expect(s.organizePlanKey).toBeNull();
   });
 });

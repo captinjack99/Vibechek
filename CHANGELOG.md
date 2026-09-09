@@ -10,6 +10,417 @@ Pre-release tags use the form `vMAJOR.MINOR.PATCH-beta` (git tag) which maps to 
 
 ## [Unreleased]
 
+### Fixed
+
+#### Organize & Undo
+
+- **Cancelling something no longer throws away the work it already did.** Stopping
+  a long run — or having the stall watchdog stop it for you — used to discard the
+  record of everything that had already happened, so the app and your disk
+  disagreed until the next scan. Analysis now saves the tracks that finished
+  before the run unwinds, on the in-app engine and the Linux/managed engine
+  alike. A cancelled undo reports the files it already put back, so Play, Show in
+  Folder and Apply tags stop pointing at locations nothing lives at any more. A
+  cancelled duplicate trash or move says "cancelled before finishing" with the
+  real count instead of the same green success message a completed run gets, and
+  cancelling a duplicate scan while the audio fingerprint tool is still
+  downloading now actually stops the scan, instead of blaming your connection and
+  handing back a "finished" report that had quietly skipped near-duplicate
+  matching.
+
+- **The organize target Vibechek checks is the target it actually uses.** Typing
+  only spaces into the optional target root looked blank to the check that
+  green-lights the run, but not to the code that performed it — so the plan was
+  approved for your library and executed against a stray folder beside the app.
+  A blank-looking target is now blank everywhere. Separately, a plan you
+  previewed could still be executed after you switched tabs and changed the
+  library or the settings underneath it; the confirmed preview and the executed
+  move now always match, and a plan whose ground has shifted has to be previewed
+  again.
+
+- **A move or an undo that only half-worked now says so.** The undo record is
+  written as the files move, and a failure to write it — a full disk, an
+  antivirus or cloud-sync lock — used to pass in silence: the organize finished,
+  the Undo button appeared, and undoing reported a clean "restored" while the
+  files the record never captured stayed where they had been moved to. A run
+  whose undo record came out incomplete now says so. In the same spirit, a move
+  onto a second drive copies rather than renames, and a copy interrupted partway
+  used to leave a half-written track in the destination — real extension,
+  plausible name, unplayable, invisible to undo, and a candidate for dedupe to
+  keep in place of the intact original. The incomplete file is now removed and
+  the error names it — and a copy whose bytes landed but whose timestamps could
+  not be set (exFAT sticks, some network shares) is kept, not deleted.
+
+- **Sorting straight from tags no longer stops dead on one awkward file.** A
+  track carrying two genre tags — what MusicBrainz Picard and foobar2000 write —
+  produced a folder name the system refuses to create, and the whole routing run
+  died on it: everything after that file was left unfiled, with no summary. The
+  first genre on the track is used, and a tag that still can't be used skips one
+  file instead of the rest of the batch.
+
+- **An undo that put nothing back no longer greys itself out as "Undone".** It
+  now offers "Retry undo" and keeps the empty-folder cleanup on screen, so a run
+  that failed outright isn't presented as a run that succeeded.
+
+  Also fixed: WAV and Ogg Vorbis genre tags are read back where Vibechek writes
+  them, so files Vibechek tagged itself are no longer reported as having no genre
+  and left in staging; a track whose stored path spells its accents differently
+  from the disk now updates its row in the library table after an organize
+  instead of showing the old location until the next scan; a single file
+  disappearing mid-scan no longer aborts the whole scan and reports your chosen
+  folder as invalid; and the "Where files landed" breakdown counts the files that
+  actually moved, so a cancelled run no longer lists folders nothing landed in
+  with bars stretched past 100%.
+
+#### Duplicates
+
+- **A duplicate group holds real duplicates again.** Three separate ways of
+  matching could put the wrong file in front of you for the bin. Shortcuts and
+  hard links were counted as second copies, and the real audio file could be the
+  one offered for removal — links are now ignored. A file whose length couldn't
+  be read was grouped with a track of known length, so a truncated download could
+  be kept in place of the healthy full-length copy; unknown-length files are no
+  longer grouped that way. And very short audio — a stinger, a riser, a truncated
+  rip — matched anything it happened to share a single fingerprint frame with.
+
+- **The "keep the file nearest the top of your library" rule really looks at
+  folder depth.** It compared how many characters the path had, so a deeply
+  buried file with a short path could be kept over a shallow one with a long
+  name — which is not what the reason shown next to the choice said it was doing.
+  It now compares folder depth, so the choice and its stated reason agree.
+
+- **Duplicates you trash or move to review leave the library list.** They stayed
+  in the table after they were dealt with, so Play, Apply tags and Organize went
+  on to fail against files that were no longer there. They are now removed from
+  the list as they are handled.
+
+- **The saved analysis follows what you did to the files.** After trashing or
+  moving duplicates — and after an organize — the analysis Vibechek keeps on disk
+  still listed the old paths, so the next launch brought the removed tracks back
+  into the list and Play, Apply tags and Organize failed against them all over
+  again. The saved analysis is now updated in step with the move or removal, and
+  the duplicates view no longer has to guess which files were dealt with: the
+  removal reports each file's outcome. A duplicate moved to a review folder
+  *outside* the library leaves the library list and the saved analysis — so the
+  next Organize cannot file it straight back in.
+
+  Also fixed: with "keep every format" on, choosing "don't change this group" for
+  one group no longer silently drops a second group that happened to share the
+  same audio fingerprint; a duplicate scan no longer aborts when a file
+  disappears while it runs (a cloud sync, or tidying a folder mid-scan) — it
+  skips that file and finishes; and the progress panel says "Removing duplicates"
+  while duplicates are being removed instead of "Finding duplicates".
+
+#### Apply tags & restore
+
+- **A genre that came from your own tag or the online lookup is written as you
+  saw it.** On the default settings the precise genre was replaced by its broader
+  parent family on the way to the file — "Tech House" landed as "House" — so the
+  genre in the track panel and the genre in the tag disagreed. The precise genre
+  now survives the write.
+
+- **The Apply tags confirmation tells you what will really happen.** It used to
+  list thousands of tracks as "will be skipped" whose genre tag was about to be
+  rewritten with their parent genre, name the subgenre in cases where the parent
+  is what lands, and promise genre writes even with genre writing switched off in
+  Settings. The track panel had the mirror-image problem: "Genre below 85%
+  threshold — won't be written" sat directly above an Apply button that then
+  replaced that track's genre. Both now name the exact genre that will land, or
+  say why nothing will be written. The summary afterwards adds up too: files that
+  received their parent genre are counted, files skipped because genre writing is
+  off are counted as skipped, and "Genre applied" no longer includes files whose
+  genre was never written.
+
+- **Restoring a tag backup really puts the file back.** Three things could
+  survive a restore that shouldn't have. A FLAC that already carried its own KEY
+  or GROUPING comment kept the key and subgenre Vibechek had written, so
+  "Restore backup" left the track showing the very key you were reverting. One
+  field that couldn't be written in the ID3 text encoding you'd chosen abandoned
+  the entire file, and fields came back in the wrong encoding — each field is now
+  restored in the encoding it originally had. And a corrupt or hand-edited backup
+  is now refused with a plain message before anything is written, instead of
+  failing part-way and leaving the library half-restored. A backup made by an
+  older Vibechek, before it recorded a FLAC's INITIALKEY and CONTENTGROUP
+  comments, restores without touching those two — they are left as they are
+  rather than treated as something Vibechek added.
+
+- **Restoring tags into a moved library switches Vibechek to that folder.** If
+  you restored into a different or relocated library folder, the track list and
+  the library path ended up pointing at two different drives — which could make a
+  later Organize plan a whole-library move back onto the old one. Vibechek now
+  follows the folder you restored into.
+
+- **Approving reviewed genres no longer collides with an import, or reports work
+  it didn't do.** Approving or reverting reviewed genres while a Rekordbox import
+  was running silently discarded one of the two. And approving genres that aren't
+  in the saved analysis — after re-organizing without re-analyzing, for example —
+  reported success while quietly saving nothing; it now tells you.
+
+  Also fixed: genre tags written in lower or upper case ("tech house", "DEEP
+  HOUSE") are recognised as the genre they name, so they keep their parent
+  family, don't create a second folder, and no longer look like they disagree
+  with a matching analysis; and a `backup_history.json` holding something other
+  than the expected list degrades to an empty backup list in the Tags view — with
+  new backups indexed again — instead of failing outright.
+
+#### Analysis
+
+- **A run that failed is reported as failed.** A run where every track failed
+  used to finish with "Analyzed N/N, 0 errors" and a green success toast; failed
+  tracks are now counted as errors. At the other end of the scale, a track whose
+  audio decodes but whose genre model fails now keeps the tempo and key it could
+  be read for, instead of coming back blank — and is recorded as *partly*
+  analyzed (genre, energy and mood missing) rather than as an error, so
+  "Analyze new" stops re-trying it forever and the summary says how many tracks
+  came back partial.
+
+- **Analysis sizes itself against the memory you actually have free.** The worker
+  count was planned against the machine's total memory rather than what was
+  available, so a busy PC started more workers than it could feed. Long recorded
+  sets made this worse: the native engine's audio frontend held whole decoded
+  files, ballooning a worker's memory. The frontend now works in fixed-size
+  blocks and releases decoded audio as soon as it's finished with, and the
+  worker count also allows for the longest track in the library — a folder of
+  90-minute recorded sets plans fewer workers than a folder of singles. The
+  Settings slider and the run itself now compute that number from the same
+  inputs, so the maximum you are shown is the maximum that runs.
+
+- **A locked or recycling worker no longer produces nonsense.** A model file
+  momentarily locked by antivirus or a cloud-sync client took down every analysis
+  worker with an unrelated "out of memory" message, which sent people looking for
+  a problem they didn't have. And the hybrid CPU+GPU pool re-analysed a finished
+  track and logged a false "worker died mid-track" warning every time a worker
+  recycled.
+
+- **"Try again" no longer silently re-runs your whole library.** After a failure,
+  Try again could start a full analysis (or a dedupe, organize or tag write) with
+  no progress bar and no Cancel, and throw the result away at the end. Retries
+  now show the progress panel and can be cancelled.
+
+  Also fixed: the "N new tracks added since last analysis" banner clears once
+  you've analysed them, instead of inviting a second hour-long run; the genre
+  review queue no longer says "All caught up" when a filter or a search is what
+  emptied the list — it says how many tracks still need review and offers to
+  clear them; and "Find compatible" includes the quietest tracks (energy level
+  0), which used to be filtered out even when the seed track was one of them, and
+  its message no longer claims a BPM filter it never applied.
+
+#### Genre lookup (online)
+
+- **A lookup that couldn't reach the web says so.** When the online lookup was
+  offline or rate-limited for every track, the run quietly fell back to tags and
+  audio and looked like a clean pass that simply found nothing — which is exactly
+  what a healthy run looks like when a track genuinely isn't listed anywhere.
+  Both the run summary and the lookup itself now report that the web couldn't be
+  reached.
+
+- **A verified genre comes from a page about your track, and cites it.** With a
+  very short artist name (MK, MØ, Ki/Ki) the artist check was skipped rather than
+  performed, so a page about somebody else could be accepted. And a genre that
+  was read correctly could be attributed to an unrelated blog that happened to be
+  read first, rather than the catalog page it actually came from. The name is now
+  checked in every case, and the citation names the page the genre was quoted
+  from.
+
+- **The genre is read out of the genre field, and read whole.** A neighbouring
+  "Style:" field was being pulled in as part of the genre, which could file a
+  punk record under a dance genre. A genre written out in words — "Drum and
+  Bass", "Melodic House and Techno" — was dropped, or answered with the wrong
+  family; those are now understood.
+
+- **A redirect can't carry the lookup somewhere it isn't allowed to go.** The
+  fetch rules were checked once, against the address the lookup started with, so
+  a page could bounce it onto a blocked site, a disallowed page, or an address on
+  your own network. Every redirect is now re-checked against the same rules.
+
+#### Settings & config
+
+- **A settings file Vibechek can't read is left alone, not replaced.** If reading
+  your settings failed — a hand-edit typo, a backup or antivirus lock — the app
+  fell back to factory defaults and then wrote them over your file the next time
+  anything saved, taking your engine choice, folders and thresholds with it.
+  Vibechek now says out loud that it couldn't read the file, leaves it untouched,
+  and only writes once you deliberately change something. When you do choose to
+  write over it — Restore defaults is the one button meant for exactly that — the
+  unreadable file is kept beside the new one as `config.json.corrupt-<time>`
+  rather than destroyed, so a typo in a hand-edit costs you nothing. A save that
+  is refused because a sync client or antivirus momentarily holds the file is
+  retried once it is free, and the warning only appears — and only stays — while
+  the file really cannot be read.
+
+- **Clearing the Organize target or the duplicate review folder saves as empty.**
+  Emptying either field in Settings stored `"."` instead of nothing, which then
+  blocked Preview with "Target root must be an absolute path" and Move with
+  "Review folder looks invalid" — for a value you never typed and couldn't see.
+
+- **"Verify model integrity" actually verifies.** The check compared each model
+  against its pinned SHA256 using a key that never matched, so every file
+  silently passed: a completely replaced model set printed hashes and reported
+  success. The comparison is now real, and a mismatch is reported as one. The
+  ONNX backbone — the first and largest file that engine loads — was the one
+  file none of the checks (Settings, `verify-models`, setup) ever verified; all
+  three now check it against its pinned hash.
+
+- **An unrecognised value in a saved config is corrected out loud.** A GPU mode
+  the app doesn't know (an "ON" from a hand-edit) left it running CPU-only with
+  nothing on screen explaining why no GPU workers were used; it now resets to
+  Auto with a note in Settings, and an unrecognised duplicates action falls back
+  to report-only the same way.
+
+  Also fixed: the two vocal-detection sliders can no longer be dragged into an
+  impossible order, which silently broke every later tag write — including genre,
+  energy and mood — and a hand-edited settings file with the pair inverted is
+  corrected on load with a note, rather than loading and then failing every
+  write; and the diagnostic report's log tail no longer contains track
+  names or your home folder path, so it is safe to paste into a bug report as
+  documented.
+
+#### WSL & installs
+
+- **Vibechek stops claiming Windows Subsystem for Linux isn't installed.** The
+  quick status check reports nothing useful when it is slow or unsupported, and
+  that was read as "not installed". It now confirms against your actual list of
+  Linux distributions, and explains itself when WSL really is off. A slow check
+  also used to abort an analysis you had just started, and a check that hung was
+  left running in the background; the check no longer cancels your run, and a
+  hung one is shut down.
+
+- **Repairing the Linux environment repairs it.** A Linux install left behind by
+  an older CUDA setup came back from a repair without the permission its launcher
+  needs to run, so the app flipped straight back to "not set up" the moment it
+  had fixed itself. And an environment whose Python had gone missing — after a
+  distribution upgrade, or an interrupted setup — failed the same way on every
+  retry of "Set up now" instead of being rebuilt.
+
+- **Raising the memory available to Vibechek does something, or says it can't.**
+  "Increase memory available to Vibechek" could hand the Linux environment less
+  memory than Windows already gives it, and on a machine with nothing to raise it
+  reported a change and asked for a restart anyway. It now says so plainly, and
+  the offer is only made on a machine where there is memory to give — the
+  "not enough memory" refusal raised inside the Linux environment now reaches
+  the desktop with its buttons intact, where before it surfaced as a generic
+  "analysis stopped unexpectedly". An
+  existing `.wslconfig` written by PowerShell or Notepad (both add a hidden
+  byte-order mark) is now read and saved in its own encoding, so your processors,
+  swap and other settings survive the edit — and a file Vibechek can't read is
+  left untouched with an honest error rather than overwritten.
+
+- **Setup says which piece is missing instead of letting analysis stall.** The
+  ONNX and native engines were reported READY with ONNX Runtime missing, so
+  analysis started and then stalled; setup now names the missing piece and how to
+  install it. And when an analysis inside Linux crashes, the reason is captured
+  before the error is shown, so you get the actual message rather than "(no
+  stderr output)".
+
+  Also fixed: "Download models" can no longer be started on top of a running
+  install, which used to hide that install's progress bar and its Cancel button;
+  and a warning meant to stay on screen — like the risky install-path notice — is
+  no longer pushed out by a burst of ordinary "done" toasts.
+
+#### CLI
+
+- **A failed command exits non-zero.** `analyze`, `tag`, `organize`, `route`,
+  `dedupe`, `backup-tags`, `restore-tags`, `revert` and `cdj-export` printed a
+  green "Done." and exited 0 even when every single operation had failed — so
+  `vibechek organize a.json && rm a.json` went ahead and deleted the analysis
+  after a run that moved nothing. They now exit non-zero when everything failed,
+  and error lists say how many more were withheld.
+
+- **`vibechek export` no longer writes over the file you handed it.** With
+  `--format json` and no `-o`, the output path resolved to the input path and
+  truncated the analysis report in place. That is now refused, json exports are
+  written atomically, the command reports the number of tracks it actually wrote,
+  and a malformed `tracks` field is rejected instead of exporting nothing and
+  claiming success.
+
+- **CDJ export produces files a CDJ can actually use.** Exporting to a network
+  (NAS) folder wrote track locations pointing at a local folder that doesn't
+  exist. An export into a folder that already held a file of that name overwrote
+  it; the new file is now saved under a free name and the renames are reported.
+  The ffmpeg fallback wrote the AIFF-C variant rather than a standard AIFF. A
+  Rekordbox XML without a `<COLLECTION>` wrapper was reported as a successful
+  export that had converted nothing. And a sample-rate reduction is reported even
+  when the source file's own rate couldn't be read.
+
+#### Desktop shell & build
+
+- **"Open install folder" and "Show in folder" open the folder.** The desktop
+  shell never configured a scope for its file-manager opener, so it fell back to
+  a URL-only default that no Windows, macOS or Linux path could ever match — both
+  buttons were dead on every platform, and the failure was swallowed without a
+  word. If opening a folder fails again for any reason, you now see the error
+  instead of a button that does nothing.
+
+- **Re-running the release workflow on a published tag no longer deletes the
+  release.** A re-run removed the live release and the downloads attached to it.
+  Only leftover drafts are removed now.
+
+### Changed
+
+- **Organizing a library spread over two drives asks you where to put it.** With
+  no destination set, Vibechek guessed one from the track paths, and when the
+  tracks had no folder in common it fell back to the first track's folder —
+  which, for a sorted library, is a genre folder. It now says the tracks span
+  different drives and asks for a destination instead of guessing.
+
+- **Moving duplicates to a review folder requires a full path.** A relative path
+  was accepted and sent the files somewhere you couldn't find them, and left the
+  one-click undo unable to bring them back. A relative path is now rejected up
+  front.
+
+- **"Verify model integrity" checks the models your engine actually loads.** On
+  the Windows default (`native`) it checked the wrong set and reported all 16
+  models missing on a perfectly healthy install. Both the Settings check and
+  `vibechek verify-models` now follow your configured engine.
+
+- **Applying or restoring tags leaves an ID3v2.3 file at v2.3.** Every write
+  quietly rewrote such files as v2.4, which drops the frames v2.4 has no
+  equivalent for. The file now keeps the version it arrived with.
+
+- **Model downloads and helper tools are checked more strictly.** The genre
+  model's label file is now checked as strictly as its weights, so a bad download
+  can't quietly relabel your library and file tracks into the wrong genre
+  folders. Vibechek also prefers its own verified copy of the audio fingerprint
+  tool over whatever happens to be on your system path, so a stray file in the
+  folder you launched from can't be run against your library.
+
+- **CLI runs write to the same rotating log the desktop app uses**, so
+  `vibechek doctor`'s log tail can show what a command-line run did.
+  `organize --target-root`'s help now describes the real default — the common
+  parent folder of the analysed tracks — instead of a resolution that was removed
+  as destructive.
+
+- **Several messages say what they mean.** The organize preview's confirm dialog
+  shows short destination paths (`Genre/Track.mp3`) again instead of full
+  absolute ones. When the worker count is limited by your CPU core count,
+  Vibechek says so instead of blaming memory on a machine with plenty free. And
+  the post-tagging summary reports parent-genre writes on their own line, so the
+  counts add up to the number of files you tagged.
+
+- **The Windows native-audio build is pinned to a specific upstream commit** and
+  verifies the checkout before compiling, instead of tracking a moving branch.
+
+### Added
+
+- **The desktop shell keeps its own log.** `vibechek-shell.log` sits beside
+  `vibechek.log`, capped at 1 MB with one backup. Windows release builds have no
+  console, so every diagnostic the shell produced — the analysis service exiting,
+  being restarted, dropping a message, or crashing before Python's own logging
+  starts — was written to nowhere. Crashes in the shell are recorded there too,
+  and `vibechek doctor` includes its tail, so a bug report has something to
+  attach.
+
+- **`vibechek verify-models` takes an `--engine` option.** It defaults to your
+  configured engine, and lets you check a model set other than the one you
+  currently run.
+
+- **Removing duplicates reports each file's outcome.** Trashing or moving
+  duplicates now hands back what happened per file rather than a single count at
+  the end — which is what lets the library list drop the files you dealt with,
+  and lets a cancelled run report the number it really got through.
+
+*Full audit ledger with reproduction traces: `internal/AUDIT_2026-09-05.md` (not shipped).*
+
 ## [0.9.1-beta] — 2026-07-26
 
 ### Added

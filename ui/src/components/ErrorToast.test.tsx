@@ -56,6 +56,51 @@ describe("<ErrorToast />", () => {
     expect(useOperationStore.getState().errorInfo).toBeNull();
   });
 
+  it("re-issues a long op's retry under a fresh op (progress panel + Cancel come back)", async () => {
+    const mockInvoke = invoke as ReturnType<typeof vi.fn>;
+    mockInvoke.mockClear();
+    // Hold the replay in flight so we can observe the operation state while it
+    // runs (finish() clears it the moment it resolves).
+    let release: (v: unknown) => void = () => {};
+    mockInvoke.mockImplementation((cmd: string, args?: { method?: string }) => {
+      if (cmd === "rpc_call" && args?.method === "install_wsl") {
+        return new Promise((res) => {
+          release = res;
+        });
+      }
+      return Promise.resolve({});
+    });
+    try {
+      setError({
+        headline: "Installing Windows' Linux environment is taking longer than expected.",
+        kind: "retryable",
+        raw: "{}",
+        // `kind` is what fail() stamped on: the op that was running when it died.
+        retry: { method: "install_wsl", params: { op_id: "dead-op" }, kind: "install-wsl" },
+      });
+      render(<ErrorToast />);
+      fireEvent.click(screen.getByText("Try again"));
+
+      // The replay runs as a REAL operation, so the progress overlay (and its
+      // Cancel button) come back — a bare replay left `active` null and ran
+      // invisibly for as long as the op took.
+      await waitFor(() => expect(useOperationStore.getState().active).toBe("install-wsl"));
+      const opId = useOperationStore.getState().opId;
+      const call = mockInvoke.mock.calls.find(
+        (c) => c[0] === "rpc_call" && c[1]?.method === "install_wsl",
+      )!;
+      // The captured params carry the DEAD op's correlation id — progress
+      // frames stamped with it are dropped, so the replay gets the fresh one.
+      expect(call[1].params.op_id).toBe(opId);
+      expect(call[1].params.op_id).not.toBe("dead-op");
+
+      release({});
+      await waitFor(() => expect(useOperationStore.getState().active).toBeNull());
+    } finally {
+      mockInvoke.mockImplementation(async () => ({}));
+    }
+  });
+
   it("shows a Try again button for a retryAction-only error (no generic retry)", () => {
     setError({
       headline: "Vibechek couldn't read the saved analysis for this library right now.",
